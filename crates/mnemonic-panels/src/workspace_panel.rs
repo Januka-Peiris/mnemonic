@@ -103,6 +103,7 @@ impl WorkspacePanel {
         cx: &mut Context<Self>,
     ) {
         self.selected_workspace_id = Some(ws_id.clone());
+        cx.set_global(crate::ActiveWorkspace(Some(ws_id.clone())));
         cx.notify();
 
         if self.focus_terminal_for_workspace(&ws_id, window, cx) {
