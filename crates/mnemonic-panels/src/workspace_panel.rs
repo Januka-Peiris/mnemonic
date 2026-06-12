@@ -4,7 +4,7 @@ use gpui::{
 };
 use mnemonic_core::models::WorkspaceSummary;
 use mnemonic_core::services::workspace_service;
-use ui::{h_flex, v_flex, Label, prelude::*};
+use ui::{h_flex, v_flex, IconButton, IconName, Label, prelude::*};
 use workspace::dock::{DockPosition, PanelEvent};
 use workspace::{Panel, Workspace};
 
@@ -52,14 +52,48 @@ impl WorkspacePanel {
         }
     }
 
+    fn status_color(&self, status: &str, cx: &Context<Self>) -> gpui::Hsla {
+        match status {
+            "Active" => cx.theme().status().info,
+            "Merged" => cx.theme().status().success,
+            "Paused" | "Idle" => cx.theme().status().warning,
+            "Failed" | "Error" => cx.theme().status().error,
+            _ => cx.theme().colors().text_muted,
+        }
+    }
+
+    fn render_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        h_flex()
+            .px_2()
+            .py_1()
+            .justify_between()
+            .items_center()
+            .border_b_1()
+            .border_color(cx.theme().colors().border)
+            .child(
+                Label::new("Workspaces")
+                    .size(LabelSize::Small)
+                    .color(Color::Muted),
+            )
+            .child(
+                IconButton::new("refresh-workspaces", IconName::ArrowCircle)
+                    .icon_size(IconSize::Small)
+                    .on_click(cx.listener(|this, _, _window, cx| {
+                        this.refresh_workspaces(cx);
+                        cx.notify();
+                    })),
+            )
+    }
+
     fn render_workspace_row(
         &self,
         ws: &WorkspaceSummary,
-        _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let agent_label = if ws.agent_session.status == "running" {
-            format!("{} (running)", ws.agent_session.agent)
+        let status_color = self.status_color(&ws.status, cx);
+
+        let agent_text = if ws.agent_session.status == "running" {
+            format!("{} running", ws.agent_session.agent)
         } else if !ws.agent_session.agent.is_empty() {
             ws.agent_session.agent.clone()
         } else {
@@ -69,28 +103,34 @@ impl WorkspacePanel {
         let files_changed = ws.changed_files.len();
 
         v_flex()
+            .id(ws.id.clone())
             .px_2()
-            .py_1()
+            .py(px(6.))
             .gap_0p5()
             .w_full()
             .rounded_md()
+            .cursor_pointer()
             .hover(|style| style.bg(cx.theme().colors().ghost_element_hover))
             .child(
                 h_flex()
-                    .justify_between()
+                    .gap_1p5()
+                    .items_center()
                     .child(
-                        Label::new(ws.name.clone())
-                            .size(LabelSize::Default)
-                            .color(Color::Default),
+                        div()
+                            .w(px(6.))
+                            .h(px(6.))
+                            .rounded_full()
+                            .bg(status_color),
                     )
                     .child(
-                        Label::new(ws.status.clone())
+                        Label::new(ws.name.clone())
                             .size(LabelSize::Small)
-                            .color(Color::Muted),
+                            .color(Color::Default),
                     ),
             )
             .child(
                 h_flex()
+                    .pl(px(16.))
                     .gap_2()
                     .child(
                         Label::new(ws.branch.clone())
@@ -99,19 +139,39 @@ impl WorkspacePanel {
                     )
                     .when(files_changed > 0, |el| {
                         el.child(
-                            Label::new(format!("{files_changed} files"))
+                            Label::new(format!("+{files_changed}"))
                                 .size(LabelSize::XSmall)
                                 .color(Color::Muted),
                         )
                     }),
             )
-            .when(!agent_label.is_empty(), |el| {
+            .when(!agent_text.is_empty(), |el| {
                 el.child(
-                    Label::new(agent_label)
-                        .size(LabelSize::XSmall)
-                        .color(Color::Accent),
+                    h_flex().pl(px(16.)).child(
+                        Label::new(agent_text)
+                            .size(LabelSize::XSmall)
+                            .color(Color::Accent),
+                    ),
                 )
             })
+    }
+
+    fn render_empty(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        v_flex()
+            .size_full()
+            .items_center()
+            .justify_center()
+            .gap_1()
+            .child(
+                Label::new("No workspaces yet")
+                    .size(LabelSize::Small)
+                    .color(Color::Muted),
+            )
+            .child(
+                Label::new("Create one to get started")
+                    .size(LabelSize::XSmall)
+                    .color(Color::Muted),
+            )
     }
 }
 
@@ -149,7 +209,7 @@ impl Panel for WorkspacePanel {
     }
 
     fn default_size(&self, _window: &Window, _cx: &App) -> Pixels {
-        px(280.)
+        px(260.)
     }
 
     fn icon(&self, _window: &Window, _cx: &App) -> Option<ui::IconName> {
@@ -187,7 +247,7 @@ impl Panel for WorkspacePanel {
 }
 
 impl Render for WorkspacePanel {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.refresh_workspaces(cx);
 
         let has_workspaces = !self.workspaces.is_empty();
@@ -197,24 +257,12 @@ impl Render for WorkspacePanel {
             .size_full()
             .track_focus(&self.focus_handle)
             .bg(cx.theme().colors().panel_background)
-            .child(
-                h_flex()
-                    .px_2()
-                    .py_1()
-                    .border_b_1()
-                    .border_color(cx.theme().colors().border)
-                    .child(
-                        Label::new("Workspaces")
-                            .size(LabelSize::Small)
-                            .color(Color::Muted),
-                    ),
-            )
+            .child(self.render_header(cx))
             .when(has_workspaces, |el| {
-                let rows: Vec<_> = self
-                    .workspaces
-                    .clone()
-                    .into_iter()
-                    .map(|ws| self.render_workspace_row(&ws, window, cx))
+                let workspaces = self.workspaces.clone();
+                let rows: Vec<_> = workspaces
+                    .iter()
+                    .map(|ws| self.render_workspace_row(ws, cx))
                     .collect();
                 el.child(
                     v_flex()
@@ -225,17 +273,7 @@ impl Render for WorkspacePanel {
                 )
             })
             .when(!has_workspaces, |el| {
-                el.child(
-                    v_flex()
-                        .size_full()
-                        .items_center()
-                        .justify_center()
-                        .child(
-                            Label::new("No workspaces")
-                                .size(LabelSize::Small)
-                                .color(Color::Muted),
-                        ),
-                )
+                el.child(self.render_empty(cx))
             })
     }
 }
