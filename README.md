@@ -1,48 +1,26 @@
-# Zed
+# Mnemonic
 
-[![Zed](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/zed-industries/zed/main/assets/badge/v0.json)](https://zed.dev)
-[![CI](https://github.com/zed-industries/zed/actions/workflows/run_tests.yml/badge.svg)](https://github.com/zed-industries/zed/actions/workflows/run_tests.yml)
+An AI-native coding workspace built on top of [Zed](https://github.com/zed-industries/zed).
 
-Welcome to Zed, a high-performance, multiplayer code editor from the creators of [Atom](https://github.com/atom/atom) and [Tree-sitter](https://github.com/tree-sitter/tree-sitter).
+Mnemonic manages projects, git worktrees, and AI agent sessions in a single interface. Each workspace gets its own isolated worktree and terminal running Claude Code, so you can work on multiple tasks across multiple repos at once.
 
----
+## Building
 
-### Installation
+```bash
+cargo run -p mnemonic
+```
 
-On macOS, Linux, and Windows you can [download Zed directly](https://zed.dev/download) or install Zed via your local package manager ([macOS](https://zed.dev/docs/installation#macos)/[Linux](https://zed.dev/docs/linux#installing-via-a-package-manager)/[Windows](https://zed.dev/docs/windows#package-managers)).
+Requires Rust 1.95.0 (pinned in `rust-toolchain.toml`). First build takes around 5 minutes, incremental builds are 10-15 seconds.
 
-Other platforms are not yet available:
+## Architecture
 
-- Web ([tracking discussion](https://github.com/zed-industries/zed/discussions/26195))
+```
+crates/mnemonic-core/       Backend brain - services, repos, models, SQLite
+crates/mnemonic-bridge/     Event bridge between mnemonic-core and GPUI
+crates/mnemonic-panels/     Projects panel, command approval, coordinator
+crates/zed/                 Main app binary (renamed to "mnemonic")
+```
 
-### Developing Zed
+## License
 
-- [Building Zed for macOS](./docs/src/development/macos.md)
-- [Building Zed for Linux](./docs/src/development/linux.md)
-- [Building Zed for Windows](./docs/src/development/windows.md)
-
-### Contributing
-
-See [CONTRIBUTING.md](./CONTRIBUTING.md) for ways you can contribute to Zed.
-
-Also... we're hiring! Check out our [jobs](https://zed.dev/jobs) page for open roles.
-
-### Licensing
-
-Zed source code is licensed primarily under GPL-3.0-or-later, with Apache-2.0 components where marked.
-
-License information for third party dependencies must be correctly provided for CI to pass.
-
-We use [`cargo-about`](https://github.com/EmbarkStudios/cargo-about) to automatically comply with open source licenses. If CI is failing, check the following:
-
-- Is it showing a `no license specified` error for a crate you've created? If so, add `publish = false` under `[package]` in your crate's Cargo.toml.
-- Is the error `failed to satisfy license requirements` for a dependency? If so, first determine what license the project has and whether this system is sufficient to comply with this license's requirements. If you're unsure, ask a lawyer. Once you've verified that this system is acceptable add the license's SPDX identifier to the `accepted` array in `script/licenses/zed-licenses.toml`.
-- Is `cargo-about` unable to find the license for a dependency? If so, add a clarification field at the end of `script/licenses/zed-licenses.toml`, as specified in the [cargo-about book](https://embarkstudios.github.io/cargo-about/cli/generate/config.html#crate-configuration).
-
-## Sponsorship
-
-Zed is developed by **Zed Industries, Inc.**, a for-profit company.
-
-If you’d like to financially support the project, you can do so via GitHub Sponsors.
-Sponsorships go directly to Zed Industries and are used as general company revenue.
-There are no perks or entitlements associated with sponsorship.
+Built on Zed, which is licensed under GPL-3.0-or-later with Apache-2.0 components where marked.
