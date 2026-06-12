@@ -5,6 +5,7 @@ edition = "2021"
 publish.workspace = true
 
 [dependencies]
+chrono.workspace = true
 mnemonic-bridge.workspace = true
 mnemonic-core.workspace = true
 gpui.workspace = true

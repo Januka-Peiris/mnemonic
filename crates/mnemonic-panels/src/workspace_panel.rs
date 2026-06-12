@@ -3,10 +3,11 @@ use std::path::PathBuf;
 
 use gpui::{
     actions, px, Action, App, AppContext as _, Context, Entity, EventEmitter, Focusable,
-    FocusHandle, IntoElement, Pixels, Render, SharedString, WeakEntity, Window,
+    FocusHandle, IntoElement, PathPromptOptions, Pixels, Render, SharedString, WeakEntity, Window,
 };
-use mnemonic_core::models::WorkspaceSummary;
-use mnemonic_core::services::workspace_service;
+use mnemonic_core::models::{CreateWorkspaceInput, DiscoveredRepository, WorkspaceSummary};
+use mnemonic_core::repositories::repository_repository;
+use mnemonic_core::services::{repo_scanner_service, workspace_service};
 use task::{RevealStrategy, Shell, SpawnInTerminal, TaskId};
 use terminal_view::terminal_panel::TerminalPanel;
 use ui::{Tooltip, h_flex, v_flex, Icon, IconButton, IconName, Label, prelude::*};
@@ -20,6 +21,7 @@ const WORKSPACE_PANEL_KEY: &str = "MnemonicWorkspacePanel";
 pub struct WorkspacePanel {
     focus_handle: FocusHandle,
     workspace: WeakEntity<Workspace>,
+    repositories: Vec<DiscoveredRepository>,
     workspaces: Vec<WorkspaceSummary>,
     collapsed_projects: Vec<String>,
     selected_workspace_id: Option<String>,
@@ -35,11 +37,12 @@ impl WorkspacePanel {
             let mut panel = Self {
                 focus_handle: cx.focus_handle(),
                 workspace: workspace.weak_handle(),
+                repositories: Vec::new(),
                 workspaces: Vec::new(),
                 collapsed_projects: Vec::new(),
                 selected_workspace_id: None,
             };
-            panel.refresh_workspaces(cx);
+            panel.refresh(cx);
             panel
         })
     }
@@ -53,16 +56,23 @@ impl WorkspacePanel {
         })
     }
 
-    fn refresh_workspaces(&mut self, cx: &App) {
+    fn refresh(&mut self, cx: &App) {
         let state = mnemonic_bridge::mnemonic_state(cx);
         match workspace_service::list_workspaces(&state) {
             Ok(ws) => self.workspaces = ws,
             Err(e) => log::error!("Failed to list workspaces: {e}"),
         }
+        match repository_repository::list(&state.db) {
+            Ok(repos) => self.repositories = repos,
+            Err(e) => log::error!("Failed to list repositories: {e}"),
+        }
     }
 
     fn grouped_workspaces(&self) -> BTreeMap<String, Vec<&WorkspaceSummary>> {
         let mut groups: BTreeMap<String, Vec<&WorkspaceSummary>> = BTreeMap::new();
+        for repo in &self.repositories {
+            groups.entry(repo.name.clone()).or_default();
+        }
         for ws in &self.workspaces {
             let project = if ws.repo.is_empty() {
                 "ungrouped".to_string()
@@ -135,6 +145,146 @@ impl WorkspacePanel {
         .detach();
     }
 
+    fn add_project(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let paths_receiver = cx.prompt_for_paths(PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: None,
+        });
+
+        cx.spawn_in(window, async move |this, cx| {
+            let paths = paths_receiver.await.ok().and_then(|r| r.ok()).flatten();
+            let Some(paths) = paths else {
+                return;
+            };
+            let Some(path) = paths.first() else {
+                return;
+            };
+
+            let now = chrono::Utc::now().to_rfc3339();
+            match repo_scanner_service::build_repository(path, &now) {
+                Ok(repo) => {
+                    this.read_with(cx, |_this, cx| {
+                        let state = mnemonic_bridge::mnemonic_state(cx);
+                        repository_repository::upsert(&state.db, &repo).ok();
+                    })
+                    .ok();
+
+                    this.update(cx, |this, cx| {
+                        this.refresh(cx);
+                        cx.notify();
+                    })
+                    .ok();
+
+                    log::info!("Added project: {}", path.display());
+                }
+                Err(e) => {
+                    log::error!("Failed to register repository: {e}");
+                }
+            }
+        })
+        .detach();
+    }
+
+    fn add_worktree(
+        &mut self,
+        project_name: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let repo = self
+            .repositories
+            .iter()
+            .find(|r| r.name == project_name)
+            .cloned();
+
+        let workspace = self.workspace.clone();
+
+        cx.spawn_in(window, async move |this, cx| {
+            let Some(repo) = repo else {
+                log::error!("Repository not found for project: {project_name}");
+                return;
+            };
+
+            let result = this.read_with(cx, |_this, cx| {
+                let state = mnemonic_bridge::mnemonic_state(cx);
+                let input = CreateWorkspaceInput {
+                    name: String::new(),
+                    repo: repo.name.clone(),
+                    base_branch: "main".to_string(),
+                    branch: None,
+                    agent: "claude".to_string(),
+                    task_prompt: String::new(),
+                    open_in_cursor: false,
+                    run_tests: false,
+                    create_pr: true,
+                    repository_id: Some(repo.id.clone()),
+                    selected_worktree_id: None,
+                    selected_branch: None,
+                    parent_workspace_id: None,
+                    source_workspace_id: None,
+                    derived_from_branch: None,
+                };
+                workspace_service::create_workspace(&state, input)
+            });
+
+            match result {
+                Ok(Ok(detail)) => {
+                    log::info!("Created workspace: {}", detail.summary.id);
+
+                    this.update(cx, |this, cx| {
+                        this.refresh(cx);
+                        cx.notify();
+                    })
+                    .ok();
+
+                    let ws_name = detail.summary.name.clone();
+                    let ws_id = detail.summary.id.clone();
+                    let cwd = if detail.worktree_path.is_empty() {
+                        detail
+                            .summary
+                            .workspace_root_path
+                            .map(PathBuf::from)
+                    } else {
+                        Some(PathBuf::from(&detail.worktree_path))
+                    }
+                    .filter(|p| p.exists());
+
+                    let spawn_task = SpawnInTerminal {
+                        id: TaskId(format!("mnemonic-{ws_id}")),
+                        full_label: ws_name.clone(),
+                        label: ws_name,
+                        command: Some("claude".to_string()),
+                        args: vec!["--dangerously-skip-permissions".to_string()],
+                        command_label: "claude --dangerously-skip-permissions".to_string(),
+                        cwd,
+                        shell: Shell::System,
+                        reveal: RevealStrategy::Always,
+                        use_new_terminal: true,
+                        allow_concurrent_runs: true,
+                        ..Default::default()
+                    };
+
+                    workspace
+                        .update_in(cx, |workspace, window, cx| {
+                            TerminalPanel::add_center_terminal(
+                                workspace,
+                                window,
+                                cx,
+                                move |project, cx| project.create_terminal_task(spawn_task, cx),
+                            )
+                            .detach_and_log_err(cx);
+                        })
+                        .ok();
+                }
+                Ok(Err(e)) => log::error!("Failed to create workspace: {e}"),
+                Err(e) => log::error!("Failed to access state: {e}"),
+            }
+        })
+        .detach();
+    }
+
     fn render_history_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         h_flex()
             .id("history-bar")
@@ -190,8 +340,8 @@ impl WorkspacePanel {
                         IconButton::new("add-project", IconName::Plus)
                             .icon_size(IconSize::Small)
                             .tooltip(Tooltip::text("New Project"))
-                            .on_click(cx.listener(|_this, _, _window, _cx| {
-                                log::info!("New project clicked");
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.add_project(window, cx);
                             })),
                     ),
             )
@@ -252,8 +402,8 @@ impl WorkspacePanel {
                     )
                     .icon_size(IconSize::XSmall)
                     .tooltip(Tooltip::text("New Worktree"))
-                    .on_click(cx.listener(move |_this, _, _window, _cx| {
-                        log::info!("Add worktree to {}", project_for_add);
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.add_worktree(project_for_add.clone(), window, cx);
                     })),
                 ),
         );
@@ -395,7 +545,7 @@ impl Panel for WorkspacePanel {
 
 impl Render for WorkspacePanel {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        self.refresh_workspaces(cx);
+        self.refresh(cx);
 
         let groups = self.grouped_workspaces();
         let has_workspaces = !groups.is_empty();
