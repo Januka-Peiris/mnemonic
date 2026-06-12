@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 
 use editor::Editor;
 use gpui::{
-    App, AppContext as _, Context, Corner, DragMoveEvent, Empty, Entity, EventEmitter, Focusable,
+    Anchor, App, AppContext as _, Context, DragMoveEvent, Empty, Entity, EventEmitter, Focusable,
     FocusHandle, IntoElement, Pixels, Render, SharedString, Subscription, WeakEntity, Window,
     actions, px,
 };
@@ -737,7 +737,7 @@ impl WorkspaceView {
                     .child({
                         let this = cx.weak_entity();
                         PopoverMenu::new("composer-model-menu")
-                            .anchor(Corner::BottomLeft)
+                            .anchor(Anchor::BottomLeft)
                             .trigger(
                                 Button::new(
                                     "composer-model",
@@ -768,7 +768,7 @@ impl WorkspaceView {
                     .child({
                         let this = cx.weak_entity();
                         PopoverMenu::new("composer-effort-menu")
-                            .anchor(Corner::BottomLeft)
+                            .anchor(Anchor::BottomLeft)
                             .trigger(
                                 Button::new(
                                     "composer-effort",
