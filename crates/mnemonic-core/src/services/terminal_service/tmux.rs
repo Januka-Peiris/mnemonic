@@ -97,7 +97,7 @@ pub(super) fn start_detached(
 
 /// Best-effort session options: no status bar inside the embedded xterm pane
 /// and no escape-key delay (TUIs read lone ESC presses).
-fn configure_session(name: &str) {
+pub(super) fn configure_session(name: &str) {
     let _ = tmux_command()
         .args(["set-option", "-t", name, "status", "off"])
         .output();
@@ -106,6 +106,14 @@ fn configure_session(name: &str) {
         .output();
     let _ = tmux_command()
         .args(["set-option", "-g", "history-limit", "10000"])
+        .output();
+    // Mouse mode makes the wheel scroll tmux's scrollback (entering copy
+    // mode automatically) instead of degrading to arrow-key presses inside
+    // fullscreen TUIs like Claude Code, where arrows mean history
+    // navigation and scrolling becomes impossible. TUIs that take mouse
+    // input themselves still receive the events passed through.
+    let _ = tmux_command()
+        .args(["set-option", "-g", "mouse", "on"])
         .output();
 }
 

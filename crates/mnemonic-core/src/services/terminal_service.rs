@@ -94,7 +94,11 @@ pub fn embedded_workspace_terminal_command(
         return fallback();
     }
     let session_name = tmux::safe_session_name(workspace_id, "main");
-    if !tmux::session_exists(&session_name) {
+    if tmux::session_exists(&session_name) {
+        // Sessions created before an option was added (e.g. mouse mode)
+        // pick up the current configuration on reattach.
+        tmux::configure_session(&session_name);
+    } else {
         let command_spec = TerminalCommandSpec {
             command: agent_command.to_string(),
             args: agent_args.to_vec(),
