@@ -201,31 +201,30 @@ impl WorkspaceDetailPanel {
         .detach();
     }
 
+    /// Asks the workspace's claude to create the PR, visibly in its
+    /// terminal: commit, push the branch, open the PR with gh.
     fn create_pr(&mut self, cx: &mut Context<Self>) {
-        let Some(workspace_id) = self.summary.as_ref().map(|summary| summary.id.clone()) else {
+        let Some(summary) = &self.summary else {
             return;
         };
-        let state = mnemonic_bridge::mnemonic_state(cx);
-        self.pr_busy = true;
-        cx.notify();
 
-        cx.spawn(async move |this, cx| {
-            let result = cx
-                .background_spawn(async move {
-                    pr_draft_service::create_workspace_pr(&state, &workspace_id)
-                })
-                .await;
-            this.update(cx, |this, cx| {
-                this.pr_busy = false;
-                match result {
-                    Ok(created) => log::info!("Created PR: {}", created.pr_url),
-                    Err(err) => log::error!("Failed to create PR: {err}"),
+        let prompt = format!(
+            "Create a pull request for this workspace. Review what changed, commit any \
+             uncommitted work with a sensible message, push the branch ({branch}) to origin, \
+             and open a PR against the default branch using `gh pr create` with a clear title \
+             and a summary body describing the changes. Report the PR URL when done.",
+            branch = summary.branch,
+        );
+
+        let workspace_id = summary.id.clone();
+        if let Some(workspace) = self.workspace.upgrade() {
+            workspace.update(cx, |workspace, cx| {
+                if !WorkspaceHost::dispatch_to_workspace_agent(workspace, &workspace_id, prompt, cx)
+                {
+                    log::warn!("No open workspace view to dispatch PR instruction to");
                 }
-                this.refresh_pr_status(cx);
-            })
-            .ok();
-        })
-        .detach();
+            });
+        }
     }
 
     /// Sends a one-shot "fix the failing CI" instruction into the
