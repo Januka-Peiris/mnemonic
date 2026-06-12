@@ -248,9 +248,7 @@ impl WorkspaceView {
             cx.background_executor()
                 .timer(Duration::from_millis(ENTER_DELAY_MILLIS))
                 .await;
-            terminal
-                .update(cx, |terminal, _| terminal.input(b"\r".to_vec()))
-                .ok();
+            terminal.update(cx, |terminal, _| terminal.input(b"\r".to_vec()));
         })
         .detach();
 
