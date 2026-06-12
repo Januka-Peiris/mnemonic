@@ -22,6 +22,7 @@ const WORKSPACE_DETAIL_PANEL_KEY: &str = "MnemonicWorkspaceDetailPanel";
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum DetailTab {
+    AllFiles,
     Changes,
     Checks,
 }
@@ -37,16 +38,19 @@ pub struct WorkspaceDetailPanel {
     pr_status: Option<WorkspacePrStatus>,
     pr_busy: bool,
     poll_scheduled: bool,
+    /// Zed's full project panel, embedded as the "All files" tab so file
+    /// browsing, right-click operations, and editing live in one panel.
+    file_tree: Option<Entity<project_panel::ProjectPanel>>,
 }
 
 impl WorkspaceDetailPanel {
     pub fn new(
         workspace: &mut Workspace,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Workspace>,
     ) -> Entity<Self> {
         let workspace_handle = workspace.weak_handle();
-        cx.new(|cx| {
+        let panel = cx.new(|cx| {
             cx.observe_global::<ActiveWorkspace>(|this: &mut Self, cx| {
                 let previous = this.summary.as_ref().map(|summary| summary.id.clone());
                 this.refresh(cx);
@@ -67,10 +71,32 @@ impl WorkspaceDetailPanel {
                 pr_status: None,
                 pr_busy: false,
                 poll_scheduled: false,
+                file_tree: None,
             };
             panel.refresh(cx);
             panel
+        });
+
+        // Load the embedded file tree asynchronously; ProjectPanel only
+        // exposes an async constructor.
+        let weak_workspace = workspace.weak_handle();
+        let weak_panel = panel.downgrade();
+        cx.spawn_in(window, async move |_, cx| {
+            match project_panel::ProjectPanel::load(weak_workspace, cx.clone()).await {
+                Ok(file_tree) => {
+                    weak_panel
+                        .update(cx, |panel, cx| {
+                            panel.file_tree = Some(file_tree);
+                            cx.notify();
+                        })
+                        .ok();
+                }
+                Err(err) => log::error!("Failed to load embedded file tree: {err}"),
+            }
         })
+        .detach();
+
+        panel
     }
 
     pub async fn load(
@@ -455,6 +481,13 @@ impl WorkspaceDetailPanel {
             .border_b_1()
             .border_color(cx.theme().colors().border)
             .child(tab_button(
+                "detail-tab-all-files",
+                "All files".to_string(),
+                DetailTab::AllFiles,
+                self.tab,
+                cx,
+            ))
+            .child(tab_button(
                 "detail-tab-changes",
                 format!("Changes {changes_count}"),
                 DetailTab::Changes,
@@ -733,6 +766,24 @@ impl WorkspaceDetailPanel {
         section
     }
 
+    fn render_file_tree(&self, _cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .flex_grow(1.0)
+            .w_full()
+            .min_h(px(0.))
+            .overflow_hidden()
+            .map(|el| match self.file_tree.clone() {
+                Some(tree) => el.child(tree),
+                None => el.child(
+                    h_flex().px_2().py_2().child(
+                        Label::new("Loading file tree…")
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
+                    ),
+                ),
+            })
+    }
+
     fn render_empty(&self) -> impl IntoElement {
         v_flex()
             .size_full()
@@ -836,6 +887,7 @@ impl Render for WorkspaceDetailPanel {
         match self.summary.clone() {
             Some(ws) => {
                 let body = match self.tab {
+                    DetailTab::AllFiles => self.render_file_tree(cx).into_any_element(),
                     DetailTab::Changes => self.render_changes(&ws, cx).into_any_element(),
                     DetailTab::Checks => self.render_checks(cx).into_any_element(),
                 };
