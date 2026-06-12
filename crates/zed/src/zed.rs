@@ -1158,6 +1158,38 @@ fn register_actions(
         )
         .register_action(
             |workspace: &mut Workspace,
+             _: &mnemonic_panels::ToggleWorkspacePanelFocus,
+             window: &mut Window,
+             cx: &mut Context<Workspace>| {
+                workspace.toggle_panel_focus::<mnemonic_panels::WorkspacePanel>(window, cx);
+            },
+        )
+        .register_action(
+            |workspace: &mut Workspace,
+             _: &mnemonic_panels::ToggleWorkspaceDetailFocus,
+             window: &mut Window,
+             cx: &mut Context<Workspace>| {
+                workspace.toggle_panel_focus::<mnemonic_panels::WorkspaceDetailPanel>(window, cx);
+            },
+        )
+        .register_action(
+            |workspace: &mut Workspace,
+             _: &mnemonic_panels::ToggleCommandApprovalFocus,
+             window: &mut Window,
+             cx: &mut Context<Workspace>| {
+                workspace.toggle_panel_focus::<mnemonic_panels::CommandApprovalPanel>(window, cx);
+            },
+        )
+        .register_action(
+            |workspace: &mut Workspace,
+             _: &mnemonic_panels::ToggleCoordinatorFocus,
+             window: &mut Window,
+             cx: &mut Context<Workspace>| {
+                workspace.toggle_panel_focus::<mnemonic_panels::CoordinatorPanel>(window, cx);
+            },
+        )
+        .register_action(
+            |workspace: &mut Workspace,
              _: &outline_panel::ToggleFocus,
              window: &mut Window,
              cx: &mut Context<Workspace>| {
