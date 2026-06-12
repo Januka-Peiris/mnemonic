@@ -18884,6 +18884,7 @@ dependencies = [
  "gpui",
  "icons",
  "livekit_client",
+ "mnemonic-bridge",
  "notifications",
  "platform_title_bar",
  "project",
