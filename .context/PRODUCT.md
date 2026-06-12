@@ -39,6 +39,13 @@ Three regions, like Conductor:
    you switch to *its* view; click back, everything is exactly as you left
    it. The terminal is a component of the workspace, not the thing itself.
 
+   Below the terminals sits the **agent composer** (from Forge): type an
+   instruction, Enter sends it into the claude TUI. Dispatch must be the
+   prompt text and the carriage return as SEPARATE PTY writes ~250ms apart
+   (`ENTER_DELAY_MILLIS`), or the TUI treats Enter as pasted newline —
+   this is Forge's proven pattern from
+   `terminal_service/queue.rs::dispatch_prompt_entry`.
+
 3. **Right panel — Workspace detail.** For the selected workspace: status
    header (name, branch, ahead/behind, status, PR number), Changes list
    (per-file +/−), and later: file tree of the worktree, Checks, and
