@@ -1,8 +1,10 @@
 use std::path::PathBuf;
+use std::time::Duration;
 
+use editor::Editor;
 use gpui::{
     App, AppContext as _, Context, Entity, EventEmitter, Focusable, FocusHandle, IntoElement,
-    Render, SharedString, WeakEntity, Window, px,
+    Render, SharedString, WeakEntity, Window, actions, px,
 };
 use mnemonic_core::models::WorkspaceSummary;
 use mnemonic_core::services::terminal_service;
@@ -13,6 +15,19 @@ use terminal_view::TerminalView;
 use ui::{Icon, IconButton, IconName, Label, Tooltip, h_flex, prelude::*, v_flex};
 use workspace::item::Item;
 use workspace::{Workspace, WorkspaceId};
+
+actions!(
+    mnemonic_composer,
+    [
+        /// Send the composer contents to the workspace's agent terminal.
+        Send
+    ]
+);
+
+/// Forge's proven dispatch pattern: the prompt text and the submitting
+/// carriage return must arrive as separate input events with a pause in
+/// between, or the agent TUI treats the Enter as part of a paste.
+const ENTER_DELAY_MILLIS: u64 = 250;
 
 /// The center view for a Mnemonic workspace. The workspace is the unit the
 /// user switches between; terminals (the agent's and any extra shells) live
@@ -27,6 +42,7 @@ pub struct WorkspaceView {
     terminals: Vec<Entity<TerminalView>>,
     terminal_titles: Vec<SharedString>,
     active_terminal: usize,
+    composer: Entity<Editor>,
     focus_handle: FocusHandle,
 }
 
@@ -65,6 +81,16 @@ impl WorkspaceView {
         let project = workspace.project().downgrade();
         let database_id = workspace.database_id();
 
+        let composer = cx.new(|cx| {
+            let mut editor = Editor::auto_height(1, 6, window, cx);
+            editor.set_placeholder_text(
+                "Send instruction to claude — Enter to send, Shift+Enter for newline",
+                window,
+                cx,
+            );
+            editor
+        });
+
         let view = cx.new(|cx| WorkspaceView {
             workspace_id: summary.id.clone(),
             workspace_name: SharedString::from(summary.name.clone()),
@@ -75,6 +101,7 @@ impl WorkspaceView {
             terminals: Vec::new(),
             terminal_titles: Vec::new(),
             active_terminal: 0,
+            composer,
             focus_handle: cx.focus_handle(),
         });
         view.update(cx, |view, cx| view.spawn_agent_terminal(window, cx));
@@ -202,6 +229,46 @@ impl WorkspaceView {
         cx.notify();
     }
 
+    /// Sends the composer contents to the agent terminal (the first tab),
+    /// using Forge's text-then-Enter dispatch so the TUI submits it.
+    fn send_to_agent(&mut self, _: &Send, window: &mut Window, cx: &mut Context<Self>) {
+        let text = self.composer.read(cx).text(cx);
+        if text.trim().is_empty() {
+            return;
+        }
+        let Some(agent_view) = self.terminals.first() else {
+            return;
+        };
+        let terminal = agent_view.read(cx).terminal().clone();
+
+        terminal.update(cx, |terminal, _| {
+            terminal.input(text.into_bytes());
+        });
+        cx.spawn(async move |_this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(ENTER_DELAY_MILLIS))
+                .await;
+            terminal
+                .update(cx, |terminal, _| terminal.input(b"\r".to_vec()))
+                .ok();
+        })
+        .detach();
+
+        self.composer.update(cx, |composer, cx| composer.clear(window, cx));
+    }
+
+    fn render_composer(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .key_context("MnemonicComposer")
+            .on_action(cx.listener(Self::send_to_agent))
+            .border_t_1()
+            .border_color(cx.theme().colors().border)
+            .bg(cx.theme().colors().editor_background)
+            .p_2()
+            .w_full()
+            .child(self.composer.clone())
+    }
+
     fn render_terminal_tabs(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let mut tabs = h_flex()
             .px_1()
@@ -304,5 +371,6 @@ impl Render for WorkspaceView {
                         ),
                     }),
             )
+            .child(self.render_composer(cx))
     }
 }
