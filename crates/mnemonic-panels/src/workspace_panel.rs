@@ -4,7 +4,7 @@ use gpui::{
 };
 use mnemonic_core::models::WorkspaceSummary;
 use mnemonic_core::services::workspace_service;
-use ui::{h_flex, v_flex, IconButton, IconName, Label, prelude::*};
+use ui::{h_flex, v_flex, IconButton, IconName, Label, prelude::*, utils::platform_title_bar_height};
 use workspace::dock::{DockPosition, PanelEvent};
 use workspace::{Panel, Workspace};
 
@@ -247,16 +247,18 @@ impl Panel for WorkspacePanel {
 }
 
 impl Render for WorkspacePanel {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.refresh_workspaces(cx);
 
         let has_workspaces = !self.workspaces.is_empty();
+        let titlebar_height = platform_title_bar_height(window);
 
         v_flex()
             .id("workspace-panel")
             .size_full()
             .track_focus(&self.focus_handle)
             .bg(cx.theme().colors().panel_background)
+            .pt(titlebar_height)
             .child(self.render_header(cx))
             .when(has_workspaces, |el| {
                 let workspaces = self.workspaces.clone();

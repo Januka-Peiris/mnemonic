@@ -1613,37 +1613,20 @@ pub(crate) async fn restore_or_create_workspace(
                     app_state.clone(),
                     cx,
                     |workspace, window, cx| {
-                        let restore_on_startup =
-                            WorkspaceSettings::get_global(cx).restore_on_startup;
-                        match restore_on_startup {
-                            workspace::RestoreOnStartupBehavior::Launchpad => {}
-                            _ => {
-                                Editor::new_file(workspace, &Default::default(), window, cx);
-                            }
-                        }
-                    },
+                        },
                 )
             })
             .await?;
         }
     } else if matches!(kvp.read_kvp(FIRST_OPEN), Ok(None)) {
-        cx.update(|cx| show_onboarding_view(app_state, cx)).await?;
+        kvp.write_kvp(FIRST_OPEN.to_string(), "false".to_string()).await.ok();
+        cx.update(|cx| {
+            workspace::open_new(Default::default(), app_state, cx, |_, _, _| {})
+        })
+        .await?;
     } else {
         cx.update(|cx| {
-            workspace::open_new(
-                Default::default(),
-                app_state,
-                cx,
-                |workspace, window, cx| {
-                    let restore_on_startup = WorkspaceSettings::get_global(cx).restore_on_startup;
-                    match restore_on_startup {
-                        workspace::RestoreOnStartupBehavior::Launchpad => {}
-                        _ => {
-                            Editor::new_file(workspace, &Default::default(), window, cx);
-                        }
-                    }
-                },
-            )
+            workspace::open_new(Default::default(), app_state, cx, |_, _, _| {})
         })
         .await?;
     }

@@ -292,7 +292,7 @@ impl Panel for CommandApprovalPanel {
     }
 
     fn position(&self, _window: &Window, _cx: &App) -> DockPosition {
-        DockPosition::Right
+        DockPosition::Bottom
     }
 
     fn position_is_valid(&self, position: DockPosition) -> bool {
