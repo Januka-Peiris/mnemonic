@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 
 use gpui::{
     actions, px, Action, App, AppContext as _, Context, Entity, EventEmitter, Focusable,
@@ -107,8 +108,47 @@ impl WorkspacePanel {
         if let Some(workspace) = self.workspace.upgrade() {
             workspace.update(cx, |workspace, cx| {
                 WorkspaceHost::activate_workspace(workspace, &summary, window, cx);
+                Self::point_project_at_worktree(workspace, &summary, cx);
             });
         }
+    }
+
+    /// Switches the Zed project's visible worktree to the selected
+    /// workspace's directory, so the file tree, editors, and git diffs all
+    /// follow the workspace selection.
+    fn point_project_at_worktree(
+        workspace: &mut Workspace,
+        summary: &WorkspaceSummary,
+        cx: &mut Context<Workspace>,
+    ) {
+        let Some(path) = summary
+            .workspace_root_path
+            .as_deref()
+            .or(summary.repository_path.as_deref())
+            .or(summary.selected_worktree_path.as_deref())
+            .map(PathBuf::from)
+            .filter(|path| path.exists())
+        else {
+            return;
+        };
+
+        let project = workspace.project().clone();
+        project.update(cx, |project, cx| {
+            let existing: Vec<_> = project
+                .visible_worktrees(cx)
+                .map(|worktree| {
+                    let worktree = worktree.read(cx);
+                    (worktree.id(), worktree.abs_path().to_path_buf())
+                })
+                .collect();
+            if existing.len() == 1 && existing[0].1 == path {
+                return;
+            }
+            for (worktree_id, _) in existing {
+                project.remove_worktree(worktree_id, cx);
+            }
+            project.create_worktree(&path, true, cx).detach_and_log_err(cx);
+        });
     }
 
     fn add_project(&mut self, window: &mut Window, cx: &mut Context<Self>) {
