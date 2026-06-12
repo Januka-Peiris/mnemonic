@@ -14,7 +14,10 @@ use project::Project;
 use task::{RevealStrategy, Shell, SpawnInTerminal, TaskId};
 use terminal::Terminal;
 use terminal_view::TerminalView;
-use ui::{Button, ButtonStyle, Icon, IconButton, IconName, Label, Tooltip, h_flex, prelude::*, v_flex};
+use ui::{
+    Button, ButtonStyle, Icon, IconButton, IconName, Label, TintColor, Tooltip, h_flex,
+    prelude::*, v_flex,
+};
 use workspace::item::{Item, ItemEvent};
 use workspace::{Workspace, WorkspaceId};
 
@@ -35,6 +38,14 @@ const ENTER_DELAY_MILLIS: u64 = 250;
 /// running. Claude Code redraws its spinner continuously while working, so
 /// output going quiet for this long means it's waiting for input.
 const AGENT_IDLE_AFTER: Duration = Duration::from_secs(4);
+
+/// Auto-fix loop: how often to poll GitHub for check results.
+const AUTO_FIX_POLL_INTERVAL: Duration = Duration::from_secs(45);
+/// Auto-fix loop: minimum gap between fix prompts, so the agent isn't
+/// re-prompted while its previous fix is still building on CI.
+const AUTO_FIX_MIN_GAP: Duration = Duration::from_secs(180);
+/// Auto-fix loop: give up after this many fix attempts.
+const AUTO_FIX_MAX_ATTEMPTS: u32 = 5;
 
 /// Drag payload for the composer resize handle.
 struct ComposerDrag;
@@ -62,6 +73,11 @@ pub struct WorkspaceView {
     composer_height: Pixels,
     last_agent_activity: Option<Instant>,
     idle_check_scheduled: bool,
+    auto_fix_enabled: bool,
+    auto_fix_attempts: u32,
+    last_auto_fix_at: Option<Instant>,
+    auto_fix_state: SharedString,
+    auto_fix_task: Option<gpui::Task<()>>,
     _terminal_subscriptions: Vec<Subscription>,
     focus_handle: FocusHandle,
 }
@@ -240,6 +256,13 @@ impl WorkspaceView {
         if text.trim().is_empty() {
             return;
         }
+        self.dispatch_to_agent(text, cx);
+        self.composer.update(cx, |composer, cx| composer.clear(window, cx));
+    }
+
+    /// Writes an instruction into the agent terminal: text first, then the
+    /// submitting Enter as a separate input event (Forge's dispatch pattern).
+    pub(crate) fn dispatch_to_agent(&mut self, text: String, cx: &mut Context<Self>) {
         let Some(agent_view) = self.terminals.first() else {
             return;
         };
@@ -255,8 +278,145 @@ impl WorkspaceView {
             terminal.update(cx, |terminal, _| terminal.input(b"\r".to_vec()));
         })
         .detach();
+    }
 
-        self.composer.update(cx, |composer, cx| composer.clear(window, cx));
+    /// Toggles the poll → fix → push loop: GitHub checks are polled, and
+    /// while they're failing the agent is periodically instructed to
+    /// investigate, fix, and push, until checks go green or attempts run out.
+    fn toggle_auto_fix(&mut self, cx: &mut Context<Self>) {
+        if self.auto_fix_enabled {
+            self.auto_fix_enabled = false;
+            self.auto_fix_task = None;
+            self.auto_fix_state = SharedString::default();
+            cx.notify();
+            return;
+        }
+
+        self.auto_fix_enabled = true;
+        self.auto_fix_attempts = 0;
+        self.last_auto_fix_at = None;
+        self.auto_fix_state = SharedString::from("watching CI");
+        let workspace_id = self.workspace_id.clone();
+        self.auto_fix_task = Some(cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(AUTO_FIX_POLL_INTERVAL).await;
+                let Some(state) = mnemonic_bridge::mnemonic_state_cloned() else {
+                    continue;
+                };
+                let status = {
+                    let workspace_id = workspace_id.clone();
+                    cx.background_spawn(async move {
+                        mnemonic_core::services::pr_draft_service::get_workspace_pr_status(
+                            &state,
+                            &workspace_id,
+                        )
+                    })
+                    .await
+                };
+                let Ok(status) = status else {
+                    continue;
+                };
+                match this.update(cx, |this, cx| this.handle_auto_fix_status(&status, cx)) {
+                    Ok(true) => {}
+                    Ok(false) | Err(_) => break,
+                }
+            }
+        }));
+        cx.notify();
+    }
+
+    /// One poll tick of the auto-fix loop. Returns false when the loop
+    /// should stop.
+    fn handle_auto_fix_status(
+        &mut self,
+        status: &mnemonic_core::models::WorkspacePrStatus,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if !self.auto_fix_enabled {
+            return false;
+        }
+        if !status.found {
+            self.auto_fix_state = SharedString::from("waiting for a PR");
+            cx.notify();
+            return true;
+        }
+
+        let failing: Vec<&str> = status
+            .checks
+            .iter()
+            .filter(|check| {
+                matches!(
+                    check.conclusion.as_deref(),
+                    Some("FAILURE") | Some("TIMED_OUT") | Some("CANCELLED") | Some("ACTION_REQUIRED")
+                )
+            })
+            .map(|check| check.name.as_str())
+            .collect();
+        let conflicts = status.mergeable.as_deref() == Some("CONFLICTING")
+            || status.merge_state_status.as_deref() == Some("DIRTY");
+        let any_pending = status
+            .checks
+            .iter()
+            .any(|check| !check.status.eq_ignore_ascii_case("completed"));
+
+        if !failing.is_empty() || conflicts {
+            if self.auto_fix_attempts >= AUTO_FIX_MAX_ATTEMPTS {
+                self.auto_fix_enabled = false;
+                self.auto_fix_state =
+                    SharedString::from(format!("gave up after {AUTO_FIX_MAX_ATTEMPTS} attempts"));
+                cx.notify();
+                return false;
+            }
+            if self.agent_is_running() {
+                self.auto_fix_state = SharedString::from("agent busy");
+                cx.notify();
+                return true;
+            }
+            if self
+                .last_auto_fix_at
+                .is_some_and(|at| at.elapsed() < AUTO_FIX_MIN_GAP)
+            {
+                return true;
+            }
+
+            self.auto_fix_attempts += 1;
+            self.last_auto_fix_at = Some(Instant::now());
+            let mut problems = Vec::new();
+            if conflicts {
+                problems.push("the PR has merge conflicts with the base branch".to_string());
+            }
+            if !failing.is_empty() {
+                problems.push(format!("these CI checks failed: {}", failing.join(", ")));
+            }
+            let prompt = format!(
+                "CI status on this PR needs fixing (auto-fix attempt {}/{}): {}. \
+                 Use `gh pr checks` and `gh run view --log-failed` to inspect the failures \
+                 (and resolve any merge conflicts by merging the base branch), fix the \
+                 problems, commit, and push.",
+                self.auto_fix_attempts,
+                AUTO_FIX_MAX_ATTEMPTS,
+                problems.join("; "),
+            );
+            self.dispatch_to_agent(prompt, cx);
+            self.auto_fix_state = SharedString::from(format!(
+                "fixing ({}/{})",
+                self.auto_fix_attempts, AUTO_FIX_MAX_ATTEMPTS
+            ));
+            cx.notify();
+            return true;
+        }
+
+        if any_pending || status.checks.is_empty() {
+            self.auto_fix_state = SharedString::from("CI running…");
+            cx.notify();
+            return true;
+        }
+
+        // Everything completed and nothing failed: done.
+        self.auto_fix_enabled = false;
+        self.auto_fix_state = SharedString::from("CI green ✓");
+        cx.notify();
+        false
     }
 
     /// Sends Escape to the agent terminal, which interrupts Claude Code
@@ -407,6 +567,35 @@ impl WorkspaceView {
         }
 
         tabs.child(div().flex_grow(1.0))
+            .when(!self.auto_fix_state.is_empty(), |el| {
+                el.child(
+                    Label::new(self.auto_fix_state.clone())
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted),
+                )
+            })
+            .child(
+                Button::new(
+                    "auto-fix-toggle",
+                    if self.auto_fix_enabled {
+                        "Auto-fix: on"
+                    } else {
+                        "Auto-fix"
+                    },
+                )
+                .style(if self.auto_fix_enabled {
+                    ButtonStyle::Tinted(TintColor::Accent)
+                } else {
+                    ButtonStyle::Subtle
+                })
+                .label_size(LabelSize::XSmall)
+                .tooltip(Tooltip::text(
+                    "Poll CI; when checks fail, instruct claude to fix and push until green",
+                ))
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.toggle_auto_fix(cx);
+                })),
+            )
             .child(self.render_status_chip(cx))
             .child(
             IconButton::new("workspace-add-terminal", IconName::Plus)
@@ -566,6 +755,11 @@ impl WorkspaceHost {
                 composer_height: px(110.),
                 last_agent_activity: None,
                 idle_check_scheduled: false,
+                auto_fix_enabled: false,
+                auto_fix_attempts: 0,
+                last_auto_fix_at: None,
+                auto_fix_state: SharedString::default(),
+                auto_fix_task: None,
                 _terminal_subscriptions: Vec::new(),
                 focus_handle: cx.focus_handle(),
             });
@@ -584,6 +778,32 @@ impl WorkspaceHost {
 
     fn active_view(&self) -> Option<&Entity<WorkspaceView>> {
         self.active.as_ref().and_then(|id| self.views.get(id))
+    }
+
+    /// Sends an instruction to the agent terminal of the given workspace, if
+    /// its view exists in this window. Returns false when the workspace has
+    /// no live view (it hasn't been opened yet).
+    pub fn dispatch_to_workspace_agent(
+        workspace: &mut Workspace,
+        workspace_id: &str,
+        text: String,
+        cx: &mut Context<Workspace>,
+    ) -> bool {
+        for pane in workspace.panes().to_vec() {
+            let host = pane
+                .read(cx)
+                .items()
+                .find_map(|item| item.downcast::<WorkspaceHost>());
+            if let Some(host) = host {
+                let view = host.read(cx).views.get(workspace_id).cloned();
+                if let Some(view) = view {
+                    view.update(cx, |view, cx| view.dispatch_to_agent(text, cx));
+                    return true;
+                }
+                return false;
+            }
+        }
+        false
     }
 }
 

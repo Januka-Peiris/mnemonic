@@ -340,6 +340,76 @@ pub fn create_workspace_pr(
     Ok(result)
 }
 
+/// Re-runs the failed GitHub Actions runs behind this workspace's failing PR
+/// checks. Run ids are extracted from the check detail URLs.
+pub fn rerun_failed_workspace_checks(
+    state: &AppState,
+    workspace_id: &str,
+) -> Result<String, String> {
+    let status = get_workspace_pr_status(state, workspace_id)?;
+    if !status.found {
+        return Err("No PR found for this branch".to_string());
+    }
+
+    let mut run_ids: Vec<String> = Vec::new();
+    for check in &status.checks {
+        let failed = matches!(
+            check.conclusion.as_deref(),
+            Some("FAILURE") | Some("TIMED_OUT") | Some("CANCELLED") | Some("ACTION_REQUIRED")
+        );
+        if !failed {
+            continue;
+        }
+        let Some(url) = check.url.as_deref() else {
+            continue;
+        };
+        let Some(rest) = url.split("/actions/runs/").nth(1) else {
+            continue;
+        };
+        let run_id: String = rest.chars().take_while(char::is_ascii_digit).collect();
+        if !run_id.is_empty() && !run_ids.contains(&run_id) {
+            run_ids.push(run_id);
+        }
+    }
+
+    if run_ids.is_empty() {
+        return Err("No failed runs with re-runnable URLs found".to_string());
+    }
+
+    let workspace = workspace_repository::get_detail(&state.db, workspace_id)?
+        .ok_or_else(|| format!("Workspace {workspace_id} not found"))?;
+    let work_dir = if !workspace.worktree_path.is_empty() {
+        workspace.worktree_path.clone()
+    } else {
+        workspace
+            .summary
+            .workspace_root_path
+            .clone()
+            .ok_or_else(|| "Workspace has no worktree path".to_string())?
+    };
+
+    let mut errors = Vec::new();
+    let mut rerun_count = 0;
+    for run_id in &run_ids {
+        let output = std::process::Command::new(gh_binary())
+            .args(["run", "rerun", run_id, "--failed"])
+            .current_dir(&work_dir)
+            .output()
+            .map_err(|err| format!("Failed to invoke gh: {err}"))?;
+        if output.status.success() {
+            rerun_count += 1;
+        } else {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            errors.push(format!("run {run_id}: {stderr}"));
+        }
+    }
+
+    if rerun_count == 0 {
+        return Err(format!("Could not re-run any runs: {}", errors.join("; ")));
+    }
+    Ok(format!("Re-ran {rerun_count} run(s)"))
+}
+
 pub fn get_workspace_pr_status(
     state: &AppState,
     workspace_id: &str,

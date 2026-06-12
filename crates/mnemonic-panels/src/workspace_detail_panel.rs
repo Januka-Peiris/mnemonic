@@ -14,6 +14,7 @@ use workspace::dock::{DockPosition, PanelEvent};
 use workspace::{OpenOptions, Panel, Workspace};
 
 use crate::ActiveWorkspace;
+use crate::workspace_view::WorkspaceHost;
 
 actions!(mnemonic_workspace_detail_panel, [ToggleFocus]);
 
@@ -25,6 +26,9 @@ enum DetailTab {
     Checks,
 }
 
+/// How often the panel re-queries GitHub while a workspace is selected.
+const PR_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
 pub struct WorkspaceDetailPanel {
     focus_handle: FocusHandle,
     workspace: WeakEntity<Workspace>,
@@ -32,6 +36,7 @@ pub struct WorkspaceDetailPanel {
     tab: DetailTab,
     pr_status: Option<WorkspacePrStatus>,
     pr_busy: bool,
+    poll_scheduled: bool,
 }
 
 impl WorkspaceDetailPanel {
@@ -61,6 +66,7 @@ impl WorkspaceDetailPanel {
                 tab: DetailTab::Changes,
                 pr_status: None,
                 pr_busy: false,
+                poll_scheduled: false,
             };
             panel.refresh(cx);
             panel
@@ -115,7 +121,54 @@ impl WorkspaceDetailPanel {
                     Ok(status) => this.pr_status = Some(status),
                     Err(err) => log::error!("Failed to fetch PR status: {err}"),
                 }
+                this.schedule_next_poll(cx);
                 cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Keeps GitHub state fresh while a workspace is selected.
+    fn schedule_next_poll(&mut self, cx: &mut Context<Self>) {
+        if self.poll_scheduled || self.summary.is_none() {
+            return;
+        }
+        self.poll_scheduled = true;
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(PR_POLL_INTERVAL).await;
+            this.update(cx, |this, cx| {
+                this.poll_scheduled = false;
+                if this.summary.is_some() && !this.pr_busy {
+                    this.refresh_pr_status(cx);
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn rerun_failed_checks(&mut self, cx: &mut Context<Self>) {
+        let Some(workspace_id) = self.summary.as_ref().map(|summary| summary.id.clone()) else {
+            return;
+        };
+        let state = mnemonic_bridge::mnemonic_state(cx);
+        self.pr_busy = true;
+        cx.notify();
+
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_spawn(async move {
+                    pr_draft_service::rerun_failed_workspace_checks(&state, &workspace_id)
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                this.pr_busy = false;
+                match result {
+                    Ok(message) => log::info!("Re-run requested: {message}"),
+                    Err(err) => log::error!("Failed to re-run checks: {err}"),
+                }
+                this.refresh_pr_status(cx);
             })
             .ok();
         })
@@ -147,6 +200,60 @@ impl WorkspaceDetailPanel {
             .ok();
         })
         .detach();
+    }
+
+    /// Sends a one-shot "fix the failing CI" instruction into the
+    /// workspace's claude terminal, so the fix is visible as it happens.
+    fn fix_errors_via_agent(&mut self, cx: &mut Context<Self>) {
+        let Some(summary) = &self.summary else {
+            return;
+        };
+        let Some(status) = &self.pr_status else {
+            return;
+        };
+
+        let failing: Vec<&str> = status
+            .checks
+            .iter()
+            .filter(|check| {
+                matches!(
+                    check.conclusion.as_deref(),
+                    Some("FAILURE") | Some("TIMED_OUT") | Some("CANCELLED") | Some("ACTION_REQUIRED")
+                )
+            })
+            .map(|check| check.name.as_str())
+            .collect();
+        let conflicts = status.mergeable.as_deref() == Some("CONFLICTING")
+            || status.merge_state_status.as_deref() == Some("DIRTY");
+
+        let mut problems = Vec::new();
+        if conflicts {
+            problems.push("the PR has merge conflicts with the base branch".to_string());
+        }
+        if !failing.is_empty() {
+            problems.push(format!("these CI checks failed: {}", failing.join(", ")));
+        }
+        if problems.is_empty() {
+            return;
+        }
+
+        let prompt = format!(
+            "CI status on this PR needs fixing: {}. Use `gh pr checks` and \
+             `gh run view --log-failed` to inspect the failures (and resolve any \
+             merge conflicts by merging the base branch), fix the problems, \
+             commit, and push.",
+            problems.join("; "),
+        );
+
+        let workspace_id = summary.id.clone();
+        if let Some(workspace) = self.workspace.upgrade() {
+            workspace.update(cx, |workspace, cx| {
+                if !WorkspaceHost::dispatch_to_workspace_agent(workspace, &workspace_id, prompt, cx)
+                {
+                    log::warn!("No open workspace view to dispatch fix instruction to");
+                }
+            });
+        }
     }
 
     fn worktree_root(&self) -> Option<PathBuf> {
@@ -524,6 +631,41 @@ impl WorkspaceDetailPanel {
                     .items_center()
                     .child(Icon::new(IconName::Circle).size(IconSize::XSmall).color(color))
                     .child(Label::new(text).size(LabelSize::XSmall).color(color)),
+            );
+        }
+
+        let any_failed = status.checks.iter().any(|check| {
+            matches!(
+                check.conclusion.as_deref(),
+                Some("FAILURE") | Some("TIMED_OUT") | Some("CANCELLED") | Some("ACTION_REQUIRED")
+            )
+        });
+        let has_conflicts = status.mergeable.as_deref() == Some("CONFLICTING")
+            || status.merge_state_status.as_deref() == Some("DIRTY");
+        if any_failed || has_conflicts {
+            section = section.child(
+                h_flex()
+                    .px_2()
+                    .py_1()
+                    .gap_1()
+                    .child(
+                        Button::new("fix-errors", "Fix errors")
+                            .style(ButtonStyle::Tinted(TintColor::Warning))
+                            .label_size(LabelSize::Small)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.fix_errors_via_agent(cx);
+                            })),
+                    )
+                    .when(any_failed, |el| {
+                        el.child(
+                            Button::new("rerun-failed", "Re-run failed")
+                                .label_size(LabelSize::Small)
+                                .disabled(self.pr_busy)
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.rerun_failed_checks(cx);
+                                })),
+                        )
+                    }),
             );
         }
 
