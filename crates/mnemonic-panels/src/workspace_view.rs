@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 
 use editor::Editor;
 use gpui::{
-    App, AppContext as _, Context, DragMoveEvent, Empty, Entity, EventEmitter, Focusable,
+    App, AppContext as _, Context, Corner, DragMoveEvent, Empty, Entity, EventEmitter, Focusable,
     FocusHandle, IntoElement, Pixels, Render, SharedString, Subscription, WeakEntity, Window,
     actions, px,
 };
@@ -15,8 +15,8 @@ use task::{RevealStrategy, Shell, SpawnInTerminal, TaskId};
 use terminal::Terminal;
 use terminal_view::TerminalView;
 use ui::{
-    Button, ButtonStyle, Icon, IconButton, IconName, Label, TintColor, Tooltip, h_flex,
-    prelude::*, v_flex,
+    Button, ButtonStyle, ContextMenu, Icon, IconButton, IconName, Label, PopoverMenu, TintColor,
+    Tooltip, h_flex, prelude::*, v_flex,
 };
 use workspace::item::{Item, ItemEvent};
 use workspace::notifications::NotificationId;
@@ -52,13 +52,22 @@ const AUTO_FIX_MIN_GAP: Duration = Duration::from_secs(180);
 const AUTO_FIX_MAX_ATTEMPTS: u32 = 5;
 
 /// Model string passed to claude (also valid for its /model command) and
-/// the chip label shown in the composer.
+/// the chip label shown in the composer. [1m] = 1M-context variant.
 const AGENT_MODELS: &[(&str, &str)] = &[
-    ("claude-opus-4-8", "OPUS 4.8"),
-    ("claude-fable-5", "FABLE 5"),
-    ("claude-sonnet-4-6", "SONNET 4.6"),
-    ("claude-haiku-4-5", "HAIKU 4.5"),
+    ("claude-opus-4-8", "Opus 4.8"),
+    ("claude-opus-4-7", "Opus 4.7"),
+    ("claude-opus-4-6", "Opus 4.6"),
+    ("claude-opus-4-6[1m]", "Opus 4.6 1M"),
+    ("claude-fable-5", "Fable 5"),
+    ("claude-fable-5[1m]", "Fable 5 1M"),
+    ("claude-sonnet-4-6", "Sonnet 4.6"),
+    ("claude-sonnet-4-6[1m]", "Sonnet 4.6 1M"),
+    ("claude-haiku-4-5", "Haiku 4.5"),
 ];
+
+/// Effort levels for the effort dropdown. xhigh and max are only supported
+/// by some models; claude reports it visibly if the combination is invalid.
+const AGENT_EFFORTS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
 
 /// Drag payload for the composer resize handle.
 struct ComposerDrag;
@@ -573,15 +582,11 @@ impl WorkspaceView {
         }
     }
 
-    /// Cycles the model chip and live-switches the focused claude session
-    /// via its /model command. New sessions launch with this model.
-    fn cycle_model(&mut self, cx: &mut Context<Self>) {
-        let index = AGENT_MODELS
-            .iter()
-            .position(|(model, _)| *model == self.agent_model)
-            .unwrap_or(0);
-        self.agent_model = AGENT_MODELS[(index + 1) % AGENT_MODELS.len()].0.to_string();
-        self.dispatch_to_agent(format!("/model {}", self.agent_model), cx);
+    /// Applies a model choice: live-switches the focused claude session via
+    /// /model, and becomes the launch flag for new sessions.
+    fn set_model(&mut self, model: &str, cx: &mut Context<Self>) {
+        self.agent_model = model.to_string();
+        self.dispatch_to_agent(format!("/model {model}"), cx);
         cx.notify();
     }
 
@@ -590,19 +595,14 @@ impl WorkspaceView {
             .iter()
             .find(|(model, _)| *model == self.agent_model)
             .map(|(_, label)| label.to_string())
-            .unwrap_or_else(|| self.agent_model.to_uppercase())
+            .unwrap_or_else(|| self.agent_model.clone())
     }
 
-    /// Cycles the effort chip and live-switches the focused claude session
-    /// via its /effort command. New sessions launch with this effort.
-    fn cycle_effort(&mut self, cx: &mut Context<Self>) {
-        const EFFORTS: &[&str] = &["low", "medium", "high", "max"];
-        let index = EFFORTS
-            .iter()
-            .position(|effort| *effort == self.agent_effort)
-            .unwrap_or(2);
-        self.agent_effort = EFFORTS[(index + 1) % EFFORTS.len()].to_string();
-        self.dispatch_to_agent(format!("/effort {}", self.agent_effort), cx);
+    /// Applies an effort choice: live-switches via /effort, and becomes the
+    /// launch flag for new sessions.
+    fn set_effort(&mut self, effort: &str, cx: &mut Context<Self>) {
+        self.agent_effort = effort.to_string();
+        self.dispatch_to_agent(format!("/effort {effort}"), cx);
         cx.notify();
     }
 
@@ -734,29 +734,72 @@ impl WorkspaceView {
                             cx.notify();
                         })),
                     )
-                    .child(
-                        Button::new("composer-model", format!("{} ⌄", self.model_label()))
-                        .label_size(LabelSize::XSmall)
-                        .tooltip(Tooltip::text(
-                            "Click to cycle model (switches the focused claude live)",
-                        ))
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.cycle_model(cx);
-                        })),
-                    )
-                    .child(
-                        Button::new(
-                            "composer-effort",
-                            format!("{} ⌄", self.agent_effort.to_uppercase()),
-                        )
-                        .label_size(LabelSize::XSmall)
-                        .tooltip(Tooltip::text(
-                            "Click to cycle effort (switches the focused claude live)",
-                        ))
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.cycle_effort(cx);
-                        })),
-                    ),
+                    .child({
+                        let this = cx.weak_entity();
+                        PopoverMenu::new("composer-model-menu")
+                            .anchor(Corner::BottomLeft)
+                            .trigger(
+                                Button::new(
+                                    "composer-model",
+                                    format!("{} ⌄", self.model_label()),
+                                )
+                                .label_size(LabelSize::XSmall)
+                                .tooltip(Tooltip::text(
+                                    "Model for the focused claude (switches it live) and \
+                                     for new sessions",
+                                )),
+                            )
+                            .menu(move |window, cx| {
+                                let this = this.clone();
+                                Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
+                                    for (model, label) in AGENT_MODELS {
+                                        let this = this.clone();
+                                        menu = menu.entry(*label, None, move |_, cx| {
+                                            this.update(cx, |this, cx| {
+                                                this.set_model(model, cx);
+                                            })
+                                            .ok();
+                                        });
+                                    }
+                                    menu
+                                }))
+                            })
+                    })
+                    .child({
+                        let this = cx.weak_entity();
+                        PopoverMenu::new("composer-effort-menu")
+                            .anchor(Corner::BottomLeft)
+                            .trigger(
+                                Button::new(
+                                    "composer-effort",
+                                    format!("{} ⌄", self.agent_effort.to_uppercase()),
+                                )
+                                .label_size(LabelSize::XSmall)
+                                .tooltip(Tooltip::text(
+                                    "Effort for the focused claude (switches it live) and \
+                                     for new sessions",
+                                )),
+                            )
+                            .menu(move |window, cx| {
+                                let this = this.clone();
+                                Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
+                                    for effort in AGENT_EFFORTS {
+                                        let this = this.clone();
+                                        menu = menu.entry(
+                                            effort.to_uppercase(),
+                                            None,
+                                            move |_, cx| {
+                                                this.update(cx, |this, cx| {
+                                                    this.set_effort(effort, cx);
+                                                })
+                                                .ok();
+                                            },
+                                        );
+                                    }
+                                    menu
+                                }))
+                            })
+                    }),
             )
             .child(
                 div()
