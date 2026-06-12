@@ -78,6 +78,37 @@ fn agent_effective_model(
         })
 }
 
+/// Command line for an editor-embedded terminal that attaches to the
+/// workspace's persistent tmux session, creating it first if needed. The
+/// session outlives the editor tab and the editor itself, so reopening a
+/// workspace reattaches to the same running agent instead of starting a new
+/// one. Falls back to running the agent directly when tmux is unavailable.
+pub fn embedded_workspace_terminal_command(
+    workspace_id: &str,
+    cwd: &Path,
+    agent_command: &str,
+    agent_args: &[String],
+) -> (String, Vec<String>) {
+    let fallback = || (agent_command.to_string(), agent_args.to_vec());
+    if !tmux::available() {
+        return fallback();
+    }
+    let session_name = tmux::safe_session_name(workspace_id, "main");
+    if !tmux::session_exists(&session_name) {
+        let command_spec = TerminalCommandSpec {
+            command: agent_command.to_string(),
+            args: agent_args.to_vec(),
+        };
+        // The attaching client resizes the session to its real dimensions;
+        // these only matter for the brief detached window before attach.
+        if let Err(err) = tmux::start_detached(&session_name, cwd, &command_spec, 200, 50) {
+            log::warn!("Falling back to direct agent launch: {err}");
+            return fallback();
+        }
+    }
+    tmux::attach_command(&session_name)
+}
+
 fn shell_friendly_cwd(real_cwd: &Path, workspace_id: &str, db: &crate::db::Database) -> PathBuf {
     let workspace = match workspace_repository::get_detail(db, workspace_id) {
         Ok(Some(w)) => w,

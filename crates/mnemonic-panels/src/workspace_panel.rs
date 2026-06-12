@@ -2,14 +2,16 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 
 use gpui::{
-    actions, px, Action, App, AppContext as _, Context, Entity, EntityId, EventEmitter, Focusable,
+    actions, px, Action, App, AppContext as _, Context, Entity, EventEmitter, Focusable,
     FocusHandle, IntoElement, PathPromptOptions, Pixels, Render, SharedString, WeakEntity, Window,
 };
 use mnemonic_core::models::{CreateWorkspaceInput, DiscoveredRepository, WorkspaceSummary};
 use mnemonic_core::repositories::repository_repository;
-use mnemonic_core::services::{repo_scanner_service, workspace_service};
+use mnemonic_core::services::{repo_scanner_service, terminal_service, workspace_service};
 use task::{RevealStrategy, Shell, SpawnInTerminal, TaskId};
+use terminal::Terminal;
 use terminal_view::terminal_panel::TerminalPanel;
+use terminal_view::TerminalView;
 use ui::{Tooltip, h_flex, v_flex, Icon, IconButton, IconName, Label, prelude::*};
 use workspace::dock::{DockPosition, PanelEvent};
 use workspace::{Panel, Workspace};
@@ -25,7 +27,7 @@ pub struct WorkspacePanel {
     workspaces: Vec<WorkspaceSummary>,
     collapsed_projects: Vec<String>,
     selected_workspace_id: Option<String>,
-    open_terminals: HashMap<String, EntityId>,
+    open_terminals: HashMap<String, WeakEntity<Terminal>>,
 }
 
 impl WorkspacePanel {
@@ -103,26 +105,54 @@ impl WorkspacePanel {
         self.selected_workspace_id = Some(ws_id.clone());
         cx.notify();
 
-        if let Some(existing_entity_id) = self.open_terminals.get(&ws_id).copied() {
-            if let Some(workspace) = self.workspace.upgrade() {
-                let found = workspace.update(cx, |workspace, _cx| {
-                    let pane = workspace.active_pane().clone();
-                    let idx = pane.read(_cx).items().enumerate().find_map(|(idx, item)| {
-                        (item.item_id() == existing_entity_id).then_some(idx)
-                    });
-                    idx.map(|idx| (pane, idx))
-                });
-                if let Some((pane, idx)) = found {
-                    pane.update(cx, |pane, cx| {
-                        pane.activate_item(idx, true, true, window, cx);
-                    });
-                    return;
-                }
-            }
-            self.open_terminals.remove(&ws_id);
+        if self.focus_terminal_for_workspace(&ws_id, window, cx) {
+            return;
         }
 
         self.launch_terminal_for_workspace(&ws_id, window, cx);
+    }
+
+    /// Finds the workspace's terminal tab in any pane and activates it.
+    /// Returns false if the terminal no longer exists anywhere.
+    fn focus_terminal_for_workspace(
+        &mut self,
+        ws_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(weak_terminal) = self.open_terminals.get(ws_id) else {
+            return false;
+        };
+        let Some(terminal) = weak_terminal.upgrade() else {
+            self.open_terminals.remove(ws_id);
+            return false;
+        };
+        let Some(workspace) = self.workspace.upgrade() else {
+            return false;
+        };
+
+        let target = terminal.entity_id();
+        let panes = workspace.read(cx).panes().to_vec();
+        let mut found = None;
+        for pane in panes {
+            let index = pane.read(cx).items().position(|item| {
+                item.downcast::<TerminalView>()
+                    .is_some_and(|view| view.read(cx).terminal().entity_id() == target)
+            });
+            if let Some(index) = index {
+                found = Some((pane, index));
+                break;
+            }
+        }
+
+        let Some((pane, index)) = found else {
+            self.open_terminals.remove(ws_id);
+            return false;
+        };
+        pane.update(cx, |pane, cx| {
+            pane.activate_item(index, true, true, window, cx);
+        });
+        true
     }
 
     fn launch_terminal_for_workspace(
@@ -145,22 +175,48 @@ impl WorkspacePanel {
 
         let workspace = self.workspace.clone();
         let ws_id_owned = ws_id.to_string();
-        let spawn_task = SpawnInTerminal {
-            id: TaskId(format!("mnemonic-{ws_id}")),
-            full_label: ws_name.clone(),
-            label: ws_name,
-            command: Some("claude".to_string()),
-            args: vec!["--dangerously-skip-permissions".to_string()],
-            command_label: "claude --dangerously-skip-permissions".to_string(),
-            cwd,
-            shell: Shell::System,
-            reveal: RevealStrategy::Always,
-            use_new_terminal: true,
-            allow_concurrent_runs: true,
-            ..Default::default()
-        };
 
         cx.spawn_in(window, async move |this, cx| {
+            // Resolving the command may shell out to tmux (session checks,
+            // creating the detached session), so keep it off the UI thread.
+            let (command, args) = cx
+                .background_spawn({
+                    let ws_id = ws_id_owned.clone();
+                    let cwd = cwd.clone();
+                    async move {
+                        let agent_args = vec!["--dangerously-skip-permissions".to_string()];
+                        match &cwd {
+                            Some(dir) => terminal_service::embedded_workspace_terminal_command(
+                                &ws_id,
+                                dir,
+                                "claude",
+                                &agent_args,
+                            ),
+                            None => ("claude".to_string(), agent_args),
+                        }
+                    }
+                })
+                .await;
+
+            let command_label = std::iter::once(command.as_str())
+                .chain(args.iter().map(String::as_str))
+                .collect::<Vec<_>>()
+                .join(" ");
+            let spawn_task = SpawnInTerminal {
+                id: TaskId(format!("mnemonic-{ws_id_owned}")),
+                full_label: ws_name.clone(),
+                label: ws_name,
+                command: Some(command),
+                args,
+                command_label,
+                cwd,
+                shell: Shell::System,
+                reveal: RevealStrategy::Always,
+                use_new_terminal: true,
+                allow_concurrent_runs: true,
+                ..Default::default()
+            };
+
             let result = workspace
                 .update_in(cx, |workspace, window, cx| {
                     TerminalPanel::add_center_terminal(
@@ -174,13 +230,11 @@ impl WorkspacePanel {
 
             if let Some(task) = result {
                 if let Ok(weak_terminal) = task.await {
-                    if let Some(entity_id) = weak_terminal.upgrade().map(|t| t.entity_id()) {
-                        this.update(cx, |this, cx| {
-                            this.open_terminals.insert(ws_id_owned, entity_id);
-                            cx.notify();
-                        })
-                        .ok();
-                    }
+                    this.update(cx, |this, cx| {
+                        this.open_terminals.insert(ws_id_owned, weak_terminal);
+                        cx.notify();
+                    })
+                    .ok();
                 }
             }
         })
@@ -241,8 +295,6 @@ impl WorkspacePanel {
             .find(|r| r.name == project_name)
             .cloned();
 
-        let workspace = self.workspace.clone();
-
         cx.spawn_in(window, async move |this, cx| {
             let Some(repo) = repo else {
                 log::error!("Repository not found for project: {project_name}");
@@ -279,50 +331,11 @@ impl WorkspacePanel {
                 Ok(Ok(detail)) => {
                     log::info!("Created workspace: {}", detail.summary.id);
 
-                    this.update(cx, |this, cx| {
+                    this.update_in(cx, |this, window, cx| {
                         this.refresh(cx);
-                        cx.notify();
+                        this.select_workspace(detail.summary.id.clone(), window, cx);
                     })
                     .ok();
-
-                    let ws_name = detail.summary.name.clone();
-                    let ws_id = detail.summary.id.clone();
-                    let cwd = if detail.worktree_path.is_empty() {
-                        detail
-                            .summary
-                            .workspace_root_path
-                            .map(PathBuf::from)
-                    } else {
-                        Some(PathBuf::from(&detail.worktree_path))
-                    }
-                    .filter(|p| p.exists());
-
-                    let spawn_task = SpawnInTerminal {
-                        id: TaskId(format!("mnemonic-{ws_id}")),
-                        full_label: ws_name.clone(),
-                        label: ws_name,
-                        command: Some("claude".to_string()),
-                        args: vec!["--dangerously-skip-permissions".to_string()],
-                        command_label: "claude --dangerously-skip-permissions".to_string(),
-                        cwd,
-                        shell: Shell::System,
-                        reveal: RevealStrategy::Always,
-                        use_new_terminal: true,
-                        allow_concurrent_runs: true,
-                        ..Default::default()
-                    };
-
-                    workspace
-                        .update_in(cx, |workspace, window, cx| {
-                            TerminalPanel::add_center_terminal(
-                                workspace,
-                                window,
-                                cx,
-                                move |project, cx| project.create_terminal_task(spawn_task, cx),
-                            )
-                            .detach_and_log_err(cx);
-                        })
-                        .ok();
                 }
                 Ok(Err(e)) => log::error!("Failed to create workspace: {e}"),
                 Err(e) => log::error!("Failed to access state: {e}"),
