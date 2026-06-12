@@ -1,8 +1,8 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 
 use gpui::{
-    actions, px, Action, App, AppContext as _, Context, Entity, EventEmitter, Focusable,
+    actions, px, Action, App, AppContext as _, Context, Entity, EntityId, EventEmitter, Focusable,
     FocusHandle, IntoElement, PathPromptOptions, Pixels, Render, SharedString, WeakEntity, Window,
 };
 use mnemonic_core::models::{CreateWorkspaceInput, DiscoveredRepository, WorkspaceSummary};
@@ -25,6 +25,7 @@ pub struct WorkspacePanel {
     workspaces: Vec<WorkspaceSummary>,
     collapsed_projects: Vec<String>,
     selected_workspace_id: Option<String>,
+    open_terminals: HashMap<String, EntityId>,
 }
 
 impl WorkspacePanel {
@@ -41,6 +42,7 @@ impl WorkspacePanel {
                 workspaces: Vec::new(),
                 collapsed_projects: Vec::new(),
                 selected_workspace_id: None,
+                open_terminals: HashMap::new(),
             };
             panel.refresh(cx);
             panel
@@ -101,6 +103,34 @@ impl WorkspacePanel {
         self.selected_workspace_id = Some(ws_id.clone());
         cx.notify();
 
+        if let Some(existing_entity_id) = self.open_terminals.get(&ws_id).copied() {
+            if let Some(workspace) = self.workspace.upgrade() {
+                let found = workspace.update(cx, |workspace, _cx| {
+                    let pane = workspace.active_pane().clone();
+                    let idx = pane.read(_cx).items().enumerate().find_map(|(idx, item)| {
+                        (item.item_id() == existing_entity_id).then_some(idx)
+                    });
+                    idx.map(|idx| (pane, idx))
+                });
+                if let Some((pane, idx)) = found {
+                    pane.update(cx, |pane, cx| {
+                        pane.activate_item(idx, true, true, window, cx);
+                    });
+                    return;
+                }
+            }
+            self.open_terminals.remove(&ws_id);
+        }
+
+        self.launch_terminal_for_workspace(&ws_id, window, cx);
+    }
+
+    fn launch_terminal_for_workspace(
+        &mut self,
+        ws_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let ws = self.workspaces.iter().find(|ws| ws.id == ws_id);
         let ws_name = ws.map(|w| w.name.clone()).unwrap_or_default();
         let cwd = ws
@@ -114,6 +144,7 @@ impl WorkspacePanel {
             .filter(|p| p.exists());
 
         let workspace = self.workspace.clone();
+        let ws_id_owned = ws_id.to_string();
         let spawn_task = SpawnInTerminal {
             id: TaskId(format!("mnemonic-{ws_id}")),
             full_label: ws_name.clone(),
@@ -129,8 +160,8 @@ impl WorkspacePanel {
             ..Default::default()
         };
 
-        cx.spawn_in(window, async move |_this, cx| {
-            workspace
+        cx.spawn_in(window, async move |this, cx| {
+            let result = workspace
                 .update_in(cx, |workspace, window, cx| {
                     TerminalPanel::add_center_terminal(
                         workspace,
@@ -138,9 +169,20 @@ impl WorkspacePanel {
                         cx,
                         move |project, cx| project.create_terminal_task(spawn_task, cx),
                     )
-                    .detach_and_log_err(cx);
                 })
                 .ok();
+
+            if let Some(task) = result {
+                if let Ok(weak_terminal) = task.await {
+                    if let Some(entity_id) = weak_terminal.upgrade().map(|t| t.entity_id()) {
+                        this.update(cx, |this, cx| {
+                            this.open_terminals.insert(ws_id_owned, entity_id);
+                            cx.notify();
+                        })
+                        .ok();
+                    }
+                }
+            }
         })
         .detach();
     }
