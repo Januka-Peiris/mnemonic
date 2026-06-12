@@ -11,7 +11,7 @@ use ui::{Tooltip, h_flex, v_flex, Icon, IconButton, IconName, Label, prelude::*}
 use workspace::dock::{DockPosition, PanelEvent};
 use workspace::{Panel, Workspace};
 
-use crate::workspace_view::WorkspaceView;
+use crate::workspace_view::WorkspaceHost;
 
 actions!(mnemonic_workspace_panel, [ToggleFocus]);
 
@@ -106,7 +106,7 @@ impl WorkspacePanel {
         };
         if let Some(workspace) = self.workspace.upgrade() {
             workspace.update(cx, |workspace, cx| {
-                WorkspaceView::activate_or_open(workspace, &summary, window, cx);
+                WorkspaceHost::activate_workspace(workspace, &summary, window, cx);
             });
         }
     }

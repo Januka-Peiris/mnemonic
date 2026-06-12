@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -13,7 +14,7 @@ use task::{RevealStrategy, Shell, SpawnInTerminal, TaskId};
 use terminal::Terminal;
 use terminal_view::TerminalView;
 use ui::{Icon, IconButton, IconName, Label, Tooltip, h_flex, prelude::*, v_flex};
-use workspace::item::Item;
+use workspace::item::{Item, ItemEvent};
 use workspace::{Workspace, WorkspaceId};
 
 actions!(
@@ -47,67 +48,6 @@ pub struct WorkspaceView {
 }
 
 impl WorkspaceView {
-    /// Activates the existing view for this workspace if any pane holds one,
-    /// otherwise creates it and starts the agent terminal inside it.
-    pub fn activate_or_open(
-        workspace: &mut Workspace,
-        summary: &WorkspaceSummary,
-        window: &mut Window,
-        cx: &mut Context<Workspace>,
-    ) {
-        let panes = workspace.panes().to_vec();
-        for pane in panes {
-            let index = pane.read(cx).items().position(|item| {
-                item.downcast::<WorkspaceView>()
-                    .is_some_and(|view| view.read(cx).workspace_id == summary.id)
-            });
-            if let Some(index) = index {
-                pane.update(cx, |pane, cx| {
-                    pane.activate_item(index, true, true, window, cx);
-                });
-                return;
-            }
-        }
-
-        let worktree_path = summary
-            .workspace_root_path
-            .as_deref()
-            .or(summary.repository_path.as_deref())
-            .or(summary.selected_worktree_path.as_deref())
-            .map(PathBuf::from)
-            .filter(|path| path.exists());
-
-        let workspace_handle = workspace.weak_handle();
-        let project = workspace.project().downgrade();
-        let database_id = workspace.database_id();
-
-        let composer = cx.new(|cx| {
-            let mut editor = Editor::auto_height(1, 6, window, cx);
-            editor.set_placeholder_text(
-                "Send instruction to claude — Enter to send, Shift+Enter for newline",
-                window,
-                cx,
-            );
-            editor
-        });
-
-        let view = cx.new(|cx| WorkspaceView {
-            workspace_id: summary.id.clone(),
-            workspace_name: SharedString::from(summary.name.clone()),
-            worktree_path,
-            workspace: workspace_handle,
-            project,
-            database_id,
-            terminals: Vec::new(),
-            terminal_titles: Vec::new(),
-            active_terminal: 0,
-            composer,
-            focus_handle: cx.focus_handle(),
-        });
-        view.update(cx, |view, cx| view.spawn_agent_terminal(window, cx));
-        workspace.add_item_to_active_pane(Box::new(view), None, true, window, cx);
-    }
-
     /// Starts the workspace's primary agent terminal, attached to its
     /// persistent tmux session.
     fn spawn_agent_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -330,20 +270,6 @@ impl Focusable for WorkspaceView {
     }
 }
 
-impl EventEmitter<()> for WorkspaceView {}
-
-impl Item for WorkspaceView {
-    type Event = ();
-
-    fn tab_content_text(&self, _detail: usize, _cx: &App) -> SharedString {
-        self.workspace_name.clone()
-    }
-
-    fn tab_icon(&self, _window: &Window, _cx: &App) -> Option<Icon> {
-        Some(Icon::new(IconName::FileGit))
-    }
-}
-
 impl Render for WorkspaceView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let active_terminal = self.terminals.get(self.active_terminal).cloned();
@@ -370,5 +296,167 @@ impl Render for WorkspaceView {
                     }),
             )
             .child(self.render_composer(cx))
+    }
+}
+
+/// The single center item that hosts workspace views. The left panel is the
+/// switcher: selecting a workspace swaps which view this item shows, instead
+/// of stacking one tab per workspace. Views are cached, so switching back is
+/// instant and terminals keep running.
+pub struct WorkspaceHost {
+    views: HashMap<String, Entity<WorkspaceView>>,
+    active: Option<String>,
+    focus_handle: FocusHandle,
+}
+
+impl WorkspaceHost {
+    /// Ensures the host item exists in a pane, activates it, and switches it
+    /// to the given workspace.
+    pub fn activate_workspace(
+        workspace: &mut Workspace,
+        summary: &WorkspaceSummary,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
+    ) {
+        let panes = workspace.panes().to_vec();
+        let mut existing = None;
+        for pane in panes {
+            let found = pane.read(cx).items().enumerate().find_map(|(index, item)| {
+                item.downcast::<WorkspaceHost>().map(|host| (index, host))
+            });
+            if let Some((index, host)) = found {
+                existing = Some((pane, index, host));
+                break;
+            }
+        }
+
+        let host = match existing {
+            Some((pane, index, host)) => {
+                pane.update(cx, |pane, cx| {
+                    pane.activate_item(index, true, true, window, cx);
+                });
+                host
+            }
+            None => {
+                let host = cx.new(|cx| WorkspaceHost {
+                    views: HashMap::new(),
+                    active: None,
+                    focus_handle: cx.focus_handle(),
+                });
+                workspace.add_item_to_active_pane(Box::new(host.clone()), None, true, window, cx);
+                host
+            }
+        };
+
+        let workspace_handle = workspace.weak_handle();
+        let project = workspace.project().downgrade();
+        let database_id = workspace.database_id();
+        host.update(cx, |host, cx| {
+            host.set_active(summary, workspace_handle, project, database_id, window, cx);
+        });
+    }
+
+    fn set_active(
+        &mut self,
+        summary: &WorkspaceSummary,
+        workspace: WeakEntity<Workspace>,
+        project: WeakEntity<Project>,
+        database_id: Option<WorkspaceId>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.views.contains_key(&summary.id) {
+            let worktree_path = summary
+                .workspace_root_path
+                .as_deref()
+                .or(summary.repository_path.as_deref())
+                .or(summary.selected_worktree_path.as_deref())
+                .map(PathBuf::from)
+                .filter(|path| path.exists());
+
+            let composer = cx.new(|cx| {
+                let mut editor = Editor::auto_height(1, 6, window, cx);
+                editor.set_placeholder_text(
+                    "Send instruction to claude — Enter to send, Shift+Enter for newline",
+                    window,
+                    cx,
+                );
+                editor
+            });
+
+            let view = cx.new(|cx| WorkspaceView {
+                workspace_id: summary.id.clone(),
+                workspace_name: SharedString::from(summary.name.clone()),
+                worktree_path,
+                workspace,
+                project,
+                database_id,
+                terminals: Vec::new(),
+                terminal_titles: Vec::new(),
+                active_terminal: 0,
+                composer,
+                focus_handle: cx.focus_handle(),
+            });
+            view.update(cx, |view, cx| view.spawn_agent_terminal(window, cx));
+            self.views.insert(summary.id.clone(), view);
+        }
+
+        self.active = Some(summary.id.clone());
+        if let Some(view) = self.views.get(&summary.id) {
+            let focus_handle = view.focus_handle(cx);
+            window.focus(&focus_handle, cx);
+        }
+        cx.emit(ItemEvent::UpdateTab);
+        cx.notify();
+    }
+
+    fn active_view(&self) -> Option<&Entity<WorkspaceView>> {
+        self.active.as_ref().and_then(|id| self.views.get(id))
+    }
+}
+
+impl Focusable for WorkspaceHost {
+    fn focus_handle(&self, cx: &App) -> FocusHandle {
+        self.active_view()
+            .map(|view| view.focus_handle(cx))
+            .unwrap_or_else(|| self.focus_handle.clone())
+    }
+}
+
+impl EventEmitter<ItemEvent> for WorkspaceHost {}
+
+impl Item for WorkspaceHost {
+    type Event = ItemEvent;
+
+    fn tab_content_text(&self, _detail: usize, cx: &App) -> SharedString {
+        self.active_view()
+            .map(|view| view.read(cx).workspace_name.clone())
+            .unwrap_or_else(|| SharedString::from("Workspace"))
+    }
+
+    fn tab_icon(&self, _window: &Window, _cx: &App) -> Option<Icon> {
+        Some(Icon::new(IconName::FileGit))
+    }
+
+    fn to_item_events(event: &Self::Event, f: &mut dyn FnMut(ItemEvent)) {
+        f(*event)
+    }
+}
+
+impl Render for WorkspaceHost {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .size_full()
+            .bg(cx.theme().colors().editor_background)
+            .map(|el| match self.active_view().cloned() {
+                Some(view) => el.child(view),
+                None => el.child(
+                    v_flex().size_full().items_center().justify_center().child(
+                        Label::new("Select a workspace")
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    ),
+                ),
+            })
     }
 }

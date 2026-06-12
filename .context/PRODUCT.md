@@ -39,6 +39,12 @@ Three regions, like Conductor:
    you switch to *its* view; click back, everything is exactly as you left
    it. The terminal is a component of the workspace, not the thing itself.
 
+   **Workspaces do NOT stack as center tabs.** Jay works across 10–20
+   workspaces; a tab per workspace is unusable. The left panel is the
+   switcher; the center has ONE `WorkspaceHost` item that swaps which
+   workspace's view it shows. Views are cached inside the host so
+   switching back is instant with terminals and scrollback intact.
+
    Below the terminals sits the **agent composer** (from Forge): type an
    instruction, Enter sends it into the claude TUI. Dispatch must be the
    prompt text and the carriage return as SEPARATE PTY writes ~250ms apart
