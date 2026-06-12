@@ -95,7 +95,7 @@ fn build_application() -> Application {
 }
 
 fn files_not_created_on_launch(errors: HashMap<io::ErrorKind, Vec<&Path>>) {
-    let message = "Zed failed to launch";
+    let message = "Mnemonic failed to launch";
     let error_details = errors
         .into_iter()
         .flat_map(|(kind, paths)| {
@@ -651,6 +651,8 @@ fn main() {
             session: app_session,
         });
         AppState::set_global(app_state.clone(), cx);
+
+        mnemonic_bridge::init(cx);
 
         auto_update::init(client.clone(), cx);
         dap_adapters::init(cx);

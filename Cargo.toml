@@ -132,6 +132,9 @@ members = [
     "crates/mermaid_render",
     "crates/media",
     "crates/menu",
+    "crates/mnemonic-bridge",
+    "crates/mnemonic-core",
+    "crates/mnemonic-panels",
     "crates/migrator",
     "crates/miniprofiler_ui",
     "crates/mistral",
@@ -391,6 +394,9 @@ svg_preview = { path = "crates/svg_preview" }
 media = { path = "crates/media" }
 menu = { path = "crates/menu" }
 migrator = { path = "crates/migrator" }
+mnemonic-bridge = { path = "crates/mnemonic-bridge" }
+mnemonic-core = { path = "crates/mnemonic-core" }
+mnemonic-panels = { path = "crates/mnemonic-panels" }
 mistral = { path = "crates/mistral" }
 multi_buffer = { path = "crates/multi_buffer" }
 miniprofiler_ui = { path = "crates/miniprofiler_ui" }
@@ -481,7 +487,7 @@ web_search_providers = { path = "crates/web_search_providers" }
 workspace = { path = "crates/workspace" }
 worktree = { path = "crates/worktree" }
 x_ai = { path = "crates/x_ai" }
-zed = { path = "crates/zed" }
+mnemonic = { path = "crates/zed" }
 zed_actions = { path = "crates/zed_actions" }
 zed_credentials_provider = { path = "crates/zed_credentials_provider" }
 zed_env_vars = { path = "crates/zed_env_vars" }
@@ -978,7 +984,7 @@ lto = "thin"
 codegen-units = 1
 
 [profile.release.package]
-zed = { codegen-units = 16 }
+mnemonic = { codegen-units = 16 }
 
 [profile.release-fast]
 inherits = "release"

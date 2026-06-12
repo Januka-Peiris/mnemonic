@@ -1,0 +1,13 @@
+[package]
+name = "mnemonic-bridge"
+version = "0.1.0"
+edition = "2021"
+publish.workspace = true
+
+[dependencies]
+mnemonic-core.workspace = true
+gpui.workspace = true
+futures.workspace = true
+log.workspace = true
+serde_json.workspace = true
+paths.workspace = true
