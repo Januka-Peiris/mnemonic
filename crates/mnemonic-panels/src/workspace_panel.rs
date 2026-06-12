@@ -165,14 +165,15 @@ impl WorkspacePanel {
             .find(|r| r.name == project_name)
             .cloned();
 
+        let existing_names: Vec<String> = self.workspaces.iter().map(|ws| ws.name.clone()).collect();
+
         cx.spawn_in(window, async move |this, cx| {
             let Some(repo) = repo else {
                 log::error!("Repository not found for project: {project_name}");
                 return;
             };
 
-            let timestamp = chrono::Utc::now().format("%m%d-%H%M%S").to_string();
-            let workspace_name = format!("{}-{}", repo.name, timestamp);
+            let workspace_name = generate_workspace_name(&existing_names);
             let branch_name = format!("jay/{}", workspace_name);
 
             let result = this.read_with(cx, |_this, cx| {
@@ -402,6 +403,67 @@ impl WorkspacePanel {
                     .size(LabelSize::Small)
                     .color(Color::Muted),
             )
+    }
+}
+
+const NAME_ADJECTIVES: &[&str] = &[
+    "amber", "bold", "brave", "bright", "brisk", "calm", "clever", "cobalt", "coral", "crisp",
+    "curious", "daring", "deft", "eager", "early", "fleet", "gentle", "gilded", "glad", "golden",
+    "happy", "hardy", "hidden", "humble", "ivory", "jade", "keen", "kind", "lively", "lucky",
+    "lunar", "mellow", "merry", "misty", "noble", "nimble", "opal", "patient", "plucky", "proud",
+    "quiet", "rapid", "rosy", "rustic", "sable", "sage", "scarlet", "sharp", "silent", "silver",
+    "sleek", "smart", "snowy", "solar", "spry", "steady", "stout", "sunny", "swift", "tidy",
+    "velvet", "vivid", "wandering", "wise",
+];
+
+const NAME_ANIMALS: &[&str] = &[
+    "badger", "bear", "beaver", "bison", "bobcat", "condor", "coyote", "crane", "deer", "dingo",
+    "dolphin", "eagle", "egret", "elk", "falcon", "ferret", "finch", "fox", "gazelle", "gecko",
+    "gibbon", "hare", "hawk", "heron", "ibex", "jackal", "jaguar", "kestrel", "kiwi", "koala",
+    "lark", "lemur", "lynx", "macaw", "marmot", "marten", "mole", "moose", "narwhal", "newt",
+    "ocelot", "orca", "osprey", "otter", "owl", "panda", "panther", "pelican", "petrel", "puffin",
+    "puma", "quail", "rabbit", "raven", "robin", "seal", "sparrow", "stork", "swan", "tapir",
+    "tern", "vole", "walrus", "wren",
+];
+
+/// Conductor-style two-word workspace names ("patient-cipher"), seeded from
+/// the clock so no rand dependency is needed. Falls back to a numeric suffix
+/// in the unlikely case the random picks keep colliding.
+fn generate_workspace_name(existing: &[String]) -> String {
+    let mut seed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos() as u64)
+        .unwrap_or(0x9E37_79B9_7F4A_7C15);
+    let mut next = move || {
+        seed = seed
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        (seed >> 33) as usize
+    };
+
+    for _ in 0..32 {
+        let name = format!(
+            "{}-{}",
+            NAME_ADJECTIVES[next() % NAME_ADJECTIVES.len()],
+            NAME_ANIMALS[next() % NAME_ANIMALS.len()]
+        );
+        if !existing.iter().any(|existing| existing == &name) {
+            return name;
+        }
+    }
+
+    let base = format!(
+        "{}-{}",
+        NAME_ADJECTIVES[next() % NAME_ADJECTIVES.len()],
+        NAME_ANIMALS[next() % NAME_ANIMALS.len()]
+    );
+    let mut counter = 2;
+    loop {
+        let candidate = format!("{base}-{counter}");
+        if !existing.iter().any(|existing| existing == &candidate) {
+            return candidate;
+        }
+        counter += 1;
     }
 }
 

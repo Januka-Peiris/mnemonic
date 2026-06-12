@@ -4,8 +4,9 @@ use std::time::{Duration, Instant};
 
 use editor::Editor;
 use gpui::{
-    App, AppContext as _, Context, Entity, EventEmitter, Focusable, FocusHandle, IntoElement,
-    Render, SharedString, Subscription, WeakEntity, Window, actions, px,
+    App, AppContext as _, Context, DragMoveEvent, Empty, Entity, EventEmitter, Focusable,
+    FocusHandle, IntoElement, Pixels, Render, SharedString, Subscription, WeakEntity, Window,
+    actions, px,
 };
 use mnemonic_core::models::WorkspaceSummary;
 use mnemonic_core::services::terminal_service;
@@ -35,6 +36,15 @@ const ENTER_DELAY_MILLIS: u64 = 250;
 /// output going quiet for this long means it's waiting for input.
 const AGENT_IDLE_AFTER: Duration = Duration::from_secs(4);
 
+/// Drag payload for the composer resize handle.
+struct ComposerDrag;
+
+impl Render for ComposerDrag {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        Empty
+    }
+}
+
 /// The center view for a Mnemonic workspace. The workspace is the unit the
 /// user switches between; terminals (the agent's and any extra shells) live
 /// inside it as inner tabs, all rooted in the workspace's worktree.
@@ -49,6 +59,7 @@ pub struct WorkspaceView {
     terminal_titles: Vec<SharedString>,
     active_terminal: usize,
     composer: Entity<Editor>,
+    composer_height: Pixels,
     last_agent_activity: Option<Instant>,
     idle_check_scheduled: bool,
     _terminal_subscriptions: Vec<Subscription>,
@@ -284,6 +295,19 @@ impl WorkspaceView {
             )
     }
 
+    fn render_resize_handle(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .id("composer-resize-handle")
+            .w_full()
+            .h(px(5.))
+            .cursor_row_resize()
+            .hover(|style| style.bg(cx.theme().colors().border_focused))
+            .on_drag(ComposerDrag, |_, _, _, cx| {
+                cx.stop_propagation();
+                cx.new(|_| ComposerDrag)
+            })
+    }
+
     fn render_composer(&self, cx: &mut Context<Self>) -> impl IntoElement {
         v_flex()
             .key_context("MnemonicComposer")
@@ -296,12 +320,15 @@ impl WorkspaceView {
             .w_full()
             .child(
                 div()
+                    .id("composer-card")
                     .w_full()
+                    .h(self.composer_height)
                     .p_1p5()
                     .rounded_md()
                     .border_1()
                     .border_color(cx.theme().colors().border)
                     .bg(cx.theme().colors().editor_background)
+                    .overflow_y_scroll()
                     .child(self.composer.clone()),
             )
             .child(
@@ -408,6 +435,15 @@ impl Render for WorkspaceView {
         v_flex()
             .size_full()
             .bg(cx.theme().colors().editor_background)
+            .on_drag_move(cx.listener(
+                |this, event: &DragMoveEvent<ComposerDrag>, _window, cx| {
+                    // Distance from the cursor to the bottom of this view,
+                    // minus the composer chrome (buttons row + paddings).
+                    let height = event.bounds.bottom() - event.event.position.y - px(60.);
+                    this.composer_height = height.clamp(px(60.), px(600.));
+                    cx.notify();
+                },
+            ))
             .child(self.render_terminal_tabs(cx))
             .child(
                 div()
@@ -426,6 +462,7 @@ impl Render for WorkspaceView {
                         ),
                     }),
             )
+            .child(self.render_resize_handle(cx))
             .child(self.render_composer(cx))
     }
 }
@@ -506,7 +543,7 @@ impl WorkspaceHost {
                 .filter(|path| path.exists());
 
             let composer = cx.new(|cx| {
-                let mut editor = Editor::auto_height(1, 6, window, cx);
+                let mut editor = Editor::auto_height(3, 32, window, cx);
                 editor.set_placeholder_text(
                     "Send instruction to claude — Enter to send, Shift+Enter for newline",
                     window,
@@ -526,6 +563,7 @@ impl WorkspaceHost {
                 terminal_titles: Vec::new(),
                 active_terminal: 0,
                 composer,
+                composer_height: px(110.),
                 last_agent_activity: None,
                 idle_check_scheduled: false,
                 _terminal_subscriptions: Vec::new(),
