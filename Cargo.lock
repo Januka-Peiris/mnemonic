@@ -11372,6 +11372,8 @@ dependencies = [
  "mnemonic-bridge",
  "mnemonic-core",
  "serde_json",
+ "task",
+ "terminal_view",
  "ui",
  "workspace",
 ]

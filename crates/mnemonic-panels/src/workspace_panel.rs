@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 
 use gpui::{
     actions, px, Action, App, AppContext as _, Context, Entity, EventEmitter, Focusable,
@@ -6,6 +7,8 @@ use gpui::{
 };
 use mnemonic_core::models::WorkspaceSummary;
 use mnemonic_core::services::workspace_service;
+use task::{RevealStrategy, Shell, SpawnInTerminal, TaskId};
+use terminal_view::terminal_panel::TerminalPanel;
 use ui::{Tooltip, h_flex, v_flex, Icon, IconButton, IconName, Label, prelude::*};
 use workspace::dock::{DockPosition, PanelEvent};
 use workspace::{Panel, Workspace};
@@ -16,7 +19,7 @@ const WORKSPACE_PANEL_KEY: &str = "MnemonicWorkspacePanel";
 
 pub struct WorkspacePanel {
     focus_handle: FocusHandle,
-    _workspace: WeakEntity<Workspace>,
+    workspace: WeakEntity<Workspace>,
     workspaces: Vec<WorkspaceSummary>,
     collapsed_projects: Vec<String>,
     selected_workspace_id: Option<String>,
@@ -31,7 +34,7 @@ impl WorkspacePanel {
         cx.new(|cx| {
             let mut panel = Self {
                 focus_handle: cx.focus_handle(),
-                _workspace: workspace.weak_handle(),
+                workspace: workspace.weak_handle(),
                 workspaces: Vec::new(),
                 collapsed_projects: Vec::new(),
                 selected_workspace_id: None,
@@ -79,9 +82,57 @@ impl WorkspacePanel {
         }
     }
 
-    fn select_workspace(&mut self, ws_id: String, cx: &mut Context<Self>) {
-        self.selected_workspace_id = Some(ws_id);
+    fn select_workspace(
+        &mut self,
+        ws_id: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.selected_workspace_id = Some(ws_id.clone());
         cx.notify();
+
+        let ws = self.workspaces.iter().find(|ws| ws.id == ws_id);
+        let ws_name = ws.map(|w| w.name.clone()).unwrap_or_default();
+        let cwd = ws
+            .and_then(|ws| {
+                ws.workspace_root_path
+                    .as_deref()
+                    .or(ws.repository_path.as_deref())
+                    .or(ws.selected_worktree_path.as_deref())
+            })
+            .map(PathBuf::from)
+            .filter(|p| p.exists());
+
+        let workspace = self.workspace.clone();
+        let spawn_task = SpawnInTerminal {
+            id: TaskId(format!("mnemonic-{ws_id}")),
+            full_label: ws_name.clone(),
+            label: ws_name,
+            command: Some("claude".to_string()),
+            args: vec!["--dangerously-skip-permissions".to_string()],
+            command_label: "claude --dangerously-skip-permissions".to_string(),
+            cwd,
+            shell: Shell::System,
+            reveal: RevealStrategy::Always,
+            use_new_terminal: true,
+            allow_concurrent_runs: true,
+            ..Default::default()
+        };
+
+        cx.spawn_in(window, async move |_this, cx| {
+            workspace
+                .update_in(cx, |workspace, window, cx| {
+                    TerminalPanel::add_center_terminal(
+                        workspace,
+                        window,
+                        cx,
+                        move |project, cx| project.create_terminal_task(spawn_task, cx),
+                    )
+                    .detach_and_log_err(cx);
+                })
+                .ok();
+        })
+        .detach();
     }
 
     fn render_history_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -241,8 +292,8 @@ impl WorkspacePanel {
                 el.bg(cx.theme().colors().ghost_element_selected)
             })
             .hover(|style| style.bg(cx.theme().colors().ghost_element_hover))
-            .on_click(cx.listener(move |this, _, _window, cx| {
-                this.select_workspace(ws_id.clone(), cx);
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.select_workspace(ws_id.clone(), window, cx);
             }))
             .child(
                 Icon::new(IconName::FileGit)
