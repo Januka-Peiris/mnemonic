@@ -71,6 +71,9 @@ pub struct WorkspaceView {
     active_terminal: usize,
     composer: Entity<Editor>,
     composer_height: Pixels,
+    agent_model: String,
+    agent_effort: String,
+    agent_bypass: bool,
     last_agent_activity: Option<Instant>,
     idle_check_scheduled: bool,
     auto_fix_enabled: bool,
@@ -86,7 +89,7 @@ impl WorkspaceView {
     /// Starts the workspace's primary agent terminal, attached to its
     /// persistent tmux session.
     fn spawn_agent_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.spawn_claude_terminal("main", "claude", Vec::new(), None, window, cx);
+        self.spawn_claude_terminal("main", "claude", None, None, window, cx);
     }
 
     /// Opens an additional claude session in this workspace, with its own
@@ -99,7 +102,7 @@ impl WorkspaceView {
             .count();
         let session = format!("claude-{}", claude_count + 1);
         let title = format!("claude {}", claude_count + 1);
-        self.spawn_claude_terminal(&session, &title, Vec::new(), None, window, cx);
+        self.spawn_claude_terminal(&session, &title, None, None, window, cx);
     }
 
     /// Opens (or refocuses) the review session: a separate claude on Sonnet
@@ -128,7 +131,7 @@ impl WorkspaceView {
         self.spawn_claude_terminal(
             "review",
             "review",
-            vec!["--model".to_string(), "sonnet".to_string()],
+            Some("sonnet".to_string()),
             Some(prompt),
             window,
             cx,
@@ -142,7 +145,7 @@ impl WorkspaceView {
         &mut self,
         session: &str,
         title: &str,
-        extra_args: Vec<String>,
+        model_override: Option<String>,
         initial_prompt: Option<String>,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -153,6 +156,9 @@ impl WorkspaceView {
         let project = self.project.clone();
         let session = session.to_string();
         let title = title.to_string();
+        let model = model_override.unwrap_or_else(|| self.agent_model.clone());
+        let effort = self.agent_effort.clone();
+        let bypass = self.agent_bypass;
 
         cx.spawn_in(window, async move |this, cx| {
             // Command resolution may shell out to tmux; keep it off the UI thread.
@@ -162,8 +168,14 @@ impl WorkspaceView {
                     let session = session.clone();
                     let cwd = cwd.clone();
                     async move {
-                        let mut agent_args = vec!["--dangerously-skip-permissions".to_string()];
-                        agent_args.extend(extra_args);
+                        let mut agent_args = Vec::new();
+                        if bypass {
+                            agent_args.push("--dangerously-skip-permissions".to_string());
+                        }
+                        agent_args.push("--model".to_string());
+                        agent_args.push(model);
+                        agent_args.push("--effort".to_string());
+                        agent_args.push(effort);
                         match &cwd {
                             Some(dir) => terminal_service::embedded_workspace_terminal_command(
                                 &workspace_id,
@@ -518,6 +530,32 @@ impl WorkspaceView {
         false
     }
 
+    /// Cycles the model chip and live-switches the focused claude session
+    /// via its /model command. New sessions launch with this model.
+    fn cycle_model(&mut self, cx: &mut Context<Self>) {
+        const MODELS: &[&str] = &["opus", "sonnet", "haiku"];
+        let index = MODELS
+            .iter()
+            .position(|model| *model == self.agent_model)
+            .unwrap_or(0);
+        self.agent_model = MODELS[(index + 1) % MODELS.len()].to_string();
+        self.dispatch_to_agent(format!("/model {}", self.agent_model), cx);
+        cx.notify();
+    }
+
+    /// Cycles the effort chip and live-switches the focused claude session
+    /// via its /effort command. New sessions launch with this effort.
+    fn cycle_effort(&mut self, cx: &mut Context<Self>) {
+        const EFFORTS: &[&str] = &["low", "medium", "high", "max"];
+        let index = EFFORTS
+            .iter()
+            .position(|effort| *effort == self.agent_effort)
+            .unwrap_or(2);
+        self.agent_effort = EFFORTS[(index + 1) % EFFORTS.len()].to_string();
+        self.dispatch_to_agent(format!("/effort {}", self.agent_effort), cx);
+        cx.notify();
+    }
+
     /// Sends Escape to the agent terminal, which interrupts Claude Code
     /// mid-generation.
     fn interrupt_agent(&mut self, cx: &mut Context<Self>) {
@@ -577,6 +615,57 @@ impl WorkspaceView {
             .p_2()
             .gap_1p5()
             .w_full()
+            .child(
+                h_flex()
+                    .gap_1()
+                    .items_center()
+                    .child(
+                        Button::new(
+                            "composer-bypass",
+                            if self.agent_bypass { "Bypass: on" } else { "Bypass: off" },
+                        )
+                        .style(if self.agent_bypass {
+                            ButtonStyle::Tinted(TintColor::Warning)
+                        } else {
+                            ButtonStyle::Subtle
+                        })
+                        .label_size(LabelSize::XSmall)
+                        .tooltip(Tooltip::text(
+                            "Whether NEW claude sessions skip permission prompts \
+                             (running sessions: shift+tab in the terminal)",
+                        ))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.agent_bypass = !this.agent_bypass;
+                            cx.notify();
+                        })),
+                    )
+                    .child(
+                        Button::new(
+                            "composer-model",
+                            format!("{} ⌄", self.agent_model.to_uppercase()),
+                        )
+                        .label_size(LabelSize::XSmall)
+                        .tooltip(Tooltip::text(
+                            "Click to cycle model (switches the focused claude live)",
+                        ))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.cycle_model(cx);
+                        })),
+                    )
+                    .child(
+                        Button::new(
+                            "composer-effort",
+                            format!("{} ⌄", self.agent_effort.to_uppercase()),
+                        )
+                        .label_size(LabelSize::XSmall)
+                        .tooltip(Tooltip::text(
+                            "Click to cycle effort (switches the focused claude live)",
+                        ))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.cycle_effort(cx);
+                        })),
+                    ),
+            )
             .child(
                 div()
                     .id("composer-card")
@@ -862,6 +951,9 @@ impl WorkspaceHost {
                 active_terminal: 0,
                 composer,
                 composer_height: px(110.),
+                agent_model: "opus".to_string(),
+                agent_effort: "high".to_string(),
+                agent_bypass: true,
                 last_agent_activity: None,
                 idle_check_scheduled: false,
                 auto_fix_enabled: false,
