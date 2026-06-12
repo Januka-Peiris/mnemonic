@@ -78,17 +78,26 @@ fn agent_effective_model(
         })
 }
 
-/// Kills the embedded editor terminal's tmux session for a workspace, e.g.
-/// when the workspace is archived. No-op when tmux or the session is absent.
+/// Kills all embedded editor tmux sessions for a workspace (the primary
+/// agent session and any extra ones), e.g. when the workspace is archived.
+/// No-op when tmux is absent.
 pub fn kill_embedded_workspace_session(workspace_id: &str) -> Result<(), String> {
     if !tmux::available() {
         return Ok(());
     }
-    let session_name = tmux::safe_session_name(workspace_id, "main");
-    if tmux::session_exists(&session_name) {
-        tmux::kill_session(&session_name)
-    } else {
+    let prefix = tmux::safe_session_name(workspace_id, "");
+    let mut errors = Vec::new();
+    for session in tmux::list_sessions() {
+        if session.starts_with(&prefix) {
+            if let Err(err) = tmux::kill_session(&session) {
+                errors.push(err);
+            }
+        }
+    }
+    if errors.is_empty() {
         Ok(())
+    } else {
+        Err(errors.join("; "))
     }
 }
 
@@ -99,6 +108,7 @@ pub fn kill_embedded_workspace_session(workspace_id: &str) -> Result<(), String>
 /// one. Falls back to running the agent directly when tmux is unavailable.
 pub fn embedded_workspace_terminal_command(
     workspace_id: &str,
+    session: &str,
     cwd: &Path,
     agent_command: &str,
     agent_args: &[String],
@@ -107,7 +117,7 @@ pub fn embedded_workspace_terminal_command(
     if !tmux::available() {
         return fallback();
     }
-    let session_name = tmux::safe_session_name(workspace_id, "main");
+    let session_name = tmux::safe_session_name(workspace_id, session);
     if tmux::session_exists(&session_name) {
         // Sessions created before an option was added (e.g. mouse mode)
         // pick up the current configuration on reattach.

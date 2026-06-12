@@ -86,22 +86,51 @@ impl WorkspaceView {
     /// Starts the workspace's primary agent terminal, attached to its
     /// persistent tmux session.
     fn spawn_agent_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.spawn_claude_terminal("main", "claude", window, cx);
+    }
+
+    /// Opens an additional claude session in this workspace, with its own
+    /// persistent tmux session.
+    fn add_claude_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let claude_count = self
+            .terminal_titles
+            .iter()
+            .filter(|title| title.starts_with("claude"))
+            .count();
+        let session = format!("claude-{}", claude_count + 1);
+        let title = format!("claude {}", claude_count + 1);
+        self.spawn_claude_terminal(&session, &title, window, cx);
+    }
+
+    /// Starts a claude terminal attached to the given persistent tmux
+    /// session of this workspace.
+    fn spawn_claude_terminal(
+        &mut self,
+        session: &str,
+        title: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let workspace_id = self.workspace_id.clone();
         let workspace_name = self.workspace_name.to_string();
         let cwd = self.worktree_path.clone();
         let project = self.project.clone();
+        let session = session.to_string();
+        let title = title.to_string();
 
         cx.spawn_in(window, async move |this, cx| {
             // Command resolution may shell out to tmux; keep it off the UI thread.
             let (command, args) = cx
                 .background_spawn({
                     let workspace_id = workspace_id.clone();
+                    let session = session.clone();
                     let cwd = cwd.clone();
                     async move {
                         let agent_args = vec!["--dangerously-skip-permissions".to_string()];
                         match &cwd {
                             Some(dir) => terminal_service::embedded_workspace_terminal_command(
                                 &workspace_id,
+                                &session,
                                 dir,
                                 "claude",
                                 &agent_args,
@@ -117,7 +146,7 @@ impl WorkspaceView {
                 .collect::<Vec<_>>()
                 .join(" ");
             let spawn_task = SpawnInTerminal {
-                id: TaskId(format!("mnemonic-{workspace_id}")),
+                id: TaskId(format!("mnemonic-{workspace_id}-{session}")),
                 full_label: workspace_name.clone(),
                 label: workspace_name,
                 command: Some(command),
@@ -141,7 +170,7 @@ impl WorkspaceView {
             match terminal {
                 Ok(terminal) => {
                     this.update_in(cx, |this, window, cx| {
-                        this.push_terminal("claude", terminal, window, cx);
+                        this.push_terminal(&title, terminal, window, cx);
                     })
                     .ok();
                 }
@@ -262,8 +291,19 @@ impl WorkspaceView {
 
     /// Writes an instruction into the agent terminal: text first, then the
     /// submitting Enter as a separate input event (Forge's dispatch pattern).
+    /// Targets the active tab when it's a claude session, otherwise the
+    /// primary agent terminal.
     pub(crate) fn dispatch_to_agent(&mut self, text: String, cx: &mut Context<Self>) {
-        let Some(agent_view) = self.terminals.first() else {
+        let active_is_claude = self
+            .terminal_titles
+            .get(self.active_terminal)
+            .is_some_and(|title| title.starts_with("claude"));
+        let agent_view = if active_is_claude {
+            self.terminals.get(self.active_terminal)
+        } else {
+            self.terminals.first()
+        };
+        let Some(agent_view) = agent_view else {
             return;
         };
         let terminal = agent_view.read(cx).terminal().clone();
@@ -605,13 +645,23 @@ impl WorkspaceView {
             )
             .child(self.render_status_chip(cx))
             .child(
-            IconButton::new("workspace-add-terminal", IconName::Plus)
-                .icon_size(IconSize::Small)
-                .tooltip(Tooltip::text("New Terminal in Workspace"))
-                .on_click(cx.listener(|this, _, window, cx| {
-                    this.add_shell_terminal(window, cx);
-                })),
-        )
+                Button::new("workspace-add-claude", "+ Claude")
+                    .label_size(LabelSize::XSmall)
+                    .tooltip(Tooltip::text(
+                        "New claude session in this workspace (own persistent tmux session)",
+                    ))
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.add_claude_terminal(window, cx);
+                    })),
+            )
+            .child(
+                IconButton::new("workspace-add-terminal", IconName::Plus)
+                    .icon_size(IconSize::Small)
+                    .tooltip(Tooltip::text("New shell in this workspace"))
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.add_shell_terminal(window, cx);
+                    })),
+            )
     }
 }
 

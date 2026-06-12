@@ -46,6 +46,23 @@ pub(super) fn safe_session_name(workspace_id: &str, session_id: &str) -> String 
     name
 }
 
+/// Names of all sessions on the private socket. Empty when the server
+/// isn't running.
+pub(super) fn list_sessions() -> Vec<String> {
+    tmux_command()
+        .args(["list-sessions", "-F", "#S"])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| {
+            String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 pub(super) fn session_exists(name: &str) -> bool {
     tmux_command()
         .args(["has-session", "-t", name])
