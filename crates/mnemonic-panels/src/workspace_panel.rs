@@ -207,10 +207,13 @@ impl WorkspacePanel {
                 return;
             };
 
+            let timestamp = chrono::Utc::now().format("%m%d-%H%M").to_string();
+            let workspace_name = format!("{}-{}", repo.name, timestamp);
+
             let result = this.read_with(cx, |_this, cx| {
                 let state = mnemonic_bridge::mnemonic_state(cx);
                 let input = CreateWorkspaceInput {
-                    name: String::new(),
+                    name: workspace_name,
                     repo: repo.name.clone(),
                     base_branch: "main".to_string(),
                     branch: None,
