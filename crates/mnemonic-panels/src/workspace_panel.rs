@@ -1,13 +1,14 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use gpui::{
     actions, px, Action, App, AppContext as _, Context, Entity, EventEmitter, Focusable,
     FocusHandle, IntoElement, PathPromptOptions, Pixels, PromptLevel, Render, SharedString,
     WeakEntity, Window,
 };
-use mnemonic_core::models::{CreateWorkspaceInput, DiscoveredRepository, WorkspaceSummary};
-use mnemonic_core::repositories::repository_repository;
+use mnemonic_core::models::{ActivityItem, CreateWorkspaceInput, DiscoveredRepository, WorkspaceSummary};
+use mnemonic_core::repositories::{activity_repository, repository_repository, settings_repository};
 use mnemonic_core::services::{repo_scanner_service, workspace_service};
 use ui::{Tooltip, h_flex, v_flex, Icon, IconButton, IconName, Label, prelude::*};
 use workspace::dock::{DockPosition, PanelEvent};
@@ -26,6 +27,8 @@ pub struct WorkspacePanel {
     workspaces: Vec<WorkspaceSummary>,
     collapsed_projects: Vec<String>,
     selected_workspace_id: Option<String>,
+    showing_history: bool,
+    activities: Vec<ActivityItem>,
 }
 
 impl WorkspacePanel {
@@ -34,7 +37,7 @@ impl WorkspacePanel {
         _window: &mut Window,
         cx: &mut Context<Workspace>,
     ) -> Entity<Self> {
-        cx.new(|cx| {
+        let panel = cx.new(|cx| {
             let mut panel = Self {
                 focus_handle: cx.focus_handle(),
                 workspace: workspace.weak_handle(),
@@ -42,10 +45,27 @@ impl WorkspacePanel {
                 workspaces: Vec::new(),
                 collapsed_projects: Vec::new(),
                 selected_workspace_id: None,
+                showing_history: false,
+                activities: Vec::new(),
             };
             panel.refresh(cx);
             panel
-        })
+        });
+
+        // Periodic repaint so the attention dots track live agent activity.
+        panel.update(cx, |_, cx| {
+            cx.spawn(async move |this, cx| {
+                loop {
+                    cx.background_executor().timer(Duration::from_secs(2)).await;
+                    if this.update(cx, |_, cx| cx.notify()).is_err() {
+                        break;
+                    }
+                }
+            })
+            .detach();
+        });
+
+        panel
     }
 
     pub async fn load(
@@ -152,6 +172,7 @@ impl WorkspacePanel {
             this.update_in(cx, |this, window, cx| {
                 match result {
                     Ok(()) => {
+                        mnemonic_bridge::clear_agent_activity(&ws_id);
                         if this.selected_workspace_id.as_deref() == Some(ws_id.as_str()) {
                             this.selected_workspace_id = None;
                             cx.set_global(crate::ActiveWorkspace(None));
@@ -281,14 +302,29 @@ impl WorkspacePanel {
             };
 
             let workspace_name = generate_workspace_name(&existing_names);
-            let branch_name = format!("jay/{}", workspace_name);
 
             let result = this.read_with(cx, |_this, cx| {
                 let state = mnemonic_bridge::mnemonic_state(cx);
+                // Settings keys (DB): branch_prefix (default: OS username)
+                // and default_base_branch (default: main).
+                let branch_prefix = settings_repository::get_value(&state.db, "branch_prefix")
+                    .ok()
+                    .flatten()
+                    .map(|value| value.trim().trim_matches('/').to_string())
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or_else(default_branch_prefix);
+                let base_branch =
+                    settings_repository::get_value(&state.db, "default_base_branch")
+                        .ok()
+                        .flatten()
+                        .map(|value| value.trim().to_string())
+                        .filter(|value| !value.is_empty())
+                        .unwrap_or_else(|| "main".to_string());
+                let branch_name = format!("{branch_prefix}/{workspace_name}");
                 let input = CreateWorkspaceInput {
                     name: workspace_name,
                     repo: repo.name.clone(),
-                    base_branch: "main".to_string(),
+                    base_branch,
                     branch: Some(branch_name),
                     agent: "claude".to_string(),
                     task_prompt: String::new(),
@@ -323,6 +359,7 @@ impl WorkspacePanel {
     }
 
     fn render_history_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let showing = self.showing_history;
         h_flex()
             .id("history-bar")
             .px_2()
@@ -334,19 +371,108 @@ impl WorkspacePanel {
             .border_b_1()
             .border_color(cx.theme().colors().border)
             .hover(|style| style.bg(cx.theme().colors().ghost_element_hover))
-            .on_click(cx.listener(|_this, _, _window, _cx| {
-                log::info!("History clicked");
+            .on_click(cx.listener(|this, _, _window, cx| {
+                this.showing_history = !this.showing_history;
+                if this.showing_history {
+                    let state = mnemonic_bridge::mnemonic_state(cx);
+                    match activity_repository::list(&state.db) {
+                        Ok(items) => this.activities = items,
+                        Err(e) => log::error!("Failed to load history: {e}"),
+                    }
+                }
+                cx.notify();
             }))
             .child(
-                Icon::new(IconName::Clock)
-                    .size(IconSize::Small)
-                    .color(Color::Muted),
+                Icon::new(if showing {
+                    IconName::ChevronLeft
+                } else {
+                    IconName::Clock
+                })
+                .size(IconSize::Small)
+                .color(Color::Muted),
             )
             .child(
-                Label::new("History")
+                Label::new(if showing { "Back to projects" } else { "History" })
                     .size(LabelSize::Default)
                     .color(Color::Default),
             )
+    }
+
+    fn render_history(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let mut list = v_flex()
+            .id("history-list")
+            .py_0p5()
+            .flex_grow(1.0)
+            .overflow_y_scroll();
+
+        if self.activities.is_empty() {
+            return list.child(
+                h_flex().px_2().py_2().child(
+                    Label::new("No activity yet")
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
+                ),
+            );
+        }
+
+        for activity in self.activities.iter().take(100) {
+            let level_color = match activity.level.as_str() {
+                "success" => cx.theme().status().success,
+                "warning" => cx.theme().status().warning,
+                "error" => cx.theme().status().error,
+                _ => cx.theme().status().info,
+            };
+            let repo_line = match &activity.branch {
+                Some(branch) if !branch.is_empty() => {
+                    format!("{} · {}", activity.repo, branch)
+                }
+                _ => activity.repo.clone(),
+            };
+
+            list = list.child(
+                v_flex()
+                    .px_2()
+                    .py_1()
+                    .gap_0p5()
+                    .w_full()
+                    .border_b_1()
+                    .border_color(cx.theme().colors().border_variant)
+                    .child(
+                        h_flex()
+                            .gap_1p5()
+                            .items_center()
+                            .child(div().w(px(6.)).h(px(6.)).rounded_full().bg(level_color))
+                            .child(
+                                div().flex_grow(1.0).overflow_hidden().child(
+                                    Label::new(activity.event.clone())
+                                        .size(LabelSize::Small)
+                                        .single_line(),
+                                ),
+                            )
+                            .child(
+                                Label::new(activity.timestamp.clone())
+                                    .size(LabelSize::XSmall)
+                                    .color(Color::Muted),
+                            ),
+                    )
+                    .child(
+                        Label::new(repo_line)
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted)
+                            .single_line(),
+                    )
+                    .when_some(activity.details.clone(), |el, details| {
+                        el.child(
+                            Label::new(details)
+                                .size(LabelSize::XSmall)
+                                .color(Color::Muted)
+                                .single_line(),
+                        )
+                    }),
+            );
+        }
+
+        list
     }
 
     fn render_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -484,6 +610,19 @@ impl WorkspacePanel {
             .on_click(cx.listener(move |this, _, window, cx| {
                 this.select_workspace(ws_id.clone(), window, cx);
             }))
+            .child({
+                // Live attention dot: green while claude is producing
+                // output, amber when it has gone quiet (waiting on you),
+                // muted when no session has run yet.
+                let dot_color = match mnemonic_bridge::last_agent_activity(&ws.id) {
+                    Some(at) if at.elapsed() < Duration::from_secs(4) => {
+                        cx.theme().status().success
+                    }
+                    Some(_) => cx.theme().status().warning,
+                    None => cx.theme().colors().text_muted,
+                };
+                div().w(px(7.)).h(px(7.)).rounded_full().bg(dot_color)
+            })
             .child(
                 Icon::new(IconName::FileGit)
                     .size(IconSize::XSmall)
@@ -554,6 +693,27 @@ const NAME_ANIMALS: &[&str] = &[
     "puma", "quail", "rabbit", "raven", "robin", "seal", "sparrow", "stork", "swan", "tapir",
     "tern", "vole", "walrus", "wren",
 ];
+
+/// Branch prefix fallback: the OS username, sanitized for git ref syntax.
+fn default_branch_prefix() -> String {
+    std::env::var("USER")
+        .ok()
+        .map(|user| {
+            user.trim()
+                .to_lowercase()
+                .chars()
+                .map(|ch| {
+                    if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_') {
+                        ch
+                    } else {
+                        '-'
+                    }
+                })
+                .collect::<String>()
+        })
+        .filter(|user| !user.is_empty())
+        .unwrap_or_else(|| "mnemonic".to_string())
+}
 
 /// Conductor-style two-word workspace names ("patient-cipher"), seeded from
 /// the clock so no rand dependency is needed. Falls back to a numeric suffix
@@ -667,16 +827,21 @@ impl Render for WorkspacePanel {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.refresh(cx);
 
-        let groups = self.grouped_workspaces();
-        let has_workspaces = !groups.is_empty();
-
         let mut content = v_flex()
             .id("workspace-panel")
             .size_full()
             .track_focus(&self.focus_handle)
             .bg(cx.theme().colors().panel_background)
-            .child(self.render_history_bar(cx))
-            .child(self.render_header(cx));
+            .child(self.render_history_bar(cx));
+
+        if self.showing_history {
+            return content.child(self.render_history(cx));
+        }
+
+        content = content.child(self.render_header(cx));
+
+        let groups = self.grouped_workspaces();
+        let has_workspaces = !groups.is_empty();
 
         if has_workspaces {
             let mut list = v_flex().py_0p5().overflow_y_hidden().flex_grow(1.0);

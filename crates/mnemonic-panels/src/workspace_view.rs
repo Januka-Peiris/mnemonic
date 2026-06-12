@@ -19,7 +19,11 @@ use ui::{
     prelude::*, v_flex,
 };
 use workspace::item::{Item, ItemEvent};
-use workspace::{Workspace, WorkspaceId};
+use workspace::notifications::NotificationId;
+use workspace::{Toast, Workspace, WorkspaceId};
+
+/// Marker for auto-fix loop toasts.
+struct MnemonicAutoFixToast;
 
 actions!(
     mnemonic_composer,
@@ -284,6 +288,7 @@ impl WorkspaceView {
             let subscription = cx.subscribe(&terminal, |this, _terminal, event, cx| {
                 if matches!(event, terminal::Event::Wakeup) {
                     this.last_agent_activity = Some(Instant::now());
+                    mnemonic_bridge::record_agent_activity(&this.workspace_id);
                     this.schedule_idle_check(cx);
                     cx.notify();
                 }
@@ -475,6 +480,13 @@ impl WorkspaceView {
                 self.auto_fix_enabled = false;
                 self.auto_fix_state =
                     SharedString::from(format!("gave up after {AUTO_FIX_MAX_ATTEMPTS} attempts"));
+                self.show_workspace_toast(
+                    format!(
+                        "{}: auto-fix gave up after {AUTO_FIX_MAX_ATTEMPTS} attempts — needs you",
+                        self.workspace_name
+                    ),
+                    cx,
+                );
                 cx.notify();
                 return false;
             }
@@ -513,6 +525,13 @@ impl WorkspaceView {
                 "fixing ({}/{})",
                 self.auto_fix_attempts, AUTO_FIX_MAX_ATTEMPTS
             ));
+            self.show_workspace_toast(
+                format!(
+                    "{}: CI failing — claude fixing ({}/{})",
+                    self.workspace_name, self.auto_fix_attempts, AUTO_FIX_MAX_ATTEMPTS
+                ),
+                cx,
+            );
             cx.notify();
             return true;
         }
@@ -526,8 +545,22 @@ impl WorkspaceView {
         // Everything completed and nothing failed: done.
         self.auto_fix_enabled = false;
         self.auto_fix_state = SharedString::from("CI green ✓");
+        self.show_workspace_toast(format!("{}: CI green ✓", self.workspace_name), cx);
         cx.notify();
         false
+    }
+
+    /// Raises a window toast, so background workspaces' auto-fix loops are
+    /// heard from without being looked at.
+    fn show_workspace_toast(&self, message: String, cx: &mut Context<Self>) {
+        if let Some(workspace) = self.workspace.upgrade() {
+            workspace.update(cx, |workspace, cx| {
+                workspace.show_toast(
+                    Toast::new(NotificationId::unique::<MnemonicAutoFixToast>(), message),
+                    cx,
+                );
+            });
+        }
     }
 
     /// Cycles the model chip and live-switches the focused claude session

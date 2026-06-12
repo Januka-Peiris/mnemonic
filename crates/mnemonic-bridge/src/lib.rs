@@ -20,6 +20,41 @@ pub struct ActiveWorkspace(pub Option<String>);
 
 impl Global for ActiveWorkspace {}
 
+/// Last terminal output time per workspace's agent, written by workspace
+/// views and read by the left panel for its attention indicators. A plain
+/// static (not a gpui Global) so high-frequency writes don't trigger
+/// observers.
+static AGENT_ACTIVITY: std::sync::Mutex<
+    Option<std::collections::HashMap<String, std::time::Instant>>,
+> = std::sync::Mutex::new(None);
+
+pub fn record_agent_activity(workspace_id: &str) {
+    let mut guard = AGENT_ACTIVITY
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    guard
+        .get_or_insert_with(Default::default)
+        .insert(workspace_id.to_string(), std::time::Instant::now());
+}
+
+pub fn last_agent_activity(workspace_id: &str) -> Option<std::time::Instant> {
+    let guard = AGENT_ACTIVITY
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    guard
+        .as_ref()
+        .and_then(|map| map.get(workspace_id).copied())
+}
+
+pub fn clear_agent_activity(workspace_id: &str) {
+    let mut guard = AGENT_ACTIVITY
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(map) = guard.as_mut() {
+        map.remove(workspace_id);
+    }
+}
+
 pub struct MnemonicEvent {
     pub name: String,
     pub payload: serde_json::Value,
