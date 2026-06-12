@@ -280,6 +280,13 @@ impl WorkspaceView {
         .detach();
     }
 
+    /// Enables the auto-fix loop if it isn't already running.
+    pub(crate) fn ensure_auto_fix_enabled(&mut self, cx: &mut Context<Self>) {
+        if !self.auto_fix_enabled {
+            self.toggle_auto_fix(cx);
+        }
+    }
+
     /// Toggles the poll → fix → push loop: GitHub checks are polled, and
     /// while they're failing the agent is periodically instructed to
     /// investigate, fix, and push, until checks go green or attempts run out.
@@ -778,6 +785,30 @@ impl WorkspaceHost {
 
     fn active_view(&self) -> Option<&Entity<WorkspaceView>> {
         self.active.as_ref().and_then(|id| self.views.get(id))
+    }
+
+    /// Turns on the CI auto-fix loop for the given workspace, if its view
+    /// exists in this window.
+    pub fn enable_auto_fix_for_workspace(
+        workspace: &mut Workspace,
+        workspace_id: &str,
+        cx: &mut Context<Workspace>,
+    ) -> bool {
+        for pane in workspace.panes().to_vec() {
+            let host = pane
+                .read(cx)
+                .items()
+                .find_map(|item| item.downcast::<WorkspaceHost>());
+            if let Some(host) = host {
+                let view = host.read(cx).views.get(workspace_id).cloned();
+                if let Some(view) = view {
+                    view.update(cx, |view, cx| view.ensure_auto_fix_enabled(cx));
+                    return true;
+                }
+                return false;
+            }
+        }
+        false
     }
 
     /// Sends an instruction to the agent terminal of the given workspace, if

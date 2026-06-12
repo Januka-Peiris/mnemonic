@@ -10,8 +10,11 @@ use ui::{
     h_flex, v_flex, Button, ButtonStyle, Icon, IconButton, IconName, Label, TintColor, Tooltip,
     prelude::*,
 };
+use std::time::{Duration, Instant};
+
 use workspace::dock::{DockPosition, PanelEvent};
-use workspace::{OpenOptions, Panel, Workspace};
+use workspace::notifications::NotificationId;
+use workspace::{OpenOptions, Panel, Toast, Workspace};
 
 use crate::ActiveWorkspace;
 use crate::workspace_view::WorkspaceHost;
@@ -28,7 +31,15 @@ enum DetailTab {
 }
 
 /// How often the panel re-queries GitHub while a workspace is selected.
-const PR_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+const PR_POLL_INTERVAL: Duration = Duration::from_secs(60);
+/// Faster cadence right after dispatching an instruction (PR creation, CI
+/// fix), so the panel catches the result without a manual refresh.
+const PR_POLL_FAST_INTERVAL: Duration = Duration::from_secs(15);
+/// How long the fast cadence lasts after a dispatch.
+const PR_POLL_BOOST: Duration = Duration::from_secs(300);
+
+/// Marker for PR state-change toasts.
+struct MnemonicPrToast;
 
 pub struct WorkspaceDetailPanel {
     focus_handle: FocusHandle,
@@ -38,6 +49,10 @@ pub struct WorkspaceDetailPanel {
     pr_status: Option<WorkspacePrStatus>,
     pr_busy: bool,
     poll_scheduled: bool,
+    /// While set and in the future, poll at the fast cadence.
+    poll_fast_until: Option<Instant>,
+    /// Feedback line for the last dispatched instruction (sent / failed).
+    dispatch_note: Option<SharedString>,
     /// Zed's full project panel, embedded as the "All files" tab so file
     /// browsing, right-click operations, and editing live in one panel.
     file_tree: Option<Entity<project_panel::ProjectPanel>>,
@@ -71,6 +86,8 @@ impl WorkspaceDetailPanel {
                 pr_status: None,
                 pr_busy: false,
                 poll_scheduled: false,
+                poll_fast_until: None,
+                dispatch_note: None,
                 file_tree: None,
             };
             panel.refresh(cx);
@@ -144,7 +161,14 @@ impl WorkspaceDetailPanel {
             this.update(cx, |this, cx| {
                 this.pr_busy = false;
                 match result {
-                    Ok(status) => this.pr_status = Some(status),
+                    Ok(status) => {
+                        if let Some(message) =
+                            Self::transition_message(this.pr_status.as_ref(), &status)
+                        {
+                            this.show_pr_toast(message, cx);
+                        }
+                        this.pr_status = Some(status);
+                    }
                     Err(err) => log::error!("Failed to fetch PR status: {err}"),
                 }
                 this.schedule_next_poll(cx);
@@ -155,14 +179,86 @@ impl WorkspaceDetailPanel {
         .detach();
     }
 
+    fn failing_count(status: &WorkspacePrStatus) -> usize {
+        status
+            .checks
+            .iter()
+            .filter(|check| {
+                matches!(
+                    check.conclusion.as_deref(),
+                    Some("FAILURE") | Some("TIMED_OUT") | Some("CANCELLED") | Some("ACTION_REQUIRED")
+                )
+            })
+            .count()
+    }
+
+    fn is_green(status: &WorkspacePrStatus) -> bool {
+        status.found
+            && !status.checks.is_empty()
+            && status
+                .checks
+                .iter()
+                .all(|check| check.status.eq_ignore_ascii_case("completed"))
+            && Self::failing_count(status) == 0
+    }
+
+    /// A notification-worthy state change between two GitHub polls.
+    fn transition_message(
+        old: Option<&WorkspacePrStatus>,
+        new: &WorkspacePrStatus,
+    ) -> Option<String> {
+        let old_found = old.is_some_and(|old| old.found);
+        if new.found && !old_found {
+            return Some(match new.number {
+                Some(number) => format!("PR #{number} created"),
+                None => "PR created".to_string(),
+            });
+        }
+        if !new.found {
+            return None;
+        }
+
+        let old_failing = old.map(Self::failing_count).unwrap_or(0);
+        let new_failing = Self::failing_count(new);
+        if new_failing > old_failing {
+            let plural = if new_failing == 1 { "" } else { "s" };
+            return Some(format!("{new_failing} CI check{plural} failing"));
+        }
+
+        let was_green = old.is_some_and(Self::is_green);
+        if Self::is_green(new) && !was_green {
+            return Some("All CI checks passed ✓".to_string());
+        }
+        None
+    }
+
+    fn show_pr_toast(&self, message: String, cx: &mut Context<Self>) {
+        if let Some(workspace) = self.workspace.upgrade() {
+            workspace.update(cx, |workspace, cx| {
+                workspace.show_toast(
+                    Toast::new(NotificationId::unique::<MnemonicPrToast>(), message),
+                    cx,
+                );
+            });
+        }
+    }
+
     /// Keeps GitHub state fresh while a workspace is selected.
     fn schedule_next_poll(&mut self, cx: &mut Context<Self>) {
         if self.poll_scheduled || self.summary.is_none() {
             return;
         }
         self.poll_scheduled = true;
+        let interval = if self
+            .poll_fast_until
+            .is_some_and(|until| Instant::now() < until)
+        {
+            PR_POLL_FAST_INTERVAL
+        } else {
+            PR_POLL_INTERVAL
+        };
         cx.spawn(async move |this, cx| {
-            cx.background_executor().timer(PR_POLL_INTERVAL).await;
+            cx.background_executor().timer(interval).await;
             this.update(cx, |this, cx| {
                 this.poll_scheduled = false;
                 if this.summary.is_some() && !this.pr_busy {
@@ -217,14 +313,35 @@ impl WorkspaceDetailPanel {
         );
 
         let workspace_id = summary.id.clone();
-        if let Some(workspace) = self.workspace.upgrade() {
-            workspace.update(cx, |workspace, cx| {
-                if !WorkspaceHost::dispatch_to_workspace_agent(workspace, &workspace_id, prompt, cx)
-                {
-                    log::warn!("No open workspace view to dispatch PR instruction to");
-                }
-            });
-        }
+        self.dispatch_instruction(&workspace_id, prompt, "PR instruction", cx);
+    }
+
+    /// Routes an instruction to the workspace's agent terminal, surfaces the
+    /// outcome in the panel, and boosts GitHub polling to catch the result.
+    fn dispatch_instruction(
+        &mut self,
+        workspace_id: &str,
+        prompt: String,
+        label: &str,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+        let workspace_id = workspace_id.to_string();
+        let sent = workspace.update(cx, |workspace, cx| {
+            WorkspaceHost::dispatch_to_workspace_agent(workspace, &workspace_id, prompt, cx)
+        });
+        self.dispatch_note = Some(if sent {
+            self.poll_fast_until = Some(Instant::now() + PR_POLL_BOOST);
+            self.schedule_next_poll(cx);
+            SharedString::from(format!("Sent {label} to claude ✓"))
+        } else {
+            SharedString::from(format!(
+                "Couldn't send {label}: open the workspace first (click its worktree)"
+            ))
+        });
+        cx.notify();
     }
 
     /// Sends a one-shot "fix the failing CI" instruction into the
@@ -271,14 +388,7 @@ impl WorkspaceDetailPanel {
         );
 
         let workspace_id = summary.id.clone();
-        if let Some(workspace) = self.workspace.upgrade() {
-            workspace.update(cx, |workspace, cx| {
-                if !WorkspaceHost::dispatch_to_workspace_agent(workspace, &workspace_id, prompt, cx)
-                {
-                    log::warn!("No open workspace view to dispatch fix instruction to");
-                }
-            });
-        }
+        self.dispatch_instruction(&workspace_id, prompt, "fix instruction", cx);
     }
 
     fn worktree_root(&self) -> Option<PathBuf> {
@@ -377,6 +487,20 @@ impl WorkspaceDetailPanel {
         }
     }
 
+    /// Create PR and immediately arm the CI auto-fix loop, so the whole
+    /// create → watch checks → fix → push cycle runs hands-off.
+    fn create_pr_with_auto_fix(&mut self, cx: &mut Context<Self>) {
+        self.create_pr(cx);
+        let Some(workspace_id) = self.summary.as_ref().map(|summary| summary.id.clone()) else {
+            return;
+        };
+        if let Some(workspace) = self.workspace.upgrade() {
+            workspace.update(cx, |workspace, cx| {
+                WorkspaceHost::enable_auto_fix_for_workspace(workspace, &workspace_id, cx);
+            });
+        }
+    }
+
     fn render_header(&self, ws: &WorkspaceSummary, cx: &mut Context<Self>) -> impl IntoElement {
         let status_color = self.status_color(&ws.status, cx);
         let ahead = ws.branch_health.ahead_by;
@@ -410,7 +534,31 @@ impl WorkspaceDetailPanel {
                                     .single_line(),
                             ),
                     )
-                    .child(self.render_pr_button(cx)),
+                    .child(
+                        h_flex()
+                            .gap_1()
+                            .child(self.render_pr_button(cx))
+                            .when(
+                                !self
+                                    .pr_status
+                                    .as_ref()
+                                    .is_some_and(|status| status.found),
+                                |el| {
+                                    el.child(
+                                        Button::new("create-pr-autofix", "+ Auto-fix")
+                                            .style(ButtonStyle::Tinted(TintColor::Accent))
+                                            .label_size(LabelSize::Small)
+                                            .disabled(self.pr_busy || self.summary.is_none())
+                                            .tooltip(Tooltip::text(
+                                                "Create PR, then watch CI and auto-fix until green",
+                                            ))
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.create_pr_with_auto_fix(cx);
+                                            })),
+                                    )
+                                },
+                            ),
+                    ),
             )
             .child(
                 h_flex()
@@ -435,6 +583,13 @@ impl WorkspaceDetailPanel {
                         )
                     }),
             )
+            .when_some(self.dispatch_note.clone(), |el, note| {
+                el.child(
+                    Label::new(note)
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted),
+                )
+            })
     }
 
     fn render_tabs(&self, ws: &WorkspaceSummary, cx: &mut Context<Self>) -> impl IntoElement {
