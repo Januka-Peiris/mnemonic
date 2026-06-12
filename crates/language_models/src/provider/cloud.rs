@@ -451,9 +451,9 @@ impl RenderOnce for ZedAiConfiguration {
         if !self.is_connected {
             return v_flex()
                 .gap_2()
-                .child(Label::new("Sign in to have access to Zed's complete agentic experience with hosted models."))
+                .child(Label::new("Sign in to access hosted models."))
                 .child(
-                    Button::new("sign_in", "Sign In to use Zed AI")
+                    Button::new("sign_in", "Sign In")
                         .start_icon(Icon::new(IconName::Github).size(IconSize::Small).color(Color::Muted))
                         .full_width()
                         .on_click({
@@ -888,7 +888,7 @@ impl Component for ZedAiConfiguration {
                     }),
                 ),
                 single_example(
-                    "Zed Pro Trial Plan",
+                    "Pro Trial Plan",
                     configuration(PreviewConfiguration {
                         plan: Some(Plan::ZedProTrial),
                         is_connected: true,
@@ -897,7 +897,7 @@ impl Component for ZedAiConfiguration {
                     }),
                 ),
                 single_example(
-                    "Zed Pro Plan",
+                    "Pro Plan",
                     configuration(PreviewConfiguration {
                         plan: Some(Plan::ZedPro),
                         is_connected: true,
