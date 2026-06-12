@@ -99,7 +99,6 @@ impl CoordinatorPanel {
         status: &WorkspaceCoordinatorStatus,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let has_run = status.active_run.is_some();
         let worker_count = status.workers.len();
 
         let mode_color = match status.mode.as_str() {
@@ -170,7 +169,7 @@ impl CoordinatorPanel {
         &self,
         ws_id: &str,
         msg: &str,
-        cx: &mut Context<Self>,
+        _cx: &mut Context<Self>,
     ) -> impl IntoElement {
         h_flex()
             .px_2()

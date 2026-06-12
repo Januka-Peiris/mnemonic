@@ -128,6 +128,9 @@ fn seed_sample_workspaces(state: &AppState) {
         ("API rate limiter", "mnemonic", "feat/rate-limiter", "Active", "Claude Code", "running"),
         ("Fix auth redirect", "mnemonic", "fix/auth-redirect", "Active", "Claude Code", "idle"),
         ("DB migration v42", "mnemonic", "feat/migration-v42", "Merged", "", ""),
+        ("AWS SDK auth fix", "axe-agent-server", "fix/aws-auth", "Active", "Claude Code", "running"),
+        ("Add webhook retries", "axe-agent-server", "feat/webhook-retries", "Active", "", ""),
+        ("Update onboarding flow", "axe-logistics", "feat/onboarding-v2", "Active", "Claude Code", "idle"),
     ];
 
     for (name, repo, branch, status, agent, agent_status) in samples {

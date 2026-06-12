@@ -4,7 +4,7 @@ use gpui::{
 };
 use mnemonic_core::events;
 use mnemonic_core::services::terminal_service;
-use ui::{h_flex, v_flex, Button, ButtonStyle, IconButton, IconName, Label, prelude::*};
+use ui::{h_flex, v_flex, Button, ButtonStyle, Label, prelude::*};
 use workspace::dock::{DockPosition, PanelEvent};
 use workspace::{Panel, Workspace};
 
@@ -15,14 +15,14 @@ const COMMAND_PANEL_KEY: &str = "MnemonicCommandPanel";
 #[derive(Clone)]
 struct PendingApproval {
     session_id: String,
-    workspace_id: String,
+    _workspace_id: String,
     command: String,
 }
 
 #[derive(Clone)]
 struct PendingDecision {
     session_id: String,
-    workspace_id: String,
+    _workspace_id: String,
     question: String,
     options: Vec<(String, String)>,
 }
@@ -86,7 +86,7 @@ impl CommandApprovalPanel {
                 {
                     self.pending_approvals.push(PendingApproval {
                         session_id: ev.session_id,
-                        workspace_id: ev.workspace_id,
+                        _workspace_id: ev.workspace_id,
                         command: ev.command,
                     });
                 }
@@ -99,7 +99,7 @@ impl CommandApprovalPanel {
                 {
                     self.pending_decisions.push(PendingDecision {
                         session_id: ev.session_id,
-                        workspace_id: ev.workspace_id,
+                        _workspace_id: ev.workspace_id,
                         question: ev.question,
                         options: ev
                             .options

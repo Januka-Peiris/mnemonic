@@ -1,10 +1,12 @@
+use std::collections::BTreeMap;
+
 use gpui::{
     actions, px, Action, App, AppContext as _, Context, Entity, EventEmitter, Focusable,
-    FocusHandle, IntoElement, Pixels, Render, WeakEntity, Window,
+    FocusHandle, IntoElement, Pixels, Render, SharedString, WeakEntity, Window,
 };
 use mnemonic_core::models::WorkspaceSummary;
 use mnemonic_core::services::workspace_service;
-use ui::{h_flex, v_flex, IconButton, IconName, Label, prelude::*, utils::platform_title_bar_height};
+use ui::{Tooltip, h_flex, v_flex, Icon, IconButton, IconName, Label, prelude::*};
 use workspace::dock::{DockPosition, PanelEvent};
 use workspace::{Panel, Workspace};
 
@@ -16,6 +18,8 @@ pub struct WorkspacePanel {
     focus_handle: FocusHandle,
     _workspace: WeakEntity<Workspace>,
     workspaces: Vec<WorkspaceSummary>,
+    collapsed_projects: Vec<String>,
+    selected_workspace_id: Option<String>,
 }
 
 impl WorkspacePanel {
@@ -29,6 +33,8 @@ impl WorkspacePanel {
                 focus_handle: cx.focus_handle(),
                 _workspace: workspace.weak_handle(),
                 workspaces: Vec::new(),
+                collapsed_projects: Vec::new(),
+                selected_workspace_id: None,
             };
             panel.refresh_workspaces(cx);
             panel
@@ -52,37 +58,162 @@ impl WorkspacePanel {
         }
     }
 
-    fn status_color(&self, status: &str, cx: &Context<Self>) -> gpui::Hsla {
-        match status {
-            "Active" => cx.theme().status().info,
-            "Merged" => cx.theme().status().success,
-            "Paused" | "Idle" => cx.theme().status().warning,
-            "Failed" | "Error" => cx.theme().status().error,
-            _ => cx.theme().colors().text_muted,
+    fn grouped_workspaces(&self) -> BTreeMap<String, Vec<&WorkspaceSummary>> {
+        let mut groups: BTreeMap<String, Vec<&WorkspaceSummary>> = BTreeMap::new();
+        for ws in &self.workspaces {
+            let project = if ws.repo.is_empty() {
+                "ungrouped".to_string()
+            } else {
+                ws.repo.clone()
+            };
+            groups.entry(project).or_default().push(ws);
         }
+        groups
+    }
+
+    fn toggle_project(&mut self, project: &str) {
+        if let Some(pos) = self.collapsed_projects.iter().position(|p| p == project) {
+            self.collapsed_projects.remove(pos);
+        } else {
+            self.collapsed_projects.push(project.to_string());
+        }
+    }
+
+    fn select_workspace(&mut self, ws_id: String, cx: &mut Context<Self>) {
+        self.selected_workspace_id = Some(ws_id);
+        cx.notify();
+    }
+
+    fn render_history_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        h_flex()
+            .id("history-bar")
+            .px_2()
+            .h(px(30.))
+            .gap_1p5()
+            .items_center()
+            .w_full()
+            .cursor_pointer()
+            .border_b_1()
+            .border_color(cx.theme().colors().border)
+            .hover(|style| style.bg(cx.theme().colors().ghost_element_hover))
+            .on_click(cx.listener(|_this, _, _window, _cx| {
+                log::info!("History clicked");
+            }))
+            .child(
+                Icon::new(IconName::Clock)
+                    .size(IconSize::Small)
+                    .color(Color::Muted),
+            )
+            .child(
+                Label::new("History")
+                    .size(LabelSize::Default)
+                    .color(Color::Default),
+            )
     }
 
     fn render_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
         h_flex()
             .px_2()
-            .py_1()
+            .h(px(28.))
             .justify_between()
             .items_center()
             .border_b_1()
             .border_color(cx.theme().colors().border)
             .child(
-                Label::new("Workspaces")
-                    .size(LabelSize::Small)
+                Label::new("Projects")
+                    .size(LabelSize::Default)
                     .color(Color::Muted),
             )
             .child(
-                IconButton::new("refresh-workspaces", IconName::ArrowCircle)
-                    .icon_size(IconSize::Small)
-                    .on_click(cx.listener(|this, _, _window, cx| {
-                        this.refresh_workspaces(cx);
-                        cx.notify();
-                    })),
+                h_flex()
+                    .gap_0p5()
+                    .child(
+                        IconButton::new("filter-projects", IconName::Filter)
+                            .icon_size(IconSize::Small)
+                            .tooltip(Tooltip::text("Filter"))
+                            .on_click(cx.listener(|_this, _, _window, _cx| {
+                                log::info!("Filter clicked");
+                            })),
+                    )
+                    .child(
+                        IconButton::new("add-project", IconName::Plus)
+                            .icon_size(IconSize::Small)
+                            .tooltip(Tooltip::text("New Project"))
+                            .on_click(cx.listener(|_this, _, _window, _cx| {
+                                log::info!("New project clicked");
+                            })),
+                    ),
             )
+    }
+
+    fn render_project_group(
+        &self,
+        project: &str,
+        workspaces: &[&WorkspaceSummary],
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let collapsed = self.collapsed_projects.contains(&project.to_string());
+        let count = workspaces.len();
+        let project_owned = project.to_string();
+        let chevron_icon = if collapsed {
+            IconName::ChevronRight
+        } else {
+            IconName::ChevronDown
+        };
+
+        let project_for_add = project.to_string();
+        let mut group = v_flex().w_full();
+
+        group = group.child(
+            h_flex()
+                .id(SharedString::from(format!("project-{project}")))
+                .px_2()
+                .h(px(28.))
+                .gap_1()
+                .items_center()
+                .w_full()
+                .cursor_pointer()
+                .hover(|style| style.bg(cx.theme().colors().ghost_element_hover))
+                .on_click(cx.listener(move |this, _, _window, cx| {
+                    this.toggle_project(&project_owned);
+                    cx.notify();
+                }))
+                .child(
+                    Icon::new(chevron_icon)
+                        .size(IconSize::XSmall)
+                        .color(Color::Muted),
+                )
+                .child(
+                    Label::new(project.to_string())
+                        .size(LabelSize::Default)
+                        .color(Color::Default),
+                )
+                .child(
+                    Label::new(count.to_string())
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted),
+                )
+                .child(div().flex_grow(1.0))
+                .child(
+                    IconButton::new(
+                        SharedString::from(format!("add-worktree-{project}")),
+                        IconName::Plus,
+                    )
+                    .icon_size(IconSize::XSmall)
+                    .tooltip(Tooltip::text("New Worktree"))
+                    .on_click(cx.listener(move |_this, _, _window, _cx| {
+                        log::info!("Add worktree to {}", project_for_add);
+                    })),
+                ),
+        );
+
+        if !collapsed {
+            for ws in workspaces {
+                group = group.child(self.render_workspace_row(ws, cx));
+            }
+        }
+
+        group
     }
 
     fn render_workspace_row(
@@ -90,86 +221,55 @@ impl WorkspacePanel {
         ws: &WorkspaceSummary,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let status_color = self.status_color(&ws.status, cx);
+        let is_selected = self
+            .selected_workspace_id
+            .as_ref()
+            .is_some_and(|id| id == &ws.id);
+        let ws_id = ws.id.clone();
 
-        let agent_text = if ws.agent_session.status == "running" {
-            format!("{} running", ws.agent_session.agent)
-        } else if !ws.agent_session.agent.is_empty() {
-            ws.agent_session.agent.clone()
-        } else {
-            String::new()
-        };
-
-        let files_changed = ws.changed_files.len();
-
-        v_flex()
-            .id(ws.id.clone())
-            .px_2()
-            .py(px(6.))
-            .gap_0p5()
+        h_flex()
+            .id(SharedString::from(ws.id.clone()))
+            .pl(px(28.))
+            .pr_2()
+            .h(px(24.))
+            .gap_1p5()
+            .items_center()
             .w_full()
-            .rounded_md()
             .cursor_pointer()
+            .rounded_md()
+            .when(is_selected, |el| {
+                el.bg(cx.theme().colors().ghost_element_selected)
+            })
             .hover(|style| style.bg(cx.theme().colors().ghost_element_hover))
+            .on_click(cx.listener(move |this, _, _window, cx| {
+                this.select_workspace(ws_id.clone(), cx);
+            }))
             .child(
-                h_flex()
-                    .gap_1p5()
-                    .items_center()
-                    .child(
-                        div()
-                            .w(px(6.))
-                            .h(px(6.))
-                            .rounded_full()
-                            .bg(status_color),
-                    )
-                    .child(
-                        Label::new(ws.name.clone())
-                            .size(LabelSize::Small)
-                            .color(Color::Default),
-                    ),
-            )
-            .child(
-                h_flex()
-                    .pl(px(16.))
-                    .gap_2()
-                    .child(
-                        Label::new(ws.branch.clone())
-                            .size(LabelSize::XSmall)
-                            .color(Color::Muted),
-                    )
-                    .when(files_changed > 0, |el| {
-                        el.child(
-                            Label::new(format!("+{files_changed}"))
-                                .size(LabelSize::XSmall)
-                                .color(Color::Muted),
-                        )
+                Icon::new(IconName::FileGit)
+                    .size(IconSize::XSmall)
+                    .color(if is_selected {
+                        Color::Default
+                    } else {
+                        Color::Muted
                     }),
             )
-            .when(!agent_text.is_empty(), |el| {
-                el.child(
-                    h_flex().pl(px(16.)).child(
-                        Label::new(agent_text)
-                            .size(LabelSize::XSmall)
-                            .color(Color::Accent),
-                    ),
-                )
-            })
+            .child(
+                Label::new(ws.name.clone())
+                    .size(LabelSize::Default)
+                    .color(Color::Default)
+                    .single_line(),
+            )
     }
 
-    fn render_empty(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_empty(&self) -> impl IntoElement {
         v_flex()
             .size_full()
             .items_center()
             .justify_center()
             .gap_1()
             .child(
-                Label::new("No workspaces yet")
+                Label::new("No projects yet")
                     .size(LabelSize::Small)
-                    .color(Color::Muted),
-            )
-            .child(
-                Label::new("Create one to get started")
-                    .size(LabelSize::XSmall)
                     .color(Color::Muted),
             )
     }
@@ -217,17 +317,13 @@ impl Panel for WorkspacePanel {
     }
 
     fn icon_tooltip(&self, _window: &Window, _cx: &App) -> Option<&'static str> {
-        Some("Workspaces")
+        Some("Projects")
     }
 
     fn icon_label(&self, _window: &Window, _cx: &App) -> Option<String> {
-        let active = self
-            .workspaces
-            .iter()
-            .filter(|w| w.status == "Active")
-            .count();
-        if active > 0 {
-            Some(active.to_string())
+        let count = self.workspaces.len();
+        if count > 0 {
+            Some(count.to_string())
         } else {
             None
         }
@@ -238,7 +334,7 @@ impl Panel for WorkspacePanel {
     }
 
     fn activation_priority(&self) -> u32 {
-        2
+        1
     }
 
     fn starts_open(&self, _window: &Window, _cx: &App) -> bool {
@@ -247,35 +343,30 @@ impl Panel for WorkspacePanel {
 }
 
 impl Render for WorkspacePanel {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.refresh_workspaces(cx);
 
-        let has_workspaces = !self.workspaces.is_empty();
-        let titlebar_height = platform_title_bar_height(window);
+        let groups = self.grouped_workspaces();
+        let has_workspaces = !groups.is_empty();
 
-        v_flex()
+        let mut content = v_flex()
             .id("workspace-panel")
             .size_full()
             .track_focus(&self.focus_handle)
             .bg(cx.theme().colors().panel_background)
-            .pt(titlebar_height)
-            .child(self.render_header(cx))
-            .when(has_workspaces, |el| {
-                let workspaces = self.workspaces.clone();
-                let rows: Vec<_> = workspaces
-                    .iter()
-                    .map(|ws| self.render_workspace_row(ws, cx))
-                    .collect();
-                el.child(
-                    v_flex()
-                        .py_1()
-                        .overflow_y_hidden()
-                        .flex_grow(1.0)
-                        .children(rows),
-                )
-            })
-            .when(!has_workspaces, |el| {
-                el.child(self.render_empty(cx))
-            })
+            .child(self.render_history_bar(cx))
+            .child(self.render_header(cx));
+
+        if has_workspaces {
+            let mut list = v_flex().py_0p5().overflow_y_hidden().flex_grow(1.0);
+            for (project, workspaces) in &groups {
+                list = list.child(self.render_project_group(project, workspaces, cx));
+            }
+            content = content.child(list);
+        } else {
+            content = content.child(self.render_empty());
+        }
+
+        content
     }
 }
