@@ -86,8 +86,8 @@ script/generate-licenses
 
 rustup target add $target_triple
 
-echo "Compiling zed binaries"
-cargo build ${build_flag} --package zed --package cli --target $target_triple
+echo "Compiling mnemonic binaries"
+cargo build ${build_flag} --package mnemonic --package cli --target $target_triple
 # Build remote_server in separate invocation to prevent feature unification from other crates
 # from influencing dynamic libraries required by it.
 cargo build ${build_flag} --package remote_server --target $target_triple
@@ -203,7 +203,7 @@ function sign_app_binaries() {
         # sequence of codesign commands modeled after this example: https://developer.apple.com/forums/thread/701514
         /usr/bin/codesign --deep --force --timestamp --options runtime --sign "$IDENTITY" "${app_path}/Contents/MacOS/cli" -v
         /usr/bin/codesign --deep --force --timestamp --options runtime --sign "$IDENTITY" "${app_path}/Contents/MacOS/git" -v
-        /usr/bin/codesign --deep --force --timestamp --options runtime --entitlements crates/zed/resources/zed.entitlements --sign "$IDENTITY" "${app_path}/Contents/MacOS/zed" -v
+        /usr/bin/codesign --deep --force --timestamp --options runtime --entitlements crates/zed/resources/zed.entitlements --sign "$IDENTITY" "${app_path}/Contents/MacOS/mnemonic" -v
         /usr/bin/codesign --force --timestamp --options runtime --entitlements crates/zed/resources/zed.entitlements --sign "$IDENTITY" "${app_path}" -v
     else
         echo "One or more of the following variables are missing: MACOS_CERTIFICATE, MACOS_CERTIFICATE_PASSWORD, APPLE_NOTARIZATION_KEY, APPLE_NOTARIZATION_KEY_ID, APPLE_NOTARIZATION_ISSUER_ID"
@@ -332,7 +332,7 @@ function upload_debug_symbols() {
 
 upload_debug_symbols
 
-cp target/${target_triple}/${target_dir}/zed "${app_path}/Contents/MacOS/zed"
+cp target/${target_triple}/${target_dir}/mnemonic "${app_path}/Contents/MacOS/mnemonic"
 cp target/${target_triple}/${target_dir}/cli "${app_path}/Contents/MacOS/cli"
 sign_app_binaries
 
