@@ -1,11 +1,11 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use editor::Editor;
 use gpui::{
     App, AppContext as _, Context, Entity, EventEmitter, Focusable, FocusHandle, IntoElement,
-    Render, SharedString, WeakEntity, Window, actions, px,
+    Render, SharedString, Subscription, WeakEntity, Window, actions, px,
 };
 use mnemonic_core::models::WorkspaceSummary;
 use mnemonic_core::services::terminal_service;
@@ -13,7 +13,7 @@ use project::Project;
 use task::{RevealStrategy, Shell, SpawnInTerminal, TaskId};
 use terminal::Terminal;
 use terminal_view::TerminalView;
-use ui::{Icon, IconButton, IconName, Label, Tooltip, h_flex, prelude::*, v_flex};
+use ui::{Button, ButtonStyle, Icon, IconButton, IconName, Label, Tooltip, h_flex, prelude::*, v_flex};
 use workspace::item::{Item, ItemEvent};
 use workspace::{Workspace, WorkspaceId};
 
@@ -30,6 +30,11 @@ actions!(
 /// between, or the agent TUI treats the Enter as part of a paste.
 const ENTER_DELAY_MILLIS: u64 = 250;
 
+/// How long after the agent terminal's last output it still counts as
+/// running. Claude Code redraws its spinner continuously while working, so
+/// output going quiet for this long means it's waiting for input.
+const AGENT_IDLE_AFTER: Duration = Duration::from_secs(4);
+
 /// The center view for a Mnemonic workspace. The workspace is the unit the
 /// user switches between; terminals (the agent's and any extra shells) live
 /// inside it as inner tabs, all rooted in the workspace's worktree.
@@ -44,6 +49,9 @@ pub struct WorkspaceView {
     terminal_titles: Vec<SharedString>,
     active_terminal: usize,
     composer: Entity<Editor>,
+    last_agent_activity: Option<Instant>,
+    idle_check_scheduled: bool,
+    _terminal_subscriptions: Vec<Subscription>,
     focus_handle: FocusHandle,
 }
 
@@ -150,6 +158,19 @@ impl WorkspaceView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // The first terminal is the agent's; track its output to derive the
+        // running/waiting status chip.
+        if self.terminals.is_empty() {
+            let subscription = cx.subscribe(&terminal, |this, _terminal, event, cx| {
+                if matches!(event, terminal::Event::Wakeup) {
+                    this.last_agent_activity = Some(Instant::now());
+                    this.schedule_idle_check(cx);
+                    cx.notify();
+                }
+            });
+            self._terminal_subscriptions.push(subscription);
+        }
+
         let view = cx.new(|cx| {
             TerminalView::new(
                 terminal,
@@ -169,9 +190,41 @@ impl WorkspaceView {
         cx.notify();
     }
 
+    /// Whether the agent terminal has produced output recently enough to be
+    /// considered working (as opposed to waiting at its input prompt).
+    fn agent_is_running(&self) -> bool {
+        self.last_agent_activity
+            .is_some_and(|at| at.elapsed() < AGENT_IDLE_AFTER)
+    }
+
+    /// Re-renders once the activity window lapses so the status chip flips
+    /// to Waiting without needing another terminal event.
+    fn schedule_idle_check(&mut self, cx: &mut Context<Self>) {
+        if self.idle_check_scheduled {
+            return;
+        }
+        self.idle_check_scheduled = true;
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(AGENT_IDLE_AFTER).await;
+            this.update(cx, |this, cx| {
+                this.idle_check_scheduled = false;
+                if this.agent_is_running() {
+                    this.schedule_idle_check(cx);
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn send_to_agent(&mut self, _: &Send, window: &mut Window, cx: &mut Context<Self>) {
+        self.send_now(window, cx);
+    }
+
     /// Sends the composer contents to the agent terminal (the first tab),
     /// using Forge's text-then-Enter dispatch so the TUI submits it.
-    fn send_to_agent(&mut self, _: &Send, window: &mut Window, cx: &mut Context<Self>) {
+    fn send_now(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let text = self.composer.read(cx).text(cx);
         if text.trim().is_empty() {
             return;
@@ -195,16 +248,92 @@ impl WorkspaceView {
         self.composer.update(cx, |composer, cx| composer.clear(window, cx));
     }
 
+    /// Sends Escape to the agent terminal, which interrupts Claude Code
+    /// mid-generation.
+    fn interrupt_agent(&mut self, cx: &mut Context<Self>) {
+        let Some(agent_view) = self.terminals.first() else {
+            return;
+        };
+        let terminal = agent_view.read(cx).terminal().clone();
+        terminal.update(cx, |terminal, _| {
+            terminal.input(b"\x1b".to_vec());
+        });
+    }
+
+    fn render_status_chip(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let running = self.agent_is_running();
+        let (color, text) = if running {
+            (cx.theme().status().success, "Running")
+        } else {
+            (cx.theme().colors().text_muted, "Waiting")
+        };
+
+        h_flex()
+            .px_1p5()
+            .py_0p5()
+            .gap_1()
+            .items_center()
+            .rounded_md()
+            .border_1()
+            .border_color(cx.theme().colors().border)
+            .child(div().w(px(6.)).h(px(6.)).rounded_full().bg(color))
+            .child(
+                Label::new(text)
+                    .size(LabelSize::XSmall)
+                    .color(if running { Color::Default } else { Color::Muted }),
+            )
+    }
+
     fn render_composer(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        div()
+        v_flex()
             .key_context("MnemonicComposer")
             .on_action(cx.listener(Self::send_to_agent))
             .border_t_1()
             .border_color(cx.theme().colors().border)
-            .bg(cx.theme().colors().editor_background)
+            .bg(cx.theme().colors().panel_background)
             .p_2()
+            .gap_1p5()
             .w_full()
-            .child(self.composer.clone())
+            .child(
+                div()
+                    .w_full()
+                    .p_1p5()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(cx.theme().colors().border)
+                    .bg(cx.theme().colors().editor_background)
+                    .child(self.composer.clone()),
+            )
+            .child(
+                h_flex()
+                    .w_full()
+                    .justify_between()
+                    .items_center()
+                    .child(
+                        Label::new("bypass permissions on")
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
+                    )
+                    .child(
+                        h_flex()
+                            .gap_1()
+                            .child(
+                                Button::new("interrupt-agent", "Interrupt")
+                                    .label_size(LabelSize::Small)
+                                    .on_click(cx.listener(|this, _, _window, cx| {
+                                        this.interrupt_agent(cx);
+                                    })),
+                            )
+                            .child(
+                                Button::new("send-to-agent", "Send")
+                                    .style(ButtonStyle::Filled)
+                                    .label_size(LabelSize::Small)
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.send_now(window, cx);
+                                    })),
+                            ),
+                    ),
+            )
     }
 
     fn render_terminal_tabs(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -250,7 +379,9 @@ impl WorkspaceView {
             );
         }
 
-        tabs.child(div().flex_grow(1.0)).child(
+        tabs.child(div().flex_grow(1.0))
+            .child(self.render_status_chip(cx))
+            .child(
             IconButton::new("workspace-add-terminal", IconName::Plus)
                 .icon_size(IconSize::Small)
                 .tooltip(Tooltip::text("New Terminal in Workspace"))
@@ -395,6 +526,9 @@ impl WorkspaceHost {
                 terminal_titles: Vec::new(),
                 active_terminal: 0,
                 composer,
+                last_agent_activity: None,
+                idle_check_scheduled: false,
+                _terminal_subscriptions: Vec::new(),
                 focus_handle: cx.focus_handle(),
             });
             view.update(cx, |view, cx| view.spawn_agent_terminal(window, cx));
