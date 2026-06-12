@@ -10,8 +10,8 @@ use crate::repositories::{
     settings_repository, workspace_repository,
 };
 use crate::services::{
-    git_worktree_service, pr_draft_service, repo_scanner_service, terminal_service,
-    workspace_script_service,
+    git_review_service, git_worktree_service, pr_draft_service, repo_scanner_service,
+    terminal_service, workspace_script_service,
 };
 use crate::state::AppState;
 
@@ -376,6 +376,39 @@ pub(super) fn create_workspace(
 }
 
 pub(super) fn delete_workspace(state: &AppState, workspace_id: &str) -> Result<(), String> {
+    delete_workspace_impl(state, workspace_id, false)
+}
+
+/// Archive: like delete, but also removes the managed worktree from disk so
+/// builds don't pile up. Refuses when the worktree has uncommitted changes,
+/// because the underlying `git worktree remove --force` would discard them.
+/// The branch (and any pushed/unpushed commits on it) is preserved.
+pub(super) fn archive_workspace(state: &AppState, workspace_id: &str) -> Result<(), String> {
+    match git_review_service::get_workspace_changed_files(state, workspace_id) {
+        Ok(changed) if !changed.is_empty() => {
+            return Err(format!(
+                "Workspace has {} uncommitted change(s). Commit and push (or discard) them \
+                 before archiving.",
+                changed.len()
+            ));
+        }
+        Ok(_) => {}
+        Err(err) => {
+            log::warn!(
+                target: "mnemonic_lib",
+                "archive: could not check for uncommitted changes ({err}); leaving worktree on disk"
+            );
+            return delete_workspace_impl(state, workspace_id, false);
+        }
+    }
+    delete_workspace_impl(state, workspace_id, true)
+}
+
+fn delete_workspace_impl(
+    state: &AppState,
+    workspace_id: &str,
+    remove_managed_worktree: bool,
+) -> Result<(), String> {
     log::info!(target: "mnemonic_lib", "delete_workspace begin: id={workspace_id}");
     let detail = workspace_repository::get_detail(&state.db, workspace_id)?
         .ok_or_else(|| format!("Workspace {workspace_id} was not found"))?;
@@ -412,8 +445,13 @@ pub(super) fn delete_workspace(state: &AppState, workspace_id: &str) -> Result<(
         .unwrap_or(&detail.worktree_path)
         .to_string();
     let path_on_disk = Path::new(&path);
-    let remove_managed_worktree = false;
+    let remove_managed_worktree =
+        remove_managed_worktree && detail.summary.worktree_managed_by_forge;
     let mut worktree_cleanup_warning: Option<String> = None;
+
+    if let Err(err) = terminal_service::kill_embedded_workspace_session(workspace_id) {
+        log::warn!(target: "mnemonic_lib", "kill embedded tmux session: {err} id={workspace_id}");
+    }
 
     if remove_managed_worktree {
         let repo_path_opt = detail
@@ -511,7 +549,7 @@ pub(super) fn delete_workspace(state: &AppState, workspace_id: &str) -> Result<(
     let activity_details = worktree_cleanup_warning.or_else(|| {
         Some(
             if remove_managed_worktree {
-                "Removed workspace record; branch and on-disk worktree were preserved."
+                "Archived workspace; worktree removed from disk, branch preserved."
             } else {
                 "Removed workspace record; on-disk worktree was not removed by Mnemonic."
             }

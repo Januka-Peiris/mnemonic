@@ -78,6 +78,20 @@ fn agent_effective_model(
         })
 }
 
+/// Kills the embedded editor terminal's tmux session for a workspace, e.g.
+/// when the workspace is archived. No-op when tmux or the session is absent.
+pub fn kill_embedded_workspace_session(workspace_id: &str) -> Result<(), String> {
+    if !tmux::available() {
+        return Ok(());
+    }
+    let session_name = tmux::safe_session_name(workspace_id, "main");
+    if tmux::session_exists(&session_name) {
+        tmux::kill_session(&session_name)
+    } else {
+        Ok(())
+    }
+}
+
 /// Command line for an editor-embedded terminal that attaches to the
 /// workspace's persistent tmux session, creating it first if needed. The
 /// session outlives the editor tab and the editor itself, so reopening a

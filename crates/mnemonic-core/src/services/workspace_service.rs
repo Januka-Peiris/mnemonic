@@ -80,6 +80,10 @@ pub fn delete_workspace(state: &AppState, workspace_id: &str) -> Result<(), Stri
     ops::delete_workspace(state, workspace_id)
 }
 
+pub fn archive_workspace(state: &AppState, workspace_id: &str) -> Result<(), String> {
+    ops::archive_workspace(state, workspace_id)
+}
+
 pub fn create_child_workspace(
     state: &AppState,
     input: CreateChildWorkspaceInput,

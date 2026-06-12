@@ -787,6 +787,32 @@ impl WorkspaceHost {
         self.active.as_ref().and_then(|id| self.views.get(id))
     }
 
+    /// Drops the cached view for an archived workspace, clearing the host's
+    /// display if it was the active one.
+    pub fn remove_workspace_view(
+        workspace: &mut Workspace,
+        workspace_id: &str,
+        cx: &mut Context<Workspace>,
+    ) {
+        for pane in workspace.panes().to_vec() {
+            let host = pane
+                .read(cx)
+                .items()
+                .find_map(|item| item.downcast::<WorkspaceHost>());
+            if let Some(host) = host {
+                host.update(cx, |host, cx| {
+                    host.views.remove(workspace_id);
+                    if host.active.as_deref() == Some(workspace_id) {
+                        host.active = None;
+                        cx.emit(ItemEvent::UpdateTab);
+                    }
+                    cx.notify();
+                });
+                return;
+            }
+        }
+    }
+
     /// Turns on the CI auto-fix loop for the given workspace, if its view
     /// exists in this window.
     pub fn enable_auto_fix_for_workspace(

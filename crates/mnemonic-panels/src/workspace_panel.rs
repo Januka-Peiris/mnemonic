@@ -3,7 +3,8 @@ use std::path::PathBuf;
 
 use gpui::{
     actions, px, Action, App, AppContext as _, Context, Entity, EventEmitter, Focusable,
-    FocusHandle, IntoElement, PathPromptOptions, Pixels, Render, SharedString, WeakEntity, Window,
+    FocusHandle, IntoElement, PathPromptOptions, Pixels, PromptLevel, Render, SharedString,
+    WeakEntity, Window,
 };
 use mnemonic_core::models::{CreateWorkspaceInput, DiscoveredRepository, WorkspaceSummary};
 use mnemonic_core::repositories::repository_repository;
@@ -111,6 +112,72 @@ impl WorkspacePanel {
                 Self::point_project_at_worktree(workspace, &summary, cx);
             });
         }
+    }
+
+    /// Archive after confirmation: stops the agent session, removes the
+    /// worktree from disk (clean worktrees only), keeps the branch.
+    fn confirm_archive(
+        &mut self,
+        ws_id: String,
+        ws_name: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let answer = window.prompt(
+            PromptLevel::Warning,
+            &format!("Archive {ws_name}?"),
+            Some(
+                "Stops the agent session and removes the worktree from disk. The branch and \
+                 its commits are kept. Archiving is refused if there are uncommitted changes.",
+            ),
+            &["Archive", "Cancel"],
+            cx,
+        );
+
+        cx.spawn_in(window, async move |this, cx| {
+            if answer.await != Ok(0) {
+                return;
+            }
+            let Some(state) = mnemonic_bridge::mnemonic_state_cloned() else {
+                return;
+            };
+            let result = {
+                let ws_id = ws_id.clone();
+                cx.background_spawn(async move {
+                    workspace_service::archive_workspace(&state, &ws_id)
+                })
+                .await
+            };
+
+            this.update_in(cx, |this, window, cx| {
+                match result {
+                    Ok(()) => {
+                        if this.selected_workspace_id.as_deref() == Some(ws_id.as_str()) {
+                            this.selected_workspace_id = None;
+                            cx.set_global(crate::ActiveWorkspace(None));
+                        }
+                        if let Some(workspace) = this.workspace.upgrade() {
+                            workspace.update(cx, |workspace, cx| {
+                                WorkspaceHost::remove_workspace_view(workspace, &ws_id, cx);
+                            });
+                        }
+                        this.refresh(cx);
+                        cx.notify();
+                    }
+                    Err(err) => {
+                        let _dismissed = window.prompt(
+                            PromptLevel::Critical,
+                            "Couldn't archive workspace",
+                            Some(&err),
+                            &["OK"],
+                            cx,
+                        );
+                    }
+                }
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// Switches the Zed project's visible worktree to the selected
@@ -397,6 +464,8 @@ impl WorkspacePanel {
             .as_ref()
             .is_some_and(|id| id == &ws.id);
         let ws_id = ws.id.clone();
+        let ws_id_for_archive = ws.id.clone();
+        let ws_name_for_archive = ws.name.clone();
 
         h_flex()
             .id(SharedString::from(ws.id.clone()))
@@ -425,10 +494,30 @@ impl WorkspacePanel {
                     }),
             )
             .child(
-                Label::new(ws.name.clone())
-                    .size(LabelSize::Default)
-                    .color(Color::Default)
-                    .single_line(),
+                div().flex_grow(1.0).overflow_hidden().child(
+                    Label::new(ws.name.clone())
+                        .size(LabelSize::Default)
+                        .color(Color::Default)
+                        .single_line(),
+                ),
+            )
+            .child(
+                IconButton::new(
+                    SharedString::from(format!("archive-{}", ws.id)),
+                    IconName::Archive,
+                )
+                .icon_size(IconSize::XSmall)
+                .icon_color(Color::Muted)
+                .tooltip(Tooltip::text("Archive workspace"))
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    cx.stop_propagation();
+                    this.confirm_archive(
+                        ws_id_for_archive.clone(),
+                        ws_name_for_archive.clone(),
+                        window,
+                        cx,
+                    );
+                })),
             )
     }
 
