@@ -55,6 +55,70 @@ pub fn clear_agent_activity(workspace_id: &str) {
     }
 }
 
+/// Last observed PR state per workspace ("open", "ready", "conflicts",
+/// "failed", "merged"), written by whichever component polls GitHub and read
+/// by the left panel's git icons.
+static PR_STATES: std::sync::Mutex<Option<std::collections::HashMap<String, String>>> =
+    std::sync::Mutex::new(None);
+
+pub fn record_pr_state(workspace_id: &str, state: &str) {
+    let mut guard = PR_STATES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    guard
+        .get_or_insert_with(Default::default)
+        .insert(workspace_id.to_string(), state.to_string());
+}
+
+pub fn pr_state(workspace_id: &str) -> Option<String> {
+    let guard = PR_STATES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    guard.as_ref().and_then(|map| map.get(workspace_id).cloned())
+}
+
+pub fn clear_pr_state(workspace_id: &str) {
+    let mut guard = PR_STATES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(map) = guard.as_mut() {
+        map.remove(workspace_id);
+    }
+}
+
+/// Classifies a GitHub PR status into the small state vocabulary used by
+/// the left panel's git icons, and records it.
+pub fn record_pr_status(
+    workspace_id: &str,
+    status: &mnemonic_core::models::WorkspacePrStatus,
+) {
+    let state = if !status.found {
+        None
+    } else if status.state.as_deref() == Some("MERGED") {
+        Some("merged")
+    } else if status.mergeable.as_deref() == Some("CONFLICTING")
+        || status.merge_state_status.as_deref() == Some("DIRTY")
+    {
+        Some("conflicts")
+    } else if status.checks.iter().any(|check| {
+        matches!(
+            check.conclusion.as_deref(),
+            Some("FAILURE") | Some("TIMED_OUT") | Some("CANCELLED") | Some("ACTION_REQUIRED")
+        )
+    }) {
+        Some("failed")
+    } else if status.merge_state_status.as_deref() == Some("CLEAN") {
+        Some("ready")
+    } else {
+        Some("open")
+    };
+
+    match state {
+        Some(state) => record_pr_state(workspace_id, state),
+        None => clear_pr_state(workspace_id),
+    }
+}
+
 pub struct MnemonicEvent {
     pub name: String,
     pub payload: serde_json::Value,

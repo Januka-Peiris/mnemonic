@@ -51,6 +51,15 @@ const AUTO_FIX_MIN_GAP: Duration = Duration::from_secs(180);
 /// Auto-fix loop: give up after this many fix attempts.
 const AUTO_FIX_MAX_ATTEMPTS: u32 = 5;
 
+/// Model string passed to claude (also valid for its /model command) and
+/// the chip label shown in the composer.
+const AGENT_MODELS: &[(&str, &str)] = &[
+    ("claude-opus-4-8", "OPUS 4.8"),
+    ("claude-fable-5", "FABLE 5"),
+    ("claude-sonnet-4-6", "SONNET 4.6"),
+    ("claude-haiku-4-5", "HAIKU 4.5"),
+];
+
 /// Drag payload for the composer resize handle.
 struct ComposerDrag;
 
@@ -135,7 +144,7 @@ impl WorkspaceView {
         self.spawn_claude_terminal(
             "review",
             "review",
-            Some("sonnet".to_string()),
+            Some("claude-sonnet-4-6".to_string()),
             Some(prompt),
             window,
             cx,
@@ -451,6 +460,7 @@ impl WorkspaceView {
         if !self.auto_fix_enabled {
             return false;
         }
+        mnemonic_bridge::record_pr_status(&self.workspace_id, status);
         if !status.found {
             self.auto_fix_state = SharedString::from("waiting for a PR");
             cx.notify();
@@ -566,14 +576,21 @@ impl WorkspaceView {
     /// Cycles the model chip and live-switches the focused claude session
     /// via its /model command. New sessions launch with this model.
     fn cycle_model(&mut self, cx: &mut Context<Self>) {
-        const MODELS: &[&str] = &["opus", "sonnet", "haiku"];
-        let index = MODELS
+        let index = AGENT_MODELS
             .iter()
-            .position(|model| *model == self.agent_model)
+            .position(|(model, _)| *model == self.agent_model)
             .unwrap_or(0);
-        self.agent_model = MODELS[(index + 1) % MODELS.len()].to_string();
+        self.agent_model = AGENT_MODELS[(index + 1) % AGENT_MODELS.len()].0.to_string();
         self.dispatch_to_agent(format!("/model {}", self.agent_model), cx);
         cx.notify();
+    }
+
+    fn model_label(&self) -> String {
+        AGENT_MODELS
+            .iter()
+            .find(|(model, _)| *model == self.agent_model)
+            .map(|(_, label)| label.to_string())
+            .unwrap_or_else(|| self.agent_model.to_uppercase())
     }
 
     /// Cycles the effort chip and live-switches the focused claude session
@@ -638,10 +655,55 @@ impl WorkspaceView {
             })
     }
 
+    /// Pasting an image into the composer saves it into the worktree (via
+    /// Forge's attachment helper) and inserts the file path, so claude can
+    /// read it. Text pastes fall through to the editor untouched.
+    fn handle_composer_paste(
+        &mut self,
+        _: &editor::actions::Paste,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(item) = cx.read_from_clipboard() else {
+            return;
+        };
+        let image = item.entries().iter().find_map(|entry| match entry {
+            gpui::ClipboardEntry::Image(image) => Some(image.clone()),
+            _ => None,
+        });
+        let Some(image) = image else {
+            return;
+        };
+        cx.stop_propagation();
+
+        let extension = match image.format() {
+            gpui::ImageFormat::Png => "png",
+            gpui::ImageFormat::Jpeg => "jpg",
+            gpui::ImageFormat::Webp => "webp",
+            gpui::ImageFormat::Gif => "gif",
+            _ => "png",
+        };
+        let state = mnemonic_bridge::mnemonic_state(cx);
+        match mnemonic_core::services::workspace_file_tree_service::save_workspace_pasted_image(
+            &state,
+            &self.workspace_id,
+            &format!("pasted.{extension}"),
+            image.bytes(),
+        ) {
+            Ok(relative_path) => {
+                self.composer.update(cx, |composer, cx| {
+                    composer.insert(&format!("{relative_path} "), window, cx);
+                });
+            }
+            Err(err) => log::error!("Failed to save pasted image: {err}"),
+        }
+    }
+
     fn render_composer(&self, cx: &mut Context<Self>) -> impl IntoElement {
         v_flex()
             .key_context("MnemonicComposer")
             .on_action(cx.listener(Self::send_to_agent))
+            .capture_action(cx.listener(Self::handle_composer_paste))
             .border_t_1()
             .border_color(cx.theme().colors().border)
             .bg(cx.theme().colors().panel_background)
@@ -673,10 +735,7 @@ impl WorkspaceView {
                         })),
                     )
                     .child(
-                        Button::new(
-                            "composer-model",
-                            format!("{} ⌄", self.agent_model.to_uppercase()),
-                        )
+                        Button::new("composer-model", format!("{} ⌄", self.model_label()))
                         .label_size(LabelSize::XSmall)
                         .tooltip(Tooltip::text(
                             "Click to cycle model (switches the focused claude live)",
@@ -984,7 +1043,7 @@ impl WorkspaceHost {
                 active_terminal: 0,
                 composer,
                 composer_height: px(110.),
-                agent_model: "opus".to_string(),
+                agent_model: "claude-opus-4-8".to_string(),
                 agent_effort: "high".to_string(),
                 agent_bypass: true,
                 last_agent_activity: None,

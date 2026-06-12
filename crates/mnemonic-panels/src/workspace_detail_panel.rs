@@ -152,6 +152,7 @@ impl WorkspaceDetailPanel {
         self.pr_busy = true;
         cx.notify();
 
+        let workspace_id_for_record = workspace_id.clone();
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_spawn(async move {
@@ -167,6 +168,7 @@ impl WorkspaceDetailPanel {
                         {
                             this.show_pr_toast(message, cx);
                         }
+                        mnemonic_bridge::record_pr_status(&workspace_id_for_record, &status);
                         this.pr_status = Some(status);
                     }
                     Err(err) => log::error!("Failed to fetch PR status: {err}"),

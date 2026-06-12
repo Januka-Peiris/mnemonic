@@ -173,6 +173,7 @@ impl WorkspacePanel {
                 match result {
                     Ok(()) => {
                         mnemonic_bridge::clear_agent_activity(&ws_id);
+                        mnemonic_bridge::clear_pr_state(&ws_id);
                         if this.selected_workspace_id.as_deref() == Some(ws_id.as_str()) {
                             this.selected_workspace_id = None;
                             cx.set_global(crate::ActiveWorkspace(None));
@@ -623,15 +624,26 @@ impl WorkspacePanel {
                 };
                 div().w(px(7.)).h(px(7.)).rounded_full().bg(dot_color)
             })
-            .child(
+            .child({
+                // Git icon colored by PR state: amber=open, green=ready to
+                // merge, red=conflicts/failed checks, accent=merged.
+                let icon_color = match mnemonic_bridge::pr_state(&ws.id).as_deref() {
+                    Some("merged") => Color::Accent,
+                    Some("ready") => Color::Success,
+                    Some("conflicts") | Some("failed") => Color::Error,
+                    Some("open") => Color::Warning,
+                    _ => {
+                        if is_selected {
+                            Color::Default
+                        } else {
+                            Color::Muted
+                        }
+                    }
+                };
                 Icon::new(IconName::FileGit)
                     .size(IconSize::XSmall)
-                    .color(if is_selected {
-                        Color::Default
-                    } else {
-                        Color::Muted
-                    }),
-            )
+                    .color(icon_color)
+            })
             .child(
                 div().flex_grow(1.0).overflow_hidden().child(
                     Label::new(ws.name.clone())
