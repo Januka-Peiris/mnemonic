@@ -361,6 +361,7 @@ impl Render for TitleBar {
                 })
                 .gap_1()
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .children(self.render_mnemonic_pr_controls(cx))
                 .child(self.render_call_controls(window, cx))
                 .children(self.render_connection_status(status, cx))
                 .child(self.update_version.clone())
@@ -441,6 +442,8 @@ impl TitleBar {
         let user_store = workspace.app_state().user_store.clone();
         let client = workspace.app_state().client.clone();
         let active_call = ActiveCall::try_global(cx);
+        cx.observe_global::<mnemonic_bridge::ActiveWorkspace>(|_, cx| cx.notify())
+            .detach();
 
         let platform_style = PlatformStyle::platform();
         let application_menu = match platform_style {
@@ -1175,6 +1178,47 @@ impl TitleBar {
             }
             _ => None,
         }
+    }
+
+    /// Quick PR actions for the active Mnemonic workspace, dispatched as
+    /// global actions and handled by the workspace detail panel.
+    fn render_mnemonic_pr_controls(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        let has_active_workspace = cx
+            .try_global::<mnemonic_bridge::ActiveWorkspace>()
+            .is_some_and(|active| active.0.is_some());
+        if !has_active_workspace {
+            return None;
+        }
+        Some(
+            h_flex()
+                .gap_1()
+                .child(
+                    Button::new("titlebar-create-pr", "Create PR")
+                        .style(ButtonStyle::Filled)
+                        .label_size(LabelSize::Small)
+                        .on_click(|_, window, cx| {
+                            window.dispatch_action(
+                                mnemonic_bridge::CreatePullRequest.boxed_clone(),
+                                cx,
+                            );
+                        }),
+                )
+                .child(
+                    Button::new("titlebar-create-pr-autofix", "+ Auto-fix")
+                        .style(ButtonStyle::Tinted(TintColor::Accent))
+                        .label_size(LabelSize::Small)
+                        .tooltip(Tooltip::text(
+                            "Create PR, then watch CI and auto-fix until green",
+                        ))
+                        .on_click(|_, window, cx| {
+                            window.dispatch_action(
+                                mnemonic_bridge::CreatePullRequestWithAutoFix.boxed_clone(),
+                                cx,
+                            );
+                        }),
+                )
+                .into_any_element(),
+        )
     }
 
     pub fn render_sign_in_button(&mut self, _: &mut Context<Self>) -> Button {

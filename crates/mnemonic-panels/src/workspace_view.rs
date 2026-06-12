@@ -86,7 +86,7 @@ impl WorkspaceView {
     /// Starts the workspace's primary agent terminal, attached to its
     /// persistent tmux session.
     fn spawn_agent_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.spawn_claude_terminal("main", "claude", window, cx);
+        self.spawn_claude_terminal("main", "claude", Vec::new(), None, window, cx);
     }
 
     /// Opens an additional claude session in this workspace, with its own
@@ -99,15 +99,51 @@ impl WorkspaceView {
             .count();
         let session = format!("claude-{}", claude_count + 1);
         let title = format!("claude {}", claude_count + 1);
-        self.spawn_claude_terminal(&session, &title, window, cx);
+        self.spawn_claude_terminal(&session, &title, Vec::new(), None, window, cx);
+    }
+
+    /// Opens (or refocuses) the review session: a separate claude on Sonnet
+    /// that is asked to review the workspace's diff.
+    pub(crate) fn start_review(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(index) = self
+            .terminal_titles
+            .iter()
+            .position(|title| title.as_ref() == "review")
+        {
+            self.active_terminal = index;
+            if let Some(view) = self.terminals.get(index) {
+                let focus_handle = view.focus_handle(cx);
+                window.focus(&focus_handle, cx);
+            }
+            cx.notify();
+            return;
+        }
+
+        let prompt = "Review the changes in this worktree. Run `git status` and diff against \
+                      the base branch (try `git diff origin/main...HEAD`, falling back to the \
+                      repo's default branch). Assess correctness, security, performance, and \
+                      style. Give a structured review: blocking issues first, then suggestions, \
+                      then what looks good. Do not make code changes unless asked."
+            .to_string();
+        self.spawn_claude_terminal(
+            "review",
+            "review",
+            vec!["--model".to_string(), "sonnet".to_string()],
+            Some(prompt),
+            window,
+            cx,
+        );
     }
 
     /// Starts a claude terminal attached to the given persistent tmux
-    /// session of this workspace.
+    /// session of this workspace, optionally typing an initial prompt into
+    /// it once it has had a moment to boot.
     fn spawn_claude_terminal(
         &mut self,
         session: &str,
         title: &str,
+        extra_args: Vec<String>,
+        initial_prompt: Option<String>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -126,7 +162,8 @@ impl WorkspaceView {
                     let session = session.clone();
                     let cwd = cwd.clone();
                     async move {
-                        let agent_args = vec!["--dangerously-skip-permissions".to_string()];
+                        let mut agent_args = vec!["--dangerously-skip-permissions".to_string()];
+                        agent_args.extend(extra_args);
                         match &cwd {
                             Some(dir) => terminal_service::embedded_workspace_terminal_command(
                                 &workspace_id,
@@ -169,10 +206,25 @@ impl WorkspaceView {
 
             match terminal {
                 Ok(terminal) => {
+                    let terminal_for_prompt = terminal.clone();
                     this.update_in(cx, |this, window, cx| {
                         this.push_terminal(&title, terminal, window, cx);
                     })
                     .ok();
+
+                    // Give the TUI a moment to boot, then type the initial
+                    // prompt using the text-then-Enter dispatch pattern.
+                    if let Some(prompt) = initial_prompt {
+                        cx.background_executor().timer(Duration::from_secs(5)).await;
+                        terminal_for_prompt.update(cx, |terminal, _| {
+                            terminal.input(prompt.into_bytes());
+                        });
+                        cx.background_executor()
+                            .timer(Duration::from_millis(ENTER_DELAY_MILLIS))
+                            .await;
+                        terminal_for_prompt
+                            .update(cx, |terminal, _| terminal.input(b"\r".to_vec()));
+                    }
                 }
                 Err(e) => log::error!("Failed to start agent terminal: {e}"),
             }
@@ -861,6 +913,31 @@ impl WorkspaceHost {
                 return;
             }
         }
+    }
+
+    /// Opens (or refocuses) the review claude session for the given
+    /// workspace, if its view exists in this window.
+    pub fn start_review_for_workspace(
+        workspace: &mut Workspace,
+        workspace_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
+    ) -> bool {
+        for pane in workspace.panes().to_vec() {
+            let host = pane
+                .read(cx)
+                .items()
+                .find_map(|item| item.downcast::<WorkspaceHost>());
+            if let Some(host) = host {
+                let view = host.read(cx).views.get(workspace_id).cloned();
+                if let Some(view) = view {
+                    view.update(cx, |view, cx| view.start_review(window, cx));
+                    return true;
+                }
+                return false;
+            }
+        }
+        false
     }
 
     /// Turns on the CI auto-fix loop for the given workspace, if its view

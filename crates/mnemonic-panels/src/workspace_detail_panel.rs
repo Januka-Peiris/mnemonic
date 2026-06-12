@@ -299,7 +299,7 @@ impl WorkspaceDetailPanel {
 
     /// Asks the workspace's claude to create the PR, visibly in its
     /// terminal: commit, push the branch, open the PR with gh.
-    fn create_pr(&mut self, cx: &mut Context<Self>) {
+    pub fn create_pr(&mut self, cx: &mut Context<Self>) {
         let Some(summary) = &self.summary else {
             return;
         };
@@ -489,7 +489,7 @@ impl WorkspaceDetailPanel {
 
     /// Create PR and immediately arm the CI auto-fix loop, so the whole
     /// create → watch checks → fix → push cycle runs hands-off.
-    fn create_pr_with_auto_fix(&mut self, cx: &mut Context<Self>) {
+    pub fn create_pr_with_auto_fix(&mut self, cx: &mut Context<Self>) {
         self.create_pr(cx);
         let Some(workspace_id) = self.summary.as_ref().map(|summary| summary.id.clone()) else {
             return;
@@ -657,6 +657,16 @@ impl WorkspaceDetailPanel {
             ))
             .child(div().flex_grow(1.0))
             .child(
+                Button::new("start-review", "Review")
+                    .label_size(LabelSize::Small)
+                    .tooltip(Tooltip::text(
+                        "Open a separate claude (Sonnet) that reviews this workspace's diff",
+                    ))
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.start_review(window, cx);
+                    })),
+            )
+            .child(
                 IconButton::new("refresh-pr-status", IconName::ArrowCircle)
                     .icon_size(IconSize::Small)
                     .tooltip(Tooltip::text("Refresh GitHub status"))
@@ -664,6 +674,25 @@ impl WorkspaceDetailPanel {
                         this.refresh_pr_status(cx);
                     })),
             )
+    }
+
+    /// Opens the review claude session for the selected workspace.
+    fn start_review(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(workspace_id) = self.summary.as_ref().map(|summary| summary.id.clone()) else {
+            return;
+        };
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+        let started = workspace.update(cx, |workspace, cx| {
+            WorkspaceHost::start_review_for_workspace(workspace, &workspace_id, window, cx)
+        });
+        self.dispatch_note = Some(if started {
+            SharedString::from("Review session started ✓")
+        } else {
+            SharedString::from("Couldn't start review: open the workspace first")
+        });
+        cx.notify();
     }
 
     fn change_status_label(status: &str) -> (String, Color) {

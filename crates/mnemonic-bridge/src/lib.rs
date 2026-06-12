@@ -1,8 +1,24 @@
 use std::sync::{mpsc, Arc};
 
 use futures::StreamExt;
-use gpui::{App, AppContext as _, Entity, EventEmitter, Global};
+use gpui::{actions, App, AppContext as _, Entity, EventEmitter, Global};
 use mnemonic_core::state::{AppEventEmitter, AppState};
+
+actions!(
+    mnemonic,
+    [
+        /// Ask claude to create a pull request for the active workspace.
+        CreatePullRequest,
+        /// Create a pull request and arm the CI auto-fix loop.
+        CreatePullRequestWithAutoFix
+    ]
+);
+
+/// The workspace currently selected in the left panel. Set by the workspace
+/// panel; observed by panels and the title bar.
+pub struct ActiveWorkspace(pub Option<String>);
+
+impl Global for ActiveWorkspace {}
 
 pub struct MnemonicEvent {
     pub name: String,

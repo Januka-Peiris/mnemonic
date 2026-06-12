@@ -1166,6 +1166,26 @@ fn register_actions(
         )
         .register_action(
             |workspace: &mut Workspace,
+             _: &mnemonic_bridge::CreatePullRequest,
+             _window: &mut Window,
+             cx: &mut Context<Workspace>| {
+                if let Some(panel) = workspace.panel::<mnemonic_panels::WorkspaceDetailPanel>(cx) {
+                    panel.update(cx, |panel, cx| panel.create_pr(cx));
+                }
+            },
+        )
+        .register_action(
+            |workspace: &mut Workspace,
+             _: &mnemonic_bridge::CreatePullRequestWithAutoFix,
+             _window: &mut Window,
+             cx: &mut Context<Workspace>| {
+                if let Some(panel) = workspace.panel::<mnemonic_panels::WorkspaceDetailPanel>(cx) {
+                    panel.update(cx, |panel, cx| panel.create_pr_with_auto_fix(cx));
+                }
+            },
+        )
+        .register_action(
+            |workspace: &mut Workspace,
              _: &mnemonic_panels::ToggleWorkspaceDetailFocus,
              window: &mut Window,
              cx: &mut Context<Workspace>| {

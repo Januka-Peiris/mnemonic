@@ -14,8 +14,4 @@ pub use workspace_panel::ToggleFocus as ToggleWorkspacePanelFocus;
 pub use workspace_panel::WorkspacePanel;
 pub use workspace_view::{WorkspaceHost, WorkspaceView};
 
-/// The workspace currently selected in the left panel. Set by
-/// [`WorkspacePanel`] and observed by panels that show per-workspace state.
-pub struct ActiveWorkspace(pub Option<String>);
-
-impl gpui::Global for ActiveWorkspace {}
+pub use mnemonic_bridge::ActiveWorkspace;
