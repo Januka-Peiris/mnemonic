@@ -12,6 +12,7 @@ mnemonic-core.workspace = true
 gpui.workspace = true
 icons.workspace = true
 project.workspace = true
+project_panel.workspace = true
 task.workspace = true
 terminal.workspace = true
 terminal_view.workspace = true

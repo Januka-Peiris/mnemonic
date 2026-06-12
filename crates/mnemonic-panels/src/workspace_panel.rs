@@ -25,6 +25,7 @@ pub struct WorkspacePanel {
     workspaces: Vec<WorkspaceSummary>,
     collapsed_projects: Vec<String>,
     selected_workspace_id: Option<String>,
+    revealed_project_panel: bool,
 }
 
 impl WorkspacePanel {
@@ -41,6 +42,7 @@ impl WorkspacePanel {
                 workspaces: Vec::new(),
                 collapsed_projects: Vec::new(),
                 selected_workspace_id: None,
+                revealed_project_panel: false,
             };
             panel.refresh(cx);
             panel
@@ -106,9 +108,17 @@ impl WorkspacePanel {
             return;
         };
         if let Some(workspace) = self.workspace.upgrade() {
+            let reveal_project_panel = !self.revealed_project_panel;
+            self.revealed_project_panel = true;
             workspace.update(cx, |workspace, cx| {
                 WorkspaceHost::activate_workspace(workspace, &summary, window, cx);
                 Self::point_project_at_worktree(workspace, &summary, cx);
+                // The project panel starts closed when the app launches
+                // without a folder; reveal it on the first selection, then
+                // leave the dock under user control.
+                if reveal_project_panel {
+                    workspace.open_panel::<project_panel::ProjectPanel>(window, cx);
+                }
             });
         }
     }
