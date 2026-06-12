@@ -3,9 +3,9 @@
 # terminal open on failure so compile errors stay visible.
 cd "$(dirname "$0")"
 cargo run -p mnemonic
-status=$?
-if [ $status -ne 0 ]; then
+exit_code=$?
+if [ $exit_code -ne 0 ]; then
     echo ""
-    echo "=== mnemonic exited with status $status ==="
+    echo "=== mnemonic exited with status $exit_code ==="
     read -k 1 "?Press any key to close..."
 fi

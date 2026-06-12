@@ -197,7 +197,8 @@ impl WorkspaceView {
         self.terminal_titles
             .push(SharedString::from(title.to_string()));
         self.active_terminal = self.terminals.len() - 1;
-        window.focus(&view.focus_handle(cx));
+        let focus_handle = view.focus_handle(cx);
+        window.focus(&focus_handle, cx);
         cx.notify();
     }
 
@@ -231,7 +232,8 @@ impl WorkspaceView {
                     .on_click(cx.listener(move |this, _, window, cx| {
                         this.active_terminal = index;
                         if let Some(view) = this.terminals.get(index) {
-                            window.focus(&view.focus_handle(cx));
+                            let focus_handle = view.focus_handle(cx);
+                            window.focus(&focus_handle, cx);
                         }
                         cx.notify();
                     }))
