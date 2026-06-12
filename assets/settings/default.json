@@ -458,7 +458,7 @@
   "allow_rewrap": "in_comments",
   // Controls whether edit predictions are shown immediately (true)
   // or manually by triggering `editor::ShowEditPrediction` (false).
-  "show_edit_predictions": true,
+  "show_edit_predictions": false,
   // Controls whether edit predictions are shown in a given language scope.
   // Example: ["string", "comment"]
   "edit_predictions_disabled_in": [],
@@ -522,7 +522,7 @@
     // Whether to show the user menu in the titlebar.
     "show_user_menu": true,
     // Whether to show the sign in button in the titlebar.
-    "show_sign_in": true,
+    "show_sign_in": false,
     // Whether to show the menus in the titlebar.
     "show_menus": false,
     // The layout of window control buttons in the title bar (Linux only).
@@ -1501,8 +1501,10 @@
   },
   // Whether to disable all AI features in Zed.
   //
+  // Mnemonic: agents run in per-workspace terminals using their own CLI
+  // auth (claude/codex login), so the built-in AI surface is off by default.
   // Default: false
-  "disable_ai": false,
+  "disable_ai": true,
   // Automatically update Zed. This setting may be ignored on Linux if
   // installed through a package manager.
   "auto_update": true,
@@ -1684,7 +1686,7 @@
   "load_direnv": "direct",
   "edit_predictions": {
     // Which edit prediction provider to use.
-    "provider": "zed",
+    "provider": "none",
     // A list of globs representing files that edit predictions should be disabled for.
     // There's a sensible default list of globs already included.
     // Any addition to this list will be merged with the default list.

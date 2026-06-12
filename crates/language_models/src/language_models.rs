@@ -19,7 +19,6 @@ pub use crate::extension::init_proxy as init_extension_proxy;
 use crate::provider::anthropic::AnthropicLanguageModelProvider;
 use crate::provider::anthropic_compatible::AnthropicCompatibleLanguageModelProvider;
 use crate::provider::bedrock::BedrockLanguageModelProvider;
-use crate::provider::cloud::CloudLanguageModelProvider;
 use crate::provider::copilot_chat::CopilotChatLanguageModelProvider;
 use crate::provider::google::GoogleLanguageModelProvider;
 use crate::provider::lmstudio::LmStudioLanguageModelProvider;
@@ -260,19 +259,13 @@ fn register_compatible_providers(
 
 fn register_language_model_providers(
     registry: &mut LanguageModelRegistry,
-    user_store: Entity<UserStore>,
+    // Mnemonic: the zed.dev cloud provider (sign-in based) is not registered;
+    // user_store is kept so the call site doesn't churn when it returns.
+    _user_store: Entity<UserStore>,
     client: Arc<Client>,
     credentials_provider: Arc<dyn CredentialsProvider>,
     cx: &mut Context<LanguageModelRegistry>,
 ) {
-    registry.register_provider(
-        Arc::new(CloudLanguageModelProvider::new(
-            user_store,
-            client.clone(),
-            cx,
-        )),
-        cx,
-    );
     registry.register_provider(
         Arc::new(AnthropicLanguageModelProvider::new(
             client.http_client(),
