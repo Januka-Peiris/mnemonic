@@ -257,16 +257,14 @@ function sign_app_binaries() {
         ln -s /Applications ${dmg_source_directory}
 
         echo "Creating final DMG at ${dmg_file_path} using ${dmg_source_directory}"
-        hdiutil create -volname Zed -srcfolder "${dmg_source_directory}" -ov -format UDZO "${dmg_file_path}"
+        hdiutil create -volname Mnemonic -srcfolder "${dmg_source_directory}" -ov -format UDZO "${dmg_file_path}"
 
         # If someone runs this bundle script locally, a symlink will be placed in `dmg_source_directory`.
         # This symlink causes CPU issues with Zed if the Zed codebase is the project being worked on, so we simply remove it for now.
         echo "Removing symlink to /Applications from ${dmg_source_directory}"
         rm ${dmg_source_directory}/Applications
 
-        echo "Adding license agreement to DMG"
-        npm install --global dmg-license minimist
-        dmg-license script/terms/terms.json "${dmg_file_path}"
+        # Mnemonic: no DMG license agreement (the upstream one was Zed's ToS).
 
         if [[ $can_code_sign = true ]]; then
             echo "Notarizing DMG with Apple"
