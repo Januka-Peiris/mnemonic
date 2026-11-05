@@ -105,7 +105,7 @@ fn run_orchestrator_pass(state: &AppState) -> Result<(), String> {
         .orchestrator_model
         .lock()
         .map(|g| g.clone())
-        .unwrap_or_else(|_| "claude-opus-4-6".to_string());
+        .unwrap_or_else(|_| "claude-opus-5-5".to_string());
 
     let workspaces = workspace_repository::list(&state.db)?;
     let active: Vec<_> = workspaces

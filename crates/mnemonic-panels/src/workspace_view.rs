@@ -52,18 +52,52 @@ const AUTO_FIX_MIN_GAP: Duration = Duration::from_secs(180);
 const AUTO_FIX_MAX_ATTEMPTS: u32 = 5;
 
 /// Model string passed to claude (also valid for its /model command) and
-/// the chip label shown in the composer. [1m] = 1M-context variant.
-const AGENT_MODELS: &[(&str, &str)] = &[
-    ("claude-opus-4-8", "Opus 4.8"),
-    ("claude-opus-4-7", "Opus 4.7"),
-    ("claude-opus-4-6", "Opus 4.6"),
-    ("claude-opus-4-6[1m]", "Opus 4.6 1M"),
-    ("claude-fable-5", "Fable 5"),
-    ("claude-fable-5[1m]", "Fable 5 1M"),
-    ("claude-sonnet-4-6", "Sonnet 4.6"),
-    ("claude-sonnet-4-6[1m]", "Sonnet 4.6 1M"),
-    ("claude-haiku-4-5", "Haiku 4.5"),
+/// the chip label shown in the composer.
+const CLAUDE_MODELS: &[(&str, &str)] = &[
+    ("claude-fable-5-1", "Fable 5.1"),
+    ("claude-opus-5-5", "Opus 5.5"),
+    ("claude-sonnet-5-5", "Sonnet 5.5"),
+    ("claude-haiku-5-5", "Haiku 5.5"),
 ];
+
+/// Model string passed to codex and the chip label shown in the composer.
+const GPT_MODELS: &[(&str, &str)] = &[
+    ("gpt-6.1-sol", "GPT-6.1 Sol"),
+    ("gpt-6.1-terra", "GPT-6.1 Terra"),
+    ("gpt-6-astra", "GPT-6 Astra"),
+    ("gpt-6-luna", "GPT-6 Luna"),
+];
+
+const DEFAULT_CLAUDE_MODEL: &str = "claude-opus-5-5";
+const DEFAULT_GPT_MODEL: &str = "gpt-6.1-sol";
+
+fn is_gpt_model(model: &str) -> bool {
+    model.starts_with("gpt-")
+}
+
+/// The CLI and arguments that start an agent session on the given model.
+fn agent_launch(model: String, effort: String, bypass: bool) -> (&'static str, Vec<String>) {
+    let mut args = Vec::new();
+    if is_gpt_model(&model) {
+        if bypass {
+            args.push("--dangerously-bypass-approvals-and-sandbox".to_string());
+        }
+        args.push("--model".to_string());
+        args.push(model);
+        args.push("-c".to_string());
+        args.push(format!("model_reasoning_effort={effort}"));
+        ("codex", args)
+    } else {
+        if bypass {
+            args.push("--dangerously-skip-permissions".to_string());
+        }
+        args.push("--model".to_string());
+        args.push(model);
+        args.push("--effort".to_string());
+        args.push(effort);
+        ("claude", args)
+    }
+}
 
 /// Effort levels for the effort dropdown. xhigh and max are only supported
 /// by some models; claude reports it visibly if the combination is invalid.
@@ -111,7 +145,8 @@ impl WorkspaceView {
     /// Starts the workspace's primary agent terminal, attached to its
     /// persistent tmux session.
     fn spawn_agent_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.spawn_claude_terminal("main", "claude", None, None, window, cx);
+        let model = self.claude_model();
+        self.spawn_session_terminal("main", "claude", model, None, window, cx);
     }
 
     /// Opens an additional claude session in this workspace, with its own
@@ -124,7 +159,34 @@ impl WorkspaceView {
             .count();
         let session = format!("claude-{}", claude_count + 1);
         let title = format!("claude {}", claude_count + 1);
-        self.spawn_claude_terminal(&session, &title, None, None, window, cx);
+        let model = self.claude_model();
+        self.spawn_session_terminal(&session, &title, model, None, window, cx);
+    }
+
+    /// Opens an additional GPT session in this workspace, with its own
+    /// persistent tmux session.
+    fn add_gpt_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let codex_count = self
+            .terminal_titles
+            .iter()
+            .filter(|title| title.starts_with("codex"))
+            .count();
+        let session = format!("codex-{}", codex_count + 1);
+        let title = format!("codex {}", codex_count + 1);
+        let model = if is_gpt_model(&self.agent_model) {
+            self.agent_model.clone()
+        } else {
+            DEFAULT_GPT_MODEL.to_string()
+        };
+        self.spawn_session_terminal(&session, &title, model, None, window, cx);
+    }
+
+    fn claude_model(&self) -> String {
+        if is_gpt_model(&self.agent_model) {
+            DEFAULT_CLAUDE_MODEL.to_string()
+        } else {
+            self.agent_model.clone()
+        }
     }
 
     /// Opens (or refocuses) the review session: a separate claude on Sonnet
@@ -150,24 +212,24 @@ impl WorkspaceView {
                       style. Give a structured review: blocking issues first, then suggestions, \
                       then what looks good. Do not make code changes unless asked."
             .to_string();
-        self.spawn_claude_terminal(
+        self.spawn_session_terminal(
             "review",
             "review",
-            Some("claude-sonnet-4-6".to_string()),
+            "claude-sonnet-5-5".to_string(),
             Some(prompt),
             window,
             cx,
         );
     }
 
-    /// Starts a claude terminal attached to the given persistent tmux
+    /// Starts an agent terminal attached to the given persistent tmux
     /// session of this workspace, optionally typing an initial prompt into
     /// it once it has had a moment to boot.
-    fn spawn_claude_terminal(
+    fn spawn_session_terminal(
         &mut self,
         session: &str,
         title: &str,
-        model_override: Option<String>,
+        model: String,
         initial_prompt: Option<String>,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -178,7 +240,6 @@ impl WorkspaceView {
         let project = self.project.clone();
         let session = session.to_string();
         let title = title.to_string();
-        let model = model_override.unwrap_or_else(|| self.agent_model.clone());
         let effort = self.agent_effort.clone();
         let bypass = self.agent_bypass;
 
@@ -190,23 +251,16 @@ impl WorkspaceView {
                     let session = session.clone();
                     let cwd = cwd.clone();
                     async move {
-                        let mut agent_args = Vec::new();
-                        if bypass {
-                            agent_args.push("--dangerously-skip-permissions".to_string());
-                        }
-                        agent_args.push("--model".to_string());
-                        agent_args.push(model);
-                        agent_args.push("--effort".to_string());
-                        agent_args.push(effort);
+                        let (agent_command, agent_args) = agent_launch(model, effort, bypass);
                         match &cwd {
                             Some(dir) => terminal_service::embedded_workspace_terminal_command(
                                 &workspace_id,
                                 &session,
                                 dir,
-                                "claude",
+                                agent_command,
                                 &agent_args,
                             ),
-                            None => ("claude".to_string(), agent_args),
+                            None => (agent_command.to_string(), agent_args),
                         }
                     }
                 })
@@ -376,21 +430,32 @@ impl WorkspaceView {
         self.composer.update(cx, |composer, cx| composer.clear(window, cx));
     }
 
-    /// Writes an instruction into the agent terminal: text first, then the
-    /// submitting Enter as a separate input event (Forge's dispatch pattern).
-    /// Targets the active tab when it's a claude session, otherwise the
-    /// primary agent terminal.
-    pub(crate) fn dispatch_to_agent(&mut self, text: String, cx: &mut Context<Self>) {
-        let active_is_claude = self
+    fn dispatch_target(&self) -> usize {
+        let active_is_agent = self
             .terminal_titles
             .get(self.active_terminal)
-            .is_some_and(|title| title.starts_with("claude"));
-        let agent_view = if active_is_claude {
-            self.terminals.get(self.active_terminal)
+            .is_some_and(|title| title.starts_with("claude") || title.starts_with("codex"));
+        if active_is_agent {
+            self.active_terminal
         } else {
-            self.terminals.first()
-        };
-        let Some(agent_view) = agent_view else {
+            0
+        }
+    }
+
+    /// Whether composer input currently goes to a claude session. Only claude
+    /// takes the /model and /effort commands used for live switching.
+    fn dispatch_target_is_claude(&self) -> bool {
+        self.terminal_titles
+            .get(self.dispatch_target())
+            .is_some_and(|title| title.starts_with("claude"))
+    }
+
+    /// Writes an instruction into the agent terminal: text first, then the
+    /// submitting Enter as a separate input event (Forge's dispatch pattern).
+    /// Targets the active tab when it's an agent session, otherwise the
+    /// primary agent terminal.
+    pub(crate) fn dispatch_to_agent(&mut self, text: String, cx: &mut Context<Self>) {
+        let Some(agent_view) = self.terminals.get(self.dispatch_target()) else {
             return;
         };
         let terminal = agent_view.read(cx).terminal().clone();
@@ -583,26 +648,32 @@ impl WorkspaceView {
     }
 
     /// Applies a model choice: live-switches the focused claude session via
-    /// /model, and becomes the launch flag for new sessions.
+    /// /model when it's a Claude model, and becomes the launch flag for new
+    /// sessions.
     fn set_model(&mut self, model: &str, cx: &mut Context<Self>) {
         self.agent_model = model.to_string();
-        self.dispatch_to_agent(format!("/model {model}"), cx);
+        if !is_gpt_model(model) && self.dispatch_target_is_claude() {
+            self.dispatch_to_agent(format!("/model {model}"), cx);
+        }
         cx.notify();
     }
 
     fn model_label(&self) -> String {
-        AGENT_MODELS
+        CLAUDE_MODELS
             .iter()
+            .chain(GPT_MODELS)
             .find(|(model, _)| *model == self.agent_model)
             .map(|(_, label)| label.to_string())
             .unwrap_or_else(|| self.agent_model.clone())
     }
 
-    /// Applies an effort choice: live-switches via /effort, and becomes the
-    /// launch flag for new sessions.
+    /// Applies an effort choice: live-switches a focused claude session via
+    /// /effort, and becomes the launch flag for new sessions.
     fn set_effort(&mut self, effort: &str, cx: &mut Context<Self>) {
         self.agent_effort = effort.to_string();
-        self.dispatch_to_agent(format!("/effort {effort}"), cx);
+        if self.dispatch_target_is_claude() {
+            self.dispatch_to_agent(format!("/effort {effort}"), cx);
+        }
         cx.notify();
     }
 
@@ -726,7 +797,7 @@ impl WorkspaceView {
                         })
                         .label_size(LabelSize::XSmall)
                         .tooltip(Tooltip::text(
-                            "Whether NEW claude sessions skip permission prompts \
+                            "Whether NEW sessions skip permission prompts \
                              (running sessions: shift+tab in the terminal)",
                         ))
                         .on_click(cx.listener(|this, _, _, cx| {
@@ -745,21 +816,28 @@ impl WorkspaceView {
                                 )
                                 .label_size(LabelSize::XSmall)
                                 .tooltip(Tooltip::text(
-                                    "Model for the focused claude (switches it live) and \
-                                     for new sessions",
+                                    "Model for new sessions; Claude models also switch the \
+                                     focused claude live",
                                 )),
                             )
                             .menu(move |window, cx| {
                                 let this = this.clone();
                                 Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
-                                    for (model, label) in AGENT_MODELS {
-                                        let this = this.clone();
-                                        menu = menu.entry(*label, None, move |_, cx| {
-                                            this.update(cx, |this, cx| {
-                                                this.set_model(model, cx);
-                                            })
-                                            .ok();
-                                        });
+                                    for (index, models) in
+                                        [CLAUDE_MODELS, GPT_MODELS].into_iter().enumerate()
+                                    {
+                                        if index > 0 {
+                                            menu = menu.separator();
+                                        }
+                                        for (model, label) in models {
+                                            let this = this.clone();
+                                            menu = menu.entry(*label, None, move |_, cx| {
+                                                this.update(cx, |this, cx| {
+                                                    this.set_model(model, cx);
+                                                })
+                                                .ok();
+                                            });
+                                        }
                                     }
                                     menu
                                 }))
@@ -931,6 +1009,16 @@ impl WorkspaceView {
                     })),
             )
             .child(
+                Button::new("workspace-add-gpt", "+ GPT")
+                    .label_size(LabelSize::XSmall)
+                    .tooltip(Tooltip::text(
+                        "New codex session in this workspace (own persistent tmux session)",
+                    ))
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.add_gpt_terminal(window, cx);
+                    })),
+            )
+            .child(
                 IconButton::new("workspace-add-terminal", IconName::Plus)
                     .icon_size(IconSize::Small)
                     .tooltip(Tooltip::text("New shell in this workspace"))
@@ -1067,7 +1155,7 @@ impl WorkspaceHost {
             let composer = cx.new(|cx| {
                 let mut editor = Editor::auto_height(3, 32, window, cx);
                 editor.set_placeholder_text(
-                    "Send instruction to claude — Enter to send, Shift+Enter for newline",
+                    "Send instruction to the agent - Enter to send, Shift+Enter for newline",
                     window,
                     cx,
                 );
@@ -1086,7 +1174,7 @@ impl WorkspaceHost {
                 active_terminal: 0,
                 composer,
                 composer_height: px(110.),
-                agent_model: "claude-opus-4-8".to_string(),
+                agent_model: DEFAULT_CLAUDE_MODEL.to_string(),
                 agent_effort: "high".to_string(),
                 agent_bypass: true,
                 last_agent_activity: None,
@@ -1261,5 +1349,26 @@ impl Render for WorkspaceHost {
                     ),
                 ),
             })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gpt_models_launch_codex_with_codex_flags() {
+        let (command, args) = agent_launch(DEFAULT_GPT_MODEL.to_string(), "high".to_string(), true);
+        assert_eq!(command, "codex");
+        assert_eq!(
+            args,
+            [
+                "--dangerously-bypass-approvals-and-sandbox",
+                "--model",
+                "gpt-6.1-sol",
+                "-c",
+                "model_reasoning_effort=high",
+            ]
+        );
     }
 }

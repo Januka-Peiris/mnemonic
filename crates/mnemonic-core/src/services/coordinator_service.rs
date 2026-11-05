@@ -1289,7 +1289,7 @@ fn call_openai_brain(
         .map_err(|_| "OPENAI_API_KEY environment variable not set".to_string())?;
     let model = profile_default_model(state, profile)
         .or_else(|| profile.model.clone())
-        .unwrap_or_else(|| "gpt-5.4".to_string());
+        .unwrap_or_else(|| "gpt-6.1-sol".to_string());
     let base_url = profile
         .endpoint
         .as_deref()
