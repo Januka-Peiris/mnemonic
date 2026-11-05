@@ -137,7 +137,7 @@ impl AppState {
             terminals: Arc::new(Mutex::new(HashMap::new())),
             pending_commands: Arc::new(Mutex::new(HashMap::new())),
             orchestrator_enabled: Arc::new(AtomicBool::new(false)),
-            orchestrator_model: Arc::new(Mutex::new("claude-opus-4-6".to_string())),
+            orchestrator_model: Arc::new(Mutex::new("claude-opus-5-5".to_string())),
             orchestrator_last_run: Arc::new(Mutex::new(None)),
             orchestrator_last_actions: Arc::new(Mutex::new(Vec::new())),
             coordinator_step_inflight: Arc::new(Mutex::new(HashSet::new())),
