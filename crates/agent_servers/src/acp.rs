@@ -439,6 +439,7 @@ pub struct AcpConnection {
 struct AcpConnectionDefaults {
     mode: Rc<RefCell<Option<acp::SessionModeId>>>,
     config_options: Rc<RefCell<HashMap<String, String>>>,
+    allowed_config_option_values: Rc<RefCell<HashMap<String, Vec<String>>>>,
 }
 
 impl AcpConnectionDefaults {
@@ -446,7 +447,46 @@ impl AcpConnectionDefaults {
         Self {
             mode: Rc::new(RefCell::new(mode)),
             config_options: Rc::new(RefCell::new(config_options)),
+            allowed_config_option_values: Rc::default(),
         }
+    }
+
+    /// Hides select values the user has not allowed. The current value is
+    /// always kept so the dropdown still shows what the agent is using.
+    fn filter_config_options(
+        &self,
+        mut config_options: Vec<acp::SessionConfigOption>,
+    ) -> Vec<acp::SessionConfigOption> {
+        let allowed_values = self.allowed_config_option_values.borrow();
+        if allowed_values.is_empty() {
+            return config_options;
+        }
+        for config_option in &mut config_options {
+            let Some(allowed) = allowed_values.get(config_option.id.0.as_ref()) else {
+                continue;
+            };
+            let acp::SessionConfigKind::Select(select) = &mut config_option.kind else {
+                continue;
+            };
+            let current_value = select.current_value.clone();
+            let is_shown = |option: &acp::SessionConfigSelectOption| {
+                option.value == current_value
+                    || allowed.iter().any(|value| value.as_str() == option.value.0.as_ref())
+            };
+            match &mut select.options {
+                acp::SessionConfigSelectOptions::Ungrouped(options) => {
+                    options.retain(|option| is_shown(option));
+                }
+                acp::SessionConfigSelectOptions::Grouped(groups) => {
+                    for group in groups.iter_mut() {
+                        group.options.retain(|option| is_shown(option));
+                    }
+                    groups.retain(|group| !group.options.is_empty());
+                }
+                _ => {}
+            }
+        }
+        config_options
     }
 
     fn mode(&self) -> Option<acp::SessionModeId> {
@@ -470,8 +510,11 @@ impl AcpConnectionDefaults {
         let settings = settings_store.get::<AllAgentServersSettings>(None);
         let Some(agent_settings) = settings.get(agent_id.as_ref()) else {
             self.set(None, HashMap::default());
+            self.allowed_config_option_values.borrow_mut().clear();
             return;
         };
+        *self.allowed_config_option_values.borrow_mut() =
+            agent_settings.allowed_config_option_values().clone();
 
         let default_config_options = match agent_settings {
             CustomAgentServerSettings::Custom {
@@ -1981,6 +2024,7 @@ impl AgentConnection for AcpConnection {
             session_id: session_id.clone(),
             connection: self.connection.clone(),
             state: config_opts.config_options.clone(),
+            defaults: self.defaults.clone(),
             watch_tx: config_opts.tx.clone(),
             watch_rx: config_opts.rx.clone(),
         }) as _)
@@ -2937,6 +2981,7 @@ mod tests {
                             "manual".to_string(),
                         )]),
                         favorite_config_option_values: HashMap::default(),
+                        allowed_config_option_values: HashMap::default(),
                     }
                     .into(),
                 )])),
@@ -3745,13 +3790,15 @@ struct AcpSessionConfigOptions {
     session_id: acp::SessionId,
     connection: ConnectionTo<Agent>,
     state: Rc<RefCell<Vec<acp::SessionConfigOption>>>,
+    defaults: AcpConnectionDefaults,
     watch_tx: Rc<RefCell<watch::Sender<()>>>,
     watch_rx: watch::Receiver<()>,
 }
 
 impl acp_thread::AgentSessionConfigOptions for AcpSessionConfigOptions {
     fn config_options(&self) -> Vec<acp::SessionConfigOption> {
-        self.state.borrow().clone()
+        self.defaults
+            .filter_config_options(self.state.borrow().clone())
     }
 
     fn set_config_option(
@@ -3765,6 +3812,7 @@ impl acp_thread::AgentSessionConfigOptions for AcpSessionConfigOptions {
         let state = self.state.clone();
 
         let watch_tx = self.watch_tx.clone();
+        let defaults = self.defaults.clone();
 
         cx.foreground_executor().spawn(async move {
             let response = into_foreground_future(connection.send_request(
@@ -3774,7 +3822,7 @@ impl acp_thread::AgentSessionConfigOptions for AcpSessionConfigOptions {
 
             *state.borrow_mut() = response.config_options.clone();
             watch_tx.borrow_mut().send(()).ok();
-            Ok(response.config_options)
+            Ok(defaults.filter_config_options(response.config_options))
         })
     }
 

@@ -667,6 +667,14 @@ pub enum CustomAgentServerSettings {
         /// Default: {}
         #[serde(default, skip_serializing_if = "HashMap::is_empty")]
         favorite_config_option_values: HashMap<String, Vec<String>>,
+        /// Values offered for session config options, such as the model dropdown.
+        ///
+        /// This is a map from config option ID to the value IDs to show. Options
+        /// not listed here show every value the agent offers.
+        ///
+        /// Default: {}
+        #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+        allowed_config_option_values: HashMap<String, Vec<String>>,
     },
     // Used for the ACP extension migration
     #[serde(alias = "extension")]
@@ -696,6 +704,14 @@ pub enum CustomAgentServerSettings {
         /// Default: {}
         #[serde(default, skip_serializing_if = "HashMap::is_empty")]
         favorite_config_option_values: HashMap<String, Vec<String>>,
+        /// Values offered for session config options, such as the model dropdown.
+        ///
+        /// This is a map from config option ID to the value IDs to show. Options
+        /// not listed here show every value the agent offers.
+        ///
+        /// Default: {}
+        #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+        allowed_config_option_values: HashMap<String, Vec<String>>,
     },
 }
 
