@@ -33,7 +33,11 @@ actions!(
     mnemonic_composer,
     [
         /// Send the composer contents to the workspace's agent terminal.
-        Send
+        Send,
+        /// Cycle the focused agent's mode by sending shift+tab to its terminal
+        /// (Claude: default, acceptEdits, plan, bypass, auto; Codex:
+        /// default and plan).
+        CycleAgentMode
     ]
 );
 
@@ -55,8 +59,7 @@ const AUTO_FIX_MIN_GAP: Duration = Duration::from_secs(180);
 /// Auto-fix loop: give up after this many fix attempts.
 const AUTO_FIX_MAX_ATTEMPTS: u32 = 5;
 
-/// Model string passed to claude (also valid for its /model command) and
-/// the chip label shown in the composer.
+/// Claude model IDs and chip labels.
 const CLAUDE_MODELS: &[(&str, &str)] = &[
     ("claude-fable-5-2", "Fable 5.2"),
     ("claude-fable-5-1", "Fable 5.1"),
@@ -65,48 +68,37 @@ const CLAUDE_MODELS: &[(&str, &str)] = &[
     ("claude-haiku-5-5", "Haiku 5.5"),
 ];
 
-/// Model string passed to codex and the chip label shown in the composer.
-const GPT_MODELS: &[(&str, &str)] = &[
+/// Codex model IDs and chip labels.
+const CODEX_MODELS: &[(&str, &str)] = &[
     ("gpt-6.1-sol", "GPT-6.1 Sol"),
     ("gpt-6.1-terra", "GPT-6.1 Terra"),
     ("gpt-6-astra", "GPT-6 Astra"),
     ("gpt-6-luna", "GPT-6 Luna"),
 ];
 
-const DEFAULT_CLAUDE_MODEL: &str = "claude-opus-5-5";
-const DEFAULT_GPT_MODEL: &str = "gpt-6.1-sol";
-
-fn is_gpt_model(model: &str) -> bool {
-    model.starts_with("gpt-")
-}
-
-/// The CLI and arguments that start an agent session on the given model.
-fn agent_launch(model: String, effort: String, bypass: bool) -> (&'static str, Vec<String>) {
-    let mut args = Vec::new();
-    if is_gpt_model(&model) {
-        if bypass {
-            args.push("--dangerously-bypass-approvals-and-sandbox".to_string());
-        }
-        args.push("--model".to_string());
-        args.push(model);
-        args.push("-c".to_string());
-        args.push(format!("model_reasoning_effort={effort}"));
-        ("codex", args)
-    } else {
-        if bypass {
-            args.push("--dangerously-skip-permissions".to_string());
-        }
-        args.push("--model".to_string());
-        args.push(model);
-        args.push("--effort".to_string());
-        args.push(effort);
-        ("claude", args)
-    }
-}
-
-/// Effort levels for the effort dropdown. xhigh and max are only supported
-/// by some models; claude reports it visibly if the combination is invalid.
+/// Effort levels for the effort dropdown.
 const AGENT_EFFORTS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
+
+/// The modes shift+tab cycles a Claude session through: the base modes
+/// (default, acceptEdits, plan) then the optional ones, bypass before auto.
+/// Sessions launch with --dangerously-skip-permissions, so the chip starts on
+/// "Bypass". The label is a best-effort mirror: pressing shift+tab inside the
+/// terminal directly can desync it.
+const CLAUDE_AGENT_MODES: &[&str] = &["Default", "Auto-accept", "Plan", "Bypass", "Auto"];
+const INITIAL_CLAUDE_MODE_INDEX: usize = 3;
+
+/// The modes shift+tab cycles a Codex session through. Codex's shift+tab only
+/// toggles the collaboration mode (plan vs default); its permission presets
+/// are set separately via /permissions and aren't part of this cycle.
+const CODEX_AGENT_MODES: &[&str] = &["Default", "Plan"];
+const INITIAL_CODEX_MODE_INDEX: usize = 0;
+
+/// Which agent provider a terminal session is running.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AgentProvider {
+    Claude,
+    Codex,
+}
 
 /// The ACP agents a workspace chat can run.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -155,8 +147,17 @@ pub(crate) struct ChatSession {
     _subscriptions: Vec<Subscription>,
 }
 
+pub(crate) struct TerminalSession {
+    view: Entity<TerminalView>,
+    /// The agent running in this terminal; None for plain shells.
+    provider: Option<AgentProvider>,
+    /// The persistent tmux session backing this terminal, if any.
+    session_name: Option<String>,
+    _subscription: Subscription,
+}
+
 pub(crate) enum SessionKind {
-    Terminal(Entity<TerminalView>),
+    Terminal(TerminalSession),
     Chat(ChatSession),
 }
 
@@ -168,7 +169,14 @@ pub(crate) struct WorkspaceSession {
 impl WorkspaceSession {
     fn terminal(&self) -> Option<&Entity<TerminalView>> {
         match &self.kind {
-            SessionKind::Terminal(view) => Some(view),
+            SessionKind::Terminal(terminal) => Some(&terminal.view),
+            SessionKind::Chat(_) => None,
+        }
+    }
+
+    fn provider(&self) -> Option<AgentProvider> {
+        match &self.kind {
+            SessionKind::Terminal(terminal) => terminal.provider,
             SessionKind::Chat(_) => None,
         }
     }
@@ -189,7 +197,7 @@ impl WorkspaceSession {
 
     fn focus_handle(&self, cx: &App) -> FocusHandle {
         match &self.kind {
-            SessionKind::Terminal(view) => view.focus_handle(cx),
+            SessionKind::Terminal(terminal) => terminal.view.focus_handle(cx),
             SessionKind::Chat(chat) => chat.view.focus_handle(cx),
         }
     }
@@ -218,7 +226,7 @@ pub(crate) enum SessionSummary {
         is_review: bool,
         failed: bool,
     },
-    Terminal { title: String },
+    Terminal { is_agent: bool },
 }
 
 /// Where a dispatched instruction came from. Composer text is typed while
@@ -275,9 +283,7 @@ pub(crate) fn pick_dispatch_target(
         )
     };
     let is_agent_terminal = |session: &SessionSummary| match session {
-        SessionSummary::Terminal { title } => {
-            title.starts_with("claude") || title.starts_with("codex")
-        }
+        SessionSummary::Terminal { is_agent } => *is_agent,
         SessionSummary::Chat { .. } => false,
     };
 
@@ -341,9 +347,13 @@ pub struct WorkspaceView {
     connection_store: Option<Entity<AgentConnectionStore>>,
     composer: Entity<Editor>,
     composer_height: Pixels,
-    agent_model: String,
+    claude_model: String,
+    codex_model: String,
     agent_effort: String,
-    agent_bypass: bool,
+    claude_mode_index: usize,
+    codex_mode_index: usize,
+    review_provider: AgentProvider,
+    pending_image_paths: Vec<String>,
     last_agent_activity: Option<Instant>,
     idle_check_scheduled: bool,
     auto_fix_enabled: bool,
@@ -351,20 +361,18 @@ pub struct WorkspaceView {
     last_auto_fix_at: Option<Instant>,
     auto_fix_state: SharedString,
     auto_fix_task: Option<gpui::Task<()>>,
-    _terminal_subscriptions: Vec<Subscription>,
     focus_handle: FocusHandle,
 }
 
 impl WorkspaceView {
     /// Starts the workspace's primary agent terminal, attached to its
     /// persistent tmux session.
-    fn spawn_agent_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let model = self.claude_model();
-        self.spawn_session_terminal("main", "claude", model, None, window, cx);
+    fn spawn_primary_agent(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.spawn_agent_terminal("main", "agent", AgentProvider::Claude, None, window, cx);
     }
 
-    /// Opens an additional claude session in this workspace, with its own
-    /// persistent tmux session.
+    /// Opens an additional Claude agent session in this workspace, with its
+    /// own persistent tmux session.
     fn add_claude_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let claude_count = self
             .terminal_titles()
@@ -372,37 +380,24 @@ impl WorkspaceView {
             .count();
         let session = format!("claude-{}", claude_count + 1);
         let title = format!("claude {}", claude_count + 1);
-        let model = self.claude_model();
-        self.spawn_session_terminal(&session, &title, model, None, window, cx);
+        self.spawn_agent_terminal(&session, &title, AgentProvider::Claude, None, window, cx);
     }
 
-    /// Opens an additional GPT session in this workspace, with its own
-    /// persistent tmux session.
-    fn add_gpt_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// Opens a Codex agent session in this workspace, with its own persistent
+    /// tmux session.
+    fn add_codex_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let codex_count = self
             .terminal_titles()
             .filter(|title| title.starts_with("codex"))
             .count();
         let session = format!("codex-{}", codex_count + 1);
         let title = format!("codex {}", codex_count + 1);
-        let model = if is_gpt_model(&self.agent_model) {
-            self.agent_model.clone()
-        } else {
-            DEFAULT_GPT_MODEL.to_string()
-        };
-        self.spawn_session_terminal(&session, &title, model, None, window, cx);
+        self.spawn_agent_terminal(&session, &title, AgentProvider::Codex, None, window, cx);
     }
 
-    fn claude_model(&self) -> String {
-        if is_gpt_model(&self.agent_model) {
-            DEFAULT_CLAUDE_MODEL.to_string()
-        } else {
-            self.agent_model.clone()
-        }
-    }
-
-    /// Opens (or refocuses) the review session: a separate claude on Sonnet
-    /// that is asked to review the workspace's diff.
+    /// Opens (or refocuses) the review session: a separate agent that reviews
+    /// the workspace's diff, run by the workspace's review provider. In
+    /// chat-first workspaces it is a dedicated Review chat.
     pub(crate) fn start_review(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let existing_review = self.sessions.iter().position(|session| {
             session.chat().is_some_and(|chat| chat.is_review)
@@ -413,22 +408,40 @@ impl WorkspaceView {
             return;
         }
 
-        let prompt = "Review the changes in this worktree. Run `git status` and diff against \
-                      the base branch (try `git diff origin/main...HEAD`, falling back to the \
-                      repo's default branch). Assess correctness, security, performance, and \
-                      style. Give a structured review: blocking issues first, then suggestions, \
-                      then what looks good. Do not make code changes unless asked."
+        let prompt = "You are a code reviewer. Review all changes in this worktree thoroughly.\n\n\
+                      Steps:\n\
+                      1. Run `git status` to see what files have changed.\n\
+                      2. Run `git diff origin/main...HEAD` (fall back to the repo's default branch \
+                         if main doesn't exist) to get the full diff.\n\
+                      3. Read the changed files in full where the diff alone is insufficient to \
+                         understand context.\n\n\
+                      Produce a structured review covering:\n\
+                      - **Blocking issues**: bugs, logic errors, data loss risks, race conditions, \
+                        or anything that would break in production.\n\
+                      - **Security**: injection risks, auth gaps, secrets exposure, unsafe input \
+                        handling.\n\
+                      - **Performance**: N+1 queries, unnecessary allocations, missing indexes, \
+                        expensive operations in hot paths.\n\
+                      - **Error handling**: swallowed errors, missing propagation, unhelpful error \
+                        messages.\n\
+                      - **Suggestions**: style, naming, simplification, missing tests, dead code.\n\
+                      - **What looks good**: call out solid patterns and good decisions.\n\n\
+                      Be direct and specific — reference file paths and line ranges. \
+                      Do not make code changes unless explicitly asked."
             .to_string();
-
         let chat_first = self
             .sessions
             .iter()
             .any(|session| session.chat().is_some());
         if chat_first {
+            let agent = match self.review_provider {
+                AgentProvider::Claude => ChatAgent::Claude,
+                AgentProvider::Codex => ChatAgent::Codex,
+            };
             let record = ChatSessionRecord {
                 id: uuid::Uuid::new_v4().to_string(),
                 workspace_id: self.workspace_id.clone(),
-                agent: ChatAgent::Claude.agent_id().to_string(),
+                agent: agent.agent_id().to_string(),
                 title: "Review".to_string(),
                 acp_session_id: None,
                 is_review: true,
@@ -443,24 +456,18 @@ impl WorkspaceView {
             return;
         }
 
-        self.spawn_session_terminal(
-            "review",
-            "review",
-            "claude-sonnet-5-5".to_string(),
-            Some(prompt),
-            window,
-            cx,
-        );
+        let provider = self.review_provider;
+        self.spawn_agent_terminal("review", "review", provider, Some(prompt), window, cx);
     }
 
-    /// Starts an agent terminal attached to the given persistent tmux
-    /// session of this workspace, optionally typing an initial prompt into
-    /// it once it has had a moment to boot.
-    fn spawn_session_terminal(
+    /// Starts an agent terminal (Claude or Codex) attached to the given
+    /// persistent tmux session of this workspace, optionally typing an
+    /// initial prompt into it once it has had a moment to boot.
+    fn spawn_agent_terminal(
         &mut self,
         session: &str,
         title: &str,
-        model: String,
+        provider: AgentProvider,
         initial_prompt: Option<String>,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -471,8 +478,6 @@ impl WorkspaceView {
         let project = self.project.clone();
         let session = session.to_string();
         let title = title.to_string();
-        let effort = self.agent_effort.clone();
-        let bypass = self.agent_bypass;
 
         cx.spawn_in(window, async move |this, cx| {
             // Command resolution may shell out to tmux; keep it off the UI thread.
@@ -482,16 +487,29 @@ impl WorkspaceView {
                     let session = session.clone();
                     let cwd = cwd.clone();
                     async move {
-                        let (agent_command, agent_args) = agent_launch(model, effort, bypass);
+                        let agent_binary = match provider {
+                            AgentProvider::Claude => "claude".to_string(),
+                            AgentProvider::Codex => "codex".to_string(),
+                        };
+
+                        // Sessions always launch with full bypass; the Mode
+                        // chip switches the running session live via shift+tab.
+                        let mut agent_args = Vec::new();
+                        if agent_binary == "codex" {
+                            agent_args
+                                .push("--dangerously-bypass-approvals-and-sandbox".to_string());
+                        } else {
+                            agent_args.push("--dangerously-skip-permissions".to_string());
+                        }
                         match &cwd {
                             Some(dir) => terminal_service::embedded_workspace_terminal_command(
                                 &workspace_id,
                                 &session,
                                 dir,
-                                agent_command,
+                                &agent_binary,
                                 &agent_args,
                             ),
-                            None => (agent_command.to_string(), agent_args),
+                            None => (agent_binary, agent_args),
                         }
                     }
                 })
@@ -526,8 +544,16 @@ impl WorkspaceView {
             match terminal {
                 Ok(terminal) => {
                     let terminal_for_prompt = terminal.clone();
+                    let session_for_close = session.clone();
                     this.update_in(cx, |this, window, cx| {
-                        this.push_terminal(&title, terminal, window, cx);
+                        this.push_terminal(
+                            &title,
+                            Some(session_for_close),
+                            Some(provider),
+                            terminal,
+                            window,
+                            cx,
+                        );
                     })
                     .ok();
 
@@ -568,7 +594,7 @@ impl WorkspaceView {
             match terminal {
                 Ok(terminal) => {
                     this.update_in(cx, |this, window, cx| {
-                        this.push_terminal(&title, terminal, window, cx);
+                        this.push_terminal(&title, None, None, terminal, window, cx);
                     })
                     .ok();
                 }
@@ -578,26 +604,63 @@ impl WorkspaceView {
         .detach();
     }
 
+    /// Closes a terminal tab and kills its tmux session so it doesn't
+    /// linger.
+    fn close_terminal(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(SessionKind::Terminal(terminal)) = self.sessions.get(index).map(|s| &s.kind)
+        else {
+            return;
+        };
+        if let Some(session_name) = terminal.session_name.clone() {
+            let workspace_id = self.workspace_id.clone();
+            cx.background_spawn(async move {
+                if let Err(err) =
+                    terminal_service::kill_embedded_workspace_terminal(&workspace_id, &session_name)
+                {
+                    log::warn!("Failed to kill tmux session: {err}");
+                }
+            })
+            .detach();
+        }
+        self.sessions.remove(index);
+        self.after_session_removed(index, window, cx);
+    }
+
+    /// Keeps the same tab active after a tab is removed, when possible.
+    fn after_session_removed(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if self.sessions.is_empty() {
+            self.active_session = 0;
+            cx.notify();
+            return;
+        }
+        if index < self.active_session {
+            self.active_session -= 1;
+        }
+        let next = self.active_session.min(self.sessions.len() - 1);
+        self.activate_session(next, window, cx);
+    }
+
     fn push_terminal(
         &mut self,
         title: &str,
+        session_name: Option<String>,
+        provider: Option<AgentProvider>,
         terminal: Entity<Terminal>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        // The first terminal is the agent's; track its output to derive the
-        // running/waiting status chip.
-        if self.first_terminal().is_none() {
-            let subscription = cx.subscribe(&terminal, |this, _terminal, event, cx| {
-                if matches!(event, terminal::Event::Wakeup) {
+        // Agent terminals' output drives the running/waiting status chip.
+        let is_agent = provider.is_some();
+        let subscription = cx.subscribe(&terminal, move |this, _terminal, event, cx| {
+            if matches!(event, terminal::Event::Wakeup) {
+                if is_agent {
                     this.last_agent_activity = Some(Instant::now());
                     mnemonic_bridge::record_agent_activity(&this.workspace_id);
                     this.schedule_idle_check(cx);
-                    cx.notify();
                 }
-            });
-            self._terminal_subscriptions.push(subscription);
-        }
+                cx.notify();
+            }
+        });
 
         let view = cx.new(|cx| {
             TerminalView::new(
@@ -611,7 +674,12 @@ impl WorkspaceView {
         });
         self.sessions.push(WorkspaceSession {
             title: SharedString::from(title.to_string()),
-            kind: SessionKind::Terminal(view),
+            kind: SessionKind::Terminal(TerminalSession {
+                view,
+                provider,
+                session_name,
+                _subscription: subscription,
+            }),
         });
         self.activate_session(self.sessions.len() - 1, window, cx);
     }
@@ -959,8 +1027,8 @@ impl WorkspaceView {
                     is_review: chat.is_review,
                     failed: chat.view.read(cx).has_load_error(),
                 },
-                SessionKind::Terminal(_) => SessionSummary::Terminal {
-                    title: session.title.to_string(),
+                SessionKind::Terminal(terminal) => SessionSummary::Terminal {
+                    is_agent: terminal.provider.is_some(),
                 },
             })
             .collect()
@@ -999,13 +1067,7 @@ impl WorkspaceView {
             log::error!("Failed to delete chat session: {err}");
         }
 
-        if self.sessions.is_empty() {
-            self.active_session = 0;
-            cx.notify();
-        } else {
-            let next = self.active_session.min(self.sessions.len() - 1);
-            self.activate_session(next, window, cx);
-        }
+        self.after_session_removed(index, window, cx);
     }
 
     /// Closes the agent connections of every chat in this workspace.
@@ -1056,9 +1118,18 @@ impl WorkspaceView {
     /// Sends the composer contents to the agent terminal (the first tab),
     /// using Forge's text-then-Enter dispatch so the TUI submits it.
     fn send_now(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let text = self.composer.read(cx).text(cx);
+        let mut text = self.composer.read(cx).text(cx);
         if text.trim().is_empty() {
             return;
+        }
+        // Restore actual image paths in place of [image] placeholders.
+        let pending_paths: Vec<String> = self.pending_image_paths.drain(..).collect();
+        for path in pending_paths {
+            if let Some(position) = text.find("[image]") {
+                text.replace_range(position..position + "[image]".len(), &path);
+            } else {
+                text = format!("{path} {text}");
+            }
         }
         self.dispatch_from(DispatchOrigin::Composer, text, cx);
         self.composer.update(cx, |composer, cx| composer.clear(window, cx));
@@ -1068,16 +1139,55 @@ impl WorkspaceView {
         pick_dispatch_target(origin, &self.session_summaries(cx), self.active_session)
     }
 
-    /// Whether composer input currently goes to a claude session. Only claude
-    /// takes the /model and /effort commands used for live switching.
-    fn dispatch_target_is_claude(&self, cx: &App) -> bool {
+    /// The terminal that composer input targets: the agent CLI being viewed,
+    /// otherwise the first agent CLI.
+    fn agent_terminal(&self, cx: &App) -> Option<Entity<Terminal>> {
         match self.dispatch_target(DispatchOrigin::Composer, cx) {
             Some(DispatchTarget::Terminal(index)) => self
                 .sessions
                 .get(index)
-                .is_some_and(|session| session.title.starts_with("claude")),
-            Some(DispatchTarget::Chat(_)) | None => false,
+                .and_then(WorkspaceSession::terminal)
+                .map(|view| view.read(cx).terminal().clone()),
+            Some(DispatchTarget::Chat(_)) | None => None,
         }
+    }
+
+    /// Cycles the focused agent's permission mode by sending shift+tab (the
+    /// CSI Z back-tab sequence) to its terminal, exactly as pressing
+    /// shift+tab in the TUI would. The local label is advanced to mirror it.
+    fn cycle_agent_mode(&mut self, cx: &mut Context<Self>) {
+        let Some(terminal) = self.agent_terminal(cx) else {
+            return;
+        };
+        terminal.update(cx, |terminal, _| {
+            terminal.input(b"\x1b[Z".to_vec());
+        });
+        match self.active_provider() {
+            AgentProvider::Claude => {
+                self.claude_mode_index = (self.claude_mode_index + 1) % CLAUDE_AGENT_MODES.len();
+            }
+            AgentProvider::Codex => {
+                self.codex_mode_index = (self.codex_mode_index + 1) % CODEX_AGENT_MODES.len();
+            }
+        }
+        cx.notify();
+    }
+
+    fn cycle_agent_mode_action(
+        &mut self,
+        _: &CycleAgentMode,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.cycle_agent_mode(cx);
+    }
+
+    fn agent_mode_label(&self) -> &'static str {
+        let (modes, index) = match self.active_provider() {
+            AgentProvider::Claude => (CLAUDE_AGENT_MODES, self.claude_mode_index),
+            AgentProvider::Codex => (CODEX_AGENT_MODES, self.codex_mode_index),
+        };
+        modes.get(index).copied().unwrap_or("Default")
     }
 
     /// Writes an instruction into the agent terminal: text first, then the
@@ -1302,33 +1412,45 @@ impl WorkspaceView {
         }
     }
 
-    /// Applies a model choice: live-switches the focused claude session via
-    /// /model when it's a Claude model, and becomes the launch flag for new
-    /// sessions.
+    /// Returns the agent provider of the active tab, defaulting to Claude for
+    /// plain shells, chats, or when no tabs exist yet.
+    fn active_provider(&self) -> AgentProvider {
+        self.sessions
+            .get(self.active_session)
+            .and_then(WorkspaceSession::provider)
+            .unwrap_or(AgentProvider::Claude)
+    }
+
+    /// Applies a model choice: live-switches the focused agent session via
+    /// /model, and becomes the model for new sessions of that provider.
     fn set_model(&mut self, model: &str, cx: &mut Context<Self>) {
-        self.agent_model = model.to_string();
-        if !is_gpt_model(model) && self.dispatch_target_is_claude(cx) {
-            self.dispatch_from(DispatchOrigin::Composer, format!("/model {model}"), cx);
+        if CLAUDE_MODELS.iter().any(|(id, _)| *id == model) {
+            self.claude_model = model.to_string();
+        } else if CODEX_MODELS.iter().any(|(id, _)| *id == model) {
+            self.codex_model = model.to_string();
         }
+        self.dispatch_from(DispatchOrigin::Composer, format!("/model {model}"), cx);
         cx.notify();
     }
 
     fn model_label(&self) -> String {
+        let current_model = match self.active_provider() {
+            AgentProvider::Claude => &self.claude_model,
+            AgentProvider::Codex => &self.codex_model,
+        };
         CLAUDE_MODELS
             .iter()
-            .chain(GPT_MODELS)
-            .find(|(model, _)| *model == self.agent_model)
+            .chain(CODEX_MODELS.iter())
+            .find(|(model, _)| *model == current_model.as_str())
             .map(|(_, label)| label.to_string())
-            .unwrap_or_else(|| self.agent_model.clone())
+            .unwrap_or_else(|| current_model.clone())
     }
 
-    /// Applies an effort choice: live-switches a focused claude session via
-    /// /effort, and becomes the launch flag for new sessions.
+    /// Applies an effort choice: live-switches the focused agent via
+    /// /effort, and becomes the effort for new sessions.
     fn set_effort(&mut self, effort: &str, cx: &mut Context<Self>) {
         self.agent_effort = effort.to_string();
-        if self.dispatch_target_is_claude(cx) {
-            self.dispatch_from(DispatchOrigin::Composer, format!("/effort {effort}"), cx);
-        }
+        self.dispatch_from(DispatchOrigin::Composer, format!("/effort {effort}"), cx);
         cx.notify();
     }
 
@@ -1436,7 +1558,7 @@ impl WorkspaceView {
                             .label_size(LabelSize::Small)
                             .on_click(cx.listener(move |this, _, window, cx| match agent {
                                 ChatAgent::Claude => this.add_claude_terminal(window, cx),
-                                ChatAgent::Codex => this.add_gpt_terminal(window, cx),
+                                ChatAgent::Codex => this.add_codex_terminal(window, cx),
                             })),
                         ),
                 )
@@ -1493,8 +1615,9 @@ impl WorkspaceView {
             image.bytes(),
         ) {
             Ok(relative_path) => {
+                self.pending_image_paths.push(relative_path);
                 self.composer.update(cx, |composer, cx| {
-                    composer.insert(&format!("{relative_path} "), window, cx);
+                    composer.insert("[image] ", window, cx);
                 });
             }
             Err(err) => log::error!("Failed to save pasted image: {err}"),
@@ -1505,6 +1628,7 @@ impl WorkspaceView {
         v_flex()
             .key_context("MnemonicComposer")
             .on_action(cx.listener(Self::send_to_agent))
+            .on_action(cx.listener(Self::cycle_agent_mode_action))
             .capture_action(cx.listener(Self::handle_composer_paste))
             .border_t_1()
             .border_color(cx.theme().colors().border)
@@ -1518,26 +1642,26 @@ impl WorkspaceView {
                     .items_center()
                     .child(
                         Button::new(
-                            "composer-bypass",
-                            if self.agent_bypass { "Bypass: on" } else { "Bypass: off" },
+                            "composer-mode",
+                            format!("Mode: {}", self.agent_mode_label()),
                         )
-                        .style(if self.agent_bypass {
-                            ButtonStyle::Tinted(TintColor::Warning)
-                        } else {
-                            ButtonStyle::Subtle
-                        })
+                        .style(ButtonStyle::Subtle)
                         .label_size(LabelSize::XSmall)
                         .tooltip(Tooltip::text(
-                            "Whether NEW sessions skip permission prompts \
-                             (running sessions: shift+tab in the terminal)",
+                            "Cycle the focused agent's mode: sends shift+tab, \
+                             the same as pressing shift+tab in the terminal",
                         ))
                         .on_click(cx.listener(|this, _, _, cx| {
-                            this.agent_bypass = !this.agent_bypass;
-                            cx.notify();
+                            this.cycle_agent_mode(cx);
                         })),
                     )
                     .child({
                         let this = cx.weak_entity();
+                        let models: &[(&str, &str)] = match self.active_provider() {
+                            AgentProvider::Claude => CLAUDE_MODELS,
+                            AgentProvider::Codex => CODEX_MODELS,
+                        };
+                        let models = models.to_vec();
                         PopoverMenu::new("composer-model-menu")
                             .anchor(Anchor::BottomLeft)
                             .trigger(
@@ -1547,28 +1671,23 @@ impl WorkspaceView {
                                 )
                                 .label_size(LabelSize::XSmall)
                                 .tooltip(Tooltip::text(
-                                    "Model for new sessions; Claude models also switch the \
-                                     focused claude live",
+                                    "Model for the focused agent (switches it live) and \
+                                     for new sessions",
                                 )),
                             )
                             .menu(move |window, cx| {
                                 let this = this.clone();
+                                let models = models.clone();
                                 Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
-                                    for (index, models) in
-                                        [CLAUDE_MODELS, GPT_MODELS].into_iter().enumerate()
-                                    {
-                                        if index > 0 {
-                                            menu = menu.separator();
-                                        }
-                                        for (model, label) in models {
-                                            let this = this.clone();
-                                            menu = menu.entry(*label, None, move |_, cx| {
-                                                this.update(cx, |this, cx| {
-                                                    this.set_model(model, cx);
-                                                })
-                                                .ok();
-                                            });
-                                        }
+                                    for (model, label) in &models {
+                                        let this = this.clone();
+                                        let model = *model;
+                                        menu = menu.entry(*label, None, move |_, cx| {
+                                            this.update(cx, |this, cx| {
+                                                this.set_model(model, cx);
+                                            })
+                                            .ok();
+                                        });
                                     }
                                     menu
                                 }))
@@ -1585,7 +1704,7 @@ impl WorkspaceView {
                                 )
                                 .label_size(LabelSize::XSmall)
                                 .tooltip(Tooltip::text(
-                                    "Effort for the focused claude (switches it live) and \
+                                    "Effort for the focused agent (switches it live) and \
                                      for new sessions",
                                 )),
                             )
@@ -1688,17 +1807,20 @@ impl WorkspaceView {
                     } else {
                         Color::Muted
                     }))
-                    .when(is_chat, |el| {
-                        el.child(
-                            IconButton::new(("workspace-close-chat", index), IconName::Close)
-                                .icon_size(IconSize::XSmall)
-                                .tooltip(Tooltip::text("Close chat"))
-                                .on_click(cx.listener(move |this, _, window, cx| {
-                                    cx.stop_propagation();
+                    .child(
+                        IconButton::new(("workspace-close-session", index), IconName::Close)
+                            .icon_size(IconSize::XSmall)
+                            .icon_color(Color::Muted)
+                            .tooltip(Tooltip::text(if is_chat { "Close chat" } else { "Close this terminal" }))
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                cx.stop_propagation();
+                                if is_chat {
                                     this.close_chat(index, window, cx);
-                                })),
-                        )
-                    }),
+                                } else {
+                                    this.close_terminal(index, window, cx);
+                                }
+                            })),
+                    ),
             );
         }
 
@@ -1760,7 +1882,7 @@ impl WorkspaceView {
                                         NewSession::ClaudeCli => {
                                             this.add_claude_terminal(window, cx)
                                         }
-                                        NewSession::CodexCli => this.add_gpt_terminal(window, cx),
+                                        NewSession::CodexCli => this.add_codex_terminal(window, cx),
                                         NewSession::Shell => this.add_shell_terminal(window, cx),
                                     })
                                     .ok();
@@ -1785,7 +1907,7 @@ impl Render for WorkspaceView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let active_content = self.sessions.get(self.active_session).map(|session| {
             match &session.kind {
-                SessionKind::Terminal(view) => view.clone().into_any_element(),
+                SessionKind::Terminal(terminal) => terminal.view.clone().into_any_element(),
                 SessionKind::Chat(chat) => self.render_chat(chat, cx).into_any_element(),
             }
         });
@@ -1925,9 +2047,13 @@ impl WorkspaceHost {
                 connection_store: None,
                 composer,
                 composer_height: px(110.),
-                agent_model: DEFAULT_CLAUDE_MODEL.to_string(),
+                claude_model: "claude-opus-5-5".to_string(),
+                codex_model: "gpt-6.1-sol".to_string(),
                 agent_effort: "high".to_string(),
-                agent_bypass: true,
+                claude_mode_index: INITIAL_CLAUDE_MODE_INDEX,
+                codex_mode_index: INITIAL_CODEX_MODE_INDEX,
+                review_provider: AgentProvider::Codex,
+                pending_image_paths: Vec::new(),
                 last_agent_activity: None,
                 idle_check_scheduled: false,
                 auto_fix_enabled: false,
@@ -1935,7 +2061,6 @@ impl WorkspaceHost {
                 last_auto_fix_at: None,
                 auto_fix_state: SharedString::default(),
                 auto_fix_task: None,
-                _terminal_subscriptions: Vec::new(),
                 focus_handle: cx.focus_handle(),
             });
             let state = mnemonic_bridge::mnemonic_state(cx);
@@ -1953,7 +2078,7 @@ impl WorkspaceHost {
                     view.open_chat(record, None, window, cx);
                 }
                 if start_main_cli {
-                    view.spawn_agent_terminal(window, cx);
+                    view.spawn_primary_agent(window, cx);
                 } else {
                     view.activate_session(0, window, cx);
                 }
@@ -2025,6 +2150,34 @@ impl WorkspaceHost {
             }
         }
         false
+    }
+
+    /// Sets the review provider for a workspace view.
+    pub fn set_review_provider_for_workspace(
+        workspace: &mut Workspace,
+        workspace_id: &str,
+        provider: &str,
+        cx: &mut Context<Workspace>,
+    ) {
+        let target = match provider {
+            "claude" => AgentProvider::Claude,
+            _ => AgentProvider::Codex,
+        };
+        for pane in workspace.panes().to_vec() {
+            let host = pane
+                .read(cx)
+                .items()
+                .find_map(|item| item.downcast::<WorkspaceHost>());
+            if let Some(host) = host {
+                if let Some(view) = host.read(cx).views.get(workspace_id).cloned() {
+                    view.update(cx, |view, cx| {
+                        view.review_provider = target;
+                        cx.notify();
+                    });
+                }
+                return;
+            }
+        }
     }
 
     /// Turns on the CI auto-fix loop for the given workspace, if its view
@@ -2138,7 +2291,7 @@ mod tests {
 
     fn terminal(title: &str) -> SessionSummary {
         SessionSummary::Terminal {
-            title: title.to_string(),
+            is_agent: title.starts_with("claude") || title.starts_with("codex"),
         }
     }
 
@@ -2231,19 +2384,4 @@ mod tests {
         assert_eq!(pending.take_next(), None);
     }
 
-    #[test]
-    fn gpt_models_launch_codex_with_codex_flags() {
-        let (command, args) = agent_launch(DEFAULT_GPT_MODEL.to_string(), "high".to_string(), true);
-        assert_eq!(command, "codex");
-        assert_eq!(
-            args,
-            [
-                "--dangerously-bypass-approvals-and-sandbox",
-                "--model",
-                "gpt-6.1-sol",
-                "-c",
-                "model_reasoning_effort=high",
-            ]
-        );
-    }
 }

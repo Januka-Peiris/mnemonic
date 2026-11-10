@@ -256,7 +256,7 @@ fn wait_for_session_ready(
         if last_output != 0 && now.saturating_sub(last_output) >= READY_IDLE_MILLIS {
             let tail = recent_output_tail(state, &session.id);
             if !trust_answered && looks_like_trust_dialog(&tail) {
-                // Forge created this worktree from the user's own repository at
+                // Mnemonic created this worktree from the user's own repository at
                 // their request, so accepting the folder-trust prompt is safe.
                 write_to_terminal(active, b"1\r")?;
                 append_log_line(

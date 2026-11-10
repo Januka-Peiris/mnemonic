@@ -123,7 +123,7 @@ pub fn run_workspace_hooks(
 
                 if blocking && !output.status.success() {
                     return Err(format!(
-                        "Pre-hook `{label}` failed (exit {exit_code}). Fix the hook or remove it from .forge/config.json hooks.{hook_kind}."
+                        "Pre-hook `{label}` failed (exit {exit_code}). Fix the hook or remove it from .mnemonic/config.json hooks.{hook_kind}."
                     ));
                 }
             }
@@ -190,7 +190,7 @@ pub fn get_workspace_hook_inspector(
 }
 
 fn collect_hook_commands(
-    hooks: &crate::models::ForgeWorkspaceHooks,
+    hooks: &crate::models::MnemonicWorkspaceHooks,
 ) -> Vec<(String, String, String, String, String)> {
     let groups = [
         ("run", "pre", hooks.pre_run.clone()),

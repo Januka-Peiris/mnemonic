@@ -23,7 +23,7 @@ pub struct DefaultRef {
 /// Check whether the cached map is up-to-date.
 pub fn is_stale(root: &Path, _db: &Database) -> bool {
     let meta_path = root
-        .join(".forge")
+        .join(".mnemonic")
         .join("context")
         .join("repo_map.meta.json");
     let Ok(raw) = fs::read_to_string(&meta_path) else {
@@ -48,7 +48,7 @@ pub fn build_repo_map(
     force: bool,
     db: &Database,
 ) -> Result<(RepoMapV2, RepoMapMetaV2), String> {
-    let context_dir = root.join(".forge").join("context");
+    let context_dir = root.join(".mnemonic").join("context");
     let map_path = context_dir.join("repo_map.json");
     let meta_path = context_dir.join("repo_map.meta.json");
 
@@ -229,7 +229,7 @@ fn run_build_pipeline(
         generated_at: unix_now(),
         generator: GeneratorInfo {
             engine: engine_name.to_string(),
-            forge_version: "0.1.0".to_string(),
+            mnemonic_version: "0.1.0".to_string(),
         },
         exclusions: vec![
             "node_modules/**".into(),

@@ -196,8 +196,8 @@ fn should_skip(path: &Path) -> bool {
     matches!(
         name,
         ".git"
-            | ".forge"
-            | ".forge-worktrees"
+            | ".mnemonic"
+            | ".mnemonic-worktrees"
             | "node_modules"
             | "target"
             | "dist"

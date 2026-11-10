@@ -72,7 +72,7 @@ pub fn create_mnemonic_worktree(
         )?;
     }
 
-    ensure_forge_gitignored(repo_path);
+    ensure_mnemonic_gitignored(repo_path);
 
     Ok(CreatedWorktree {
         path: worktree_path.to_string_lossy().to_string(),
@@ -81,27 +81,27 @@ pub fn create_mnemonic_worktree(
 }
 
 /// Public entry point for callers outside this module (e.g. external worktree workspaces).
-pub fn ensure_forge_gitignored_at(repo_path: &Path) {
-    ensure_forge_gitignored(repo_path);
+pub fn ensure_mnemonic_gitignored_at(repo_path: &Path) {
+    ensure_mnemonic_gitignored(repo_path);
 }
 
-/// Ensures `.forge/` is listed in the repository root `.gitignore` so
+/// Ensures `.mnemonic/` is listed in the repository root `.gitignore` so
 /// Mnemonic's per-repo config directory never shows up as untracked.
 /// Silently does nothing if already present or if the file cannot be written.
-fn ensure_forge_gitignored(repo_path: &Path) {
+fn ensure_mnemonic_gitignored(repo_path: &Path) {
     let gitignore = repo_path.join(".gitignore");
     let content = fs::read_to_string(&gitignore).unwrap_or_default();
     let already_ignored = content.lines().any(|line| {
         let trimmed = line.trim();
-        trimmed == ".forge/" || trimmed == ".forge" || trimmed == "/.forge/" || trimmed == "/.forge"
+        trimmed == ".mnemonic/" || trimmed == ".mnemonic" || trimmed == "/.mnemonic/" || trimmed == "/.mnemonic"
     });
     if already_ignored {
         return;
     }
     let entry = if content.ends_with('\n') || content.is_empty() {
-        ".forge/\n".to_string()
+        ".mnemonic/\n".to_string()
     } else {
-        "\n.forge/\n".to_string()
+        "\n.mnemonic/\n".to_string()
     };
     let _ = fs::OpenOptions::new()
         .create(true)

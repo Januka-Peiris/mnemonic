@@ -30,7 +30,7 @@ pub fn list_workspace_checkpoints(
     workspace_id: &str,
 ) -> Result<Vec<WorkspaceCheckpoint>, String> {
     let root = workspace_root_path(state, workspace_id)?;
-    let pattern = format!("refs/forge/checkpoints/{workspace_id}");
+    let pattern = format!("refs/mnemonic/checkpoints/{workspace_id}");
     let output = git(
         &root,
         &[
@@ -285,7 +285,7 @@ pub fn create_checkpoint_if_dirty(
     }
 
     let suffix = unique_suffix();
-    let checkpoint_ref = format!("refs/forge/checkpoints/{workspace_id}/{suffix}");
+    let checkpoint_ref = format!("refs/mnemonic/checkpoints/{workspace_id}/{suffix}");
     let message = format!("mnemonic checkpoint: {reason}");
     let oid = git(&root, &["stash", "create", &message])?;
     let oid = oid.trim().to_string();
@@ -325,7 +325,7 @@ fn workspace_root_path(state: &AppState, workspace_id: &str) -> Result<PathBuf, 
 }
 
 fn validate_checkpoint_ref(workspace_id: &str, reference: &str) -> Result<(), String> {
-    let prefix = format!("refs/forge/checkpoints/{workspace_id}/");
+    let prefix = format!("refs/mnemonic/checkpoints/{workspace_id}/");
     if !reference.starts_with(&prefix) {
         return Err("Checkpoint does not belong to this workspace".to_string());
     }
@@ -382,8 +382,8 @@ mod tests {
 
     #[test]
     fn validates_checkpoint_ref_ownership() {
-        assert!(validate_checkpoint_ref("ws-1", "refs/forge/checkpoints/ws-1/123").is_ok());
-        assert!(validate_checkpoint_ref("ws-1", "refs/forge/checkpoints/ws-2/123").is_err());
+        assert!(validate_checkpoint_ref("ws-1", "refs/mnemonic/checkpoints/ws-1/123").is_ok());
+        assert!(validate_checkpoint_ref("ws-1", "refs/mnemonic/checkpoints/ws-2/123").is_err());
         assert!(validate_checkpoint_ref("ws-1", "refs/heads/main").is_err());
     }
 }

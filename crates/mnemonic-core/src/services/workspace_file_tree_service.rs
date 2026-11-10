@@ -88,7 +88,7 @@ pub fn save_workspace_pasted_image(
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis().to_string())
         .unwrap_or_else(|_| "0".to_string());
-    let relative = format!(".forge/attachments/pasted-{suffix}.{extension}");
+    let relative = format!(".mnemonic/attachments/pasted-{suffix}.{extension}");
     let file_path = resolve_target_path(&root, &relative)?;
     let parent = file_path
         .parent()
@@ -126,7 +126,7 @@ pub fn save_workspace_attachment(
         .map(|duration| duration.as_millis().to_string())
         .unwrap_or_else(|_| "0".to_string());
     let safe_name = sanitize_attachment_filename(filename);
-    let relative = format!(".forge/attachments/{workspace_id}/{suffix}-{safe_name}");
+    let relative = format!(".mnemonic/attachments/{workspace_id}/{suffix}-{safe_name}");
     let file_path = resolve_target_path(&root, &relative)?;
     let parent = file_path
         .parent()
@@ -512,7 +512,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0);
-        let dir = std::env::temp_dir().join(format!("forge-file-tree-test-{stamp}"));
+        let dir = std::env::temp_dir().join(format!("mnemonic-file-tree-test-{stamp}"));
         fs::create_dir_all(&dir).expect("create temp dir");
         dir
     }

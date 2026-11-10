@@ -63,17 +63,17 @@ pub(super) fn create_workspace(
     let selected_worktree_path;
     let workspace_root_path;
     let worktree_path;
-    let worktree_managed_by_forge;
+    let worktree_managed_by_mnemonic;
     let workspace_source;
 
     if let Some(worktree) = &selected_worktree {
         selected_worktree_path = Some(worktree.path.clone());
         workspace_root_path = Some(worktree.path.clone());
         worktree_path = worktree.path.clone();
-        worktree_managed_by_forge = false;
+        worktree_managed_by_mnemonic = false;
         workspace_source = "external_worktree".to_string();
         if let Some(repo) = &selected_repo {
-            git_worktree_service::ensure_forge_gitignored_at(std::path::Path::new(&repo.path));
+            git_worktree_service::ensure_mnemonic_gitignored_at(std::path::Path::new(&repo.path));
         }
     } else if let Some(repo) = &selected_repo {
         let managed_workspaces_root = settings_repository::get_managed_workspaces_root(&state.db)?;
@@ -88,7 +88,7 @@ pub(super) fn create_workspace(
         selected_worktree_path = Some(created.path.clone());
         workspace_root_path = Some(created.path.clone());
         worktree_path = created.path;
-        worktree_managed_by_forge = true;
+        worktree_managed_by_mnemonic = true;
         workspace_source = "mnemonic_managed_worktree".to_string();
     } else {
         return Err(
@@ -96,7 +96,7 @@ pub(super) fn create_workspace(
         );
     }
 
-    if worktree_managed_by_forge {
+    if worktree_managed_by_mnemonic {
         if let Some(repository_id) = selected_repo.as_ref().map(|r| r.id.as_str()) {
             if let Ok(Some(init_files_raw)) = repository_settings_repository::get_value(
                 &state.db,
@@ -158,7 +158,7 @@ pub(super) fn create_workspace(
             last_updated: "just now".to_string(),
             pr_status: None,
             pr_number: None,
-            description: if worktree_managed_by_forge {
+            description: if worktree_managed_by_mnemonic {
                 "Branch workspace created with a Mnemonic-managed Git worktree.".to_string()
             } else if selected_worktree.is_some() {
                 "Branch workspace linked to an existing external Git worktree.".to_string()
@@ -191,7 +191,7 @@ pub(super) fn create_workspace(
                 .map(|worktree| worktree.id.clone()),
             selected_worktree_path: selected_worktree_path.clone(),
             workspace_root_path: workspace_root_path.clone(),
-            worktree_managed_by_forge,
+            worktree_managed_by_mnemonic,
             workspace_source: workspace_source.clone(),
             parent_workspace_id: input.parent_workspace_id.clone(),
             source_workspace_id: input.source_workspace_id.clone(),
@@ -207,7 +207,7 @@ pub(super) fn create_workspace(
     };
 
     if let Err(err) = workspace_repository::insert(&state.db, &detail) {
-        if detail.summary.worktree_managed_by_forge {
+        if detail.summary.worktree_managed_by_mnemonic {
             if let Some(repo_path) = detail.summary.repository_path.as_deref() {
                 let _ = git_worktree_service::remove_mnemonic_worktree(
                     repo_path,
@@ -238,11 +238,11 @@ pub(super) fn create_workspace(
         .map(|value| value == "true")
         .unwrap_or(false);
 
-    if detail.summary.worktree_managed_by_forge && auto_setup_enabled {
+    if detail.summary.worktree_managed_by_mnemonic && auto_setup_enabled {
         match workspace_script_service::run_workspace_setup(state, &detail.summary.id) {
             Ok(sessions) if !sessions.is_empty() => {
                 let details = format!(
-                    "Started {} setup command(s) from .forge/config.json",
+                    "Started {} setup command(s) from .mnemonic/config.json",
                     sessions.len()
                 );
                 let _ = activity_repository::record(
@@ -268,7 +268,7 @@ pub(super) fn create_workspace(
                 );
             }
         }
-    } else if detail.summary.worktree_managed_by_forge {
+    } else if detail.summary.worktree_managed_by_mnemonic {
         let _ = activity_repository::record(
             &state.db,
             &detail.summary.id,
@@ -282,7 +282,7 @@ pub(super) fn create_workspace(
         );
     }
 
-    if detail.summary.worktree_managed_by_forge {
+    if detail.summary.worktree_managed_by_mnemonic {
         if let Some(repository_id) = detail.summary.repository_id.as_deref() {
             if let Ok(Some(setup_script)) =
                 repository_settings_repository::get_value(&state.db, repository_id, "setup_script")
@@ -395,9 +395,9 @@ fn delete_workspace_impl(
         .ok_or_else(|| format!("Workspace {workspace_id} was not found"))?;
     log::info!(
         target: "mnemonic_lib",
-        "delete_workspace loaded: id={workspace_id} worktree_path={} forge_managed={}",
+        "delete_workspace loaded: id={workspace_id} worktree_path={} mnemonic_managed={}",
         detail.worktree_path,
-        detail.summary.worktree_managed_by_forge
+        detail.summary.worktree_managed_by_mnemonic
     );
 
     match terminal_service::stop_workspace_terminal_session(state, workspace_id) {
@@ -427,7 +427,7 @@ fn delete_workspace_impl(
         .to_string();
     let path_on_disk = Path::new(&path);
     let remove_managed_worktree =
-        remove_managed_worktree && detail.summary.worktree_managed_by_forge;
+        remove_managed_worktree && detail.summary.worktree_managed_by_mnemonic;
     let mut worktree_cleanup_warning: Option<String> = None;
 
     if let Err(err) = terminal_service::kill_embedded_workspace_session(workspace_id) {

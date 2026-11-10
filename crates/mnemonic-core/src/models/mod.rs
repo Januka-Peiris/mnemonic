@@ -69,7 +69,7 @@ pub use pr_draft::{WorkspacePrCheck, WorkspacePrDraft, WorkspacePrResult, Worksp
 pub use prompt_template::{PromptTemplate, WorkspacePromptTemplates};
 pub use repository::{DiscoveredRepository, DiscoveredWorktree, ScanRepositoriesResult};
 pub use repository_relationship::{
-    CreateRepositoryRelationshipInput, ForgeRepositoryRelationshipConfig,
+    CreateRepositoryRelationshipInput, MnemonicRepositoryRelationshipConfig,
     RelevantRepositoriesSuggestionResult, RepositoryRelationship, RepositoryRelationshipsResult,
     RepositoryScopeSuggestion, SuggestRelevantRepositoriesInput, UpdateRepositoryRelationshipInput,
 };
@@ -104,5 +104,5 @@ pub use workspace_health::{
 };
 pub use workspace_port::WorkspacePort;
 pub use workspace_readiness::WorkspaceReadiness;
-pub use workspace_script::{ForgeMcpServerConfig, ForgeWorkspaceConfig, ForgeWorkspaceHooks};
+pub use workspace_script::{MnemonicMcpServerConfig, MnemonicWorkspaceConfig, MnemonicWorkspaceHooks};
 pub use workspace_template::WorkspaceTemplate;

@@ -3,28 +3,28 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 
 use crate::models::agent_profile::RawAgentProfile;
-use crate::models::{AgentProfile, ForgeRepositoryRelationshipConfig};
+use crate::models::{AgentProfile, MnemonicRepositoryRelationshipConfig};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "camelCase")]
-pub struct ForgeWorkspaceConfig {
+pub struct MnemonicWorkspaceConfig {
     pub exists: bool,
     pub path: Option<String>,
     pub setup: Vec<String>,
     pub run: Vec<String>,
     pub teardown: Vec<String>,
-    pub hooks: ForgeWorkspaceHooks,
+    pub hooks: MnemonicWorkspaceHooks,
     pub agent_profiles: Vec<AgentProfile>,
-    pub mcp_servers: Vec<ForgeMcpServerConfig>,
+    pub mcp_servers: Vec<MnemonicMcpServerConfig>,
     pub mcp_warnings: Vec<String>,
-    pub repository_relationships: Vec<ForgeRepositoryRelationshipConfig>,
+    pub repository_relationships: Vec<MnemonicRepositoryRelationshipConfig>,
     pub repository_relationship_warnings: Vec<String>,
     pub warning: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "camelCase")]
-pub struct ForgeWorkspaceHooks {
+pub struct MnemonicWorkspaceHooks {
     pub pre_run: Vec<String>,
     pub post_run: Vec<String>,
     pub pre_tool: Vec<String>,
@@ -35,7 +35,7 @@ pub struct ForgeWorkspaceHooks {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
-pub struct ForgeMcpServerConfig {
+pub struct MnemonicMcpServerConfig {
     pub id: String,
     pub transport: String,
     pub command: Option<String>,
@@ -47,7 +47,7 @@ pub struct ForgeMcpServerConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct RawForgeWorkspaceConfig {
+pub(crate) struct RawMnemonicWorkspaceConfig {
     #[serde(default)]
     pub setup: Vec<String>,
     #[serde(default)]
@@ -55,7 +55,7 @@ pub(crate) struct RawForgeWorkspaceConfig {
     #[serde(default)]
     pub teardown: Vec<String>,
     #[serde(default)]
-    pub hooks: RawForgeWorkspaceHooks,
+    pub hooks: RawMnemonicWorkspaceHooks,
     #[serde(default, alias = "agent_profiles")]
     pub agent_profiles: Vec<RawAgentProfile>,
     #[serde(default, alias = "mcpServers", alias = "mcp")]
@@ -65,12 +65,12 @@ pub(crate) struct RawForgeWorkspaceConfig {
         alias = "repositoryRelationships",
         alias = "repository_relationships"
     )]
-    pub repository_relationships: Vec<RawForgeRepositoryRelationshipConfig>,
+    pub repository_relationships: Vec<RawMnemonicRepositoryRelationshipConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct RawForgeWorkspaceHooks {
+pub(crate) struct RawMnemonicWorkspaceHooks {
     #[serde(default)]
     pub pre_run: Vec<String>,
     #[serde(default)]
@@ -87,7 +87,7 @@ pub(crate) struct RawForgeWorkspaceHooks {
 
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct RawForgeRepositoryRelationshipConfig {
+pub(crate) struct RawMnemonicRepositoryRelationshipConfig {
     #[serde(default)]
     pub to: String,
     #[serde(default)]

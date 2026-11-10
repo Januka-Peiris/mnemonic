@@ -57,7 +57,7 @@ pub struct WorkspaceSummary {
     pub selected_worktree_id: Option<String>,
     pub selected_worktree_path: Option<String>,
     pub workspace_root_path: Option<String>,
-    pub worktree_managed_by_forge: bool,
+    pub worktree_managed_by_mnemonic: bool,
     pub workspace_source: String,
     pub parent_workspace_id: Option<String>,
     pub source_workspace_id: Option<String>,

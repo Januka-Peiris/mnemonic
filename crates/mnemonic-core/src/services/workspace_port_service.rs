@@ -331,17 +331,17 @@ mod tests {
 
     #[test]
     fn matches_workspace_ancestry() {
-        let root = Path::new("/tmp/forge-workspace");
+        let root = Path::new("/tmp/mnemonic-workspace");
         assert!(path_is_inside_workspace(
-            Path::new("/tmp/forge-workspace"),
+            Path::new("/tmp/mnemonic-workspace"),
             root
         ));
         assert!(path_is_inside_workspace(
-            Path::new("/tmp/forge-workspace/app"),
+            Path::new("/tmp/mnemonic-workspace/app"),
             root
         ));
         assert!(!path_is_inside_workspace(
-            Path::new("/tmp/forge-other"),
+            Path::new("/tmp/mnemonic-other"),
             root
         ));
     }
@@ -355,13 +355,13 @@ mod tests {
             user: Some("jay".to_string()),
             protocol: "tcp".to_string(),
             address: "*:5173".to_string(),
-            cwd: Some("/tmp/forge-workspace".to_string()),
+            cwd: Some("/tmp/mnemonic-workspace".to_string()),
             workspace_matched: true,
         });
 
         assert!(details.contains("pid 12345"));
         assert!(details.contains("node"));
         assert!(details.contains("localhost:5173"));
-        assert!(details.contains("/tmp/forge-workspace"));
+        assert!(details.contains("/tmp/mnemonic-workspace"));
     }
 }

@@ -57,7 +57,7 @@ pub struct RepoMapMetaV2 {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GeneratorInfo {
     pub engine: String,
-    pub forge_version: String,
+    pub mnemonic_version: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

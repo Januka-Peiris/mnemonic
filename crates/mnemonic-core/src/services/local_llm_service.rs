@@ -367,7 +367,7 @@ mod tests {
             id: "missing".to_string(),
             label: "Missing".to_string(),
             agent: "local_llm".to_string(),
-            command: "definitely-not-a-real-forge-command".to_string(),
+            command: "definitely-not-a-real-mnemonic-command".to_string(),
             args: vec![],
             model: Some("llama3.2".to_string()),
             reasoning: None,
