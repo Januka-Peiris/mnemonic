@@ -3,6 +3,7 @@ pub mod agent_context;
 pub mod agent_memory;
 pub mod agent_profile;
 pub mod agent_run;
+pub mod chat_session;
 pub mod checkpoint;
 pub mod coordination_artifact;
 pub mod coordinator;
@@ -42,6 +43,7 @@ pub use agent_context::{
 pub use agent_memory::{AgentMemory, SetAgentMemoryInput};
 pub use agent_profile::AgentProfile;
 pub use agent_run::WorkspaceRun;
+pub use chat_session::ChatSessionRecord;
 pub use checkpoint::{
     WorkspaceCheckpoint, WorkspaceCheckpointBranchResult, WorkspaceCheckpointDeleteResult,
     WorkspaceCheckpointDiff, WorkspaceCheckpointRestorePlan, WorkspaceCheckpointRestoreResult,
