@@ -191,10 +191,10 @@ impl ReleaseChannel {
     /// Returns the display name for this [`ReleaseChannel`].
     pub fn display_name(&self) -> &'static str {
         match self {
-            ReleaseChannel::Dev => "Zed Dev",
-            ReleaseChannel::Nightly => "Zed Nightly",
-            ReleaseChannel::Preview => "Zed Preview",
-            ReleaseChannel::Stable => "Zed",
+            ReleaseChannel::Dev => "Mnemonic Dev",
+            ReleaseChannel::Nightly => "Mnemonic Nightly",
+            ReleaseChannel::Preview => "Mnemonic Preview",
+            ReleaseChannel::Stable => "Mnemonic",
         }
     }
 

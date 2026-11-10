@@ -836,7 +836,7 @@ impl ConfigurationView {
                             .child(Label::new("ollama run gpt-oss:20b").inline_code(cx)),
                     )
                     .child(ListBulletItem::new(
-                        "Click 'Connect' below to start using Ollama in Zed",
+                        "Click 'Connect' below to start using Ollama in Mnemonic",
                     )),
             )
             .child(Label::new(
@@ -860,7 +860,7 @@ impl ConfigurationView {
               .child(self.api_key_editor.clone())
               .child(
                   Label::new(
-                      format!("You can also set the {API_KEY_ENV_VAR_NAME} environment variable and restart Zed.")
+                      format!("You can also set the {API_KEY_ENV_VAR_NAME} environment variable and restart Mnemonic.")
                   )
                   .size(LabelSize::Small)
                   .color(Color::Muted),
