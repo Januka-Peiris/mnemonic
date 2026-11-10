@@ -10,8 +10,8 @@ use crate::repositories::{
     settings_repository, workspace_repository,
 };
 use crate::services::{
-    git_review_service, git_worktree_service, pr_draft_service, repo_scanner_service,
-    terminal_service, workspace_script_service,
+    git_worktree_service, pr_draft_service, repo_scanner_service, terminal_service,
+    workspace_script_service,
 };
 use crate::state::AppState;
 
@@ -379,28 +379,9 @@ pub(super) fn delete_workspace(state: &AppState, workspace_id: &str) -> Result<(
     delete_workspace_impl(state, workspace_id, false)
 }
 
-/// Archive: like delete, but also removes the managed worktree from disk so
-/// builds don't pile up. Refuses when the worktree has uncommitted changes,
-/// because the underlying `git worktree remove --force` would discard them.
-/// The branch (and any pushed/unpushed commits on it) is preserved.
+/// Archive: like delete, but also moves the managed worktree into the archive
+/// folder so it no longer sits among active workspaces. Nothing is discarded.
 pub(super) fn archive_workspace(state: &AppState, workspace_id: &str) -> Result<(), String> {
-    match git_review_service::get_workspace_changed_files(state, workspace_id) {
-        Ok(changed) if !changed.is_empty() => {
-            return Err(format!(
-                "Workspace has {} uncommitted change(s). Commit and push (or discard) them \
-                 before archiving.",
-                changed.len()
-            ));
-        }
-        Ok(_) => {}
-        Err(err) => {
-            log::warn!(
-                target: "mnemonic_lib",
-                "archive: could not check for uncommitted changes ({err}); leaving worktree on disk"
-            );
-            return delete_workspace_impl(state, workspace_id, false);
-        }
-    }
     delete_workspace_impl(state, workspace_id, true)
 }
 
@@ -476,35 +457,18 @@ fn delete_workspace_impl(
                         );
                     }
                 } else {
-                    log::info!(
-                        target: "mnemonic_lib",
-                        "git worktree remove: repo={} path={}",
-                        repo_path,
-                        path
-                    );
-                    match git_worktree_service::remove_mnemonic_worktree(&repo_path, &path) {
-                        Ok(()) => {
-                            log::info!(target: "mnemonic_lib", "git worktree remove: ok path={path}");
+                    match git_worktree_service::archive_mnemonic_worktree(&repo_path, &path) {
+                        Ok(archived_path) => {
+                            log::info!(
+                                target: "mnemonic_lib",
+                                "git worktree move: ok from={path} to={}",
+                                archived_path.display()
+                            );
                         }
                         Err(err) => {
-                            if !Path::new(&path).exists() {
-                                log::warn!(
-                                    target: "mnemonic_lib",
-                                    "git worktree remove failed after folder disappeared: {err}"
-                                );
-                                let _ =
-                                    git_worktree_service::prune_worktrees(Path::new(&repo_path));
-                            } else {
-                                log::warn!(
-                                    target: "mnemonic_lib",
-                                    "git worktree remove failed; still deleting workspace row: {err}"
-                                );
-                                worktree_cleanup_warning = Some(format!(
-                                    "Git worktree remove failed ({err}). The workspace was removed from Mnemonic; delete the folder manually or run `git worktree prune` in the repository."
-                                ));
-                                let _ =
-                                    git_worktree_service::prune_worktrees(Path::new(&repo_path));
-                            }
+                            return Err(format!(
+                                "Could not move the worktree into the archive folder: {err}"
+                            ));
                         }
                     }
                 }
@@ -549,7 +513,7 @@ fn delete_workspace_impl(
     let activity_details = worktree_cleanup_warning.or_else(|| {
         Some(
             if remove_managed_worktree {
-                "Archived workspace; worktree removed from disk, branch preserved."
+                "Archived workspace; worktree moved to the archive folder."
             } else {
                 "Removed workspace record; on-disk worktree was not removed by Mnemonic."
             }

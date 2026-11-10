@@ -147,8 +147,8 @@ impl WorkspacePanel {
             PromptLevel::Warning,
             &format!("Archive {ws_name}?"),
             Some(
-                "Stops the agent session and removes the worktree from disk. The branch and \
-                 its commits are kept. Archiving is refused if there are uncommitted changes.",
+                "Stops the agent session and moves the worktree into the archive folder. \
+                 Nothing is deleted.",
             ),
             &["Archive", "Cancel"],
             cx,
