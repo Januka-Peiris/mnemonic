@@ -128,6 +128,56 @@ pub fn remove_mnemonic_worktree(repo_path: &str, worktree_path: &str) -> Result<
     Ok(())
 }
 
+/// Moves a managed worktree from `<root>/<repo>/<workspace>` to
+/// `<root's parent>/archive/<repo>/<workspace>` with `git worktree move`, so the
+/// checkout (including uncommitted changes) stays intact and registered with git.
+pub fn archive_mnemonic_worktree(repo_path: &str, worktree_path: &str) -> Result<PathBuf, String> {
+    let repo_path = Path::new(repo_path);
+    let worktree_path = Path::new(worktree_path);
+    let workspace_dir = worktree_path
+        .file_name()
+        .ok_or_else(|| format!("Invalid worktree path: {}", worktree_path.display()))?;
+    let repo_dir = worktree_path.parent();
+    let archive_root = repo_dir
+        .and_then(Path::parent)
+        .and_then(Path::parent)
+        .map(|base| base.join("archive"))
+        .ok_or_else(|| {
+            format!(
+                "Cannot derive an archive folder for {}",
+                worktree_path.display()
+            )
+        })?;
+    let repo_dir_name = repo_dir
+        .and_then(Path::file_name)
+        .ok_or_else(|| format!("Invalid worktree path: {}", worktree_path.display()))?;
+    let archive_parent = archive_root.join(repo_dir_name);
+    fs::create_dir_all(&archive_parent).map_err(|err| {
+        format!(
+            "Failed to create archive folder {}: {err}",
+            archive_parent.display()
+        )
+    })?;
+
+    let mut destination = archive_parent.join(workspace_dir);
+    let mut suffix = 1;
+    while destination.exists() {
+        destination = archive_parent.join(format!("{}-{suffix}", workspace_dir.to_string_lossy()));
+        suffix += 1;
+    }
+
+    git(
+        repo_path,
+        &[
+            "worktree",
+            "move",
+            path_arg(worktree_path).as_str(),
+            path_arg(&destination).as_str(),
+        ],
+    )?;
+    Ok(destination)
+}
+
 /// Clears stale `git worktree` registrations after the checkout directory was removed manually.
 pub fn prune_worktrees(repo_path: &Path) -> Result<(), String> {
     git(repo_path, &["worktree", "prune"])?;
