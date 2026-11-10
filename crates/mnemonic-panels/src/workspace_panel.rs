@@ -168,7 +168,13 @@ impl WorkspacePanel {
             let result = {
                 let ws_id = ws_id.clone();
                 cx.background_spawn(async move {
-                    workspace_service::archive_workspace(&state, &ws_id)
+                    workspace_service::archive_workspace(&state, &ws_id)?;
+                    if let Err(err) =
+                        chat_session_repository::delete_for_workspace(&state.db, &ws_id)
+                    {
+                        log::error!("Failed to delete chat sessions for {ws_id}: {err}");
+                    }
+                    Ok::<(), String>(())
                 })
                 .await
             };

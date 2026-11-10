@@ -1,4 +1,4 @@
-use rusqlite::{params, Row};
+use rusqlite::{Row, params};
 
 use crate::db::Database;
 use crate::models::ChatSessionRecord;
@@ -63,7 +63,10 @@ pub fn set_acp_session_id(db: &Database, id: &str, acp_session_id: &str) -> Resu
 
 pub fn delete(db: &Database, id: &str) -> Result<(), String> {
     db.with_connection_mut(|connection| {
-        connection.execute("DELETE FROM workspace_chat_sessions WHERE id = ?1", params![id])?;
+        connection.execute(
+            "DELETE FROM workspace_chat_sessions WHERE id = ?1",
+            params![id],
+        )?;
         Ok(())
     })
 }
@@ -108,7 +111,9 @@ mod tests {
         set_acp_session_id(&db, "first", "sess-1")?;
         let sessions = list_for_workspace(&db, "ws-a")?;
         assert_eq!(
-            sessions.first().and_then(|session| session.acp_session_id.as_deref()),
+            sessions
+                .first()
+                .and_then(|session| session.acp_session_id.as_deref()),
             Some("sess-1")
         );
 
