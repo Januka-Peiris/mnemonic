@@ -58,6 +58,7 @@ const AUTO_FIX_MAX_ATTEMPTS: u32 = 5;
 /// Model string passed to claude (also valid for its /model command) and
 /// the chip label shown in the composer.
 const CLAUDE_MODELS: &[(&str, &str)] = &[
+    ("claude-fable-5-2", "Fable 5.2"),
     ("claude-fable-5-1", "Fable 5.1"),
     ("claude-opus-5-5", "Opus 5.5"),
     ("claude-sonnet-5-5", "Sonnet 5.5"),
