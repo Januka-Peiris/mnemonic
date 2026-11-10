@@ -900,3 +900,37 @@ pub mod notebook {
         ]
     );
 }
+
+pub mod mnemonic {
+    use gpui::{Action, actions};
+    use schemars::JsonSchema;
+    use serde::Deserialize;
+
+    /// The kind of session to open in a Mnemonic workspace.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, JsonSchema)]
+    #[serde(rename_all = "snake_case")]
+    pub enum AgentSessionKind {
+        ClaudeChat,
+        CodexChat,
+        ClaudeCli,
+        CodexCli,
+        Shell,
+    }
+
+    /// Opens a new session in the active Mnemonic workspace.
+    #[derive(Clone, PartialEq, Deserialize, JsonSchema, Action)]
+    #[action(namespace = mnemonic)]
+    #[serde(deny_unknown_fields)]
+    pub struct NewAgentSession {
+        pub kind: AgentSessionKind,
+    }
+
+    actions!(
+        mnemonic,
+        [
+            /// Opens a Claude chat in the active Mnemonic workspace, or a new
+            /// file when no workspace is active.
+            NewDefaultAgentSession,
+        ]
+    );
+}
