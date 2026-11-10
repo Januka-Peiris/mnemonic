@@ -294,6 +294,7 @@
     "bindings": {
       "enter": "mnemonic_composer::Send",
       "shift-enter": "editor::Newline",
+      "shift-tab": "mnemonic_composer::CycleAgentMode",
     },
   },
   {

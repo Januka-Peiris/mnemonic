@@ -12,7 +12,7 @@ pub const REPOSITORY_RELATIONSHIP_KINDS: &[&str] = &[
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
-pub struct ForgeRepositoryRelationshipConfig {
+pub struct MnemonicRepositoryRelationshipConfig {
     pub to: String,
     pub kind: String,
     pub label: Option<String>,

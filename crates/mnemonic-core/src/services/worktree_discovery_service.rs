@@ -99,8 +99,8 @@ fn should_skip_discovered_worktree(
     managed_workspaces_root: Option<&Path>,
 ) -> bool {
     let wt = worktree_path.to_string_lossy().replace('\\', "/");
-    if wt.contains("/.forge-worktrees/")
-        || wt.ends_with("/.forge-worktrees")
+    if wt.contains("/.mnemonic-worktrees/")
+        || wt.ends_with("/.mnemonic-worktrees")
         || wt.contains("/.cursor/worktrees/")
         || wt.contains("/.codex/")
         || wt.contains("/.codex-app/")
@@ -239,7 +239,7 @@ mod tests {
         ));
         assert!(should_skip_discovered_worktree(
             repo,
-            Path::new("/legacy/.forge-worktrees/x/y"),
+            Path::new("/legacy/.mnemonic-worktrees/x/y"),
             None
         ));
     }

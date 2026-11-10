@@ -101,6 +101,15 @@ pub fn kill_embedded_workspace_session(workspace_id: &str) -> Result<(), String>
     }
 }
 
+/// Kills a single embedded tmux session identified by workspace + session name.
+pub fn kill_embedded_workspace_terminal(workspace_id: &str, session: &str) -> Result<(), String> {
+    if !tmux::available() {
+        return Ok(());
+    }
+    let name = tmux::safe_session_name(workspace_id, session);
+    tmux::kill_session(&name)
+}
+
 /// Command line for an editor-embedded terminal that attaches to the
 /// workspace's persistent tmux session, creating it first if needed. The
 /// session outlives the editor tab and the editor itself, so reopening a
@@ -1499,7 +1508,7 @@ mod tests {
             workspace_id: "ws-123".to_string(),
             session_role: "agent".to_string(),
             profile: "codex".to_string(),
-            cwd: "/tmp/forge-workspace".to_string(),
+            cwd: "/tmp/mnemonic-workspace".to_string(),
             status: "running".to_string(),
             started_at: "now".to_string(),
             ended_at: None,
@@ -1523,7 +1532,7 @@ mod tests {
         assert!(details.contains("role: agent"));
         assert!(details.contains("profile: codex"));
         assert!(details.contains("pid: 42"));
-        assert!(details.contains("/tmp/forge-workspace"));
+        assert!(details.contains("/tmp/mnemonic-workspace"));
     }
 
     #[test]
@@ -1533,7 +1542,7 @@ mod tests {
             workspace_id: "ws-123".to_string(),
             session_role: "agent".to_string(),
             profile: "qwen-local".to_string(),
-            cwd: "/tmp/forge-workspace".to_string(),
+            cwd: "/tmp/mnemonic-workspace".to_string(),
             status: "running".to_string(),
             started_at: "now".to_string(),
             ended_at: None,
@@ -1569,7 +1578,7 @@ mod tests {
             workspace_id: "ws-123".to_string(),
             session_role: "agent".to_string(),
             profile: "claude-code".to_string(),
-            cwd: "/tmp/forge-workspace".to_string(),
+            cwd: "/tmp/mnemonic-workspace".to_string(),
             status: "running".to_string(),
             started_at: "now".to_string(),
             ended_at: None,
@@ -1703,7 +1712,7 @@ mod tests {
             workspace_id: "ws-123".to_string(),
             session_role: "agent".to_string(),
             profile: "ollama-local".to_string(),
-            cwd: "/tmp/forge-workspace".to_string(),
+            cwd: "/tmp/mnemonic-workspace".to_string(),
             status: "running".to_string(),
             started_at: "now".to_string(),
             ended_at: None,

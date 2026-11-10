@@ -1001,7 +1001,7 @@ mod tests {
             .map(|duration| duration.as_nanos())
             .unwrap_or(0);
         let dir = std::env::temp_dir().join(format!(
-            "forge-ri-test-{}-{}-{}",
+            "mnemonic-ri-test-{}-{}-{}",
             tag,
             std::process::id(),
             nanos

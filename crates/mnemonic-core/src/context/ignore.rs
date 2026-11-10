@@ -10,7 +10,7 @@ pub struct IgnoreSet {
 
 impl IgnoreSet {
     pub fn load(_repo_root: &Path) -> Self {
-        // In a future iteration, parse .forgeignore and .gitignore here.
+        // In a future iteration, parse .mnemonicignore and .gitignore here.
         // For now, use built-in defaults only (covers the vast majority of cases).
         Self::with_defaults()
     }
@@ -19,7 +19,7 @@ impl IgnoreSet {
         Self {
             hard_prefixes: vec![
                 ".git/".into(),
-                ".forge/context/".into(),
+                ".mnemonic/context/".into(),
                 ".cursor/".into(),
                 ".claude/".into(),
                 ".github/".into(),

@@ -46,7 +46,7 @@ fn sync_workspace_candidates(state: &AppState, workspace_id: &str) -> Result<(),
                     key: "workspace-rules",
                     value: &summary,
                     confidence: 0.68,
-                    source_label: Some(".forge/config.json"),
+                    source_label: Some(".mnemonic/config.json"),
                     source_detail: Some(
                         "Derived from durable workspace setup/run/hook configuration.",
                     ),
@@ -96,7 +96,7 @@ fn sync_workspace_candidates(state: &AppState, workspace_id: &str) -> Result<(),
     Ok(())
 }
 
-fn summarize_workspace_rules(config: &crate::models::ForgeWorkspaceConfig) -> String {
+fn summarize_workspace_rules(config: &crate::models::MnemonicWorkspaceConfig) -> String {
     let mut parts = Vec::new();
     if !config.setup.is_empty() {
         parts.push(format!(

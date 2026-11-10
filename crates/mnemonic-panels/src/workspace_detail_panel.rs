@@ -1,14 +1,14 @@
 use std::path::PathBuf;
 
 use gpui::{
-    actions, px, Action, App, AppContext as _, Context, Entity, EventEmitter, Focusable,
+    actions, px, Action, Anchor, App, AppContext as _, Context, Entity, EventEmitter, Focusable,
     FocusHandle, IntoElement, Pixels, Render, SharedString, WeakEntity, Window,
 };
 use mnemonic_core::models::{WorkspacePrStatus, WorkspaceSummary};
 use mnemonic_core::services::{pr_draft_service, workspace_service};
 use ui::{
-    h_flex, v_flex, Button, ButtonStyle, Icon, IconButton, IconName, Label, TintColor, Tooltip,
-    prelude::*,
+    h_flex, v_flex, Button, ButtonStyle, ContextMenu, Icon, IconButton, IconName, Label,
+    PopoverMenu, TintColor, Tooltip, prelude::*,
 };
 use std::time::{Duration, Instant};
 
@@ -53,6 +53,8 @@ pub struct WorkspaceDetailPanel {
     poll_fast_until: Option<Instant>,
     /// Feedback line for the last dispatched instruction (sent / failed).
     dispatch_note: Option<SharedString>,
+    /// Which provider the Review button uses: "codex" or "claude".
+    review_provider: String,
     /// Zed's full project panel, embedded as the "All files" tab so file
     /// browsing, right-click operations, and editing live in one panel.
     file_tree: Option<Entity<project_panel::ProjectPanel>>,
@@ -88,6 +90,7 @@ impl WorkspaceDetailPanel {
                 poll_scheduled: false,
                 poll_fast_until: None,
                 dispatch_note: None,
+                review_provider: "codex".to_string(),
                 file_tree: None,
             };
             panel.refresh(cx);
@@ -331,19 +334,28 @@ impl WorkspaceDetailPanel {
             return;
         };
         let workspace_id = workspace_id.to_string();
-        let sent = workspace.update(cx, |workspace, cx| {
-            WorkspaceHost::dispatch_to_workspace_agent(workspace, &workspace_id, prompt, cx)
+        let label = label.to_string();
+        let this_handle = cx.weak_entity();
+        // Defer the workspace update to avoid a double-lease panic when this
+        // method is called from within a workspace update (e.g. via an action
+        // handler registered on Workspace).
+        cx.defer(move |cx| {
+            let sent = workspace.update(cx, |workspace, cx| {
+                WorkspaceHost::dispatch_to_workspace_agent(workspace, &workspace_id, prompt, cx)
+            });
+            let _ = this_handle.update(cx, |this, cx| {
+                this.dispatch_note = Some(if sent {
+                    this.poll_fast_until = Some(Instant::now() + PR_POLL_BOOST);
+                    this.schedule_next_poll(cx);
+                    SharedString::from(format!("Sent {label} to claude ✓"))
+                } else {
+                    SharedString::from(format!(
+                        "Couldn't send {label}: open the workspace first (click its worktree)"
+                    ))
+                });
+                cx.notify();
+            });
         });
-        self.dispatch_note = Some(if sent {
-            self.poll_fast_until = Some(Instant::now() + PR_POLL_BOOST);
-            self.schedule_next_poll(cx);
-            SharedString::from(format!("Sent {label} to claude ✓"))
-        } else {
-            SharedString::from(format!(
-                "Couldn't send {label}: open the workspace first (click its worktree)"
-            ))
-        });
-        cx.notify();
     }
 
     /// Sends a one-shot "fix the failing CI" instruction into the
@@ -497,8 +509,11 @@ impl WorkspaceDetailPanel {
             return;
         };
         if let Some(workspace) = self.workspace.upgrade() {
-            workspace.update(cx, |workspace, cx| {
-                WorkspaceHost::enable_auto_fix_for_workspace(workspace, &workspace_id, cx);
+            let workspace_id = workspace_id.clone();
+            cx.defer(move |cx| {
+                workspace.update(cx, |workspace, cx| {
+                    WorkspaceHost::enable_auto_fix_for_workspace(workspace, &workspace_id, cx);
+                });
             });
         }
     }
@@ -659,14 +674,55 @@ impl WorkspaceDetailPanel {
             ))
             .child(div().flex_grow(1.0))
             .child(
-                Button::new("start-review", "Review")
-                    .label_size(LabelSize::Small)
-                    .tooltip(Tooltip::text(
-                        "Open a separate claude (Sonnet) that reviews this workspace's diff",
-                    ))
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.start_review(window, cx);
-                    })),
+                h_flex()
+                    .gap_0p5()
+                    .child(
+                        Button::new("start-review", "Review")
+                            .label_size(LabelSize::Small)
+                            .tooltip(Tooltip::text(
+                                "Open a review session that analyses your diff for bugs, security, and performance issues",
+                            ))
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.start_review(window, cx);
+                            })),
+                    )
+                    .child({
+                        let provider_label = if self.review_provider == "codex" {
+                            "Codex ⌄"
+                        } else {
+                            "Claude ⌄"
+                        };
+                        let weak = cx.weak_entity();
+                        PopoverMenu::new("review-provider-menu")
+                            .anchor(Anchor::BottomRight)
+                            .trigger(
+                                Button::new("review-provider", provider_label)
+                                    .label_size(LabelSize::XSmall)
+                                    .style(ButtonStyle::Subtle)
+                                    .tooltip(Tooltip::text("Change the review provider")),
+                            )
+                            .menu(move |window, cx| {
+                                let weak = weak.clone();
+                                Some(ContextMenu::build(window, cx, move |menu, _, _| {
+                                    let weak_codex = weak.clone();
+                                    let weak_claude = weak.clone();
+                                    menu.entry("Codex", None, move |_, cx| {
+                                        weak_codex
+                                            .update(cx, |this, cx| {
+                                                this.set_review_provider("codex", cx);
+                                            })
+                                            .ok();
+                                    })
+                                    .entry("Claude", None, move |_, cx| {
+                                        weak_claude
+                                            .update(cx, |this, cx| {
+                                                this.set_review_provider("claude", cx);
+                                            })
+                                            .ok();
+                                    })
+                                }))
+                            })
+                    }),
             )
             .child(
                 IconButton::new("refresh-pr-status", IconName::ArrowCircle)
@@ -678,7 +734,27 @@ impl WorkspaceDetailPanel {
             )
     }
 
-    /// Opens the review claude session for the selected workspace.
+    fn set_review_provider(&mut self, provider: &str, cx: &mut Context<Self>) {
+        self.review_provider = provider.to_string();
+        // Push the choice to the workspace view so the next review uses it.
+        let Some(workspace_id) = self.summary.as_ref().map(|summary| summary.id.clone()) else {
+            cx.notify();
+            return;
+        };
+        if let Some(workspace) = self.workspace.upgrade() {
+            workspace.update(cx, |workspace, cx| {
+                WorkspaceHost::set_review_provider_for_workspace(
+                    workspace,
+                    &workspace_id,
+                    provider,
+                    cx,
+                );
+            });
+        }
+        cx.notify();
+    }
+
+    /// Opens the review session for the selected workspace.
     fn start_review(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(workspace_id) = self.summary.as_ref().map(|summary| summary.id.clone()) else {
             return;

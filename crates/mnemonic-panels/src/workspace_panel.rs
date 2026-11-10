@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -13,6 +13,36 @@ use mnemonic_core::models::{
 use mnemonic_core::repositories::{
     activity_repository, chat_session_repository, repository_repository, settings_repository,
 };
+
+#[derive(Clone)]
+#[allow(dead_code)]
+struct DraggedWorkspace {
+    id: String,
+    project: String,
+}
+
+#[derive(Clone)]
+struct DraggedProject {
+    name: String,
+}
+
+struct DragGhostView {
+    label: String,
+}
+
+impl Render for DragGhostView {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .px_2()
+            .py_1()
+            .rounded_md()
+            .bg(cx.theme().colors().ghost_element_selected)
+            .child(Label::new(self.label.clone()).size(LabelSize::Small))
+    }
+}
+
+const PROJECT_ORDER_KEY: &str = "panel_project_order";
+const WORKSPACE_ORDER_KEY: &str = "panel_workspace_order";
 use mnemonic_core::services::{repo_scanner_service, workspace_service};
 use ui::{Tooltip, h_flex, v_flex, Icon, IconButton, IconName, Label, prelude::*};
 use workspace::dock::{DockPosition, PanelEvent};
@@ -33,6 +63,8 @@ pub struct WorkspacePanel {
     selected_workspace_id: Option<String>,
     showing_history: bool,
     activities: Vec<ActivityItem>,
+    workspace_order: HashMap<String, Vec<String>>,
+    project_order: Vec<String>,
 }
 
 impl WorkspacePanel {
@@ -51,6 +83,8 @@ impl WorkspacePanel {
                 selected_workspace_id: None,
                 showing_history: false,
                 activities: Vec::new(),
+                workspace_order: HashMap::new(),
+                project_order: Vec::new(),
             };
             panel.refresh(cx);
             panel
@@ -91,9 +125,34 @@ impl WorkspacePanel {
             Ok(repos) => self.repositories = repos,
             Err(e) => log::error!("Failed to list repositories: {e}"),
         }
+        // Load persisted ordering.
+        if self.project_order.is_empty() {
+            if let Ok(Some(json)) = settings_repository::get_value(&state.db, PROJECT_ORDER_KEY) {
+                if let Ok(order) = serde_json::from_str::<Vec<String>>(&json) {
+                    self.project_order = order;
+                }
+            }
+        }
+        if self.workspace_order.is_empty() {
+            if let Ok(Some(json)) = settings_repository::get_value(&state.db, WORKSPACE_ORDER_KEY) {
+                if let Ok(order) = serde_json::from_str::<HashMap<String, Vec<String>>>(&json) {
+                    self.workspace_order = order;
+                }
+            }
+        }
     }
 
-    fn grouped_workspaces(&self) -> BTreeMap<String, Vec<&WorkspaceSummary>> {
+    fn save_ordering(&self, cx: &App) {
+        let state = mnemonic_bridge::mnemonic_state(cx);
+        if let Ok(json) = serde_json::to_string(&self.project_order) {
+            let _ = settings_repository::set_value(&state.db, PROJECT_ORDER_KEY, &json);
+        }
+        if let Ok(json) = serde_json::to_string(&self.workspace_order) {
+            let _ = settings_repository::set_value(&state.db, WORKSPACE_ORDER_KEY, &json);
+        }
+    }
+
+    fn grouped_workspaces(&self) -> Vec<(String, Vec<&WorkspaceSummary>)> {
         let mut groups: BTreeMap<String, Vec<&WorkspaceSummary>> = BTreeMap::new();
         for repo in &self.repositories {
             groups.entry(repo.name.clone()).or_default();
@@ -106,7 +165,106 @@ impl WorkspacePanel {
             };
             groups.entry(project).or_default().push(ws);
         }
-        groups
+        // Apply custom workspace ordering within each group.
+        for (project, workspaces) in &mut groups {
+            if let Some(order) = self.workspace_order.get(project) {
+                workspaces.sort_by_key(|ws| {
+                    order.iter().position(|id| id == &ws.id).unwrap_or(usize::MAX)
+                });
+            }
+        }
+        // Apply custom project ordering.
+        let mut result: Vec<(String, Vec<&WorkspaceSummary>)> = groups.into_iter().collect();
+        if !self.project_order.is_empty() {
+            result.sort_by_key(|(name, _)| {
+                self.project_order
+                    .iter()
+                    .position(|p| p == name)
+                    .unwrap_or(usize::MAX)
+            });
+        }
+        result
+    }
+
+    /// Ensures `project_order` contains all current project names,
+    /// appending any missing ones at the end.
+    fn sync_project_order(&mut self) {
+        let mut all_projects: Vec<String> = Vec::new();
+        for repo in &self.repositories {
+            if !all_projects.contains(&repo.name) {
+                all_projects.push(repo.name.clone());
+            }
+        }
+        for ws in &self.workspaces {
+            let p = if ws.repo.is_empty() {
+                "ungrouped".to_string()
+            } else {
+                ws.repo.clone()
+            };
+            if !all_projects.contains(&p) {
+                all_projects.push(p);
+            }
+        }
+        if self.project_order.is_empty() {
+            self.project_order = all_projects;
+        } else {
+            for p in all_projects {
+                if !self.project_order.contains(&p) {
+                    self.project_order.push(p);
+                }
+            }
+        }
+    }
+
+    fn reorder_project(&mut self, dragged: &str, target: &str, cx: &App) {
+        if dragged == target {
+            return;
+        }
+        self.sync_project_order();
+        let Some(from) = self.project_order.iter().position(|p| p == dragged) else {
+            return;
+        };
+        let Some(to) = self.project_order.iter().position(|p| p == target) else {
+            return;
+        };
+        let name = self.project_order.remove(from);
+        self.project_order.insert(to, name);
+        self.save_ordering(cx);
+    }
+
+    fn reorder_workspace(&mut self, dragged_id: &str, project: &str, target_id: &str, cx: &App) {
+        if dragged_id == target_id {
+            return;
+        }
+        // Build current workspace IDs for this project group.
+        let current_ids: Vec<String> = self
+            .workspaces
+            .iter()
+            .filter(|ws| {
+                let p = if ws.repo.is_empty() { "ungrouped" } else { &ws.repo };
+                p == project
+            })
+            .map(|ws| ws.id.clone())
+            .collect();
+        let order = self
+            .workspace_order
+            .entry(project.to_string())
+            .or_insert_with(|| current_ids.clone());
+        // Append any new workspace IDs not yet in the order list.
+        for id in &current_ids {
+            if !order.contains(id) {
+                order.push(id.clone());
+            }
+        }
+        let Some(from) = order.iter().position(|id| id == dragged_id) else {
+            return;
+        };
+        let Some(to) = order.iter().position(|id| id == target_id) else {
+            return;
+        };
+        let id = order.remove(from);
+        order.insert(to, id);
+        self.save_ordering(cx);
     }
 
     fn toggle_project(&mut self, project: &str) {
@@ -555,6 +713,10 @@ impl WorkspacePanel {
         };
 
         let project_for_add = project.to_string();
+        let drag_data = DraggedProject {
+            name: project.to_string(),
+        };
+        let drop_target_project = project.to_string();
         let mut group = v_flex().w_full();
 
         group = group.child(
@@ -567,6 +729,23 @@ impl WorkspacePanel {
                 .w_full()
                 .cursor_pointer()
                 .hover(|style| style.bg(cx.theme().colors().ghost_element_hover))
+                .on_drag(drag_data, {
+                    let project_name = project.to_string();
+                    move |_, _, _, cx| {
+                        cx.new(|_| DragGhostView {
+                            label: project_name.clone(),
+                        })
+                    }
+                })
+                .drag_over::<DraggedProject>(|style, _, _, cx| {
+                    style.bg(cx.theme().colors().drop_target_background)
+                })
+                .on_drop(cx.listener(
+                    move |this, dragged: &DraggedProject, _window, cx| {
+                        this.reorder_project(&dragged.name, &drop_target_project, cx);
+                        cx.notify();
+                    },
+                ))
                 .on_click(cx.listener(move |this, _, _window, cx| {
                     this.toggle_project(&project_owned);
                     cx.notify();
@@ -602,7 +781,7 @@ impl WorkspacePanel {
 
         if !collapsed {
             for ws in workspaces {
-                group = group.child(self.render_workspace_row(ws, cx));
+                group = group.child(self.render_workspace_row(ws, project, cx));
             }
         }
 
@@ -612,6 +791,7 @@ impl WorkspacePanel {
     fn render_workspace_row(
         &self,
         ws: &WorkspaceSummary,
+        project: &str,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let is_selected = self
@@ -621,6 +801,12 @@ impl WorkspacePanel {
         let ws_id = ws.id.clone();
         let ws_id_for_archive = ws.id.clone();
         let ws_name_for_archive = ws.name.clone();
+        let drag_data = DraggedWorkspace {
+            id: ws.id.clone(),
+            project: project.to_string(),
+        };
+        let drop_target_id = ws.id.clone();
+        let drop_target_project = project.to_string();
 
         h_flex()
             .id(SharedString::from(ws.id.clone()))
@@ -636,6 +822,28 @@ impl WorkspacePanel {
                 el.bg(cx.theme().colors().ghost_element_selected)
             })
             .hover(|style| style.bg(cx.theme().colors().ghost_element_hover))
+            .on_drag(drag_data, {
+                let ws_name = ws.name.clone();
+                move |_, _, _, cx| {
+                    cx.new(|_| DragGhostView {
+                        label: ws_name.clone(),
+                    })
+                }
+            })
+            .drag_over::<DraggedWorkspace>(|style, _, _, cx| {
+                style.bg(cx.theme().colors().drop_target_background)
+            })
+            .on_drop(cx.listener(
+                move |this, dragged: &DraggedWorkspace, _window, cx| {
+                    this.reorder_workspace(
+                        &dragged.id,
+                        &drop_target_project,
+                        &drop_target_id,
+                        cx,
+                    );
+                    cx.notify();
+                },
+            ))
             .on_click(cx.listener(move |this, _, window, cx| {
                 this.select_workspace(ws_id.clone(), window, cx);
             }))
@@ -886,7 +1094,7 @@ impl Render for WorkspacePanel {
         if has_workspaces {
             let mut list = v_flex().py_0p5().overflow_y_hidden().flex_grow(1.0);
             for (project, workspaces) in &groups {
-                list = list.child(self.render_project_group(project, workspaces, cx));
+                list = list.child(self.render_project_group(project, &workspaces, cx));
             }
             content = content.child(list);
         } else {

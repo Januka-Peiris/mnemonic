@@ -38,7 +38,7 @@ impl Database {
         fs::create_dir_all(data_dir)
             .map_err(|err| format!("Failed to create app data directory: {err}"))?;
 
-        let path = data_dir.join("forge.sqlite3");
+        let path = data_dir.join("mnemonic.sqlite3");
         let connection = Connection::open(&path).map_err(|err| {
             format!(
                 "Failed to open SQLite database at {}: {err}",

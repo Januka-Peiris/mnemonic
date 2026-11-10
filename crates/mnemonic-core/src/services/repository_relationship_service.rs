@@ -55,7 +55,7 @@ pub fn list_repository_relationships(
         }
         let config_path = config.path.clone().unwrap_or_else(|| {
             Path::new(&from_repo.path)
-                .join(".forge/config.json")
+                .join(".mnemonic/config.json")
                 .display()
                 .to_string()
         });
@@ -700,7 +700,7 @@ mod tests {
                 label: Some("Config label".to_string()),
                 notes: Some("Config notes".to_string()),
                 sources: BTreeSet::from(["config".to_string()]),
-                config_paths: BTreeSet::from(["/tmp/a/.forge/config.json".to_string()]),
+                config_paths: BTreeSet::from(["/tmp/a/.mnemonic/config.json".to_string()]),
             },
         );
 

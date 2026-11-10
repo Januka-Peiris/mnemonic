@@ -1,10 +1,10 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::models::workspace_script::RawForgeWorkspaceConfig;
+use crate::models::workspace_script::RawMnemonicWorkspaceConfig;
 use crate::models::{
-    CreateWorkspaceTerminalInput, ForgeMcpServerConfig, ForgeRepositoryRelationshipConfig,
-    ForgeWorkspaceConfig, TerminalSession,
+    CreateWorkspaceTerminalInput, MnemonicMcpServerConfig, MnemonicRepositoryRelationshipConfig,
+    MnemonicWorkspaceConfig, TerminalSession,
 };
 use crate::repositories::{
     activity_repository, settings_repository, terminal_repository, workspace_repository,
@@ -14,12 +14,12 @@ use crate::services::{
 };
 use crate::state::AppState;
 
-const CONFIG_RELATIVE_PATH: &str = ".forge/config.json";
+const CONFIG_RELATIVE_PATH: &str = ".mnemonic/config.json";
 
 pub fn get_workspace_mnemonic_config(
     state: &AppState,
     workspace_id: &str,
-) -> Result<ForgeWorkspaceConfig, String> {
+) -> Result<MnemonicWorkspaceConfig, String> {
     let root = workspace_root_path(state, workspace_id)?;
     Ok(load_config_from_root(&root))
 }
@@ -82,7 +82,7 @@ pub fn start_workspace_run_command(
     let config = get_workspace_mnemonic_config(state, workspace_id)?;
     let command = config.run.get(command_index).ok_or_else(|| {
         format!(
-            "Run command {} was not found in .forge/config.json",
+            "Run command {} was not found in .mnemonic/config.json",
             command_index + 1
         )
     })?;
@@ -127,7 +127,7 @@ pub fn restart_workspace_run_command(
     let config = get_workspace_mnemonic_config(state, workspace_id)?;
     let command = config.run.get(command_index).ok_or_else(|| {
         format!(
-            "Run command {} was not found in .forge/config.json",
+            "Run command {} was not found in .mnemonic/config.json",
             command_index + 1
         )
     })?;
@@ -246,31 +246,31 @@ pub fn start_command_terminal(
     )
 }
 
-pub fn load_config_from_root(root: &Path) -> ForgeWorkspaceConfig {
+pub fn load_config_from_root(root: &Path) -> MnemonicWorkspaceConfig {
     let config_path = root.join(CONFIG_RELATIVE_PATH);
     if !config_path.exists() {
-        return ForgeWorkspaceConfig::default();
+        return MnemonicWorkspaceConfig::default();
     }
 
     let display_path = config_path.display().to_string();
     let text = match fs::read_to_string(&config_path) {
         Ok(text) => text,
         Err(err) => {
-            return ForgeWorkspaceConfig {
+            return MnemonicWorkspaceConfig {
                 exists: true,
                 path: Some(display_path),
-                warning: Some(format!("Could not read .forge/config.json: {err}")),
-                ..ForgeWorkspaceConfig::default()
+                warning: Some(format!("Could not read .mnemonic/config.json: {err}")),
+                ..MnemonicWorkspaceConfig::default()
             };
         }
     };
 
-    match serde_json::from_str::<RawForgeWorkspaceConfig>(&text) {
+    match serde_json::from_str::<RawMnemonicWorkspaceConfig>(&text) {
         Ok(raw) => {
             let (mcp_servers, mcp_warnings) = parse_mcp_servers(raw.mcp_servers);
             let (repository_relationships, repository_relationship_warnings) =
                 parse_repository_relationships(raw.repository_relationships);
-            ForgeWorkspaceConfig {
+            MnemonicWorkspaceConfig {
                 exists: true,
                 path: Some(display_path),
                 setup: sanitize_commands(raw.setup),
@@ -289,11 +289,11 @@ pub fn load_config_from_root(root: &Path) -> ForgeWorkspaceConfig {
                 warning: None,
             }
         }
-        Err(err) => ForgeWorkspaceConfig {
+        Err(err) => MnemonicWorkspaceConfig {
             exists: true,
             path: Some(display_path),
-            warning: Some(format!("Invalid .forge/config.json: {err}")),
-            ..ForgeWorkspaceConfig::default()
+            warning: Some(format!("Invalid .mnemonic/config.json: {err}")),
+            ..MnemonicWorkspaceConfig::default()
         },
     }
 }
@@ -331,9 +331,9 @@ fn sanitize_commands(commands: Vec<String>) -> Vec<String> {
 }
 
 fn sanitize_hooks(
-    raw: crate::models::workspace_script::RawForgeWorkspaceHooks,
-) -> crate::models::ForgeWorkspaceHooks {
-    crate::models::ForgeWorkspaceHooks {
+    raw: crate::models::workspace_script::RawMnemonicWorkspaceHooks,
+) -> crate::models::MnemonicWorkspaceHooks {
+    crate::models::MnemonicWorkspaceHooks {
         pre_run: sanitize_commands(raw.pre_run),
         post_run: sanitize_commands(raw.post_run),
         pre_tool: sanitize_commands(raw.pre_tool),
@@ -344,8 +344,8 @@ fn sanitize_hooks(
 }
 
 fn parse_repository_relationships(
-    relationships: Vec<crate::models::workspace_script::RawForgeRepositoryRelationshipConfig>,
-) -> (Vec<ForgeRepositoryRelationshipConfig>, Vec<String>) {
+    relationships: Vec<crate::models::workspace_script::RawMnemonicRepositoryRelationshipConfig>,
+) -> (Vec<MnemonicRepositoryRelationshipConfig>, Vec<String>) {
     let mut parsed = Vec::new();
     let mut warnings = Vec::new();
 
@@ -366,7 +366,7 @@ fn parse_repository_relationships(
             ));
             continue;
         }
-        parsed.push(ForgeRepositoryRelationshipConfig {
+        parsed.push(MnemonicRepositoryRelationshipConfig {
             to,
             kind,
             label: relationship
@@ -383,7 +383,7 @@ fn parse_repository_relationships(
     (parsed, warnings)
 }
 
-fn parse_mcp_servers(value: serde_json::Value) -> (Vec<ForgeMcpServerConfig>, Vec<String>) {
+fn parse_mcp_servers(value: serde_json::Value) -> (Vec<MnemonicMcpServerConfig>, Vec<String>) {
     match value {
         serde_json::Value::Array(items) => collect_mcp_servers(
             items
@@ -402,7 +402,7 @@ fn parse_mcp_servers(value: serde_json::Value) -> (Vec<ForgeMcpServerConfig>, Ve
 
 fn collect_mcp_servers(
     items: impl IntoIterator<Item = (String, serde_json::Value)>,
-) -> (Vec<ForgeMcpServerConfig>, Vec<String>) {
+) -> (Vec<MnemonicMcpServerConfig>, Vec<String>) {
     let mut servers = Vec::new();
     let mut warnings = Vec::new();
     for (id_hint, value) in items {
@@ -417,7 +417,7 @@ fn collect_mcp_servers(
 fn mcp_from_value(
     id_hint: String,
     value: serde_json::Value,
-) -> Result<ForgeMcpServerConfig, String> {
+) -> Result<MnemonicMcpServerConfig, String> {
     let object = value
         .as_object()
         .ok_or_else(|| "MCP server entry must be an object.".to_string())?;
@@ -488,7 +488,7 @@ fn mcp_from_value(
         return Err("enabled MCP server needs either command or url.".to_string());
     }
 
-    Ok(ForgeMcpServerConfig {
+    Ok(MnemonicMcpServerConfig {
         id,
         transport,
         command,
@@ -553,7 +553,7 @@ mod tests {
 
     fn temp_root(name: &str) -> PathBuf {
         let root = std::env::temp_dir().join(format!(
-            "forge-script-test-{name}-{}",
+            "mnemonic-script-test-{name}-{}",
             terminal_service::timestamp()
         ));
         let _ = fs::remove_dir_all(&root);
@@ -575,7 +575,7 @@ mod tests {
     #[test]
     fn valid_config_parses_and_trims_commands() {
         let dir = temp_root("valid");
-        fs::create_dir_all(dir.join(".forge")).expect("forge dir");
+        fs::create_dir_all(dir.join(".mnemonic")).expect("mnemonic dir");
         fs::write(
             dir.join(CONFIG_RELATIVE_PATH),
             r#"{"setup":[" npm install ", ""],"run":["npm run dev"],"teardown":["kill-port 3000"],"hooks":{"preRun":[" echo pre "],"postRun":["echo post"],"preTool":["echo tool"],"postTool":["echo tool-post"],"preShip":["echo ship"],"postShip":["echo ship-post"]},"agentProfiles":[{"id":"ollama-qwen","agent":"ollama","provider":"ollama","endpoint":"http://localhost:11434","command":"ollama","args":["run","qwen2.5-coder"],"model":"qwen2.5-coder"}],"mcpServers":{"linear":{"command":"npx","args":["-y","linear-mcp"],"env":{"LINEAR_API_KEY":"test"}}},"repositoryRelationships":[{"to":"backend","kind":"frontend_backend","label":"Calls API","notes":"REST"}]}"#,
@@ -623,7 +623,7 @@ mod tests {
     #[test]
     fn repository_relationships_accept_snake_case_alias_and_warn_on_invalid() {
         let dir = temp_root("repo-rel");
-        fs::create_dir_all(dir.join(".forge")).expect("forge dir");
+        fs::create_dir_all(dir.join(".mnemonic")).expect("mnemonic dir");
         fs::write(
             dir.join(CONFIG_RELATIVE_PATH),
             r#"{"repository_relationships":[{"to":"api","kind":"sdk_api"},{"to":"bad","kind":"unknown"},{"kind":"related"}]}"#,
@@ -643,7 +643,7 @@ mod tests {
     #[test]
     fn invalid_mcp_config_is_non_blocking_warning() {
         let dir = temp_root("invalid-mcp");
-        fs::create_dir_all(dir.join(".forge")).expect("forge dir");
+        fs::create_dir_all(dir.join(".mnemonic")).expect("mnemonic dir");
         fs::write(
             dir.join(CONFIG_RELATIVE_PATH),
             r#"{"setup":["echo ok"],"mcpServers":{"broken":{"transport":"stdio"}}}"#,
@@ -662,7 +662,7 @@ mod tests {
     #[test]
     fn invalid_config_returns_readable_warning() {
         let dir = temp_root("invalid");
-        fs::create_dir_all(dir.join(".forge")).expect("forge dir");
+        fs::create_dir_all(dir.join(".mnemonic")).expect("mnemonic dir");
         fs::write(dir.join(CONFIG_RELATIVE_PATH), "{").expect("write config");
 
         let config = load_config_from_root(&dir);
@@ -670,7 +670,7 @@ mod tests {
         assert!(config
             .warning
             .unwrap()
-            .contains("Invalid .forge/config.json"));
+            .contains("Invalid .mnemonic/config.json"));
         let _ = fs::remove_dir_all(dir);
     }
 

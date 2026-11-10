@@ -76,7 +76,7 @@ pub fn resolve_agent_profile(
             return Ok(profile.clone());
         }
         return Err(format!(
-            "Agent profile `{requested}` was not found. Add it in Settings → Agent Profiles or .forge/config.json."
+            "Agent profile `{requested}` was not found. Add it in Settings → Agent Profiles or .mnemonic/config.json."
         ));
     }
 
@@ -85,7 +85,7 @@ pub fn resolve_agent_profile(
         .find(|profile| profile.agent != "shell")
         .cloned()
         .ok_or_else(|| {
-            "No non-shell agent profile is configured. Add one in Settings → Agent Profiles or .forge/config.json."
+            "No non-shell agent profile is configured. Add one in Settings → Agent Profiles or .mnemonic/config.json."
                 .to_string()
         })
 }
@@ -253,7 +253,7 @@ pub fn resolve_profile_for_role(
         .map(|profile| (*profile).clone())
         .ok_or_else(|| {
             format!(
-                "No eligible {} profile found. Add one in Settings → Agent Profiles or .forge/config.json.",
+                "No eligible {} profile found. Add one in Settings → Agent Profiles or .mnemonic/config.json.",
                 role
             )
         })

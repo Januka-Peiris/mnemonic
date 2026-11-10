@@ -7,8 +7,8 @@ use crate::models::{PromptTemplate, WorkspacePromptTemplates};
 use crate::repositories::workspace_repository;
 use crate::state::AppState;
 
-const PROMPTS_JSON: &str = ".forge/prompts.json";
-const PROMPTS_DIR: &str = ".forge/prompts";
+const PROMPTS_JSON: &str = ".mnemonic/prompts.json";
+const PROMPTS_DIR: &str = ".mnemonic/prompts";
 
 pub fn list_workspace_prompt_templates(
     state: &AppState,
@@ -49,9 +49,9 @@ pub fn load_templates_from_root(root: &Path) -> WorkspacePromptTemplates {
 
 fn load_json_templates(path: &Path) -> Result<Vec<PromptTemplate>, String> {
     let text = fs::read_to_string(path)
-        .map_err(|err| format!("Could not read .forge/prompts.json: {err}"))?;
+        .map_err(|err| format!("Could not read .mnemonic/prompts.json: {err}"))?;
     let value = serde_json::from_str::<Value>(&text)
-        .map_err(|err| format!("Invalid .forge/prompts.json: {err}"))?;
+        .map_err(|err| format!("Invalid .mnemonic/prompts.json: {err}"))?;
     let source = path.display().to_string();
 
     match value {
@@ -95,14 +95,14 @@ fn load_json_templates(path: &Path) -> Result<Vec<PromptTemplate>, String> {
                 })
             })
             .collect()),
-        _ => Err("Invalid .forge/prompts.json: expected an array or object".to_string()),
+        _ => Err("Invalid .mnemonic/prompts.json: expected an array or object".to_string()),
     }
 }
 
 fn load_markdown_templates(dir: &Path) -> Result<Vec<PromptTemplate>, String> {
     let mut templates = Vec::new();
     let entries =
-        fs::read_dir(dir).map_err(|err| format!("Could not read .forge/prompts: {err}"))?;
+        fs::read_dir(dir).map_err(|err| format!("Could not read .mnemonic/prompts: {err}"))?;
     for entry in entries {
         let entry = entry.map_err(|err| format!("Could not read prompt template entry: {err}"))?;
         let path = entry.path();
@@ -196,7 +196,7 @@ mod tests {
 
     fn temp_root(name: &str) -> PathBuf {
         let root = std::env::temp_dir().join(format!(
-            "forge-prompt-template-test-{name}-{}",
+            "mnemonic-prompt-template-test-{name}-{}",
             terminal_service::timestamp()
         ));
         let _ = fs::remove_dir_all(&root);
@@ -216,7 +216,7 @@ mod tests {
     #[test]
     fn parses_json_object_templates() {
         let dir = temp_root("json-object");
-        fs::create_dir_all(dir.join(".forge")).expect("forge dir");
+        fs::create_dir_all(dir.join(".mnemonic")).expect("mnemonic dir");
         fs::write(
             dir.join(PROMPTS_JSON),
             r#"{"fix_tests":"Fix the failing tests.","review_notes":"Summarize the changes."}"#,
@@ -234,14 +234,14 @@ mod tests {
     #[test]
     fn invalid_json_is_warning() {
         let dir = temp_root("invalid-json");
-        fs::create_dir_all(dir.join(".forge")).expect("forge dir");
+        fs::create_dir_all(dir.join(".mnemonic")).expect("mnemonic dir");
         fs::write(dir.join(PROMPTS_JSON), "{").expect("write prompts");
         let result = load_templates_from_root(&dir);
         assert!(result.templates.is_empty());
         assert!(result
             .warning
             .unwrap()
-            .contains("Invalid .forge/prompts.json"));
+            .contains("Invalid .mnemonic/prompts.json"));
         let _ = fs::remove_dir_all(dir);
     }
 
