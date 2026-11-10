@@ -2,18 +2,22 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
+use agent_client_protocol::schema as acp;
+use agent_ui::{Agent, AgentConnectionStore, AgentThreadSource, ConversationView};
 use editor::Editor;
 use gpui::{
-    Anchor, App, AppContext as _, Context, DragMoveEvent, Empty, Entity, EventEmitter, Focusable,
-    FocusHandle, IntoElement, Pixels, Render, SharedString, Subscription, WeakEntity, Window,
-    actions, px,
+    Anchor, App, AppContext as _, Context, DragMoveEvent, Empty, Entity, EntityId, EventEmitter,
+    Focusable, FocusHandle, IntoElement, Pixels, Render, SharedString, Subscription, WeakEntity,
+    Window, actions, px,
 };
-use mnemonic_core::models::WorkspaceSummary;
+use mnemonic_core::models::{ChatSessionRecord, WorkspaceSummary};
+use mnemonic_core::repositories::chat_session_repository;
 use mnemonic_core::services::terminal_service;
-use project::Project;
+use project::{AgentId, Project};
 use task::{RevealStrategy, Shell, SpawnInTerminal, TaskId};
 use terminal::Terminal;
 use terminal_view::TerminalView;
+use util::path_list::PathList;
 use ui::{
     Button, ButtonStyle, ContextMenu, Icon, IconButton, IconName, Label, PopoverMenu, TintColor,
     Tooltip, h_flex, prelude::*, v_flex,
@@ -54,6 +58,7 @@ const AUTO_FIX_MAX_ATTEMPTS: u32 = 5;
 /// Model string passed to claude (also valid for its /model command) and
 /// the chip label shown in the composer.
 const CLAUDE_MODELS: &[(&str, &str)] = &[
+    ("claude-fable-5-2", "Fable 5.2"),
     ("claude-fable-5-1", "Fable 5.1"),
     ("claude-opus-5-5", "Opus 5.5"),
     ("claude-sonnet-5-5", "Sonnet 5.5"),
@@ -103,6 +108,215 @@ fn agent_launch(model: String, effort: String, bypass: bool) -> (&'static str, V
 /// by some models; claude reports it visibly if the combination is invalid.
 const AGENT_EFFORTS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
 
+/// The ACP agents a workspace chat can run.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum ChatAgent {
+    Claude,
+    Codex,
+}
+
+impl ChatAgent {
+    fn agent_id(self) -> &'static str {
+        match self {
+            Self::Claude => "claude-acp",
+            Self::Codex => "codex-acp",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Claude => "Claude",
+            Self::Codex => "Codex",
+        }
+    }
+
+    fn from_agent_id(agent_id: &str) -> Self {
+        if agent_id == Self::Codex.agent_id() {
+            Self::Codex
+        } else {
+            Self::Claude
+        }
+    }
+}
+
+pub(crate) struct ChatSession {
+    record_id: String,
+    agent: ChatAgent,
+    is_review: bool,
+    view: Entity<ConversationView>,
+    stored_session_id: Option<String>,
+    observed_thread: Option<EntityId>,
+    pending_messages: PendingMessages,
+    /// A new review chat holds its prompt until it has been switched to the
+    /// review model.
+    awaiting_model: bool,
+    /// Watches the current root thread; replaced when the thread changes.
+    thread_subscriptions: Vec<Subscription>,
+    _subscriptions: Vec<Subscription>,
+}
+
+pub(crate) enum SessionKind {
+    Terminal(Entity<TerminalView>),
+    Chat(ChatSession),
+}
+
+pub(crate) struct WorkspaceSession {
+    title: SharedString,
+    kind: SessionKind,
+}
+
+impl WorkspaceSession {
+    fn terminal(&self) -> Option<&Entity<TerminalView>> {
+        match &self.kind {
+            SessionKind::Terminal(view) => Some(view),
+            SessionKind::Chat(_) => None,
+        }
+    }
+
+    fn chat(&self) -> Option<&ChatSession> {
+        match &self.kind {
+            SessionKind::Chat(chat) => Some(chat),
+            SessionKind::Terminal(_) => None,
+        }
+    }
+
+    fn chat_mut(&mut self) -> Option<&mut ChatSession> {
+        match &mut self.kind {
+            SessionKind::Chat(chat) => Some(chat),
+            SessionKind::Terminal(_) => None,
+        }
+    }
+
+    fn focus_handle(&self, cx: &App) -> FocusHandle {
+        match &self.kind {
+            SessionKind::Terminal(view) => view.focus_handle(cx),
+            SessionKind::Chat(chat) => chat.view.focus_handle(cx),
+        }
+    }
+}
+
+/// Instructions waiting for a chat to connect or finish its current turn,
+/// sent oldest first.
+#[derive(Default)]
+pub(crate) struct PendingMessages(std::collections::VecDeque<String>);
+
+impl PendingMessages {
+    pub(crate) fn push(&mut self, text: String) {
+        self.0.push_back(text);
+    }
+
+    pub(crate) fn take_next(&mut self) -> Option<String> {
+        self.0.pop_front()
+    }
+}
+
+/// What dispatch routing needs to know about a session.
+#[derive(Clone, Debug)]
+pub(crate) enum SessionSummary {
+    Chat {
+        agent: ChatAgent,
+        is_review: bool,
+        failed: bool,
+    },
+    Terminal { title: String },
+}
+
+/// Where a dispatched instruction came from. Composer text is typed while
+/// looking at a CLI tab, so it goes to that CLI; everything else (Create PR,
+/// Fix errors, auto-fix) prefers the workspace's chat.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum DispatchOrigin {
+    Composer,
+    External,
+}
+
+/// Whether a thread event ends the current turn, so the next queued
+/// instruction can be sent. A turn ending does not notify the thread's
+/// observers, only emits these events.
+pub(crate) fn releases_pending(event: &acp_thread::AcpThreadEvent) -> bool {
+    matches!(
+        event,
+        acp_thread::AcpThreadEvent::Stopped(_)
+            | acp_thread::AcpThreadEvent::Error
+            | acp_thread::AcpThreadEvent::Refusal
+    )
+}
+
+/// Workspaces created chat-first have a primary chat; every other workspace
+/// keeps starting its main claude CLI, even after chats are added to it.
+pub(crate) fn should_start_main_cli(records: &[ChatSessionRecord]) -> bool {
+    !records.iter().any(|record| record.is_primary)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum DispatchTarget {
+    Chat(usize),
+    Terminal(usize),
+}
+
+/// Picks where a dispatched instruction goes: the active chat, else the
+/// first Claude chat, else the first chat, else the active agent CLI, else
+/// the first agent CLI. Composer text goes to the agent CLI being viewed.
+/// The review chat and chats that failed to load never receive
+/// instructions.
+pub(crate) fn pick_dispatch_target(
+    origin: DispatchOrigin,
+    sessions: &[SessionSummary],
+    active: usize,
+) -> Option<DispatchTarget> {
+    let is_work_chat = |session: &SessionSummary| {
+        matches!(
+            session,
+            SessionSummary::Chat {
+                is_review: false,
+                failed: false,
+                ..
+            }
+        )
+    };
+    let is_agent_terminal = |session: &SessionSummary| match session {
+        SessionSummary::Terminal { title } => {
+            title.starts_with("claude") || title.starts_with("codex")
+        }
+        SessionSummary::Chat { .. } => false,
+    };
+
+    if origin == DispatchOrigin::Composer && sessions.get(active).is_some_and(is_agent_terminal) {
+        return Some(DispatchTarget::Terminal(active));
+    }
+    if sessions.get(active).is_some_and(is_work_chat) {
+        return Some(DispatchTarget::Chat(active));
+    }
+    let first_claude_chat = sessions.iter().position(|session| {
+        is_work_chat(session)
+            && matches!(
+                session,
+                SessionSummary::Chat {
+                    agent: ChatAgent::Claude,
+                    ..
+                }
+            )
+    });
+    if let Some(index) = first_claude_chat.or_else(|| sessions.iter().position(is_work_chat)) {
+        return Some(DispatchTarget::Chat(index));
+    }
+    if sessions.get(active).is_some_and(is_agent_terminal) {
+        return Some(DispatchTarget::Terminal(active));
+    }
+    sessions
+        .iter()
+        .position(is_agent_terminal)
+        .map(DispatchTarget::Terminal)
+}
+
+#[derive(Clone, Copy)]
+enum NewSession {
+    Chat(ChatAgent),
+    ClaudeCli,
+    CodexCli,
+    Shell,
+}
+
 /// Drag payload for the composer resize handle.
 struct ComposerDrag;
 
@@ -122,9 +336,9 @@ pub struct WorkspaceView {
     workspace: WeakEntity<Workspace>,
     project: WeakEntity<Project>,
     database_id: Option<WorkspaceId>,
-    terminals: Vec<Entity<TerminalView>>,
-    terminal_titles: Vec<SharedString>,
-    active_terminal: usize,
+    sessions: Vec<WorkspaceSession>,
+    active_session: usize,
+    connection_store: Option<Entity<AgentConnectionStore>>,
     composer: Entity<Editor>,
     composer_height: Pixels,
     agent_model: String,
@@ -153,8 +367,7 @@ impl WorkspaceView {
     /// persistent tmux session.
     fn add_claude_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let claude_count = self
-            .terminal_titles
-            .iter()
+            .terminal_titles()
             .filter(|title| title.starts_with("claude"))
             .count();
         let session = format!("claude-{}", claude_count + 1);
@@ -167,8 +380,7 @@ impl WorkspaceView {
     /// persistent tmux session.
     fn add_gpt_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let codex_count = self
-            .terminal_titles
-            .iter()
+            .terminal_titles()
             .filter(|title| title.starts_with("codex"))
             .count();
         let session = format!("codex-{}", codex_count + 1);
@@ -192,17 +404,12 @@ impl WorkspaceView {
     /// Opens (or refocuses) the review session: a separate claude on Sonnet
     /// that is asked to review the workspace's diff.
     pub(crate) fn start_review(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(index) = self
-            .terminal_titles
-            .iter()
-            .position(|title| title.as_ref() == "review")
-        {
-            self.active_terminal = index;
-            if let Some(view) = self.terminals.get(index) {
-                let focus_handle = view.focus_handle(cx);
-                window.focus(&focus_handle, cx);
-            }
-            cx.notify();
+        let existing_review = self.sessions.iter().position(|session| {
+            session.chat().is_some_and(|chat| chat.is_review)
+                || (session.terminal().is_some() && session.title.as_ref() == "review")
+        });
+        if let Some(index) = existing_review {
+            self.activate_session(index, window, cx);
             return;
         }
 
@@ -212,6 +419,30 @@ impl WorkspaceView {
                       style. Give a structured review: blocking issues first, then suggestions, \
                       then what looks good. Do not make code changes unless asked."
             .to_string();
+
+        let chat_first = self
+            .sessions
+            .iter()
+            .any(|session| session.chat().is_some());
+        if chat_first {
+            let record = ChatSessionRecord {
+                id: uuid::Uuid::new_v4().to_string(),
+                workspace_id: self.workspace_id.clone(),
+                agent: ChatAgent::Claude.agent_id().to_string(),
+                title: "Review".to_string(),
+                acp_session_id: None,
+                is_review: true,
+                is_primary: false,
+                position: self.next_chat_position(cx),
+            };
+            let state = mnemonic_bridge::mnemonic_state(cx);
+            if let Err(err) = chat_session_repository::insert(&state.db, &record) {
+                log::error!("Failed to save review chat session: {err}");
+            }
+            self.open_chat(record, Some(prompt), window, cx);
+            return;
+        }
+
         self.spawn_session_terminal(
             "review",
             "review",
@@ -324,7 +555,7 @@ impl WorkspaceView {
     fn add_shell_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let cwd = self.worktree_path.clone();
         let project = self.project.clone();
-        let title = format!("shell {}", self.terminals.len());
+        let title = format!("shell {}", self.terminal_titles().count());
 
         cx.spawn_in(window, async move |this, cx| {
             let terminal = match project
@@ -356,7 +587,7 @@ impl WorkspaceView {
     ) {
         // The first terminal is the agent's; track its output to derive the
         // running/waiting status chip.
-        if self.terminals.is_empty() {
+        if self.first_terminal().is_none() {
             let subscription = cx.subscribe(&terminal, |this, _terminal, event, cx| {
                 if matches!(event, terminal::Event::Wakeup) {
                     this.last_agent_activity = Some(Instant::now());
@@ -378,13 +609,416 @@ impl WorkspaceView {
                 cx,
             )
         });
-        self.terminals.push(view.clone());
-        self.terminal_titles
-            .push(SharedString::from(title.to_string()));
-        self.active_terminal = self.terminals.len() - 1;
-        let focus_handle = view.focus_handle(cx);
+        self.sessions.push(WorkspaceSession {
+            title: SharedString::from(title.to_string()),
+            kind: SessionKind::Terminal(view),
+        });
+        self.activate_session(self.sessions.len() - 1, window, cx);
+    }
+
+    fn terminal_titles(&self) -> impl Iterator<Item = &SharedString> {
+        self.sessions
+            .iter()
+            .filter(|session| session.terminal().is_some())
+            .map(|session| &session.title)
+    }
+
+    fn first_terminal(&self) -> Option<&Entity<TerminalView>> {
+        self.sessions.iter().find_map(WorkspaceSession::terminal)
+    }
+
+    fn active_is_chat(&self) -> bool {
+        self.sessions
+            .get(self.active_session)
+            .is_some_and(|session| session.chat().is_some())
+    }
+
+    fn activate_session(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(session) = self.sessions.get(index) else {
+            return;
+        };
+        self.active_session = index;
+        let focus_handle = session.focus_handle(cx);
         window.focus(&focus_handle, cx);
         cx.notify();
+    }
+
+    /// Adds a new chat tab running the given agent, persisted so it comes
+    /// back after a restart.
+    fn add_chat(&mut self, agent: ChatAgent, window: &mut Window, cx: &mut Context<Self>) {
+        let same_agent_count = self
+            .sessions
+            .iter()
+            .filter_map(WorkspaceSession::chat)
+            .filter(|chat| chat.agent == agent && !chat.is_review)
+            .count();
+        let title = if same_agent_count == 0 {
+            agent.label().to_string()
+        } else {
+            format!("{} {}", agent.label(), same_agent_count + 1)
+        };
+        let record = ChatSessionRecord {
+            id: uuid::Uuid::new_v4().to_string(),
+            workspace_id: self.workspace_id.clone(),
+            agent: agent.agent_id().to_string(),
+            title,
+            acp_session_id: None,
+            is_review: false,
+            is_primary: false,
+            position: self.next_chat_position(cx),
+        };
+        let state = mnemonic_bridge::mnemonic_state(cx);
+        if let Err(err) = chat_session_repository::insert(&state.db, &record) {
+            log::error!("Failed to save chat session: {err}");
+        }
+        self.open_chat(record, None, window, cx);
+    }
+
+    fn next_chat_position(&self, cx: &App) -> i64 {
+        let state = mnemonic_bridge::mnemonic_state(cx);
+        match chat_session_repository::list_for_workspace(&state.db, &self.workspace_id) {
+            Ok(records) => records
+                .iter()
+                .map(|record| record.position + 1)
+                .max()
+                .unwrap_or(0),
+            Err(err) => {
+                log::error!("Failed to list chat sessions: {err}");
+                0
+            }
+        }
+    }
+
+    /// Opens a chat tab for a saved chat session, resuming the agent's
+    /// session when one was recorded. An initial prompt is queued and sent
+    /// once the agent is connected and idle.
+    fn open_chat(
+        &mut self,
+        record: ChatSessionRecord,
+        initial_prompt: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(project) = self.project.upgrade() else {
+            return;
+        };
+        let connection_store = match &self.connection_store {
+            Some(store) => store.clone(),
+            None => {
+                let store = cx.new(|cx| AgentConnectionStore::new(project.clone(), cx));
+                self.connection_store = Some(store.clone());
+                store
+            }
+        };
+
+        let agent = Agent::Custom {
+            id: AgentId(SharedString::from(record.agent.clone())),
+        };
+        let fs = project.read(cx).fs().clone();
+        let server = agent.server(fs, agent::ThreadStore::global(cx));
+        let resume_session_id = record.acp_session_id.clone().map(acp::SessionId::new);
+        let work_dirs = self
+            .worktree_path
+            .as_ref()
+            .map(|path| PathList::new(&[path]));
+        let title = SharedString::from(record.title.clone());
+        let workspace = self.workspace.clone();
+
+        let view = cx.new(|cx| {
+            ConversationView::new(
+                server,
+                connection_store,
+                agent,
+                resume_session_id,
+                None,
+                work_dirs,
+                Some(title.clone()),
+                None,
+                workspace,
+                project,
+                None,
+                AgentThreadSource::AgentPanel,
+                window,
+                cx,
+            )
+        });
+
+        let view_id = view.entity_id();
+        let observation = cx.observe(&view, move |this, _view, cx| {
+            this.handle_chat_changed(view_id, cx);
+        });
+
+        self.sessions.push(WorkspaceSession {
+            title,
+            kind: SessionKind::Chat(ChatSession {
+                record_id: record.id,
+                agent: ChatAgent::from_agent_id(&record.agent),
+                is_review: record.is_review,
+                view,
+                stored_session_id: record.acp_session_id.clone(),
+                observed_thread: None,
+                pending_messages: {
+                    let mut pending = PendingMessages::default();
+                    if let Some(prompt) = initial_prompt {
+                        pending.push(prompt);
+                    }
+                    pending
+                },
+                awaiting_model: record.is_review && record.acp_session_id.is_none(),
+                thread_subscriptions: Vec::new(),
+                _subscriptions: vec![observation],
+            }),
+        });
+        self.activate_session(self.sessions.len() - 1, window, cx);
+        self.handle_chat_changed(view_id, cx);
+    }
+
+    fn chat_index(&self, view_id: EntityId) -> Option<usize> {
+        self.sessions.iter().position(|session| {
+            session
+                .chat()
+                .is_some_and(|chat| chat.view.entity_id() == view_id)
+        })
+    }
+
+    /// Records the agent's session id once it exists (so the chat can be
+    /// resumed) and starts watching its thread for activity and turn ends.
+    fn handle_chat_changed(&mut self, view_id: EntityId, cx: &mut Context<Self>) {
+        let Some(index) = self.chat_index(view_id) else {
+            return;
+        };
+        let Some(thread) = self
+            .sessions
+            .get(index)
+            .and_then(WorkspaceSession::chat)
+            .and_then(|chat| chat.view.read(cx).root_thread(cx))
+        else {
+            return;
+        };
+        let session_id = thread.read(cx).session_id().0.to_string();
+        let thread_id = thread.entity_id();
+        let is_new_thread = self
+            .sessions
+            .get(index)
+            .and_then(WorkspaceSession::chat)
+            .is_some_and(|chat| chat.observed_thread != Some(thread_id));
+
+        let thread_subscriptions = if is_new_thread {
+            vec![
+                cx.observe(&thread, move |this, thread, cx| {
+                    if thread.read(cx).status() == acp_thread::ThreadStatus::Generating {
+                        this.last_agent_activity = Some(Instant::now());
+                        mnemonic_bridge::record_agent_activity(&this.workspace_id);
+                        this.schedule_idle_check(cx);
+                    }
+                    cx.notify();
+                }),
+                cx.subscribe(&thread, move |this, _thread, event, cx| {
+                    if releases_pending(event) {
+                        this.flush_pending(view_id, cx);
+                        cx.notify();
+                    }
+                }),
+            ]
+        } else {
+            Vec::new()
+        };
+
+        let Some(chat) = self
+            .sessions
+            .get_mut(index)
+            .and_then(WorkspaceSession::chat_mut)
+        else {
+            return;
+        };
+
+        if chat.stored_session_id.as_deref() != Some(session_id.as_str()) {
+            chat.stored_session_id = Some(session_id.clone());
+            let record_id = chat.record_id.clone();
+            cx.background_spawn(async move {
+                let Some(state) = mnemonic_bridge::mnemonic_state_cloned() else {
+                    return;
+                };
+                if let Err(err) = chat_session_repository::set_acp_session_id(
+                    &state.db,
+                    &record_id,
+                    Some(&session_id),
+                ) {
+                    log::error!("Failed to save chat session id: {err}");
+                }
+            })
+            .detach();
+        }
+
+        if is_new_thread {
+            chat.observed_thread = Some(thread_id);
+            chat.thread_subscriptions = thread_subscriptions;
+            if chat.awaiting_model {
+                self.select_review_model(view_id, thread, cx);
+            } else {
+                self.flush_pending(view_id, cx);
+            }
+        }
+    }
+
+    /// Sends the next queued instruction to a chat if its thread is idle.
+    fn flush_pending(&mut self, view_id: EntityId, cx: &mut Context<Self>) {
+        let Some(index) = self.chat_index(view_id) else {
+            return;
+        };
+        let Some(thread) = self
+            .sessions
+            .get(index)
+            .and_then(WorkspaceSession::chat)
+            .and_then(|chat| chat.view.read(cx).root_thread(cx))
+        else {
+            return;
+        };
+        if thread.read(cx).status() != acp_thread::ThreadStatus::Idle {
+            return;
+        }
+        let Some(chat) = self
+            .sessions
+            .get_mut(index)
+            .and_then(WorkspaceSession::chat_mut)
+        else {
+            return;
+        };
+        if chat.awaiting_model {
+            return;
+        }
+        let Some(text) = chat.pending_messages.take_next() else {
+            return;
+        };
+        let send = thread.update(cx, |thread, cx| thread.send(vec![text.as_str().into()], cx));
+        cx.spawn(async move |_this, _cx| {
+            if let Err(err) = send.await {
+                log::error!("Failed to send instruction to chat: {err}");
+            }
+        })
+        .detach();
+    }
+
+    /// Switches a new review chat to a Sonnet model when the agent offers
+    /// one, then releases its review prompt.
+    fn select_review_model(
+        &mut self,
+        view_id: EntityId,
+        thread: Entity<acp_thread::AcpThread>,
+        cx: &mut Context<Self>,
+    ) {
+        let selector = {
+            let thread = thread.read(cx);
+            thread.connection().model_selector(thread.session_id())
+        };
+        let list_task = selector.as_ref().map(|selector| selector.list_models(cx));
+        cx.spawn(async move |this, cx| {
+            if let (Some(selector), Some(list_task)) = (selector, list_task) {
+                match list_task.await {
+                    Ok(list) => {
+                        let models = match list {
+                            acp_thread::AgentModelList::Flat(models) => models,
+                            acp_thread::AgentModelList::Grouped(groups) => {
+                                groups.into_values().flatten().collect()
+                            }
+                        };
+                        let sonnet = models.into_iter().find(|model| {
+                            model.id.as_str().to_lowercase().contains("sonnet")
+                        });
+                        if let Some(model) = sonnet {
+                            let select_task = cx.update(|cx| selector.select_model(model.id, cx));
+                            if let Err(err) = select_task.await {
+                                log::error!("Failed to select review model: {err}");
+                            }
+                        }
+                    }
+                    Err(err) => log::error!("Failed to list models for review chat: {err}"),
+                }
+            }
+            this.update(cx, |this, cx| {
+                if let Some(chat) = this
+                    .chat_index(view_id)
+                    .and_then(|index| this.sessions.get_mut(index))
+                    .and_then(WorkspaceSession::chat_mut)
+                {
+                    chat.awaiting_model = false;
+                }
+                this.flush_pending(view_id, cx);
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn session_summaries(&self, cx: &App) -> Vec<SessionSummary> {
+        self.sessions
+            .iter()
+            .map(|session| match &session.kind {
+                SessionKind::Chat(chat) => SessionSummary::Chat {
+                    agent: chat.agent,
+                    is_review: chat.is_review,
+                    failed: chat.view.read(cx).has_load_error(),
+                },
+                SessionKind::Terminal(_) => SessionSummary::Terminal {
+                    title: session.title.to_string(),
+                },
+            })
+            .collect()
+    }
+
+    fn any_chat_generating(&self, cx: &App) -> bool {
+        self.sessions
+            .iter()
+            .filter_map(WorkspaceSession::chat)
+            .any(|chat| {
+                chat.view.read(cx).root_thread(cx).is_some_and(|thread| {
+                    thread.read(cx).status() == acp_thread::ThreadStatus::Generating
+                })
+            })
+    }
+
+    /// Closes a chat tab and forgets it, so it does not come back on
+    /// restart.
+    fn close_chat(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(chat) = self.sessions.get(index).and_then(WorkspaceSession::chat) else {
+            return;
+        };
+        let view = chat.view.clone();
+        let record_id = chat.record_id.clone();
+        self.sessions.remove(index);
+
+        let close_task = view.update(cx, |view, cx| {
+            view.as_connected()
+                .map(|connected| connected.close_all_sessions(cx))
+        });
+        if let Some(close_task) = close_task {
+            close_task.detach();
+        }
+        let state = mnemonic_bridge::mnemonic_state(cx);
+        if let Err(err) = chat_session_repository::delete(&state.db, &record_id) {
+            log::error!("Failed to delete chat session: {err}");
+        }
+
+        if self.sessions.is_empty() {
+            self.active_session = 0;
+            cx.notify();
+        } else {
+            let next = self.active_session.min(self.sessions.len() - 1);
+            self.activate_session(next, window, cx);
+        }
+    }
+
+    /// Closes the agent connections of every chat in this workspace.
+    pub(crate) fn close_all_chats(&mut self, cx: &mut Context<Self>) {
+        for chat in self.sessions.iter().filter_map(WorkspaceSession::chat) {
+            let close_task = chat.view.update(cx, |view, cx| {
+                view.as_connected()
+                    .map(|connected| connected.close_all_sessions(cx))
+            });
+            if let Some(close_task) = close_task {
+                close_task.detach();
+            }
+        }
     }
 
     /// Whether the agent terminal has produced output recently enough to be
@@ -426,28 +1060,24 @@ impl WorkspaceView {
         if text.trim().is_empty() {
             return;
         }
-        self.dispatch_to_agent(text, cx);
+        self.dispatch_from(DispatchOrigin::Composer, text, cx);
         self.composer.update(cx, |composer, cx| composer.clear(window, cx));
     }
 
-    fn dispatch_target(&self) -> usize {
-        let active_is_agent = self
-            .terminal_titles
-            .get(self.active_terminal)
-            .is_some_and(|title| title.starts_with("claude") || title.starts_with("codex"));
-        if active_is_agent {
-            self.active_terminal
-        } else {
-            0
-        }
+    fn dispatch_target(&self, origin: DispatchOrigin, cx: &App) -> Option<DispatchTarget> {
+        pick_dispatch_target(origin, &self.session_summaries(cx), self.active_session)
     }
 
     /// Whether composer input currently goes to a claude session. Only claude
     /// takes the /model and /effort commands used for live switching.
-    fn dispatch_target_is_claude(&self) -> bool {
-        self.terminal_titles
-            .get(self.dispatch_target())
-            .is_some_and(|title| title.starts_with("claude"))
+    fn dispatch_target_is_claude(&self, cx: &App) -> bool {
+        match self.dispatch_target(DispatchOrigin::Composer, cx) {
+            Some(DispatchTarget::Terminal(index)) => self
+                .sessions
+                .get(index)
+                .is_some_and(|session| session.title.starts_with("claude")),
+            Some(DispatchTarget::Chat(_)) | None => false,
+        }
     }
 
     /// Writes an instruction into the agent terminal: text first, then the
@@ -455,7 +1085,32 @@ impl WorkspaceView {
     /// Targets the active tab when it's an agent session, otherwise the
     /// primary agent terminal.
     pub(crate) fn dispatch_to_agent(&mut self, text: String, cx: &mut Context<Self>) {
-        let Some(agent_view) = self.terminals.get(self.dispatch_target()) else {
+        self.dispatch_from(DispatchOrigin::External, text, cx);
+    }
+
+    fn dispatch_from(&mut self, origin: DispatchOrigin, text: String, cx: &mut Context<Self>) {
+        let index = match self.dispatch_target(origin, cx) {
+            Some(DispatchTarget::Chat(index)) => {
+                let Some(chat) = self
+                    .sessions
+                    .get_mut(index)
+                    .and_then(WorkspaceSession::chat_mut)
+                else {
+                    return;
+                };
+                chat.pending_messages.push(text);
+                let view_id = chat.view.entity_id();
+                self.flush_pending(view_id, cx);
+                return;
+            }
+            Some(DispatchTarget::Terminal(index)) => index,
+            None => {
+                log::warn!("No agent session to receive the instruction");
+                return;
+            }
+        };
+        let Some(agent_view) = self.sessions.get(index).and_then(WorkspaceSession::terminal)
+        else {
             return;
         };
         let terminal = agent_view.read(cx).terminal().clone();
@@ -574,7 +1229,7 @@ impl WorkspaceView {
                 cx.notify();
                 return false;
             }
-            if self.agent_is_running() {
+            if self.agent_is_running() || self.any_chat_generating(cx) {
                 self.auto_fix_state = SharedString::from("agent busy");
                 cx.notify();
                 return true;
@@ -652,8 +1307,8 @@ impl WorkspaceView {
     /// sessions.
     fn set_model(&mut self, model: &str, cx: &mut Context<Self>) {
         self.agent_model = model.to_string();
-        if !is_gpt_model(model) && self.dispatch_target_is_claude() {
-            self.dispatch_to_agent(format!("/model {model}"), cx);
+        if !is_gpt_model(model) && self.dispatch_target_is_claude(cx) {
+            self.dispatch_from(DispatchOrigin::Composer, format!("/model {model}"), cx);
         }
         cx.notify();
     }
@@ -671,8 +1326,8 @@ impl WorkspaceView {
     /// /effort, and becomes the launch flag for new sessions.
     fn set_effort(&mut self, effort: &str, cx: &mut Context<Self>) {
         self.agent_effort = effort.to_string();
-        if self.dispatch_target_is_claude() {
-            self.dispatch_to_agent(format!("/effort {effort}"), cx);
+        if self.dispatch_target_is_claude(cx) {
+            self.dispatch_from(DispatchOrigin::Composer, format!("/effort {effort}"), cx);
         }
         cx.notify();
     }
@@ -680,7 +1335,7 @@ impl WorkspaceView {
     /// Sends Escape to the agent terminal, which interrupts Claude Code
     /// mid-generation.
     fn interrupt_agent(&mut self, cx: &mut Context<Self>) {
-        let Some(agent_view) = self.terminals.first() else {
+        let Some(agent_view) = self.first_terminal() else {
             return;
         };
         let terminal = agent_view.read(cx).terminal().clone();
@@ -690,7 +1345,7 @@ impl WorkspaceView {
     }
 
     fn render_status_chip(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let running = self.agent_is_running();
+        let running = self.agent_is_running() || self.any_chat_generating(cx);
         let (color, text) = if running {
             (cx.theme().status().success, "Running")
         } else {
@@ -711,6 +1366,82 @@ impl WorkspaceView {
                     .size(LabelSize::XSmall)
                     .color(if running { Color::Default } else { Color::Muted }),
             )
+    }
+
+    /// Replaces a chat whose saved session can no longer be resumed with a
+    /// fresh conversation in the same tab.
+    fn restart_chat(&mut self, record_id: String, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(index) = self.sessions.iter().position(|session| {
+            session
+                .chat()
+                .is_some_and(|chat| chat.record_id == record_id)
+        }) else {
+            return;
+        };
+        let state = mnemonic_bridge::mnemonic_state(cx);
+        let record = match chat_session_repository::list_for_workspace(&state.db, &self.workspace_id)
+        {
+            Ok(records) => records.into_iter().find(|record| record.id == record_id),
+            Err(err) => {
+                log::error!("Failed to load chat session: {err}");
+                None
+            }
+        };
+        let Some(mut record) = record else {
+            return;
+        };
+        if let Err(err) = chat_session_repository::set_acp_session_id(&state.db, &record.id, None) {
+            log::error!("Failed to clear chat session id: {err}");
+        }
+        record.acp_session_id = None;
+
+        self.sessions.remove(index);
+        self.open_chat(record, None, window, cx);
+        let last = self.sessions.len() - 1;
+        let reopened = self.sessions.remove(last);
+        self.sessions.insert(index, reopened);
+        self.activate_session(index, window, cx);
+    }
+
+    fn render_chat(&self, chat: &ChatSession, cx: &mut Context<Self>) -> impl IntoElement {
+        let failed = chat.view.read(cx).has_load_error();
+        let record_id = chat.record_id.clone();
+        let agent = chat.agent;
+        v_flex()
+            .size_full()
+            .when(failed, |el| {
+                el.child(
+                    h_flex()
+                        .p_2()
+                        .gap_2()
+                        .border_b_1()
+                        .border_color(cx.theme().colors().border)
+                        .child(
+                            Label::new("This chat couldn't start.")
+                                .size(LabelSize::Small)
+                                .color(Color::Muted),
+                        )
+                        .child(
+                            Button::new("chat-start-new", "Start new chat")
+                                .label_size(LabelSize::Small)
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.restart_chat(record_id.clone(), window, cx);
+                                })),
+                        )
+                        .child(
+                            Button::new(
+                                "chat-open-cli-instead",
+                                format!("Open {} CLI instead", agent.label()),
+                            )
+                            .label_size(LabelSize::Small)
+                            .on_click(cx.listener(move |this, _, window, cx| match agent {
+                                ChatAgent::Claude => this.add_claude_terminal(window, cx),
+                                ChatAgent::Codex => this.add_gpt_terminal(window, cx),
+                            })),
+                        ),
+                )
+            })
+            .child(div().flex_grow(1.0).min_h(px(0.)).child(chat.view.clone()))
     }
 
     fn render_resize_handle(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -933,16 +1664,14 @@ impl WorkspaceView {
             .border_b_1()
             .border_color(cx.theme().colors().border);
 
-        for index in 0..self.terminals.len() {
-            let title = self
-                .terminal_titles
-                .get(index)
-                .cloned()
-                .unwrap_or_else(|| SharedString::from("terminal"));
-            let active = index == self.active_terminal;
+        for (index, session) in self.sessions.iter().enumerate() {
+            let title = session.title.clone();
+            let is_chat = session.chat().is_some();
+            let active = index == self.active_session;
             tabs = tabs.child(
-                div()
-                    .id(("workspace-terminal-tab", index))
+                h_flex()
+                    .id(("workspace-session-tab", index))
+                    .gap_0p5()
                     .px_2()
                     .py_0p5()
                     .rounded_md()
@@ -952,18 +1681,24 @@ impl WorkspaceView {
                     })
                     .hover(|style| style.bg(cx.theme().colors().ghost_element_hover))
                     .on_click(cx.listener(move |this, _, window, cx| {
-                        this.active_terminal = index;
-                        if let Some(view) = this.terminals.get(index) {
-                            let focus_handle = view.focus_handle(cx);
-                            window.focus(&focus_handle, cx);
-                        }
-                        cx.notify();
+                        this.activate_session(index, window, cx);
                     }))
                     .child(Label::new(title).size(LabelSize::XSmall).color(if active {
                         Color::Default
                     } else {
                         Color::Muted
-                    })),
+                    }))
+                    .when(is_chat, |el| {
+                        el.child(
+                            IconButton::new(("workspace-close-chat", index), IconName::Close)
+                                .icon_size(IconSize::XSmall)
+                                .tooltip(Tooltip::text("Close chat"))
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    cx.stop_propagation();
+                                    this.close_chat(index, window, cx);
+                                })),
+                        )
+                    }),
             );
         }
 
@@ -998,49 +1733,63 @@ impl WorkspaceView {
                 })),
             )
             .child(self.render_status_chip(cx))
-            .child(
-                Button::new("workspace-add-claude", "+ Claude")
-                    .label_size(LabelSize::XSmall)
-                    .tooltip(Tooltip::text(
-                        "New claude session in this workspace (own persistent tmux session)",
-                    ))
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.add_claude_terminal(window, cx);
-                    })),
-            )
-            .child(
-                Button::new("workspace-add-gpt", "+ GPT")
-                    .label_size(LabelSize::XSmall)
-                    .tooltip(Tooltip::text(
-                        "New codex session in this workspace (own persistent tmux session)",
-                    ))
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.add_gpt_terminal(window, cx);
-                    })),
-            )
-            .child(
-                IconButton::new("workspace-add-terminal", IconName::Plus)
-                    .icon_size(IconSize::Small)
-                    .tooltip(Tooltip::text("New shell in this workspace"))
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.add_shell_terminal(window, cx);
-                    })),
-            )
+            .child({
+                let this = cx.entity().downgrade();
+                PopoverMenu::new("workspace-add-session-menu")
+                    .anchor(Anchor::TopRight)
+                    .trigger(
+                        IconButton::new("workspace-add-session", IconName::Plus)
+                            .icon_size(IconSize::Small)
+                            .tooltip(Tooltip::text("New session in this workspace")),
+                    )
+                    .menu(move |window, cx| {
+                        let this = this.clone();
+                        Some(ContextMenu::build(window, cx, move |menu, _, _| {
+                            let entries: [(&str, NewSession); 5] = [
+                                ("Claude chat", NewSession::Chat(ChatAgent::Claude)),
+                                ("Codex chat", NewSession::Chat(ChatAgent::Codex)),
+                                ("Claude CLI", NewSession::ClaudeCli),
+                                ("Codex CLI", NewSession::CodexCli),
+                                ("Shell", NewSession::Shell),
+                            ];
+                            entries.into_iter().fold(menu, |menu, (label, kind)| {
+                                let this = this.clone();
+                                menu.entry(label, None, move |window, cx| {
+                                    this.update(cx, |this, cx| match kind {
+                                        NewSession::Chat(agent) => this.add_chat(agent, window, cx),
+                                        NewSession::ClaudeCli => {
+                                            this.add_claude_terminal(window, cx)
+                                        }
+                                        NewSession::CodexCli => this.add_gpt_terminal(window, cx),
+                                        NewSession::Shell => this.add_shell_terminal(window, cx),
+                                    })
+                                    .ok();
+                                })
+                            })
+                        }))
+                    })
+            })
     }
 }
 
 impl Focusable for WorkspaceView {
     fn focus_handle(&self, cx: &App) -> FocusHandle {
-        self.terminals
-            .get(self.active_terminal)
-            .map(|view| view.focus_handle(cx))
+        self.sessions
+            .get(self.active_session)
+            .map(|session| session.focus_handle(cx))
             .unwrap_or_else(|| self.focus_handle.clone())
     }
 }
 
 impl Render for WorkspaceView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let active_terminal = self.terminals.get(self.active_terminal).cloned();
+        let active_content = self.sessions.get(self.active_session).map(|session| {
+            match &session.kind {
+                SessionKind::Terminal(view) => view.clone().into_any_element(),
+                SessionKind::Chat(chat) => self.render_chat(chat, cx).into_any_element(),
+            }
+        });
+        let show_composer = !self.active_is_chat();
 
         v_flex()
             .size_full()
@@ -1061,19 +1810,21 @@ impl Render for WorkspaceView {
                     .w_full()
                     .min_h(px(0.))
                     .overflow_hidden()
-                    .map(|el| match active_terminal {
-                        Some(view) => el.child(view),
+                    .map(|el| match active_content {
+                        Some(content) => el.child(content),
                         None => el.child(
                             v_flex().size_full().items_center().justify_center().child(
-                                Label::new("Starting claude…")
+                                Label::new("Starting…")
                                     .size(LabelSize::Small)
                                     .color(Color::Muted),
                             ),
                         ),
                     }),
             )
-            .child(self.render_resize_handle(cx))
-            .child(self.render_composer(cx))
+            .when(show_composer, |el| {
+                el.child(self.render_resize_handle(cx))
+                    .child(self.render_composer(cx))
+            })
     }
 }
 
@@ -1169,9 +1920,9 @@ impl WorkspaceHost {
                 workspace,
                 project,
                 database_id,
-                terminals: Vec::new(),
-                terminal_titles: Vec::new(),
-                active_terminal: 0,
+                sessions: Vec::new(),
+                active_session: 0,
+                connection_store: None,
                 composer,
                 composer_height: px(110.),
                 agent_model: DEFAULT_CLAUDE_MODEL.to_string(),
@@ -1187,7 +1938,26 @@ impl WorkspaceHost {
                 _terminal_subscriptions: Vec::new(),
                 focus_handle: cx.focus_handle(),
             });
-            view.update(cx, |view, cx| view.spawn_agent_terminal(window, cx));
+            let state = mnemonic_bridge::mnemonic_state(cx);
+            let chat_records =
+                match chat_session_repository::list_for_workspace(&state.db, &summary.id) {
+                    Ok(records) => records,
+                    Err(err) => {
+                        log::error!("Failed to load chat sessions: {err}");
+                        Vec::new()
+                    }
+                };
+            view.update(cx, |view, cx| {
+                let start_main_cli = should_start_main_cli(&chat_records);
+                for record in chat_records {
+                    view.open_chat(record, None, window, cx);
+                }
+                if start_main_cli {
+                    view.spawn_agent_terminal(window, cx);
+                } else {
+                    view.activate_session(0, window, cx);
+                }
+            });
             self.views.insert(summary.id.clone(), view);
         }
 
@@ -1218,7 +1988,9 @@ impl WorkspaceHost {
                 .find_map(|item| item.downcast::<WorkspaceHost>());
             if let Some(host) = host {
                 host.update(cx, |host, cx| {
-                    host.views.remove(workspace_id);
+                    if let Some(view) = host.views.remove(workspace_id) {
+                        view.update(cx, |view, cx| view.close_all_chats(cx));
+                    }
                     if host.active.as_deref() == Some(workspace_id) {
                         host.active = None;
                         cx.emit(ItemEvent::UpdateTab);
@@ -1355,6 +2127,109 @@ impl Render for WorkspaceHost {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn chat(agent: ChatAgent, is_review: bool) -> SessionSummary {
+        SessionSummary::Chat {
+            agent,
+            is_review,
+            failed: false,
+        }
+    }
+
+    fn terminal(title: &str) -> SessionSummary {
+        SessionSummary::Terminal {
+            title: title.to_string(),
+        }
+    }
+
+    #[test]
+    fn dispatch_prefers_active_chat_then_first_claude_chat() {
+        let sessions = [
+            chat(ChatAgent::Codex, false),
+            chat(ChatAgent::Claude, false),
+            chat(ChatAgent::Claude, true),
+            terminal("claude"),
+        ];
+        assert_eq!(pick_dispatch_target(DispatchOrigin::External, &sessions, 0), Some(DispatchTarget::Chat(0)));
+        assert_eq!(pick_dispatch_target(DispatchOrigin::External, &sessions, 2), Some(DispatchTarget::Chat(1)));
+        assert_eq!(pick_dispatch_target(DispatchOrigin::External, &sessions, 3), Some(DispatchTarget::Chat(1)));
+    }
+
+    #[test]
+    fn dispatch_falls_back_to_cli_without_chats() {
+        let sessions = [terminal("claude"), terminal("shell 1")];
+        assert_eq!(pick_dispatch_target(DispatchOrigin::External, &sessions, 1), Some(DispatchTarget::Terminal(0)));
+        assert_eq!(pick_dispatch_target(DispatchOrigin::External, &sessions, 0), Some(DispatchTarget::Terminal(0)));
+        assert_eq!(pick_dispatch_target(DispatchOrigin::External, &[terminal("shell 1")], 0), None);
+        assert_eq!(pick_dispatch_target(DispatchOrigin::External, &[chat(ChatAgent::Claude, true)], 0), None);
+    }
+
+    #[test]
+    fn dispatch_skips_chats_that_failed_to_load() {
+        let sessions = [
+            SessionSummary::Chat {
+                agent: ChatAgent::Claude,
+                is_review: false,
+                failed: true,
+            },
+            terminal("claude"),
+        ];
+        assert_eq!(
+            pick_dispatch_target(DispatchOrigin::External, &sessions, 0),
+            Some(DispatchTarget::Terminal(1))
+        );
+    }
+
+    #[test]
+    fn composer_text_goes_to_the_cli_tab_being_viewed() {
+        let sessions = [chat(ChatAgent::Claude, false), terminal("claude-2")];
+        assert_eq!(
+            pick_dispatch_target(DispatchOrigin::Composer, &sessions, 1),
+            Some(DispatchTarget::Terminal(1))
+        );
+        assert_eq!(
+            pick_dispatch_target(DispatchOrigin::External, &sessions, 1),
+            Some(DispatchTarget::Chat(0))
+        );
+    }
+
+    #[test]
+    fn workspaces_not_created_chat_first_keep_their_main_cli() {
+        let record = |is_primary: bool| ChatSessionRecord {
+            id: "chat".to_string(),
+            workspace_id: "ws".to_string(),
+            agent: "codex-acp".to_string(),
+            title: "Codex".to_string(),
+            acp_session_id: None,
+            is_review: false,
+            is_primary,
+            position: 0,
+        };
+        assert!(should_start_main_cli(&[]));
+        assert!(should_start_main_cli(&[record(false)]));
+        assert!(!should_start_main_cli(&[record(true)]));
+    }
+
+    #[test]
+    fn turn_end_events_release_queued_instructions() {
+        assert!(releases_pending(&acp_thread::AcpThreadEvent::Stopped(
+            acp::StopReason::EndTurn
+        )));
+        assert!(releases_pending(&acp_thread::AcpThreadEvent::Error));
+        assert!(!releases_pending(
+            &acp_thread::AcpThreadEvent::TokenUsageUpdated
+        ));
+    }
+
+    #[test]
+    fn dispatch_to_unconnected_or_busy_chat_is_queued_in_order() {
+        let mut pending = PendingMessages::default();
+        pending.push("a".to_string());
+        pending.push("b".to_string());
+        assert_eq!(pending.take_next().as_deref(), Some("a"));
+        assert_eq!(pending.take_next().as_deref(), Some("b"));
+        assert_eq!(pending.take_next(), None);
+    }
 
     #[test]
     fn gpt_models_launch_codex_with_codex_flags() {

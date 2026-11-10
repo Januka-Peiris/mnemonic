@@ -732,6 +732,31 @@ pub fn run(connection: &Connection) -> Result<(), String> {
         )
         .map_err(|err| format!("Failed to create workspace_templates table: {err}"))?;
 
+    connection
+        .execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS workspace_chat_sessions (
+                id TEXT PRIMARY KEY,
+                workspace_id TEXT NOT NULL,
+                agent TEXT NOT NULL,
+                title TEXT NOT NULL,
+                acp_session_id TEXT,
+                is_review INTEGER NOT NULL DEFAULT 0,
+                position INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE INDEX IF NOT EXISTS idx_workspace_chat_sessions_workspace
+                ON workspace_chat_sessions(workspace_id);
+            "#,
+        )
+        .map_err(|err| format!("Failed to create workspace_chat_sessions table: {err}"))?;
+    add_column_if_missing(
+        connection,
+        "workspace_chat_sessions",
+        "is_primary",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+
     // Drop deprecated agent_chat tables (child table first to respect FK).
     // Idempotent: IF EXISTS means this is safe on fresh installs too.
     connection

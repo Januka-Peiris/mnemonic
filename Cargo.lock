@@ -11365,6 +11365,10 @@ dependencies = [
 name = "mnemonic-panels"
 version = "0.1.0"
 dependencies = [
+ "acp_thread",
+ "agent",
+ "agent-client-protocol",
+ "agent_ui",
  "anyhow",
  "chrono",
  "editor",
@@ -11380,6 +11384,8 @@ dependencies = [
  "terminal",
  "terminal_view",
  "ui",
+ "util",
+ "uuid",
  "workspace",
 ]
 
