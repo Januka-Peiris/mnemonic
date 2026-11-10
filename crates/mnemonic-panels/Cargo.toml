@@ -5,6 +5,12 @@ edition = "2021"
 publish.workspace = true
 
 [dependencies]
+acp_thread.workspace = true
+agent.workspace = true
+agent-client-protocol.workspace = true
+agent_ui.workspace = true
+util.workspace = true
+uuid.workspace = true
 chrono.workspace = true
 editor.workspace = true
 mnemonic-bridge.workspace = true

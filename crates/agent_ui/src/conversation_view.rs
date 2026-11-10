@@ -613,9 +613,13 @@ impl ConversationView {
         })
     }
 
-    pub(crate) fn root_thread(&self, cx: &App) -> Option<Entity<AcpThread>> {
+    pub fn root_thread(&self, cx: &App) -> Option<Entity<AcpThread>> {
         self.root_thread_view()
             .map(|view| view.read(cx).thread.clone())
+    }
+
+    pub fn has_load_error(&self) -> bool {
+        matches!(self.server_state, ServerState::LoadError { .. })
     }
 
     pub fn root_thread_view(&self) -> Option<Entity<ThreadView>> {

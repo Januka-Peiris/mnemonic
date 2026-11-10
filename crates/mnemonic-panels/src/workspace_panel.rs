@@ -7,8 +7,12 @@ use gpui::{
     FocusHandle, IntoElement, PathPromptOptions, Pixels, PromptLevel, Render, SharedString,
     WeakEntity, Window,
 };
-use mnemonic_core::models::{ActivityItem, CreateWorkspaceInput, DiscoveredRepository, WorkspaceSummary};
-use mnemonic_core::repositories::{activity_repository, repository_repository, settings_repository};
+use mnemonic_core::models::{
+    ActivityItem, ChatSessionRecord, CreateWorkspaceInput, DiscoveredRepository, WorkspaceSummary,
+};
+use mnemonic_core::repositories::{
+    activity_repository, chat_session_repository, repository_repository, settings_repository,
+};
 use mnemonic_core::services::{repo_scanner_service, workspace_service};
 use ui::{Tooltip, h_flex, v_flex, Icon, IconButton, IconName, Label, prelude::*};
 use workspace::dock::{DockPosition, PanelEvent};
@@ -345,6 +349,23 @@ impl WorkspacePanel {
             match result {
                 Ok(Ok(detail)) => {
                     log::info!("Created workspace: {}", detail.summary.id);
+                    // New workspaces are chat-first: the saved chat session
+                    // makes the workspace view open a Claude chat instead of
+                    // the claude CLI.
+                    if let Some(state) = mnemonic_bridge::mnemonic_state_cloned() {
+                        let record = ChatSessionRecord {
+                            id: uuid::Uuid::new_v4().to_string(),
+                            workspace_id: detail.summary.id.clone(),
+                            agent: "claude-acp".to_string(),
+                            title: "Claude".to_string(),
+                            acp_session_id: None,
+                            is_review: false,
+                            position: 0,
+                        };
+                        if let Err(err) = chat_session_repository::insert(&state.db, &record) {
+                            log::error!("Failed to save initial chat session: {err}");
+                        }
+                    }
 
                     this.update_in(cx, |this, window, cx| {
                         this.refresh(cx);
