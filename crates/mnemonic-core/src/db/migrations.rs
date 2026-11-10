@@ -750,6 +750,12 @@ pub fn run(connection: &Connection) -> Result<(), String> {
             "#,
         )
         .map_err(|err| format!("Failed to create workspace_chat_sessions table: {err}"))?;
+    add_column_if_missing(
+        connection,
+        "workspace_chat_sessions",
+        "is_primary",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
 
     // Drop deprecated agent_chat tables (child table first to respect FK).
     // Idempotent: IF EXISTS means this is safe on fresh installs too.

@@ -12,5 +12,8 @@ pub struct ChatSessionRecord {
     /// resumed after a restart.
     pub acp_session_id: Option<String>,
     pub is_review: bool,
+    /// The chat a workspace was created with. Workspaces that have one open
+    /// on their chats instead of starting the main claude CLI.
+    pub is_primary: bool,
     pub position: i64,
 }

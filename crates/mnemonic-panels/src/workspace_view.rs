@@ -149,6 +149,8 @@ pub(crate) struct ChatSession {
     /// A new review chat holds its prompt until it has been switched to the
     /// review model.
     awaiting_model: bool,
+    /// Watches the current root thread; replaced when the thread changes.
+    thread_subscriptions: Vec<Subscription>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -210,8 +212,39 @@ impl PendingMessages {
 /// What dispatch routing needs to know about a session.
 #[derive(Clone, Debug)]
 pub(crate) enum SessionSummary {
-    Chat { agent: ChatAgent, is_review: bool },
+    Chat {
+        agent: ChatAgent,
+        is_review: bool,
+        failed: bool,
+    },
     Terminal { title: String },
+}
+
+/// Where a dispatched instruction came from. Composer text is typed while
+/// looking at a CLI tab, so it goes to that CLI; everything else (Create PR,
+/// Fix errors, auto-fix) prefers the workspace's chat.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum DispatchOrigin {
+    Composer,
+    External,
+}
+
+/// Whether a thread event ends the current turn, so the next queued
+/// instruction can be sent. A turn ending does not notify the thread's
+/// observers, only emits these events.
+pub(crate) fn releases_pending(event: &acp_thread::AcpThreadEvent) -> bool {
+    matches!(
+        event,
+        acp_thread::AcpThreadEvent::Stopped(_)
+            | acp_thread::AcpThreadEvent::Error
+            | acp_thread::AcpThreadEvent::Refusal
+    )
+}
+
+/// Workspaces created chat-first have a primary chat; every other workspace
+/// keeps starting its main claude CLI, even after chats are added to it.
+pub(crate) fn should_start_main_cli(records: &[ChatSessionRecord]) -> bool {
+    !records.iter().any(|record| record.is_primary)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -220,16 +253,25 @@ pub(crate) enum DispatchTarget {
     Terminal(usize),
 }
 
-/// Picks where a dispatched instruction (Create PR, Fix errors, auto-fix,
-/// composer text) goes: the active chat, else the first Claude chat, else
-/// the first chat, else the active agent CLI, else the first agent CLI.
-/// The review chat never receives dispatched instructions.
+/// Picks where a dispatched instruction goes: the active chat, else the
+/// first Claude chat, else the first chat, else the active agent CLI, else
+/// the first agent CLI. Composer text goes to the agent CLI being viewed.
+/// The review chat and chats that failed to load never receive
+/// instructions.
 pub(crate) fn pick_dispatch_target(
+    origin: DispatchOrigin,
     sessions: &[SessionSummary],
     active: usize,
 ) -> Option<DispatchTarget> {
     let is_work_chat = |session: &SessionSummary| {
-        matches!(session, SessionSummary::Chat { is_review: false, .. })
+        matches!(
+            session,
+            SessionSummary::Chat {
+                is_review: false,
+                failed: false,
+                ..
+            }
+        )
     };
     let is_agent_terminal = |session: &SessionSummary| match session {
         SessionSummary::Terminal { title } => {
@@ -238,17 +280,21 @@ pub(crate) fn pick_dispatch_target(
         SessionSummary::Chat { .. } => false,
     };
 
+    if origin == DispatchOrigin::Composer && sessions.get(active).is_some_and(is_agent_terminal) {
+        return Some(DispatchTarget::Terminal(active));
+    }
     if sessions.get(active).is_some_and(is_work_chat) {
         return Some(DispatchTarget::Chat(active));
     }
     let first_claude_chat = sessions.iter().position(|session| {
-        matches!(
-            session,
-            SessionSummary::Chat {
-                agent: ChatAgent::Claude,
-                is_review: false
-            }
-        )
+        is_work_chat(session)
+            && matches!(
+                session,
+                SessionSummary::Chat {
+                    agent: ChatAgent::Claude,
+                    ..
+                }
+            )
     });
     if let Some(index) = first_claude_chat.or_else(|| sessions.iter().position(is_work_chat)) {
         return Some(DispatchTarget::Chat(index));
@@ -385,6 +431,7 @@ impl WorkspaceView {
                 title: "Review".to_string(),
                 acp_session_id: None,
                 is_review: true,
+                is_primary: false,
                 position: self.next_chat_position(cx),
             };
             let state = mnemonic_bridge::mnemonic_state(cx);
@@ -616,6 +663,7 @@ impl WorkspaceView {
             title,
             acp_session_id: None,
             is_review: false,
+            is_primary: false,
             position: self.next_chat_position(cx),
         };
         let state = mnemonic_bridge::mnemonic_state(cx);
@@ -716,6 +764,7 @@ impl WorkspaceView {
                     pending
                 },
                 awaiting_model: record.is_review && record.acp_session_id.is_none(),
+                thread_subscriptions: Vec::new(),
                 _subscriptions: vec![observation],
             }),
         });
@@ -732,7 +781,7 @@ impl WorkspaceView {
     }
 
     /// Records the agent's session id once it exists (so the chat can be
-    /// resumed) and starts watching its thread for activity.
+    /// resumed) and starts watching its thread for activity and turn ends.
     fn handle_chat_changed(&mut self, view_id: EntityId, cx: &mut Context<Self>) {
         let Some(index) = self.chat_index(view_id) else {
             return;
@@ -747,17 +796,32 @@ impl WorkspaceView {
         };
         let session_id = thread.read(cx).session_id().0.to_string();
         let thread_id = thread.entity_id();
+        let is_new_thread = self
+            .sessions
+            .get(index)
+            .and_then(WorkspaceSession::chat)
+            .is_some_and(|chat| chat.observed_thread != Some(thread_id));
 
-        let subscription = cx.observe(&thread, move |this, thread, cx| {
-            if thread.read(cx).status() == acp_thread::ThreadStatus::Generating {
-                this.last_agent_activity = Some(Instant::now());
-                mnemonic_bridge::record_agent_activity(&this.workspace_id);
-                this.schedule_idle_check(cx);
-            } else {
-                this.flush_pending(view_id, cx);
-            }
-            cx.notify();
-        });
+        let thread_subscriptions = if is_new_thread {
+            vec![
+                cx.observe(&thread, move |this, thread, cx| {
+                    if thread.read(cx).status() == acp_thread::ThreadStatus::Generating {
+                        this.last_agent_activity = Some(Instant::now());
+                        mnemonic_bridge::record_agent_activity(&this.workspace_id);
+                        this.schedule_idle_check(cx);
+                    }
+                    cx.notify();
+                }),
+                cx.subscribe(&thread, move |this, _thread, event, cx| {
+                    if releases_pending(event) {
+                        this.flush_pending(view_id, cx);
+                        cx.notify();
+                    }
+                }),
+            ]
+        } else {
+            Vec::new()
+        };
 
         let Some(chat) = self
             .sessions
@@ -774,18 +838,20 @@ impl WorkspaceView {
                 let Some(state) = mnemonic_bridge::mnemonic_state_cloned() else {
                     return;
                 };
-                if let Err(err) =
-                    chat_session_repository::set_acp_session_id(&state.db, &record_id, &session_id)
-                {
+                if let Err(err) = chat_session_repository::set_acp_session_id(
+                    &state.db,
+                    &record_id,
+                    Some(&session_id),
+                ) {
                     log::error!("Failed to save chat session id: {err}");
                 }
             })
             .detach();
         }
 
-        if chat.observed_thread != Some(thread_id) {
+        if is_new_thread {
             chat.observed_thread = Some(thread_id);
-            chat._subscriptions.push(subscription);
+            chat.thread_subscriptions = thread_subscriptions;
             if chat.awaiting_model {
                 self.select_review_model(view_id, thread, cx);
             } else {
@@ -883,13 +949,14 @@ impl WorkspaceView {
         .detach();
     }
 
-    fn session_summaries(&self) -> Vec<SessionSummary> {
+    fn session_summaries(&self, cx: &App) -> Vec<SessionSummary> {
         self.sessions
             .iter()
             .map(|session| match &session.kind {
                 SessionKind::Chat(chat) => SessionSummary::Chat {
                     agent: chat.agent,
                     is_review: chat.is_review,
+                    failed: chat.view.read(cx).has_load_error(),
                 },
                 SessionKind::Terminal(_) => SessionSummary::Terminal {
                     title: session.title.to_string(),
@@ -992,18 +1059,18 @@ impl WorkspaceView {
         if text.trim().is_empty() {
             return;
         }
-        self.dispatch_to_agent(text, cx);
+        self.dispatch_from(DispatchOrigin::Composer, text, cx);
         self.composer.update(cx, |composer, cx| composer.clear(window, cx));
     }
 
-    fn dispatch_target(&self) -> Option<DispatchTarget> {
-        pick_dispatch_target(&self.session_summaries(), self.active_session)
+    fn dispatch_target(&self, origin: DispatchOrigin, cx: &App) -> Option<DispatchTarget> {
+        pick_dispatch_target(origin, &self.session_summaries(cx), self.active_session)
     }
 
     /// Whether composer input currently goes to a claude session. Only claude
     /// takes the /model and /effort commands used for live switching.
-    fn dispatch_target_is_claude(&self) -> bool {
-        match self.dispatch_target() {
+    fn dispatch_target_is_claude(&self, cx: &App) -> bool {
+        match self.dispatch_target(DispatchOrigin::Composer, cx) {
             Some(DispatchTarget::Terminal(index)) => self
                 .sessions
                 .get(index)
@@ -1017,7 +1084,11 @@ impl WorkspaceView {
     /// Targets the active tab when it's an agent session, otherwise the
     /// primary agent terminal.
     pub(crate) fn dispatch_to_agent(&mut self, text: String, cx: &mut Context<Self>) {
-        let index = match self.dispatch_target() {
+        self.dispatch_from(DispatchOrigin::External, text, cx);
+    }
+
+    fn dispatch_from(&mut self, origin: DispatchOrigin, text: String, cx: &mut Context<Self>) {
+        let index = match self.dispatch_target(origin, cx) {
             Some(DispatchTarget::Chat(index)) => {
                 let Some(chat) = self
                     .sessions
@@ -1157,7 +1228,7 @@ impl WorkspaceView {
                 cx.notify();
                 return false;
             }
-            if self.agent_is_running() {
+            if self.agent_is_running() || self.any_chat_generating(cx) {
                 self.auto_fix_state = SharedString::from("agent busy");
                 cx.notify();
                 return true;
@@ -1235,8 +1306,8 @@ impl WorkspaceView {
     /// sessions.
     fn set_model(&mut self, model: &str, cx: &mut Context<Self>) {
         self.agent_model = model.to_string();
-        if !is_gpt_model(model) && self.dispatch_target_is_claude() {
-            self.dispatch_to_agent(format!("/model {model}"), cx);
+        if !is_gpt_model(model) && self.dispatch_target_is_claude(cx) {
+            self.dispatch_from(DispatchOrigin::Composer, format!("/model {model}"), cx);
         }
         cx.notify();
     }
@@ -1254,8 +1325,8 @@ impl WorkspaceView {
     /// /effort, and becomes the launch flag for new sessions.
     fn set_effort(&mut self, effort: &str, cx: &mut Context<Self>) {
         self.agent_effort = effort.to_string();
-        if self.dispatch_target_is_claude() {
-            self.dispatch_to_agent(format!("/effort {effort}"), cx);
+        if self.dispatch_target_is_claude(cx) {
+            self.dispatch_from(DispatchOrigin::Composer, format!("/effort {effort}"), cx);
         }
         cx.notify();
     }
@@ -1296,8 +1367,45 @@ impl WorkspaceView {
             )
     }
 
+    /// Replaces a chat whose saved session can no longer be resumed with a
+    /// fresh conversation in the same tab.
+    fn restart_chat(&mut self, record_id: String, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(index) = self.sessions.iter().position(|session| {
+            session
+                .chat()
+                .is_some_and(|chat| chat.record_id == record_id)
+        }) else {
+            return;
+        };
+        let state = mnemonic_bridge::mnemonic_state(cx);
+        let record = match chat_session_repository::list_for_workspace(&state.db, &self.workspace_id)
+        {
+            Ok(records) => records.into_iter().find(|record| record.id == record_id),
+            Err(err) => {
+                log::error!("Failed to load chat session: {err}");
+                None
+            }
+        };
+        let Some(mut record) = record else {
+            return;
+        };
+        if let Err(err) = chat_session_repository::set_acp_session_id(&state.db, &record.id, None) {
+            log::error!("Failed to clear chat session id: {err}");
+        }
+        record.acp_session_id = None;
+
+        self.sessions.remove(index);
+        self.open_chat(record, None, window, cx);
+        let last = self.sessions.len() - 1;
+        let reopened = self.sessions.remove(last);
+        self.sessions.insert(index, reopened);
+        self.activate_session(index, window, cx);
+    }
+
     fn render_chat(&self, chat: &ChatSession, cx: &mut Context<Self>) -> impl IntoElement {
         let failed = chat.view.read(cx).has_load_error();
+        let record_id = chat.record_id.clone();
+        let agent = chat.agent;
         v_flex()
             .size_full()
             .when(failed, |el| {
@@ -1313,11 +1421,22 @@ impl WorkspaceView {
                                 .color(Color::Muted),
                         )
                         .child(
-                            Button::new("chat-open-cli-instead", "Open Claude CLI instead")
+                            Button::new("chat-start-new", "Start new chat")
                                 .label_size(LabelSize::Small)
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    this.add_claude_terminal(window, cx);
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.restart_chat(record_id.clone(), window, cx);
                                 })),
+                        )
+                        .child(
+                            Button::new(
+                                "chat-open-cli-instead",
+                                format!("Open {} CLI instead", agent.label()),
+                            )
+                            .label_size(LabelSize::Small)
+                            .on_click(cx.listener(move |this, _, window, cx| match agent {
+                                ChatAgent::Claude => this.add_claude_terminal(window, cx),
+                                ChatAgent::Codex => this.add_gpt_terminal(window, cx),
+                            })),
                         ),
                 )
             })
@@ -1828,12 +1947,13 @@ impl WorkspaceHost {
                     }
                 };
             view.update(cx, |view, cx| {
-                if chat_records.is_empty() {
+                let start_main_cli = should_start_main_cli(&chat_records);
+                for record in chat_records {
+                    view.open_chat(record, None, window, cx);
+                }
+                if start_main_cli {
                     view.spawn_agent_terminal(window, cx);
                 } else {
-                    for record in chat_records {
-                        view.open_chat(record, None, window, cx);
-                    }
                     view.activate_session(0, window, cx);
                 }
             });
@@ -2008,7 +2128,11 @@ mod tests {
     use super::*;
 
     fn chat(agent: ChatAgent, is_review: bool) -> SessionSummary {
-        SessionSummary::Chat { agent, is_review }
+        SessionSummary::Chat {
+            agent,
+            is_review,
+            failed: false,
+        }
     }
 
     fn terminal(title: &str) -> SessionSummary {
@@ -2025,18 +2149,75 @@ mod tests {
             chat(ChatAgent::Claude, true),
             terminal("claude"),
         ];
-        assert_eq!(pick_dispatch_target(&sessions, 0), Some(DispatchTarget::Chat(0)));
-        assert_eq!(pick_dispatch_target(&sessions, 2), Some(DispatchTarget::Chat(1)));
-        assert_eq!(pick_dispatch_target(&sessions, 3), Some(DispatchTarget::Chat(1)));
+        assert_eq!(pick_dispatch_target(DispatchOrigin::External, &sessions, 0), Some(DispatchTarget::Chat(0)));
+        assert_eq!(pick_dispatch_target(DispatchOrigin::External, &sessions, 2), Some(DispatchTarget::Chat(1)));
+        assert_eq!(pick_dispatch_target(DispatchOrigin::External, &sessions, 3), Some(DispatchTarget::Chat(1)));
     }
 
     #[test]
     fn dispatch_falls_back_to_cli_without_chats() {
         let sessions = [terminal("claude"), terminal("shell 1")];
-        assert_eq!(pick_dispatch_target(&sessions, 1), Some(DispatchTarget::Terminal(0)));
-        assert_eq!(pick_dispatch_target(&sessions, 0), Some(DispatchTarget::Terminal(0)));
-        assert_eq!(pick_dispatch_target(&[terminal("shell 1")], 0), None);
-        assert_eq!(pick_dispatch_target(&[chat(ChatAgent::Claude, true)], 0), None);
+        assert_eq!(pick_dispatch_target(DispatchOrigin::External, &sessions, 1), Some(DispatchTarget::Terminal(0)));
+        assert_eq!(pick_dispatch_target(DispatchOrigin::External, &sessions, 0), Some(DispatchTarget::Terminal(0)));
+        assert_eq!(pick_dispatch_target(DispatchOrigin::External, &[terminal("shell 1")], 0), None);
+        assert_eq!(pick_dispatch_target(DispatchOrigin::External, &[chat(ChatAgent::Claude, true)], 0), None);
+    }
+
+    #[test]
+    fn dispatch_skips_chats_that_failed_to_load() {
+        let sessions = [
+            SessionSummary::Chat {
+                agent: ChatAgent::Claude,
+                is_review: false,
+                failed: true,
+            },
+            terminal("claude"),
+        ];
+        assert_eq!(
+            pick_dispatch_target(DispatchOrigin::External, &sessions, 0),
+            Some(DispatchTarget::Terminal(1))
+        );
+    }
+
+    #[test]
+    fn composer_text_goes_to_the_cli_tab_being_viewed() {
+        let sessions = [chat(ChatAgent::Claude, false), terminal("claude-2")];
+        assert_eq!(
+            pick_dispatch_target(DispatchOrigin::Composer, &sessions, 1),
+            Some(DispatchTarget::Terminal(1))
+        );
+        assert_eq!(
+            pick_dispatch_target(DispatchOrigin::External, &sessions, 1),
+            Some(DispatchTarget::Chat(0))
+        );
+    }
+
+    #[test]
+    fn workspaces_not_created_chat_first_keep_their_main_cli() {
+        let record = |is_primary: bool| ChatSessionRecord {
+            id: "chat".to_string(),
+            workspace_id: "ws".to_string(),
+            agent: "codex-acp".to_string(),
+            title: "Codex".to_string(),
+            acp_session_id: None,
+            is_review: false,
+            is_primary,
+            position: 0,
+        };
+        assert!(should_start_main_cli(&[]));
+        assert!(should_start_main_cli(&[record(false)]));
+        assert!(!should_start_main_cli(&[record(true)]));
+    }
+
+    #[test]
+    fn turn_end_events_release_queued_instructions() {
+        assert!(releases_pending(&acp_thread::AcpThreadEvent::Stopped(
+            acp::StopReason::EndTurn
+        )));
+        assert!(releases_pending(&acp_thread::AcpThreadEvent::Error));
+        assert!(!releases_pending(
+            &acp_thread::AcpThreadEvent::TokenUsageUpdated
+        ));
     }
 
     #[test]

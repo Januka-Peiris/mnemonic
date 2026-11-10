@@ -366,6 +366,7 @@ impl WorkspacePanel {
                             title: "Claude".to_string(),
                             acp_session_id: None,
                             is_review: false,
+                            is_primary: true,
                             position: 0,
                         };
                         if let Err(err) = chat_session_repository::insert(&state.db, &record) {

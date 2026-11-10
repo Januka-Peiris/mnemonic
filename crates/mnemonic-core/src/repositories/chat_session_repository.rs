@@ -11,6 +11,7 @@ fn record_from_row(row: &Row) -> rusqlite::Result<ChatSessionRecord> {
         title: row.get("title")?,
         acp_session_id: row.get("acp_session_id")?,
         is_review: row.get::<_, i64>("is_review")? != 0,
+        is_primary: row.get::<_, i64>("is_primary")? != 0,
         position: row.get("position")?,
     })
 }
@@ -35,8 +36,8 @@ pub fn insert(db: &Database, record: &ChatSessionRecord) -> Result<(), String> {
     db.with_connection_mut(|connection| {
         connection.execute(
             "INSERT INTO workspace_chat_sessions \
-             (id, workspace_id, agent, title, acp_session_id, is_review, position) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+             (id, workspace_id, agent, title, acp_session_id, is_review, is_primary, position) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
                 record.id,
                 record.workspace_id,
@@ -44,6 +45,7 @@ pub fn insert(db: &Database, record: &ChatSessionRecord) -> Result<(), String> {
                 record.title,
                 record.acp_session_id,
                 i64::from(record.is_review),
+                i64::from(record.is_primary),
                 record.position,
             ],
         )?;
@@ -51,7 +53,11 @@ pub fn insert(db: &Database, record: &ChatSessionRecord) -> Result<(), String> {
     })
 }
 
-pub fn set_acp_session_id(db: &Database, id: &str, acp_session_id: &str) -> Result<(), String> {
+pub fn set_acp_session_id(
+    db: &Database,
+    id: &str,
+    acp_session_id: Option<&str>,
+) -> Result<(), String> {
     db.with_connection_mut(|connection| {
         connection.execute(
             "UPDATE workspace_chat_sessions SET acp_session_id = ?1 WHERE id = ?2",
@@ -93,6 +99,7 @@ mod tests {
             title: format!("Claude {id}"),
             acp_session_id: None,
             is_review: false,
+            is_primary: false,
             position,
         }
     }
@@ -108,7 +115,7 @@ mod tests {
         let ids: Vec<&str> = sessions.iter().map(|session| session.id.as_str()).collect();
         assert_eq!(ids, ["first", "later"]);
 
-        set_acp_session_id(&db, "first", "sess-1")?;
+        set_acp_session_id(&db, "first", Some("sess-1"))?;
         let sessions = list_for_workspace(&db, "ws-a")?;
         assert_eq!(
             sessions
