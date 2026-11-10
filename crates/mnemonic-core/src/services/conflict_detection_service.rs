@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use crate::db::Database;
 use crate::models::{WorkspaceConflict, WorkspaceConflicts};
 
@@ -80,6 +82,49 @@ pub fn detect_workspace_conflicts(db: &Database) -> Result<WorkspaceConflicts, S
     })
 }
 
+/// For each file changed in `workspace_id`, the names of other unmerged
+/// workspaces of the same repository that also change it, from the
+/// changed-files cache that list_workspaces keeps refreshed.
+pub fn files_also_changed_elsewhere(
+    db: &Database,
+    workspace_id: &str,
+) -> Result<BTreeMap<String, Vec<String>>, String> {
+    db.with_connection(|connection| {
+        let mut statement = connection.prepare(
+            r#"
+            SELECT mine.path, other_workspace.name
+            FROM   changed_files mine
+            JOIN   workspaces this_workspace ON this_workspace.id = mine.workspace_id
+            JOIN   changed_files theirs
+                   ON  theirs.path = mine.path
+                   AND theirs.workspace_id != mine.workspace_id
+            JOIN   workspaces other_workspace ON other_workspace.id = theirs.workspace_id
+            WHERE  mine.workspace_id = ?1
+              AND  other_workspace.status != 'Merged'
+              AND  other_workspace.repo = this_workspace.repo
+              AND  (this_workspace.repository_id IS NULL
+                    OR other_workspace.repository_id IS NULL
+                    OR other_workspace.repository_id = this_workspace.repository_id)
+            ORDER  BY mine.path, other_workspace.name
+            "#,
+        )?;
+        let rows = statement
+            .query_map([workspace_id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        let mut overlaps: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for (path, other_name) in rows {
+            let names = overlaps.entry(path).or_default();
+            if !names.contains(&other_name) {
+                names.push(other_name);
+            }
+        }
+        Ok(overlaps)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -134,6 +179,51 @@ mod tests {
         assert!(result
             .conflicting_workspace_ids
             .contains(&"ws-2".to_string()));
+    }
+
+    #[test]
+    fn overlaps_only_count_unmerged_workspaces_of_the_same_repository() {
+        let db = Database::in_memory().unwrap();
+        db.with_connection_mut(|conn| {
+            conn.execute_batch(
+                r#"
+                INSERT INTO workspaces (
+                    id, name, repo, branch, agent, status, current_step, completed_steps,
+                    last_updated, pr_status, description, current_task,
+                    ahead_by, behind_by, merge_risk, last_rebase, base_branch,
+                    agent_session_id, agent_session_agent, agent_session_status,
+                    agent_session_model, agent_session_token_count, agent_session_estimated_cost,
+                    agent_session_last_message, agent_session_started_at,
+                    worktree_path, recent_events
+                ) VALUES
+                    ('ws-mine','Mine','r','b1','claude_code','Running','Planning','[]',
+                     '1','null','','',0,0,'Low','','main',
+                     '','','idle','',0,'$0.00','','','','[]'),
+                    ('ws-peer','Peer','r','b2','claude_code','Running','Planning','[]',
+                     '1','null','','',0,0,'Low','','main',
+                     '','','idle','',0,'$0.00','','','','[]'),
+                    ('ws-merged','Merged one','r','b3','claude_code','Merged','Planning','[]',
+                     '1','null','','',0,0,'Low','','main',
+                     '','','idle','',0,'$0.00','','','','[]'),
+                    ('ws-other-repo','Elsewhere','other','b4','claude_code','Running','Planning','[]',
+                     '1','null','','',0,0,'Low','','main',
+                     '','','idle','',0,'$0.00','','','','[]');
+                INSERT INTO changed_files (workspace_id, path, additions, deletions, status, sort_order)
+                VALUES
+                    ('ws-mine', 'src/lib.rs', 1, 0, 'modified', 0),
+                    ('ws-mine', 'src/only_mine.rs', 1, 0, 'modified', 1),
+                    ('ws-peer', 'src/lib.rs', 1, 0, 'modified', 0),
+                    ('ws-merged', 'src/lib.rs', 1, 0, 'modified', 0),
+                    ('ws-other-repo', 'src/lib.rs', 1, 0, 'modified', 0);
+                "#,
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+        let overlaps = files_also_changed_elsewhere(&db, "ws-mine").unwrap();
+        assert_eq!(overlaps.len(), 1);
+        assert_eq!(overlaps.get("src/lib.rs"), Some(&vec!["Peer".to_string()]));
     }
 
     #[test]

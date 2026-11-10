@@ -4,7 +4,8 @@ use serde_json::Value;
 
 use crate::models::{WorkspacePrCheck, WorkspacePrDraft, WorkspacePrResult, WorkspacePrStatus};
 use crate::repositories::{
-    activity_repository, agent_run_repository, pr_draft_repository, workspace_repository,
+    activity_repository, agent_run_repository, pr_draft_repository, settings_repository,
+    workspace_repository,
 };
 use crate::services::{
     environment_service, git_review_service, hook_service, review_summary_service,
@@ -410,6 +411,105 @@ pub fn rerun_failed_workspace_checks(
     Ok(format!("Re-ran {rerun_count} run(s)"))
 }
 
+const MERGE_METHOD_KEY: &str = "merge_method";
+const DEFAULT_MERGE_METHOD: &str = "squash";
+
+/// The merge method from the `merge_method` setting: "squash" (default),
+/// "merge" or "rebase".
+pub fn configured_merge_method(state: &AppState) -> String {
+    match settings_repository::get_value(&state.db, MERGE_METHOD_KEY) {
+        Ok(Some(value)) if merge_method_flag(value.trim()).is_some() => value.trim().to_string(),
+        Ok(Some(value)) => {
+            log::warn!("Ignoring unknown merge_method setting {value:?}; using squash");
+            DEFAULT_MERGE_METHOD.to_string()
+        }
+        Ok(None) => DEFAULT_MERGE_METHOD.to_string(),
+        Err(err) => {
+            log::warn!("Failed to read merge_method setting: {err}");
+            DEFAULT_MERGE_METHOD.to_string()
+        }
+    }
+}
+
+fn merge_method_flag(method: &str) -> Option<&'static str> {
+    match method {
+        "squash" => Some("--squash"),
+        "merge" => Some("--merge"),
+        "rebase" => Some("--rebase"),
+        _ => None,
+    }
+}
+
+/// Merges the workspace PR with `gh pr merge`, pinned to `head_ref_oid` so
+/// GitHub refuses if the PR head moved since the caller read its status. The
+/// branch is never deleted because the workspace worktree still uses it.
+pub fn merge_workspace_pr(
+    state: &AppState,
+    workspace_id: &str,
+    number: i64,
+    head_ref_oid: &str,
+    method: &str,
+) -> Result<String, String> {
+    let method_flag =
+        merge_method_flag(method).ok_or_else(|| format!("Unknown merge method {method:?}"))?;
+    if head_ref_oid.trim().is_empty() {
+        return Err(
+            "The PR head commit is unknown; refresh the PR status and try again.".to_string(),
+        );
+    }
+    let work_dir = workspace_work_dir(state, workspace_id)?;
+    let number_text = number.to_string();
+    let gh = gh_binary();
+    let output = std::process::Command::new(&gh)
+        .args([
+            "pr",
+            "merge",
+            &number_text,
+            method_flag,
+            "--match-head-commit",
+            head_ref_oid,
+        ])
+        .current_dir(&work_dir)
+        .output()
+        .map_err(|err| format!("Failed to run gh: {err}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let detail = if stderr.is_empty() { stdout } else { stderr };
+        return Err(if detail.is_empty() {
+            format!("gh pr merge {number} failed")
+        } else {
+            detail
+        });
+    }
+
+    // gh exits successfully when it only queues the PR or enables auto-merge,
+    // so confirm the actual state before telling the user it merged.
+    match run_in_dir(
+        &work_dir,
+        &gh,
+        &[
+            "pr",
+            "view",
+            &number_text,
+            "--json",
+            "state",
+            "--jq",
+            ".state",
+        ],
+    ) {
+        Ok(pr_state) if pr_state == "MERGED" => Ok(format!("Merged PR #{number} ({method})")),
+        Ok(pr_state) => Ok(format!(
+            "GitHub accepted the merge for PR #{number} but it is still {}; it may be queued or waiting on auto-merge",
+            pr_state.to_lowercase()
+        )),
+        Err(err) => {
+            log::warn!("Merged PR #{number} but could not confirm its state: {err}");
+            Ok(format!("Merge requested for PR #{number}"))
+        }
+    }
+}
+
 pub fn get_workspace_pr_status(
     state: &AppState,
     workspace_id: &str,
@@ -431,7 +531,7 @@ pub fn get_workspace_pr_status(
             "pr",
             "view",
             "--json",
-            "number,title,url,state,isDraft,reviewDecision,mergeable,mergeStateStatus,statusCheckRollup",
+            "number,title,url,state,isDraft,reviewDecision,mergeable,mergeStateStatus,headRefOid,statusCheckRollup",
         ])
         .current_dir(&work_dir)
         .output();
@@ -459,6 +559,7 @@ pub fn get_workspace_pr_status(
             review_decision: None,
             mergeable: None,
             merge_state_status: None,
+            head_ref_oid: None,
             checks_summary: "No PR found for this branch".to_string(),
             checks: vec![],
             warning: if stderr.is_empty() {
@@ -503,6 +604,10 @@ pub fn get_workspace_pr_status(
             .get("mergeStateStatus")
             .and_then(Value::as_str)
             .map(str::to_string),
+        head_ref_oid: value
+            .get("headRefOid")
+            .and_then(Value::as_str)
+            .map(str::to_string),
         checks_summary,
         checks,
         warning: None,
@@ -521,6 +626,7 @@ fn pr_status_warning(workspace_id: &str, warning: String) -> WorkspacePrStatus {
         review_decision: None,
         mergeable: None,
         merge_state_status: None,
+        head_ref_oid: None,
         checks_summary: "PR status unavailable".to_string(),
         checks: vec![],
         warning: Some(warning),

@@ -87,6 +87,21 @@ pub fn update_agent_session_cost(
     })
 }
 
+pub fn update_name_and_branch(
+    db: &Database,
+    workspace_id: &str,
+    name: &str,
+    branch: &str,
+) -> Result<(), String> {
+    db.with_connection_mut(|connection| {
+        connection.execute(
+            "UPDATE workspaces SET name = ?1, branch = ?2, selected_branch = ?2 WHERE id = ?3",
+            params![name, branch, workspace_id],
+        )?;
+        Ok(())
+    })
+}
+
 pub fn update_last_rebase(
     db: &Database,
     workspace_id: &str,

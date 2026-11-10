@@ -34,6 +34,8 @@ pub struct WorkspacePrStatus {
     pub review_decision: Option<String>,
     pub mergeable: Option<String>,
     pub merge_state_status: Option<String>,
+    /// The PR head commit the status was read at; merging pins to it.
+    pub head_ref_oid: Option<String>,
     pub checks_summary: String,
     pub checks: Vec<WorkspacePrCheck>,
     pub warning: Option<String>,

@@ -7,8 +7,8 @@ use crate::models::{
     DiscoveredRepository, LinkedWorktreeRef, RepositoryWorkspaceOptions, WorkspaceDetail,
     WorkspaceSummary,
 };
-use crate::repositories::{repository_repository, workspace_repository};
-use crate::services::{git_review_service, git_worktree_service};
+use crate::repositories::{activity_repository, repository_repository, workspace_repository};
+use crate::services::{git_review_service, git_worktree_service, repo_scanner_service};
 use crate::state::AppState;
 
 mod ops;
@@ -249,6 +249,90 @@ pub fn open_worktree_in_cursor(path: &str) -> Result<(), String> {
             format!("Cursor failed to open linked worktree: {stderr}")
         })
     }
+}
+
+/// Renames a Mnemonic-managed workspace and its branch to
+/// `<same prefix>/<new_name>`, adding `-2`, `-3`, ... when that branch name is
+/// taken. Returns the updated summary, or None when renaming is not safe: the
+/// stored name is no longer `expected_name`, a PR is recorded, the worktree
+/// has moved off the workspace branch, or the branch has been pushed.
+pub fn rename_unpublished_workspace(
+    state: &AppState,
+    workspace_id: &str,
+    expected_name: &str,
+    new_name: &str,
+) -> Result<Option<WorkspaceSummary>, String> {
+    let summary = workspace_repository::get(&state.db, workspace_id)?;
+    if summary.name != expected_name
+        || !summary.worktree_managed_by_mnemonic
+        || summary.pr_status.is_some()
+        || summary.pr_number.is_some()
+    {
+        return Ok(None);
+    }
+    let Some(root) = summary
+        .workspace_root_path
+        .as_deref()
+        .map(Path::new)
+        .filter(|path| path.is_dir())
+    else {
+        return Ok(None);
+    };
+    let old_branch = summary.branch.clone();
+    if git_worktree_service::current_branch(root)?.as_deref() != Some(old_branch.as_str()) {
+        return Ok(None);
+    }
+    if git_worktree_service::branch_is_published(root, &old_branch)? {
+        return Ok(None);
+    }
+
+    let prefix = old_branch
+        .rsplit_once('/')
+        .map(|(prefix, _)| format!("{prefix}/"))
+        .unwrap_or_default();
+    let candidates = std::iter::once(new_name.to_string())
+        .chain((2..100).map(|suffix| format!("{new_name}-{suffix}")));
+    let mut chosen_name = None;
+    for candidate in candidates {
+        if !git_worktree_service::branch_name_taken(root, &format!("{prefix}{candidate}"))? {
+            chosen_name = Some(candidate);
+            break;
+        }
+    }
+    let Some(name) = chosen_name else {
+        return Ok(None);
+    };
+    let new_branch = format!("{prefix}{name}");
+
+    git_worktree_service::rename_branch(root, &old_branch, &new_branch)?;
+    if let Err(err) =
+        workspace_repository::update_name_and_branch(&state.db, workspace_id, &name, &new_branch)
+    {
+        if let Err(revert_err) = git_worktree_service::rename_branch(root, &new_branch, &old_branch)
+        {
+            log::error!("Failed to restore branch {old_branch} after rename failed: {revert_err}");
+        }
+        return Err(err);
+    }
+
+    if let Err(err) = activity_repository::record(
+        &state.db,
+        workspace_id,
+        &summary.repo,
+        Some(&new_branch),
+        "Branch renamed",
+        "info",
+        Some(&format!("{old_branch} -> {new_branch}")),
+    ) {
+        log::error!("Failed to record branch rename: {err}");
+    }
+    if let Some(repository_id) = summary.repository_id.as_deref() {
+        if let Err(err) = repo_scanner_service::refresh_repository_by_id(state, repository_id) {
+            log::error!("Failed to refresh repository after branch rename: {err}");
+        }
+    }
+
+    workspace_repository::get(&state.db, workspace_id).map(Some)
 }
 
 pub fn pull_workspace_branch(state: &AppState, workspace_id: &str) -> Result<String, String> {

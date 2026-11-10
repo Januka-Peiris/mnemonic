@@ -13,6 +13,9 @@ pub struct WorkspaceFileReviewState {
     pub reviewed_at: Option<String>,
     pub reviewed_by: String,
     pub notes: Option<String>,
+    /// Hash of the file content when it was marked reviewed; a mark whose
+    /// hash no longer matches the file is stale.
+    pub content_hash: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

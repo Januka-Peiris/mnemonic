@@ -203,9 +203,7 @@ pub fn start_command_terminal(
 ) -> Result<TerminalSession, String> {
     if command_safety_service::is_risky_command(command) && !risky_workspace_scripts_enabled(state)
     {
-        let message = format!(
-            "{title} was blocked because it looks destructive. Enable risky workspace scripts in Settings to run it."
-        );
+        let message = blocked_command_message(title);
         insert_script_activity(
             state,
             workspace_id,
@@ -243,6 +241,133 @@ pub fn start_command_terminal(
             cols: None,
             rows: None,
         },
+    )
+}
+
+/// A configured run command, approved to start.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunCommandPlan {
+    pub index: usize,
+    pub title: String,
+    pub command: String,
+}
+
+/// Prepares the workspace's run commands for a host that starts them in its
+/// own terminals (the GPUI app's embedded terminals) instead of core PTY
+/// sessions: applies the same risky-command gate as `start_command_terminal`
+/// and runs the pre-run hooks. Returns the directory to run them in.
+pub fn prepare_workspace_run_commands(
+    state: &AppState,
+    workspace_id: &str,
+    action_kind: &str,
+) -> Result<(PathBuf, Vec<RunCommandPlan>), String> {
+    let root = workspace_root_path(state, workspace_id)?;
+    let config = load_config_from_root(&root);
+    let plans = match plan_run_commands(&config, risky_workspace_scripts_enabled(state)) {
+        Ok(plans) => plans,
+        Err(err) => {
+            insert_script_activity(
+                state,
+                workspace_id,
+                "Run commands not started",
+                "warning",
+                &err,
+            );
+            return Err(err);
+        }
+    };
+    for plan in &plans {
+        insert_script_activity(
+            state,
+            workspace_id,
+            "Run command started",
+            "info",
+            &format!("{} · {}", plan.title, plan.command),
+        );
+        hook_service::run_workspace_hooks(
+            state,
+            workspace_id,
+            "run",
+            hook_service::HookPhase::Pre,
+            &run_hook_context(workspace_id, action_kind, plan),
+        )?;
+    }
+    Ok((root, plans))
+}
+
+/// Runs the post-run hooks once the host has started the prepared commands.
+pub fn finish_workspace_run_commands(
+    state: &AppState,
+    workspace_id: &str,
+    action_kind: &str,
+    plans: &[RunCommandPlan],
+) -> Result<(), String> {
+    let mut errors = Vec::new();
+    for plan in plans {
+        if let Err(err) = hook_service::run_workspace_hooks(
+            state,
+            workspace_id,
+            "run",
+            hook_service::HookPhase::Post,
+            &run_hook_context(workspace_id, action_kind, plan),
+        ) {
+            errors.push(err);
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; "))
+    }
+}
+
+fn plan_run_commands(
+    config: &MnemonicWorkspaceConfig,
+    risky_allowed: bool,
+) -> Result<Vec<RunCommandPlan>, String> {
+    if let Some(warning) = &config.warning {
+        return Err(warning.clone());
+    }
+    if config.run.is_empty() {
+        return Err(format!(
+            "No run commands are configured in {CONFIG_RELATIVE_PATH}"
+        ));
+    }
+    config
+        .run
+        .iter()
+        .enumerate()
+        .map(|(index, command)| {
+            let title = run_title(index, command);
+            if !risky_allowed && command_safety_service::is_risky_command(command) {
+                return Err(blocked_command_message(&title));
+            }
+            Ok(RunCommandPlan {
+                index,
+                title,
+                command: command.clone(),
+            })
+        })
+        .collect()
+}
+
+fn run_hook_context(
+    workspace_id: &str,
+    action_kind: &str,
+    plan: &RunCommandPlan,
+) -> serde_json::Value {
+    serde_json::json!({
+        "workspaceId": workspace_id,
+        "actionKind": action_kind,
+        "runIndex": plan.index,
+        "title": plan.title,
+        "command": plan.command,
+    })
+}
+
+fn blocked_command_message(title: &str) -> String {
+    format!(
+        "{title} was blocked because it looks destructive. Enable risky workspace scripts in Settings to run it."
     )
 }
 
@@ -667,11 +792,32 @@ mod tests {
 
         let config = load_config_from_root(&dir);
         assert!(config.exists);
-        assert!(config
-            .warning
-            .unwrap()
-            .contains("Invalid .mnemonic/config.json"));
+        assert!(
+            config
+                .warning
+                .unwrap()
+                .contains("Invalid .mnemonic/config.json")
+        );
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn run_plan_blocks_risky_commands_unless_enabled() {
+        let config = MnemonicWorkspaceConfig {
+            exists: true,
+            run: vec!["npm run dev".to_string(), "rm -rf node_modules".to_string()],
+            ..MnemonicWorkspaceConfig::default()
+        };
+
+        let blocked = plan_run_commands(&config, false).unwrap_err();
+        assert!(blocked.contains("rm -rf node_modules was blocked"));
+
+        let plans = plan_run_commands(&config, true).expect("risky allowed");
+        assert_eq!(plans.len(), 2);
+        assert_eq!(plans[1].title, "rm -rf node_modules");
+
+        let empty = plan_run_commands(&MnemonicWorkspaceConfig::default(), false).unwrap_err();
+        assert!(empty.contains(".mnemonic/config.json"));
     }
 
     #[test]

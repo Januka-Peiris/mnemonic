@@ -11349,6 +11349,7 @@ dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
+ "sha2",
  "streaming-iterator",
  "tree-sitter",
  "tree-sitter-go",
@@ -11374,6 +11375,7 @@ dependencies = [
  "editor",
  "gpui",
  "icons",
+ "language",
  "log",
  "mnemonic-bridge",
  "mnemonic-core",
@@ -11387,6 +11389,7 @@ dependencies = [
  "util",
  "uuid",
  "workspace",
+ "zed_actions",
 ]
 
 [[package]]

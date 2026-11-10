@@ -1,14 +1,23 @@
+use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
+use std::time::{SystemTime, UNIX_EPOCH};
 
+use editor::Editor;
 use gpui::{
     actions, px, Action, Anchor, App, AppContext as _, Context, Entity, EventEmitter, Focusable,
-    FocusHandle, IntoElement, Pixels, Render, SharedString, WeakEntity, Window,
+    FocusHandle, IntoElement, Pixels, PromptLevel, Render, SharedString, Task, WeakEntity, Window,
 };
-use mnemonic_core::models::{WorkspacePrStatus, WorkspaceSummary};
-use mnemonic_core::services::{pr_draft_service, workspace_service};
+use mnemonic_core::models::{
+    WorkspaceCheckpoint, WorkspaceCheckpointRestorePlan, WorkspacePort, WorkspacePrComment,
+    WorkspacePrStatus, WorkspaceSummary,
+};
+use mnemonic_core::services::{
+    checkpoint_service, conflict_detection_service, pr_draft_service, review_cockpit_service,
+    workspace_port_service, workspace_service,
+};
 use ui::{
-    h_flex, v_flex, Button, ButtonStyle, ContextMenu, Icon, IconButton, IconName, Label,
-    PopoverMenu, TintColor, Tooltip, prelude::*,
+    h_flex, v_flex, Button, ButtonStyle, Checkbox, ContextMenu, Icon, IconButton, IconName,
+    Label, PopoverMenu, TintColor, ToggleState, Tooltip, prelude::*,
 };
 use std::time::{Duration, Instant};
 
@@ -28,6 +37,8 @@ enum DetailTab {
     AllFiles,
     Changes,
     Checks,
+    Ports,
+    Checkpoints,
 }
 
 /// How often the panel re-queries GitHub while a workspace is selected.
@@ -38,8 +49,31 @@ const PR_POLL_FAST_INTERVAL: Duration = Duration::from_secs(15);
 /// How long the fast cadence lasts after a dispatch.
 const PR_POLL_BOOST: Duration = Duration::from_secs(300);
 
+/// How often the Ports tab rescans while it is showing. Matches the port
+/// service's cache lifetime, so each poll is a real scan.
+const PORTS_POLL_INTERVAL: Duration = Duration::from_secs(15);
+
+/// How stale viewed marks and cross-workspace overlaps may get while the
+/// Changes tab keeps rendering an unchanged list. Catches in-place edits that
+/// keep the line counts and edits made in other workspaces.
+const CHANGE_ANNOTATIONS_RECHECK_INTERVAL: Duration = Duration::from_secs(10);
+
 /// Marker for PR state-change toasts.
 struct MnemonicPrToast;
+
+/// Marker for port action toasts.
+struct MnemonicPortToast;
+
+/// Marker for checkpoint toasts.
+struct MnemonicCheckpointToast;
+
+/// How many files a restore confirmation names before summarising the rest.
+const RESTORE_PROMPT_FILE_LIMIT: usize = 8;
+
+/// Characters of a review comment shown in its one-line preview.
+const COMMENT_PREVIEW_CHARS: usize = 140;
+/// Characters of each review comment body sent to the agent.
+const COMMENT_PROMPT_BODY_CHARS: usize = 4000;
 
 pub struct WorkspaceDetailPanel {
     focus_handle: FocusHandle,
@@ -58,6 +92,39 @@ pub struct WorkspaceDetailPanel {
     /// Zed's full project panel, embedded as the "All files" tab so file
     /// browsing, right-click operations, and editing live in one panel.
     file_tree: Option<Entity<project_panel::ProjectPanel>>,
+    ports: Vec<WorkspacePort>,
+    ports_error: Option<SharedString>,
+    ports_busy: bool,
+    ports_poll_scheduled: bool,
+    checkpoints: Vec<WorkspaceCheckpoint>,
+    checkpoints_error: Option<SharedString>,
+    checkpoints_loading: bool,
+    /// Replacing it cancels a list still in flight, so an older result never
+    /// overwrites a newer one.
+    checkpoints_task: Option<Task<()>>,
+    checkpoint_restoring: bool,
+    merging: bool,
+    /// Unresolved review threads on the open PR, one entry per thread.
+    review_threads: Vec<WorkspacePrComment>,
+    review_threads_error: Option<SharedString>,
+    review_threads_loading: bool,
+    /// Replacing it cancels a fetch still in flight.
+    review_threads_task: Option<Task<()>>,
+    resolving_thread: Option<String>,
+    /// Changed files marked viewed whose content is unchanged since the mark.
+    viewed_files: HashSet<String>,
+    /// Bumped on every viewed toggle, so a load started before the toggle
+    /// cannot overwrite it.
+    viewed_generation: u64,
+    viewed_writes_pending: usize,
+    /// Each write awaits the previous one so quick toggles land in click order.
+    viewed_write_task: Option<Task<()>>,
+    /// Changed file -> other workspaces of the same repository changing it.
+    file_overlaps: BTreeMap<String, Vec<String>>,
+    /// Workspace and (path, additions, deletions) of the last annotated list.
+    change_annotations_key: Option<(String, Vec<(String, u32, u32)>)>,
+    change_annotations_checked_at: Option<Instant>,
+    change_annotations_task: Option<Task<()>>,
 }
 
 impl WorkspaceDetailPanel {
@@ -75,6 +142,22 @@ impl WorkspaceDetailPanel {
                 if previous != current {
                     this.pr_status = None;
                     this.refresh_pr_status(cx);
+                    this.ports.clear();
+                    this.ports_error = None;
+                    if this.tab == DetailTab::Ports {
+                        this.refresh_ports(true, cx);
+                    }
+                    this.checkpoints.clear();
+                    this.checkpoints_error = None;
+                    if this.tab == DetailTab::Checkpoints {
+                        this.refresh_checkpoints(cx);
+                    }
+                    this.clear_review_threads();
+                    this.viewed_files.clear();
+                    this.file_overlaps.clear();
+                    this.change_annotations_key = None;
+                    this.change_annotations_checked_at = None;
+                    this.change_annotations_task = None;
                 }
                 cx.notify();
             })
@@ -92,6 +175,29 @@ impl WorkspaceDetailPanel {
                 dispatch_note: None,
                 review_provider: "codex".to_string(),
                 file_tree: None,
+                ports: Vec::new(),
+                ports_error: None,
+                ports_busy: false,
+                ports_poll_scheduled: false,
+                checkpoints: Vec::new(),
+                checkpoints_error: None,
+                checkpoints_loading: false,
+                checkpoints_task: None,
+                checkpoint_restoring: false,
+                merging: false,
+                review_threads: Vec::new(),
+                review_threads_error: None,
+                review_threads_loading: false,
+                review_threads_task: None,
+                resolving_thread: None,
+                viewed_files: HashSet::new(),
+                viewed_generation: 0,
+                viewed_writes_pending: 0,
+                viewed_write_task: None,
+                file_overlaps: BTreeMap::new(),
+                change_annotations_key: None,
+                change_annotations_checked_at: None,
+                change_annotations_task: None,
             };
             panel.refresh(cx);
             panel
@@ -166,17 +272,322 @@ impl WorkspaceDetailPanel {
                 this.pr_busy = false;
                 match result {
                     Ok(status) => {
-                        if let Some(message) =
-                            Self::transition_message(this.pr_status.as_ref(), &status)
-                        {
-                            this.show_pr_toast(message, cx);
-                        }
                         mnemonic_bridge::record_pr_status(&workspace_id_for_record, &status);
-                        this.pr_status = Some(status);
+                        // A status fetched for a workspace the user has since
+                        // switched away from must not drive this panel's Merge.
+                        if this.current_workspace_id() == Some(workspace_id_for_record.as_str()) {
+                            if let Some(message) =
+                                Self::transition_message(this.pr_status.as_ref(), &status)
+                            {
+                                this.show_pr_toast(message, cx);
+                            }
+                            let open_pr_url = status.url.clone().filter(|_| {
+                                status.found && status.state.as_deref() == Some("OPEN")
+                            });
+                            this.pr_status = Some(status);
+                            match open_pr_url {
+                                Some(pr_url) => this.refresh_review_threads(pr_url, cx),
+                                None => this.clear_review_threads(),
+                            }
+                        }
                     }
                     Err(err) => log::error!("Failed to fetch PR status: {err}"),
                 }
                 this.schedule_next_poll(cx);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn current_workspace_id(&self) -> Option<&str> {
+        self.summary.as_ref().map(|summary| summary.id.as_str())
+    }
+
+    fn clear_review_threads(&mut self) {
+        self.review_threads.clear();
+        self.review_threads_error = None;
+        self.review_threads_loading = false;
+        self.review_threads_task = None;
+        self.resolving_thread = None;
+    }
+
+    /// Fetches the PR's unresolved review threads from GitHub (via gh).
+    fn refresh_review_threads(&mut self, pr_url: String, cx: &mut Context<Self>) {
+        let Some(workspace_id) = self.current_workspace_id().map(str::to_string) else {
+            return;
+        };
+        let state = mnemonic_bridge::mnemonic_state(cx);
+        self.review_threads_loading = true;
+        cx.notify();
+        self.review_threads_task = Some(cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_spawn({
+                    let workspace_id = workspace_id.clone();
+                    async move {
+                        review_cockpit_service::list_unresolved_review_threads(
+                            &state,
+                            &workspace_id,
+                            &pr_url,
+                        )
+                    }
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                this.review_threads_loading = false;
+                if this.current_workspace_id() != Some(workspace_id.as_str()) {
+                    return;
+                }
+                match result {
+                    Ok(threads) => {
+                        this.review_threads = threads;
+                        this.review_threads_error = None;
+                    }
+                    Err(err) => {
+                        log::error!("Failed to fetch PR review threads: {err}");
+                        this.review_threads_error = Some(SharedString::from(err));
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
+    fn can_merge(status: &WorkspacePrStatus) -> bool {
+        status.found
+            && status.state.as_deref() == Some("OPEN")
+            && !status.is_draft
+            && status.merge_state_status.as_deref() == Some("CLEAN")
+            && status.number.is_some()
+            && status.head_ref_oid.is_some()
+    }
+
+    /// Confirms, then merges the PR pinned to the head commit the panel last
+    /// saw, so a push after the user looked makes GitHub refuse the merge.
+    fn merge_pr(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.merging {
+            return;
+        }
+        let Some(workspace_id) = self.current_workspace_id().map(str::to_string) else {
+            return;
+        };
+        let Some(status) = self
+            .pr_status
+            .as_ref()
+            .filter(|status| status.workspace_id == workspace_id && Self::can_merge(status))
+        else {
+            return;
+        };
+        let (Some(number), Some(head_ref_oid)) = (status.number, status.head_ref_oid.clone())
+        else {
+            return;
+        };
+        let title = status.title.clone().unwrap_or_default();
+        let state = mnemonic_bridge::mnemonic_state(cx);
+        let method = pr_draft_service::configured_merge_method(&state);
+        let short_head = head_ref_oid.chars().take(7).collect::<String>();
+        let detail = format!(
+            "{title}\n\nMethod: {method}\nHead commit: {short_head}\n\nGitHub refuses the merge if \
+             commits were pushed after this status was fetched. The branch is kept because this \
+             workspace still uses it."
+        );
+        let answer = window.prompt(
+            PromptLevel::Info,
+            &format!("Merge PR #{number}?"),
+            Some(&detail),
+            &["Merge", "Cancel"],
+            cx,
+        );
+        self.merging = true;
+        cx.notify();
+
+        cx.spawn_in(window, async move |this, cx| {
+            if answer.await != Ok(0) {
+                this.update(cx, |this, cx| {
+                    this.merging = false;
+                    cx.notify();
+                })
+                .ok();
+                return;
+            }
+            let result = cx
+                .background_spawn(async move {
+                    pr_draft_service::merge_workspace_pr(
+                        &state,
+                        &workspace_id,
+                        number,
+                        &head_ref_oid,
+                        &method,
+                    )
+                })
+                .await;
+            this.update_in(cx, |this, window, cx| {
+                this.merging = false;
+                match result {
+                    Ok(message) => this.show_pr_toast(message, cx),
+                    Err(err) => {
+                        log::error!("Failed to merge PR #{number}: {err}");
+                        let _dismissed = window.prompt(
+                            PromptLevel::Critical,
+                            &format!("Couldn't merge PR #{number}"),
+                            Some(&err),
+                            &["OK"],
+                            cx,
+                        );
+                    }
+                }
+                this.refresh_pr_status(cx);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn comment_location(comment: &WorkspacePrComment) -> String {
+        match (comment.path.as_deref(), comment.line) {
+            (Some(path), Some(line)) => format!("{path}:{line}"),
+            (Some(path), None) => path.to_string(),
+            (None, _) => "PR conversation".to_string(),
+        }
+    }
+
+    fn comment_preview(body: &str) -> String {
+        let first_line = body
+            .lines()
+            .map(str::trim)
+            .find(|line| !line.is_empty())
+            .unwrap_or("");
+        if first_line.chars().count() <= COMMENT_PREVIEW_CHARS {
+            first_line.to_string()
+        } else {
+            let mut preview = first_line
+                .chars()
+                .take(COMMENT_PREVIEW_CHARS)
+                .collect::<String>();
+            preview.push_str("...");
+            preview
+        }
+    }
+
+    fn review_comments_prompt(number: Option<i64>, comments: &[&WorkspacePrComment]) -> String {
+        let pr = number
+            .map(|number| format!("PR #{number}"))
+            .unwrap_or_else(|| "this PR".to_string());
+        let mut prompt = format!(
+            "Address these unresolved review comments on {pr}. For each one, make the change if \
+             it is right, or tell me why it should not be changed. Then commit and push."
+        );
+        for (index, comment) in comments.iter().enumerate() {
+            let mut body = comment.body.trim().to_string();
+            if body.chars().count() > COMMENT_PROMPT_BODY_CHARS {
+                body = body.chars().take(COMMENT_PROMPT_BODY_CHARS).collect();
+                body.push_str("\n...[truncated]");
+            }
+            let thread = comment
+                .thread_id
+                .as_deref()
+                .map(|thread_id| format!(", thread {thread_id}"))
+                .unwrap_or_default();
+            let outdated = if comment.thread_outdated {
+                ", outdated: the code has changed since"
+            } else {
+                ""
+            };
+            prompt.push_str(&format!(
+                "\n\n{}. {} (by {}{thread}{outdated})\n{body}",
+                index + 1,
+                Self::comment_location(comment),
+                comment.author,
+            ));
+        }
+        prompt
+    }
+
+    /// Sends the given review threads (all when `thread_id` is None) to the
+    /// workspace agent through the app dispatch path.
+    fn send_review_comments_to_agent(&mut self, thread_id: Option<&str>, cx: &mut Context<Self>) {
+        let Some(workspace_id) = self.current_workspace_id().map(str::to_string) else {
+            return;
+        };
+        let comments = self
+            .review_threads
+            .iter()
+            .filter(|comment| thread_id.is_none() || comment.thread_id.as_deref() == thread_id)
+            .collect::<Vec<_>>();
+        if comments.is_empty() {
+            return;
+        }
+        let number = self.pr_status.as_ref().and_then(|status| status.number);
+        let prompt = Self::review_comments_prompt(number, &comments);
+        let label = if comments.len() == 1 {
+            "review comment".to_string()
+        } else {
+            format!("{} review comments", comments.len())
+        };
+        self.dispatch_instruction(&workspace_id, prompt, &label, cx);
+    }
+
+    fn resolve_review_thread(
+        &mut self,
+        thread_id: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.resolving_thread.is_some() {
+            return;
+        }
+        let Some(workspace_id) = self.current_workspace_id().map(str::to_string) else {
+            return;
+        };
+        let Some(pr_url) = self
+            .pr_status
+            .as_ref()
+            .and_then(|status| status.url.clone())
+        else {
+            return;
+        };
+        let state = mnemonic_bridge::mnemonic_state(cx);
+        self.resolving_thread = Some(thread_id.clone());
+        cx.notify();
+
+        cx.spawn_in(window, async move |this, cx| {
+            let result = cx
+                .background_spawn({
+                    let workspace_id = workspace_id.clone();
+                    let thread_id = thread_id.clone();
+                    async move {
+                        review_cockpit_service::resolve_review_thread(
+                            &state,
+                            &workspace_id,
+                            &thread_id,
+                        )
+                    }
+                })
+                .await;
+            this.update_in(cx, |this, window, cx| {
+                this.resolving_thread = None;
+                if this.current_workspace_id() != Some(workspace_id.as_str()) {
+                    return;
+                }
+                match result {
+                    Ok(()) => this
+                        .review_threads
+                        .retain(|comment| comment.thread_id.as_deref() != Some(thread_id.as_str())),
+                    Err(err) => {
+                        log::error!("Failed to resolve review thread {thread_id}: {err}");
+                        let _dismissed = window.prompt(
+                            PromptLevel::Critical,
+                            "Couldn't resolve the review thread",
+                            Some(&err),
+                            &["OK"],
+                            cx,
+                        );
+                    }
+                }
+                this.refresh_review_threads(pr_url, cx);
                 cx.notify();
             })
             .ok();
@@ -556,6 +967,28 @@ impl WorkspaceDetailPanel {
                             .gap_1()
                             .child(self.render_pr_button(cx))
                             .when(
+                                self.pr_status.as_ref().is_some_and(|status| {
+                                    status.workspace_id == ws.id && Self::can_merge(status)
+                                }),
+                                |el| {
+                                    el.child(
+                                        Button::new(
+                                            "merge-pr",
+                                            if self.merging { "Merging…" } else { "Merge" },
+                                        )
+                                        .style(ButtonStyle::Tinted(TintColor::Success))
+                                        .label_size(LabelSize::Small)
+                                        .disabled(self.merging || self.pr_busy)
+                                        .tooltip(Tooltip::text(
+                                            "Merge this PR on GitHub (keeps the branch)",
+                                        ))
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.merge_pr(window, cx);
+                                        })),
+                                    )
+                                },
+                            )
+                            .when(
                                 !self
                                     .pr_status
                                     .as_ref()
@@ -631,6 +1064,12 @@ impl WorkspaceDetailPanel {
                     if tab == DetailTab::Checks && this.pr_status.is_none() && !this.pr_busy {
                         this.refresh_pr_status(cx);
                     }
+                    if tab == DetailTab::Ports {
+                        this.refresh_ports(true, cx);
+                    }
+                    if tab == DetailTab::Checkpoints {
+                        this.refresh_checkpoints(cx);
+                    }
                     cx.notify();
                 }))
                 .child(
@@ -669,6 +1108,24 @@ impl WorkspaceDetailPanel {
                 "detail-tab-checks",
                 "Checks".to_string(),
                 DetailTab::Checks,
+                self.tab,
+                cx,
+            ))
+            .child(tab_button(
+                "detail-tab-ports",
+                if self.ports.is_empty() {
+                    "Ports".to_string()
+                } else {
+                    format!("Ports {}", self.ports.len())
+                },
+                DetailTab::Ports,
+                self.tab,
+                cx,
+            ))
+            .child(tab_button(
+                "detail-tab-checkpoints",
+                "Checkpoints".to_string(),
+                DetailTab::Checkpoints,
                 self.tab,
                 cx,
             ))
@@ -784,6 +1241,145 @@ impl WorkspaceDetailPanel {
         }
     }
 
+    fn maybe_refresh_change_annotations(&mut self, cx: &mut Context<Self>) {
+        if self.tab != DetailTab::Changes {
+            return;
+        }
+        let Some(summary) = self.summary.as_ref() else {
+            return;
+        };
+        let list_unchanged =
+            self.change_annotations_key
+                .as_ref()
+                .is_some_and(|(workspace_id, files)| {
+                    workspace_id == &summary.id
+                        && files.len() == summary.changed_files.len()
+                        && files.iter().zip(&summary.changed_files).all(
+                            |((path, additions, deletions), file)| {
+                                path == &file.path
+                                    && *additions == file.additions
+                                    && *deletions == file.deletions
+                            },
+                        )
+                });
+        let recently_checked = self
+            .change_annotations_checked_at
+            .is_some_and(|checked_at| checked_at.elapsed() < CHANGE_ANNOTATIONS_RECHECK_INTERVAL);
+        if list_unchanged && recently_checked {
+            return;
+        }
+        self.refresh_change_annotations(cx);
+    }
+
+    /// Loads viewed marks and cross-workspace overlaps off the UI thread.
+    fn refresh_change_annotations(&mut self, cx: &mut Context<Self>) {
+        let Some(summary) = self.summary.as_ref() else {
+            return;
+        };
+        let workspace_id = summary.id.clone();
+        self.change_annotations_key = Some((
+            workspace_id.clone(),
+            summary
+                .changed_files
+                .iter()
+                .map(|file| (file.path.clone(), file.additions, file.deletions))
+                .collect(),
+        ));
+        self.change_annotations_checked_at = Some(Instant::now());
+        // The last pending write triggers a refresh once it lands.
+        if self.viewed_writes_pending > 0 {
+            return;
+        }
+        let changed_paths = summary
+            .changed_files
+            .iter()
+            .map(|file| file.path.clone())
+            .collect::<Vec<_>>();
+        let generation = self.viewed_generation;
+        let state = mnemonic_bridge::mnemonic_state(cx);
+        self.change_annotations_task = Some(cx.spawn(async move |this, cx| {
+            let (viewed, overlaps) = cx
+                .background_spawn({
+                    let workspace_id = workspace_id.clone();
+                    async move {
+                        (
+                            review_cockpit_service::list_workspace_viewed_files(
+                                &state,
+                                &workspace_id,
+                                &changed_paths,
+                            ),
+                            conflict_detection_service::files_also_changed_elsewhere(
+                                &state.db,
+                                &workspace_id,
+                            ),
+                        )
+                    }
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                if this.current_workspace_id() != Some(workspace_id.as_str()) {
+                    return;
+                }
+                match overlaps {
+                    Ok(overlaps) => this.file_overlaps = overlaps,
+                    Err(err) => {
+                        log::error!("Failed to find files changed in other workspaces: {err}")
+                    }
+                }
+                if generation == this.viewed_generation && this.viewed_writes_pending == 0 {
+                    match viewed {
+                        Ok(viewed) => this.viewed_files = viewed,
+                        Err(err) => log::error!("Failed to load viewed files: {err}"),
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
+    fn toggle_file_viewed(&mut self, path: String, cx: &mut Context<Self>) {
+        let Some(workspace_id) = self.current_workspace_id().map(str::to_string) else {
+            return;
+        };
+        let viewed = !self.viewed_files.contains(&path);
+        if viewed {
+            self.viewed_files.insert(path.clone());
+        } else {
+            self.viewed_files.remove(&path);
+        }
+        self.viewed_generation += 1;
+        self.viewed_writes_pending += 1;
+        let state = mnemonic_bridge::mnemonic_state(cx);
+        let previous_write = self.viewed_write_task.take();
+        self.viewed_write_task = Some(cx.spawn(async move |this, cx| {
+            if let Some(previous_write) = previous_write {
+                previous_write.await;
+            }
+            let result = cx
+                .background_spawn(async move {
+                    review_cockpit_service::set_workspace_file_viewed(
+                        &state,
+                        &workspace_id,
+                        &path,
+                        viewed,
+                    )
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                this.viewed_writes_pending = this.viewed_writes_pending.saturating_sub(1);
+                if let Err(err) = result {
+                    log::error!("Failed to update viewed mark: {err}");
+                }
+                if this.viewed_writes_pending == 0 {
+                    this.refresh_change_annotations(cx);
+                }
+            })
+            .ok();
+        }));
+        cx.notify();
+    }
+
     fn render_changes(&self, ws: &WorkspaceSummary, cx: &mut Context<Self>) -> impl IntoElement {
         let mut section = v_flex().w_full().flex_grow(1.0);
 
@@ -797,50 +1393,146 @@ impl WorkspaceDetailPanel {
             );
         }
 
+        let viewed_count = ws
+            .changed_files
+            .iter()
+            .filter(|file| self.viewed_files.contains(&file.path))
+            .count();
+        let overlapping = ws
+            .changed_files
+            .iter()
+            .filter_map(|file| self.file_overlaps.get(&file.path))
+            .collect::<Vec<_>>();
+        section = section.child(
+            h_flex().px_2().h(px(22.)).gap_1().items_center().child(
+                Label::new(format!("{viewed_count}/{} viewed", ws.changed_files.len()))
+                    .size(LabelSize::XSmall)
+                    .color(Color::Muted),
+            ),
+        );
+        if !overlapping.is_empty() {
+            let mut workspace_names = overlapping
+                .iter()
+                .flat_map(|names| names.iter().map(String::as_str))
+                .collect::<Vec<_>>();
+            workspace_names.sort_unstable();
+            workspace_names.dedup();
+            let file_word = if overlapping.len() == 1 {
+                "file"
+            } else {
+                "files"
+            };
+            section = section.child(
+                h_flex()
+                    .px_2()
+                    .py_0p5()
+                    .gap_1()
+                    .items_start()
+                    .child(
+                        Icon::new(IconName::Warning)
+                            .size(IconSize::XSmall)
+                            .color(Color::Warning),
+                    )
+                    .child(
+                        Label::new(format!(
+                            "{} {file_word} also changed in {}",
+                            overlapping.len(),
+                            workspace_names.join(", ")
+                        ))
+                        .size(LabelSize::XSmall)
+                        .color(Color::Warning),
+                    ),
+            );
+        }
+
         for file in &ws.changed_files {
             let additions = file.additions;
             let deletions = file.deletions;
             let (status_label, status_label_color) = Self::change_status_label(&file.status);
             let path_for_open = file.path.clone();
+            let path_for_viewed = file.path.clone();
+            let viewed = self.viewed_files.contains(&file.path);
+            let overlap_tooltip = self
+                .file_overlaps
+                .get(&file.path)
+                .map(|names| format!("Also changed in {}", names.join(", ")));
             section = section.child(
                 h_flex()
-                    .id(SharedString::from(format!("changed-{}", file.path)))
                     .px_2()
                     .h(px(24.))
                     .gap_1p5()
                     .items_center()
                     .w_full()
-                    .cursor_pointer()
                     .hover(|style| style.bg(cx.theme().colors().ghost_element_hover))
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.open_changed_file(&path_for_open, window, cx);
-                    }))
                     .child(
-                        Label::new(status_label)
-                            .size(LabelSize::XSmall)
-                            .color(status_label_color),
+                        Checkbox::new(
+                            SharedString::from(format!("viewed-{}", file.path)),
+                            if viewed {
+                                ToggleState::Selected
+                            } else {
+                                ToggleState::Unselected
+                            },
+                        )
+                        .tooltip(Tooltip::text(if viewed {
+                            "Viewed. Clears when the file changes again"
+                        } else {
+                            "Mark as viewed"
+                        }))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.toggle_file_viewed(path_for_viewed.clone(), cx);
+                        })),
                     )
                     .child(
-                        div().flex_grow(1.0).overflow_hidden().child(
-                            Label::new(file.path.clone())
-                                .size(LabelSize::XSmall)
-                                .single_line(),
-                        ),
-                    )
-                    .when(additions > 0, |el| {
-                        el.child(
-                            Label::new(format!("+{additions}"))
-                                .size(LabelSize::XSmall)
-                                .color(Color::Created),
-                        )
-                    })
-                    .when(deletions > 0, |el| {
-                        el.child(
-                            Label::new(format!("-{deletions}"))
-                                .size(LabelSize::XSmall)
-                                .color(Color::Deleted),
-                        )
-                    }),
+                        h_flex()
+                            .id(SharedString::from(format!("changed-{}", file.path)))
+                            .flex_grow(1.0)
+                            .min_w_0()
+                            .gap_1p5()
+                            .items_center()
+                            .cursor_pointer()
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.open_changed_file(&path_for_open, window, cx);
+                            }))
+                            .child(
+                                Label::new(status_label)
+                                    .size(LabelSize::XSmall)
+                                    .color(status_label_color),
+                            )
+                            .child(
+                                div().flex_grow(1.0).overflow_hidden().child(
+                                    Label::new(file.path.clone())
+                                        .size(LabelSize::XSmall)
+                                        .color(if viewed { Color::Muted } else { Color::Default })
+                                        .single_line(),
+                                ),
+                            )
+                            .when_some(overlap_tooltip, |el, tooltip| {
+                                el.child(
+                                    div()
+                                        .id(SharedString::from(format!("overlap-{}", file.path)))
+                                        .tooltip(Tooltip::text(tooltip))
+                                        .child(
+                                            Icon::new(IconName::Warning)
+                                                .size(IconSize::XSmall)
+                                                .color(Color::Warning),
+                                        ),
+                                )
+                            })
+                            .when(additions > 0, |el| {
+                                el.child(
+                                    Label::new(format!("+{additions}"))
+                                        .size(LabelSize::XSmall)
+                                        .color(Color::Created),
+                                )
+                            })
+                            .when(deletions > 0, |el| {
+                                el.child(
+                                    Label::new(format!("-{deletions}"))
+                                        .size(LabelSize::XSmall)
+                                        .color(Color::Deleted),
+                                )
+                            }),
+                    ),
             );
         }
 
@@ -1014,6 +1706,10 @@ impl WorkspaceDetailPanel {
             );
         }
 
+        if status.state.as_deref() == Some("OPEN") {
+            section = section.child(self.render_review_threads(cx));
+        }
+
         if let Some(warning) = &status.warning {
             section = section.child(
                 h_flex().px_2().py_1().child(
@@ -1021,6 +1717,776 @@ impl WorkspaceDetailPanel {
                         .size(LabelSize::XSmall)
                         .color(Color::Warning),
                 ),
+            );
+        }
+
+        section
+    }
+
+    fn render_review_threads(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let count = self.review_threads.len();
+        let heading = if self.review_threads_loading && count == 0 {
+            "Review comments · loading…".to_string()
+        } else {
+            format!("Review comments · {count} unresolved")
+        };
+        let mut section = v_flex().w_full().pt_1().child(
+            h_flex()
+                .px_2()
+                .h(px(26.))
+                .gap_1()
+                .items_center()
+                .justify_between()
+                .child(
+                    Label::new(heading)
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted),
+                )
+                .when(count > 0, |el| {
+                    el.child(
+                        Button::new("send-all-comments", "Send all to agent")
+                            .style(ButtonStyle::Tinted(TintColor::Accent))
+                            .label_size(LabelSize::Small)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.send_review_comments_to_agent(None, cx);
+                            })),
+                    )
+                }),
+        );
+
+        if let Some(error) = self.review_threads_error.clone() {
+            section = section.child(
+                h_flex().px_2().py_1().child(
+                    Label::new(error)
+                        .size(LabelSize::XSmall)
+                        .color(Color::Error),
+                ),
+            );
+        }
+
+        for (index, comment) in self.review_threads.iter().enumerate() {
+            let Some(thread_id) = comment.thread_id.clone() else {
+                continue;
+            };
+            let resolving = self.resolving_thread.as_deref() == Some(thread_id.as_str());
+            let url = comment.url.clone();
+            let thread_for_send = thread_id.clone();
+            let thread_for_resolve = thread_id.clone();
+            section = section.child(
+                v_flex()
+                    .px_2()
+                    .py_1()
+                    .gap_0p5()
+                    .w_full()
+                    .border_t_1()
+                    .border_color(cx.theme().colors().border_variant)
+                    .child(
+                        h_flex()
+                            .gap_1p5()
+                            .items_center()
+                            .w_full()
+                            .child(Label::new(comment.author.clone()).size(LabelSize::XSmall))
+                            .child(
+                                div().flex_grow(1.0).overflow_hidden().child(
+                                    Label::new(Self::comment_location(comment))
+                                        .size(LabelSize::XSmall)
+                                        .color(Color::Muted)
+                                        .single_line(),
+                                ),
+                            )
+                            .when(comment.thread_outdated, |el| {
+                                el.child(
+                                    Label::new("outdated")
+                                        .size(LabelSize::XSmall)
+                                        .color(Color::Warning),
+                                )
+                            })
+                            .when(url.is_some(), |el| {
+                                el.child(
+                                    IconButton::new(
+                                        ("open-comment", index),
+                                        IconName::ArrowUpRight,
+                                    )
+                                    .icon_size(IconSize::XSmall)
+                                    .tooltip(Tooltip::text("Open on GitHub"))
+                                    .on_click(cx.listener(
+                                        move |_, _, _, cx| {
+                                            if let Some(url) = url.as_deref() {
+                                                cx.open_url(url);
+                                            }
+                                        },
+                                    )),
+                                )
+                            }),
+                    )
+                    .child(
+                        Label::new(Self::comment_preview(&comment.body))
+                            .size(LabelSize::XSmall)
+                            .single_line(),
+                    )
+                    .child(
+                        h_flex()
+                            .gap_1()
+                            .child(
+                                Button::new(("send-comment", index), "Send to agent")
+                                    .style(ButtonStyle::Subtle)
+                                    .label_size(LabelSize::XSmall)
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.send_review_comments_to_agent(
+                                            Some(&thread_for_send),
+                                            cx,
+                                        );
+                                    })),
+                            )
+                            .when(comment.thread_resolvable, |el| {
+                                el.child(
+                                    Button::new(
+                                        ("resolve-comment", index),
+                                        if resolving { "Resolving…" } else { "Resolve" },
+                                    )
+                                    .style(ButtonStyle::Subtle)
+                                    .label_size(LabelSize::XSmall)
+                                    .disabled(self.resolving_thread.is_some())
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.resolve_review_thread(
+                                            thread_for_resolve.clone(),
+                                            window,
+                                            cx,
+                                        );
+                                    })),
+                                )
+                            }),
+                    ),
+            );
+        }
+
+        section
+    }
+
+    /// Scans the workspace's listening ports off the UI thread (lsof).
+    /// `rescan` skips the port service's short-lived cache.
+    fn refresh_ports(&mut self, rescan: bool, cx: &mut Context<Self>) {
+        let Some(workspace_id) = self.summary.as_ref().map(|summary| summary.id.clone()) else {
+            return;
+        };
+        if self.ports_busy {
+            return;
+        }
+        self.ports_busy = true;
+        cx.notify();
+
+        let state = mnemonic_bridge::mnemonic_state(cx);
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_spawn({
+                    let workspace_id = workspace_id.clone();
+                    async move {
+                        if rescan {
+                            workspace_port_service::invalidate_workspace_port_cache(&workspace_id);
+                        }
+                        workspace_port_service::list_workspace_ports(&state, &workspace_id)
+                    }
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                this.ports_busy = false;
+                this.apply_ports_result(&workspace_id, result);
+                this.schedule_ports_poll(cx);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn apply_ports_result(&mut self, workspace_id: &str, result: Result<Vec<WorkspacePort>, String>) {
+        let still_selected = self
+            .summary
+            .as_ref()
+            .is_some_and(|summary| summary.id == workspace_id);
+        if !still_selected {
+            return;
+        }
+        match result {
+            Ok(ports) => {
+                self.ports = ports;
+                self.ports_error = None;
+            }
+            Err(err) => {
+                log::warn!("Failed to list workspace ports: {err}");
+                self.ports_error = Some(SharedString::from(err));
+            }
+        }
+    }
+
+    /// Keeps the Ports tab fresh only while it is the tab showing in a
+    /// visible panel; opening the tab or the panel again restarts it.
+    fn schedule_ports_poll(&mut self, cx: &mut Context<Self>) {
+        if self.ports_poll_scheduled || self.tab != DetailTab::Ports || self.summary.is_none() {
+            return;
+        }
+        self.ports_poll_scheduled = true;
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(PORTS_POLL_INTERVAL).await;
+            this.update(cx, |this, cx| {
+                this.ports_poll_scheduled = false;
+                if this.tab == DetailTab::Ports && this.is_visible_in_dock(cx) {
+                    this.refresh_ports(false, cx);
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn is_visible_in_dock(&self, cx: &Context<Self>) -> bool {
+        let Some(workspace) = self.workspace.upgrade() else {
+            return false;
+        };
+        let panel_id = cx.entity_id();
+        workspace.read(cx).all_docks().iter().any(|dock| {
+            dock.read(cx)
+                .visible_panel()
+                .is_some_and(|panel| panel.panel_id() == panel_id)
+        })
+    }
+
+    fn kill_port(&mut self, port: u16, pid: u32, cx: &mut Context<Self>) {
+        let Some(workspace_id) = self.summary.as_ref().map(|summary| summary.id.clone()) else {
+            return;
+        };
+        self.ports_busy = true;
+        cx.notify();
+
+        let state = mnemonic_bridge::mnemonic_state(cx);
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_spawn({
+                    let workspace_id = workspace_id.clone();
+                    async move {
+                        workspace_port_service::kill_workspace_port_process(
+                            &state,
+                            &workspace_id,
+                            port,
+                            pid,
+                        )
+                    }
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                this.ports_busy = false;
+                match result {
+                    Ok(ports) => this.apply_ports_result(&workspace_id, Ok(ports)),
+                    Err(err) => {
+                        log::error!("Failed to kill port {port} (pid {pid}): {err}");
+                        this.show_port_toast(format!("Couldn't kill port {port}: {err}"), cx);
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn show_port_toast(&self, message: String, cx: &mut Context<Self>) {
+        if let Some(workspace) = self.workspace.upgrade() {
+            workspace.update(cx, |workspace, cx| {
+                workspace.show_toast(
+                    Toast::new(NotificationId::unique::<MnemonicPortToast>(), message),
+                    cx,
+                );
+            });
+        }
+    }
+
+    fn render_ports(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let mut section = v_flex().w_full().flex_grow(1.0).py_1();
+
+        if let Some(error) = self.ports_error.clone() {
+            section = section.child(
+                h_flex()
+                    .px_2()
+                    .py_1()
+                    .child(Label::new(error).size(LabelSize::XSmall).color(Color::Warning)),
+            );
+        }
+
+        if self.ports.is_empty() {
+            let message = if self.ports_busy {
+                "Scanning ports…"
+            } else {
+                "No listening ports from this workspace"
+            };
+            return section.child(
+                h_flex().px_2().py_2().child(
+                    Label::new(message)
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted),
+                ),
+            );
+        }
+
+        for (index, port) in self.ports.iter().enumerate() {
+            let port_number = port.port;
+            let pid = port.pid;
+            section = section.child(
+                h_flex()
+                    .id(("workspace-port", index))
+                    .px_2()
+                    .h(px(26.))
+                    .gap_1p5()
+                    .items_center()
+                    .w_full()
+                    .hover(|style| style.bg(cx.theme().colors().ghost_element_hover))
+                    .child(Label::new(format!(":{port_number}")).size(LabelSize::Small))
+                    .child(
+                        div().flex_grow(1.0).overflow_hidden().child(
+                            Label::new(format!("{} · pid {pid}", port.command))
+                                .size(LabelSize::XSmall)
+                                .color(Color::Muted)
+                                .single_line(),
+                        ),
+                    )
+                    .child(
+                        Button::new(("open-port", index), "Open")
+                            .label_size(LabelSize::XSmall)
+                            .tooltip(Tooltip::text(format!("Open http://localhost:{port_number}")))
+                            .on_click(cx.listener(move |_, _, _, cx| {
+                                cx.open_url(&format!("http://localhost:{port_number}"));
+                            })),
+                    )
+                    .child(
+                        IconButton::new(("kill-port", index), IconName::Close)
+                            .icon_size(IconSize::XSmall)
+                            .icon_color(Color::Muted)
+                            .disabled(self.ports_busy)
+                            .tooltip(Tooltip::text(format!("Kill pid {pid} (SIGTERM)")))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.kill_port(port_number, pid, cx);
+                            })),
+                    ),
+            );
+        }
+
+        section
+    }
+
+    /// Lists the workspace's checkpoints (newest first) off the UI thread.
+    fn refresh_checkpoints(&mut self, cx: &mut Context<Self>) {
+        let Some(workspace_id) = self.summary.as_ref().map(|summary| summary.id.clone()) else {
+            return;
+        };
+        self.checkpoints_loading = true;
+        cx.notify();
+
+        let state = mnemonic_bridge::mnemonic_state(cx);
+        self.checkpoints_task = Some(cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_spawn({
+                    let workspace_id = workspace_id.clone();
+                    async move {
+                        checkpoint_service::list_workspace_checkpoints(&state, &workspace_id)
+                    }
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                this.checkpoints_loading = false;
+                let still_selected = this
+                    .summary
+                    .as_ref()
+                    .is_some_and(|summary| summary.id == workspace_id);
+                if still_selected {
+                    match result {
+                        Ok(checkpoints) => {
+                            this.checkpoints = checkpoints;
+                            this.checkpoints_error = None;
+                        }
+                        Err(err) => {
+                            log::warn!("Failed to list checkpoints: {err}");
+                            this.checkpoints_error = Some(SharedString::from(err));
+                        }
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
+    /// Called by the workspace view after it saves a checkpoint.
+    pub(crate) fn checkpoints_changed(&mut self, workspace_id: &str, cx: &mut Context<Self>) {
+        let showing = self.tab == DetailTab::Checkpoints
+            && self
+                .summary
+                .as_ref()
+                .is_some_and(|summary| summary.id == workspace_id);
+        if showing {
+            self.refresh_checkpoints(cx);
+        }
+    }
+
+    fn agent_busy(&self, workspace_id: &str, cx: &App) -> bool {
+        self.workspace.upgrade().is_some_and(|workspace| {
+            WorkspaceHost::workspace_agent_busy(workspace.read(cx), workspace_id, cx)
+        })
+    }
+
+    fn show_agent_busy_prompt(window: &mut Window, cx: &mut App) {
+        let _dismissed = window.prompt(
+            PromptLevel::Warning,
+            "An agent is working in this workspace",
+            Some("Wait for its turn to finish, or stop it, before restoring a checkpoint."),
+            &["OK"],
+            cx,
+        );
+    }
+
+    fn show_checkpoint_toast(&self, message: String, cx: &mut Context<Self>) {
+        if let Some(workspace) = self.workspace.upgrade() {
+            workspace.update(cx, |workspace, cx| {
+                workspace.show_toast(
+                    Toast::new(NotificationId::unique::<MnemonicCheckpointToast>(), message),
+                    cx,
+                );
+            });
+        }
+    }
+
+    fn restore_prompt_detail(plan: &WorkspaceCheckpointRestorePlan) -> String {
+        let mut lines = Vec::new();
+        let file_count = plan.files_to_restore.len();
+        if file_count > 0 {
+            let mut names = plan
+                .files_to_restore
+                .iter()
+                .take(RESTORE_PROMPT_FILE_LIMIT)
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                .join(", ");
+            if file_count > RESTORE_PROMPT_FILE_LIMIT {
+                names.push_str(&format!(
+                    " and {} more",
+                    file_count - RESTORE_PROMPT_FILE_LIMIT
+                ));
+            }
+            let plural = if file_count == 1 { "" } else { "s" };
+            lines.push(format!(
+                "{file_count} tracked file{plural} will be changed back to this checkpoint: {names}."
+            ));
+        }
+        if plan.current_dirty {
+            lines.push(
+                "Your current uncommitted changes are saved as a new checkpoint first, so this \
+                 can be undone."
+                    .to_string(),
+            );
+        }
+        lines.extend(plan.warnings.iter().cloned());
+        lines.join("\n\n")
+    }
+
+    /// Restores a checkpoint after showing its restore plan. Refused while an
+    /// agent in the workspace is mid-turn, both before and after the prompt.
+    fn restore_checkpoint(
+        &mut self,
+        reference: String,
+        label: SharedString,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(workspace_id) = self.summary.as_ref().map(|summary| summary.id.clone()) else {
+            return;
+        };
+        if self.checkpoint_restoring {
+            return;
+        }
+        if self.agent_busy(&workspace_id, cx) {
+            Self::show_agent_busy_prompt(window, cx);
+            return;
+        }
+        self.checkpoint_restoring = true;
+        cx.notify();
+
+        let state = mnemonic_bridge::mnemonic_state(cx);
+        cx.spawn_in(window, async move |this, cx| {
+            let plan = cx
+                .background_spawn({
+                    let state = state.clone();
+                    let workspace_id = workspace_id.clone();
+                    let reference = reference.clone();
+                    async move {
+                        checkpoint_service::get_workspace_checkpoint_restore_plan(
+                            &state,
+                            &workspace_id,
+                            &reference,
+                        )
+                    }
+                })
+                .await;
+
+            let answer = this.update_in(cx, |this, window, cx| match plan {
+                Err(err) => {
+                    this.checkpoint_restoring = false;
+                    cx.notify();
+                    let _dismissed = window.prompt(
+                        PromptLevel::Critical,
+                        "Couldn't prepare the restore",
+                        Some(&err),
+                        &["OK"],
+                        cx,
+                    );
+                    None
+                }
+                Ok(plan) if !plan.overwritten_untracked_files.is_empty() => {
+                    this.checkpoint_restoring = false;
+                    cx.notify();
+                    let _dismissed = window.prompt(
+                        PromptLevel::Critical,
+                        "This checkpoint can't be restored yet",
+                        Some(&Self::restore_prompt_detail(&plan)),
+                        &["OK"],
+                        cx,
+                    );
+                    None
+                }
+                Ok(plan) => Some(window.prompt(
+                    PromptLevel::Warning,
+                    &format!("Restore to before \"{label}\"?"),
+                    Some(&Self::restore_prompt_detail(&plan)),
+                    &["Restore", "Cancel"],
+                    cx,
+                )),
+            });
+            let Ok(Some(answer)) = answer else {
+                return;
+            };
+            let confirmed = answer.await == Ok(0);
+
+            let proceed = this.update_in(cx, |this, window, cx| {
+                let busy = this.agent_busy(&workspace_id, cx);
+                if !confirmed || busy {
+                    this.checkpoint_restoring = false;
+                    cx.notify();
+                }
+                if confirmed && busy {
+                    Self::show_agent_busy_prompt(window, cx);
+                }
+                confirmed && !busy
+            });
+            if !matches!(proceed, Ok(true)) {
+                return;
+            }
+
+            let result = cx
+                .background_spawn(async move {
+                    checkpoint_service::restore_workspace_checkpoint(
+                        &state,
+                        &workspace_id,
+                        &reference,
+                    )
+                })
+                .await;
+            this.update_in(cx, |this, window, cx| {
+                this.checkpoint_restoring = false;
+                match result {
+                    Ok(restored) => this.show_checkpoint_toast(restored.message, cx),
+                    Err(err) => {
+                        log::error!("Failed to restore checkpoint: {err}");
+                        let _dismissed = window.prompt(
+                            PromptLevel::Critical,
+                            "Couldn't restore checkpoint",
+                            Some(&err),
+                            &["OK"],
+                            cx,
+                        );
+                    }
+                }
+                this.refresh(cx);
+                this.refresh_checkpoints(cx);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Opens what changed in tracked files since the checkpoint as a
+    /// read-only diff in the editor.
+    fn view_checkpoint_changes(
+        &mut self,
+        reference: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(workspace_id) = self.summary.as_ref().map(|summary| summary.id.clone()) else {
+            return;
+        };
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+        let project = workspace.read(cx).project().clone();
+        if project.read(cx).is_remote() {
+            self.show_checkpoint_toast(
+                "Checkpoint diffs can only be opened in local projects".to_string(),
+                cx,
+            );
+            return;
+        }
+        let language = project.read(cx).languages().language_for_name("Diff");
+        let state = mnemonic_bridge::mnemonic_state(cx);
+        cx.spawn_in(window, async move |this, cx| {
+            let result = cx
+                .background_spawn(async move {
+                    checkpoint_service::get_workspace_changes_since_checkpoint(
+                        &state,
+                        &workspace_id,
+                        &reference,
+                    )
+                })
+                .await;
+            let diff = match result {
+                Ok(diff) if diff.diff.trim().is_empty() => {
+                    this.update(cx, |this, cx| {
+                        this.show_checkpoint_toast(
+                            "No tracked file has changed since this checkpoint".to_string(),
+                            cx,
+                        );
+                    })
+                    .ok();
+                    return;
+                }
+                Ok(diff) => diff.diff,
+                Err(err) => {
+                    log::error!("Failed to diff checkpoint: {err}");
+                    this.update(cx, |this, cx| {
+                        this.show_checkpoint_toast(format!("Couldn't load the diff: {err}"), cx);
+                    })
+                    .ok();
+                    return;
+                }
+            };
+            let language = language.await.ok();
+            workspace
+                .update_in(cx, |workspace, window, cx| {
+                    let buffer = project.update(cx, |project, cx| {
+                        project.create_local_buffer(&diff, language, false, cx)
+                    });
+                    // Read-only so closing the diff never asks to save it.
+                    buffer.update(cx, |buffer, cx| {
+                        buffer.set_capability(language::Capability::ReadOnly, cx);
+                    });
+                    let editor =
+                        cx.new(|cx| Editor::for_buffer(buffer, Some(project.clone()), window, cx));
+                    workspace.add_item_to_active_pane(Box::new(editor), None, true, window, cx);
+                })
+                .ok();
+        })
+        .detach();
+    }
+
+    fn relative_time(created_at: &str) -> String {
+        let Ok(created) = created_at.parse::<u64>() else {
+            return String::new();
+        };
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_secs())
+            .unwrap_or(created);
+        let elapsed = now.saturating_sub(created);
+        match elapsed {
+            0..60 => "just now".to_string(),
+            60..3_600 => format!("{}m ago", elapsed / 60),
+            3_600..86_400 => format!("{}h ago", elapsed / 3_600),
+            _ => format!("{}d ago", elapsed / 86_400),
+        }
+    }
+
+    fn render_checkpoints(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let mut section = v_flex().w_full().flex_grow(1.0).py_1();
+
+        if let Some(error) = self.checkpoints_error.clone() {
+            section = section.child(
+                h_flex().px_2().py_1().child(
+                    Label::new(error)
+                        .size(LabelSize::XSmall)
+                        .color(Color::Warning),
+                ),
+            );
+        }
+
+        if self.checkpoints.is_empty() {
+            let message = if self.checkpoints_loading {
+                "Loading checkpoints…"
+            } else {
+                "No checkpoints yet. One is saved before each agent turn."
+            };
+            return section.child(
+                h_flex().px_2().py_2().child(
+                    Label::new(message)
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted),
+                ),
+            );
+        }
+
+        for (index, checkpoint) in self.checkpoints.iter().enumerate() {
+            let label = SharedString::from(
+                checkpoint_service::checkpoint_label(&checkpoint.subject).to_string(),
+            );
+            let reference_for_diff = checkpoint.reference.clone();
+            let reference_for_restore = checkpoint.reference.clone();
+            let label_for_restore = label.clone();
+            section = section.child(
+                h_flex()
+                    .id(("workspace-checkpoint", index))
+                    .px_2()
+                    .h(px(26.))
+                    .gap_1p5()
+                    .items_center()
+                    .w_full()
+                    .hover(|style| style.bg(cx.theme().colors().ghost_element_hover))
+                    .tooltip(Tooltip::text(format!("{label}\n{}", checkpoint.short_oid)))
+                    .child(
+                        div().flex_grow(1.0).overflow_hidden().child(
+                            Label::new(label.clone())
+                                .size(LabelSize::XSmall)
+                                .single_line(),
+                        ),
+                    )
+                    .child(
+                        Label::new(Self::relative_time(&checkpoint.created_at))
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
+                    )
+                    .child(
+                        IconButton::new(("checkpoint-diff", index), IconName::FileDiff)
+                            .icon_size(IconSize::XSmall)
+                            .icon_color(Color::Muted)
+                            .tooltip(Tooltip::text("View changes since this checkpoint"))
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.view_checkpoint_changes(
+                                    reference_for_diff.clone(),
+                                    window,
+                                    cx,
+                                );
+                            })),
+                    )
+                    .child(
+                        IconButton::new(("checkpoint-restore", index), IconName::RotateCcw)
+                            .icon_size(IconSize::XSmall)
+                            .icon_color(Color::Muted)
+                            .disabled(self.checkpoint_restoring)
+                            .tooltip(Tooltip::text("Restore files to this checkpoint"))
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.restore_checkpoint(
+                                    reference_for_restore.clone(),
+                                    label_for_restore.clone(),
+                                    window,
+                                    cx,
+                                );
+                            })),
+                    ),
             );
         }
 
@@ -1133,11 +2599,18 @@ impl Panel for WorkspaceDetailPanel {
     fn starts_open(&self, _window: &Window, _cx: &App) -> bool {
         true
     }
+
+    fn set_active(&mut self, active: bool, _window: &mut Window, cx: &mut Context<Self>) {
+        if active && self.tab == DetailTab::Ports {
+            self.refresh_ports(true, cx);
+        }
+    }
 }
 
 impl Render for WorkspaceDetailPanel {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.refresh(cx);
+        self.maybe_refresh_change_annotations(cx);
 
         let content = v_flex()
             .id("workspace-detail-panel")
@@ -1151,6 +2624,8 @@ impl Render for WorkspaceDetailPanel {
                     DetailTab::AllFiles => self.render_file_tree(cx).into_any_element(),
                     DetailTab::Changes => self.render_changes(&ws, cx).into_any_element(),
                     DetailTab::Checks => self.render_checks(cx).into_any_element(),
+                    DetailTab::Ports => self.render_ports(cx).into_any_element(),
+                    DetailTab::Checkpoints => self.render_checkpoints(cx).into_any_element(),
                 };
                 content
                     .child(self.render_header(&ws, cx))

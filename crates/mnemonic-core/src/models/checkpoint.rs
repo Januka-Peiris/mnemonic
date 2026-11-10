@@ -26,6 +26,13 @@ pub struct WorkspaceCheckpointRestorePlan {
     pub current_dirty: bool,
     pub changed_file_count: usize,
     pub checkpoint_file_count: usize,
+    /// Tracked files a restore would rewrite or delete.
+    #[serde(default)]
+    pub files_to_restore: Vec<String>,
+    /// Untracked files the checkpoint also contains; restore refuses while
+    /// any exist because it would overwrite them.
+    #[serde(default)]
+    pub overwritten_untracked_files: Vec<String>,
     pub warnings: Vec<String>,
     pub steps: Vec<String>,
 }
