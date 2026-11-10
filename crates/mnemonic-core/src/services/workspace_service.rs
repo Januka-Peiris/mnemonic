@@ -27,22 +27,79 @@ fn spawn_changed_files_refresh(state: &AppState, workspaces: &[WorkspaceSummary]
     use std::sync::atomic::{AtomicBool, Ordering};
     static REFRESHING: AtomicBool = AtomicBool::new(false);
 
-    let ids: Vec<String> = workspaces
+    let active: Vec<&WorkspaceSummary> = workspaces
         .iter()
         .filter(|workspace| workspace.status != "Merged")
-        .map(|workspace| workspace.id.clone())
         .collect();
-    if ids.is_empty() || REFRESHING.swap(true, Ordering::SeqCst) {
+    if active.is_empty() || REFRESHING.swap(true, Ordering::SeqCst) {
         return;
     }
 
+    let ids: Vec<String> = active
+        .iter()
+        .map(|workspace| workspace.id.clone())
+        .collect();
+    let mut base_refs: Vec<(String, String)> = active
+        .iter()
+        .filter_map(|workspace| {
+            let base = workspace.branch_health.base_branch.trim();
+            let root = workspace
+                .repository_path
+                .clone()
+                .or_else(|| workspace.workspace_root_path.clone())?;
+            (!base.is_empty()).then(|| (root, base.to_string()))
+        })
+        .collect();
+    base_refs.sort();
+    base_refs.dedup();
+
     let state = state.clone();
     std::thread::spawn(move || {
+        for (root, base) in base_refs {
+            fetch_remote_base_if_stale(Path::new(&root), &base);
+        }
         for id in ids {
             let _ = git_review_service::get_workspace_changed_files(&state, &id);
         }
         REFRESHING.store(false, Ordering::SeqCst);
     });
+}
+
+/// Changed files are diffed against `origin/<base>`, which only moves on a
+/// fetch. Without this, merged work keeps showing as changed until someone
+/// fetches by hand. Throttled per repo and base because list_workspaces polls.
+fn fetch_remote_base_if_stale(root: &Path, base: &str) {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
+
+    static LAST_FETCH: Mutex<Option<HashMap<(String, String), Instant>>> = Mutex::new(None);
+    const MIN_INTERVAL: Duration = Duration::from_secs(60);
+
+    let key = (root.to_string_lossy().to_string(), base.to_string());
+    {
+        let Ok(mut guard) = LAST_FETCH.lock() else {
+            return;
+        };
+        let last_fetch = guard.get_or_insert_with(HashMap::new);
+        if let Some(when) = last_fetch.get(&key) {
+            if when.elapsed() < MIN_INTERVAL {
+                return;
+            }
+        }
+        last_fetch.insert(key, Instant::now());
+    }
+
+    // An explicit refspec keeps origin/<base> current even when the remote's
+    // configured fetch refspec does not cover it.
+    let refspec = format!("+refs/heads/{base}:refs/remotes/origin/{base}");
+    if let Err(err) = run_git(root, &["fetch", "--quiet", "--no-tags", "origin", &refspec]) {
+        log::warn!(
+            target: "mnemonic_lib",
+            "fetch origin/{base} for changed files failed in {}: {err}",
+            root.display()
+        );
+    }
 }
 
 pub fn get_workspace_detail(state: &AppState, id: &str) -> Result<Option<WorkspaceDetail>, String> {
