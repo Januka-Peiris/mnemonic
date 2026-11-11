@@ -2947,7 +2947,7 @@ impl ConversationView {
         }
     }
 
-    pub(crate) fn insert_dragged_files(
+    pub fn insert_dragged_files(
         &self,
         paths: Vec<project::ProjectPath>,
         added_worktrees: Vec<Entity<project::Worktree>>,
