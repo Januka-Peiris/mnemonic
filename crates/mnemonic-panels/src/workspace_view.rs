@@ -13,7 +13,7 @@ use agent_ui::{
 use editor::Editor;
 use futures::future::Either;
 use gpui::{
-    Action as _, Anchor, AnyWindowHandle, App, AppContext as _, Context, DragMoveEvent, Empty,
+    Action as _, Anchor, AnyWindowHandle, App, AppContext as _, Axis, Context, DragMoveEvent, Empty,
     Entity, EntityId, EventEmitter, ExternalPaths, FocusHandle, Focusable, IntoElement, Pixels,
     Render, SharedString, Subscription, WeakEntity, Window, WindowHandle, actions, px,
 };
@@ -41,7 +41,8 @@ use workspace::item::{Item, ItemEvent, ItemHandle};
 use workspace::notifications::NotificationId;
 use workspace::{
     ActivatePaneDown, ActivatePaneLeft, ActivatePaneRight, ActivatePaneUp, DraggedTab, Pane,
-    PaneGroup, PaneRenderContext, SplitDirection, SplitMode, Toast, Workspace, WorkspaceId, pane,
+    Member, PaneAxis, PaneGroup, PaneRenderContext, SplitDirection, SplitMode, Toast, Workspace,
+    WorkspaceId, pane,
 };
 use zed_actions::mnemonic::AgentSessionKind;
 
@@ -697,6 +698,8 @@ pub struct WorkspaceView {
     active_session: usize,
     center: PaneGroup,
     active_pane: Entity<Pane>,
+    /// The strip along the bottom that shells and Run output open in.
+    terminal_pane: Option<Entity<Pane>>,
     connection_store: Option<Entity<AgentConnectionStore>>,
     composer: Entity<Editor>,
     composer_height: Pixels,
@@ -1363,7 +1366,49 @@ impl WorkspaceView {
                 _subscription: subscription,
             }),
         });
-        self.show_new_session(item, window, cx);
+        if provider.is_some() {
+            self.show_new_session(item, window, cx);
+            return;
+        }
+        let Some(pane) = self.ensure_terminal_pane(window, cx) else {
+            self.show_new_session(item, window, cx);
+            return;
+        };
+        self.active_session = self.sessions.len().saturating_sub(1);
+        pane.update(cx, |pane, cx| {
+            pane.add_item(Box::new(item), true, true, None, window, cx);
+        });
+        self.active_pane = pane;
+        cx.notify();
+    }
+
+    /// The pane along the bottom of the workspace for shells and Run output,
+    /// created under all the other panes the first time one opens, so a
+    /// terminal doesn't take the place of the chat.
+    fn ensure_terminal_pane(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<Entity<Pane>> {
+        let existing = self
+            .terminal_pane
+            .clone()
+            .filter(|pane| self.center.panes().contains(&pane));
+        if existing.is_some() {
+            return existing;
+        }
+        let pane = self.add_pane(window, cx)?;
+        let above = self.center.root.clone();
+        // Flexes are relative to an even split, so these give the chats
+        // about 70% of the height and the terminal 30%.
+        self.center.root = Member::Axis(PaneAxis::load(
+            Axis::Vertical,
+            vec![above, Member::Pane(pane.clone())],
+            Some(vec![1.4, 0.6]),
+        ));
+        self.center.mark_positions(cx);
+        self.terminal_pane = Some(pane.clone());
+        Some(pane)
     }
 
     /// Reads the workspace's run commands off the UI thread, so the Run
@@ -3545,6 +3590,7 @@ impl WorkspaceHost {
                     active_session: 0,
                     center: PaneGroup::new(pane.clone()),
                     active_pane: pane,
+                    terminal_pane: None,
                     connection_store: None,
                     composer,
                     composer_height: px(110.),
@@ -3870,6 +3916,10 @@ impl Item for WorkspaceHost {
 
     fn tab_icon(&self, _window: &Window, _cx: &App) -> Option<Icon> {
         Some(Icon::new(IconName::FileGit))
+    }
+
+    fn hides_tab_bar_when_alone(&self) -> bool {
+        true
     }
 
     fn to_item_events(event: &Self::Event, f: &mut dyn FnMut(ItemEvent)) {

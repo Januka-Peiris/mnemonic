@@ -46,6 +46,7 @@ impl Render for DragGhostView {
 }
 
 const PROJECT_ORDER_KEY: &str = "panel_project_order";
+const HIDDEN_PROJECTS_KEY: &str = "panel_hidden_projects";
 const PROJECT_BASE_BRANCH_KEY: &str = "base_branch";
 const PROJECT_SETUP_SCRIPT_KEY: &str = "setup_script";
 const PROJECT_INIT_FILES_KEY: &str = "workspace_init_files";
@@ -56,8 +57,8 @@ use mnemonic_core::services::{
 };
 use settings::Settings as _;
 use ui::{
-    Button, ButtonStyle, CommonAnimationExt as _, ContextMenu, Icon, IconButton, IconName, Label,
-    PopoverMenu, Tooltip, h_flex, prelude::*, right_click_menu, v_flex,
+    Button, ButtonStyle, CommonAnimationExt as _, ContextMenu, ContextMenuEntry, Icon, IconButton,
+    IconName, Label, PopoverMenu, Tooltip, h_flex, prelude::*, right_click_menu, v_flex,
 };
 use util::ResultExt as _;
 use workspace::dock::{DockPosition, PanelEvent};
@@ -98,6 +99,9 @@ pub struct WorkspacePanel {
     /// Projects whose archived workspaces are listed.
     expanded_archives: Vec<String>,
     collapsed_projects: Vec<String>,
+    /// Projects left out of the list until shown again from "Hidden (n)".
+    hidden_projects: Option<Vec<String>>,
+    showing_hidden_projects: bool,
     selected_workspace_id: Option<String>,
     showing_history: bool,
     activities: Vec<ActivityItem>,
@@ -121,6 +125,8 @@ impl WorkspacePanel {
                 workspace_links: Vec::new(),
                 expanded_archives: Vec::new(),
                 collapsed_projects: Vec::new(),
+                hidden_projects: None,
+                showing_hidden_projects: false,
                 selected_workspace_id: None,
                 showing_history: false,
                 activities: Vec::new(),
@@ -181,6 +187,13 @@ impl WorkspacePanel {
                     self.project_order = order;
                 }
             }
+        }
+        if self.hidden_projects.is_none() {
+            let hidden = settings_repository::get_value(&state.db, HIDDEN_PROJECTS_KEY)
+                .log_err()
+                .flatten()
+                .and_then(|json| serde_json::from_str::<Vec<String>>(&json).log_err());
+            self.hidden_projects = Some(hidden.unwrap_or_default());
         }
         if self.workspace_order.is_empty() {
             if let Ok(Some(json)) = settings_repository::get_value(&state.db, WORKSPACE_ORDER_KEY) {
@@ -316,6 +329,57 @@ impl WorkspacePanel {
         self.save_ordering(cx);
     }
 
+    fn is_project_hidden(&self, project: &str) -> bool {
+        self.hidden_projects
+            .as_ref()
+            .is_some_and(|hidden| hidden.iter().any(|name| name == project))
+    }
+
+    fn set_project_hidden(&mut self, project: &str, hidden: bool, cx: &mut Context<Self>) {
+        let list = self.hidden_projects.get_or_insert_with(Vec::new);
+        list.retain(|name| name != project);
+        if hidden {
+            list.push(project.to_string());
+        }
+        if list.is_empty() {
+            self.showing_hidden_projects = false;
+        }
+        let state = mnemonic_bridge::mnemonic_state(cx);
+        match serde_json::to_string(list) {
+            Ok(json) => {
+                settings_repository::set_value(&state.db, HIDDEN_PROJECTS_KEY, &json).log_err();
+            }
+            Err(err) => log::error!("Failed to save hidden projects: {err}"),
+        }
+        cx.notify();
+    }
+
+    /// Takes the project out of the list. Only its registration is removed:
+    /// nothing on disk changes, and adding the folder again brings it back.
+    fn remove_project(&mut self, project: String, cx: &mut Context<Self>) {
+        let Some(repository_id) = self
+            .repositories
+            .iter()
+            .find(|repository| repository.name == project)
+            .map(|repository| repository.id.clone())
+        else {
+            return;
+        };
+        let state = mnemonic_bridge::mnemonic_state(cx);
+        if let Err(err) = repo_scanner_service::remove_repository(&state, &repository_id) {
+            self.show_archive_toast(format!("Couldn't remove {project}: {err}"), cx);
+            return;
+        }
+        self.project_order.retain(|name| name != &project);
+        self.collapsed_projects.retain(|name| name != &project);
+        self.save_ordering(cx);
+        if self.is_project_hidden(&project) {
+            self.set_project_hidden(&project, false, cx);
+        }
+        self.refresh(cx);
+        cx.notify();
+    }
+
     fn toggle_project(&mut self, project: &str) {
         if let Some(pos) = self.collapsed_projects.iter().position(|p| p == project) {
             self.collapsed_projects.remove(pos);
@@ -356,7 +420,9 @@ impl WorkspacePanel {
         let visible_ids: Vec<String> = self
             .grouped_workspaces()
             .into_iter()
-            .filter(|(project, _)| !self.collapsed_projects.contains(project))
+            .filter(|(project, _)| {
+                !self.collapsed_projects.contains(project) && !self.is_project_hidden(project)
+            })
             .flat_map(|(_, workspaces)| workspaces)
             .map(|workspace| workspace.id.clone())
             .collect();
@@ -467,33 +533,18 @@ impl WorkspacePanel {
         .detach();
     }
 
-    /// Archive after confirmation: runs the configured teardown commands in
-    /// the workspace's view, stops the agent session and run commands, frees
-    /// the workspace's ports, moves the worktree into the archive folder,
-    /// keeps the branch.
-    pub(crate) fn confirm_archive(
+    /// Runs the configured teardown commands in the workspace's view, stops
+    /// the agent session and run commands, frees the workspace's ports, moves
+    /// the worktree into the archive folder, keeps the branch. There is no
+    /// confirmation because an archived workspace can be restored.
+    pub(crate) fn archive_workspace(
         &mut self,
         ws_id: String,
         ws_name: String,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let answer = window.prompt(
-            PromptLevel::Warning,
-            &format!("Archive {ws_name}?"),
-            Some(
-                "Runs any teardown commands from .mnemonic/config.json, stops the agent \
-                 session and run commands, frees the workspace's ports, and moves the \
-                 worktree into the archive folder. Nothing is deleted.",
-            ),
-            &["Archive", "Cancel"],
-            cx,
-        );
-
         cx.spawn_in(window, async move |this, cx| {
-            if answer.await != Ok(0) {
-                return;
-            }
             let Some(state) = mnemonic_bridge::mnemonic_state_cloned() else {
                 return;
             };
@@ -1154,6 +1205,8 @@ impl WorkspacePanel {
         let project_for_add = project.to_string();
         let project_for_issue = project.to_string();
         let project_for_settings = project.to_string();
+        let project_for_hide = project.to_string();
+        let project_for_remove = project.to_string();
         let has_repository = self
             .repositories
             .iter()
@@ -1228,6 +1281,8 @@ impl WorkspacePanel {
                             let this = this.clone();
                             let project_for_issue = project_for_issue.clone();
                             let project_for_settings = project_for_settings.clone();
+                            let project_for_hide = project_for_hide.clone();
+                            let project_for_remove = project_for_remove.clone();
                             Some(ContextMenu::build(window, cx, move |menu, _, _| {
                                 menu.entry("New from Issue or PR…", None, {
                                     let this = this.clone();
@@ -1243,6 +1298,7 @@ impl WorkspacePanel {
                                     }
                                 })
                                 .when(has_repository, |menu| {
+                                    let this = this.clone();
                                     menu.entry("Project Settings…", None, move |window, cx| {
                                         this.update(cx, |this, cx| {
                                             this.open_project_settings(
@@ -1253,6 +1309,38 @@ impl WorkspacePanel {
                                         })
                                         .log_err();
                                     })
+                                })
+                                .separator()
+                                .entry("Hide Project", None, {
+                                    let this = this.clone();
+                                    move |_, cx| {
+                                        this.update(cx, |this, cx| {
+                                            this.set_project_hidden(&project_for_hide, true, cx);
+                                        })
+                                        .log_err();
+                                    }
+                                })
+                                .when(has_repository, |menu| {
+                                    // Its workspaces would be left without the
+                                    // project they are created and refreshed from.
+                                    let label = if count == 0 {
+                                        "Remove Project"
+                                    } else {
+                                        "Remove Project (archive its workspaces first)"
+                                    };
+                                    menu.item(
+                                        ContextMenuEntry::new(label).disabled(count > 0).handler(
+                                            move |_, cx| {
+                                                this.update(cx, |this, cx| {
+                                                    this.remove_project(
+                                                        project_for_remove.clone(),
+                                                        cx,
+                                                    );
+                                                })
+                                                .log_err();
+                                            },
+                                        ),
+                                    )
                                 })
                             }))
                         })
@@ -1288,6 +1376,82 @@ impl WorkspacePanel {
         }
 
         group
+    }
+
+    /// A collapsed "Hidden (n)" row below the projects that expands to the
+    /// hidden projects, each with a button to show it again.
+    fn render_hidden_projects(
+        &self,
+        hidden: &[String],
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let expanded = self.showing_hidden_projects;
+        let mut section = v_flex().w_full().child(
+            h_flex()
+                .id("hidden-projects")
+                .px_2()
+                .h(px(28.))
+                .gap_1()
+                .items_center()
+                .w_full()
+                .cursor_pointer()
+                .hover(|style| style.bg(cx.theme().colors().ghost_element_hover))
+                .on_click(cx.listener(|this, _, _window, cx| {
+                    this.showing_hidden_projects = !this.showing_hidden_projects;
+                    cx.notify();
+                }))
+                .child(
+                    Icon::new(if expanded {
+                        IconName::ChevronDown
+                    } else {
+                        IconName::ChevronRight
+                    })
+                    .size(IconSize::XSmall)
+                    .color(Color::Muted),
+                )
+                .child(
+                    Label::new(format!("Hidden ({})", hidden.len()))
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
+                ),
+        );
+        if expanded {
+            for project in hidden {
+                let project_for_show = project.clone();
+                section = section.child(
+                    h_flex()
+                        .pl(px(28.))
+                        .pr_2()
+                        .h(px(22.))
+                        .gap_1p5()
+                        .items_center()
+                        .w_full()
+                        .child(
+                            div().flex_grow(1.0).overflow_hidden().child(
+                                Label::new(project.clone())
+                                    .size(LabelSize::Small)
+                                    .color(Color::Muted)
+                                    .single_line(),
+                            ),
+                        )
+                        .child(
+                            IconButton::new(
+                                SharedString::from(format!("show-project-{project}")),
+                                IconName::Eye,
+                            )
+                            .icon_size(IconSize::XSmall)
+                            .icon_color(Color::Muted)
+                            .tooltip(Tooltip::text("Show project"))
+                            .on_click(cx.listener(
+                                move |this, _, _window, cx| {
+                                    this.set_project_hidden(&project_for_show, false, cx);
+                                },
+                            )),
+                        ),
+                );
+            }
+        }
+        section
     }
 
     /// A collapsed "Archived (n)" row under a project's workspaces that
@@ -1554,7 +1718,7 @@ impl WorkspacePanel {
                 .tooltip(Tooltip::text("Archive workspace"))
                 .on_click(cx.listener(move |this, _, window, cx| {
                     cx.stop_propagation();
-                    this.confirm_archive(
+                    this.archive_workspace(
                         ws_id_for_archive.clone(),
                         ws_name_for_archive.clone(),
                         window,
@@ -1644,9 +1808,9 @@ impl WorkspacePanel {
                         }
                     })
                     .separator()
-                    .entry("Archive…", None, move |window, cx| {
+                    .entry("Archive", None, move |window, cx| {
                         this.update(cx, |this, cx| {
-                            this.confirm_archive(
+                            this.archive_workspace(
                                 workspace_id.clone(),
                                 workspace_name.clone(),
                                 window,
@@ -2566,8 +2730,16 @@ impl Render for WorkspacePanel {
 
         if has_workspaces {
             let mut list = v_flex().py_0p5().overflow_y_hidden().flex_grow(1.0);
+            let mut hidden = Vec::new();
             for (project, workspaces) in &groups {
-                list = list.child(self.render_project_group(project, &workspaces, cx));
+                if self.is_project_hidden(project) {
+                    hidden.push(project.clone());
+                } else {
+                    list = list.child(self.render_project_group(project, &workspaces, cx));
+                }
+            }
+            if !hidden.is_empty() {
+                list = list.child(self.render_hidden_projects(&hidden, cx));
             }
             content = content.child(list);
         } else {
