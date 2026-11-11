@@ -25,7 +25,7 @@ use mnemonic_core::services::{
     checkpoint_service, terminal_service, workspace_script_service, workspace_service,
 };
 use project::agent_server_store::AllAgentServersSettings;
-use project::{AgentId, Project};
+use project::{AgentId, DiagnosticSummary, Project};
 use settings::{NotifyWhenAgentWaiting, ReviewAgent, Settings as _};
 use task::{RevealStrategy, Shell, SpawnInTerminal, TaskId};
 use terminal::Terminal;
@@ -34,7 +34,7 @@ use util::path_list::PathList;
 use util::ResultExt as _;
 use util::shell_builder::ShellBuilder;
 use ui::{
-    Button, ButtonStyle, ContextMenu, Icon, IconButton, IconName, Label, PopoverMenu,
+    Button, ButtonLike, ButtonStyle, ContextMenu, Icon, IconButton, IconName, Label, PopoverMenu,
     Tooltip, h_flex, prelude::*, v_flex,
 };
 use workspace::item::{Item, ItemEvent, ItemHandle};
@@ -732,8 +732,12 @@ pub struct WorkspaceView {
     cli_quiet_reported: bool,
     notification_windows: Vec<WindowHandle<AgentNotification>>,
     notification_subscriptions: Vec<Subscription>,
+    /// Errors and warnings in this workspace's files, from the project's
+    /// language servers.
+    diagnostic_summary: DiagnosticSummary,
     _window_activation: Subscription,
     _pane_refresh: Subscription,
+    _diagnostics_updated: Subscription,
 }
 
 impl WorkspaceView {
@@ -1430,7 +1434,7 @@ impl WorkspaceView {
                         this.run_tooltip = SharedString::from(match config.warning {
                             Some(warning) => warning,
                             None if config.run.is_empty() => {
-                                "Add \"run\" commands to .mnemonic/config.json to enable Run"
+                                "Set a run script in the project's settings to enable Run"
                                     .to_string()
                             }
                             None => format!("Run {}", config.run.join(" + ")),
@@ -1711,6 +1715,67 @@ impl WorkspaceView {
                 .log_err();
             }
         })
+    }
+
+    /// The project is shared by every workspace in the window, so only
+    /// diagnostics under this workspace's root are counted.
+    fn refresh_diagnostic_summary(&mut self, project: &Entity<Project>, cx: &mut Context<Self>) {
+        let Some(root) = self.worktree_path.as_deref() else {
+            return;
+        };
+        let project = project.read(cx);
+        let mut summary = DiagnosticSummary::default();
+        for (path, _, path_summary) in project.diagnostic_summaries(false, cx) {
+            let Some(worktree) = project.worktree_for_id(path.worktree_id, cx) else {
+                continue;
+            };
+            if worktree.read(cx).abs_path().starts_with(root) {
+                summary.error_count += path_summary.error_count;
+                summary.warning_count += path_summary.warning_count;
+            }
+        }
+        if summary != self.diagnostic_summary {
+            self.diagnostic_summary = summary;
+            cx.notify();
+        }
+    }
+
+    fn render_diagnostics_button(&self) -> Option<AnyElement> {
+        let DiagnosticSummary {
+            error_count,
+            warning_count,
+        } = self.diagnostic_summary;
+        if error_count == 0 && warning_count == 0 {
+            return None;
+        }
+        Some(
+            ButtonLike::new("workspace-diagnostics")
+                .child(
+                    h_flex()
+                        .gap_1()
+                        .when(error_count > 0, |el| {
+                            el.child(
+                                Icon::new(IconName::XCircle)
+                                    .size(IconSize::XSmall)
+                                    .color(Color::Error),
+                            )
+                            .child(Label::new(error_count.to_string()).size(LabelSize::XSmall))
+                        })
+                        .when(warning_count > 0, |el| {
+                            el.child(
+                                Icon::new(IconName::Warning)
+                                    .size(IconSize::XSmall)
+                                    .color(Color::Warning),
+                            )
+                            .child(Label::new(warning_count.to_string()).size(LabelSize::XSmall))
+                        }),
+                )
+                .tooltip(Tooltip::text("Open the list of errors and warnings"))
+                .on_click(|_, window, cx| {
+                    window.dispatch_action(Box::new(diagnostics::Deploy), cx);
+                })
+                .into_any_element(),
+        )
     }
 
     fn render_run_controls(&self, this: &WeakEntity<Self>) -> AnyElement {
@@ -3297,7 +3362,8 @@ impl WorkspaceView {
             .gap_0p5()
             .items_center()
             .when(is_first_pane, |el| {
-                el.child(self.render_run_controls(&this))
+                el.children(self.render_diagnostics_button())
+                    .child(self.render_run_controls(&this))
                     .when(!self.auto_fix_state.is_empty(), |el| {
                         el.child(
                             Label::new(self.auto_fix_state.clone())
@@ -3576,6 +3642,19 @@ impl WorkspaceHost {
                             pane.update(cx, |_, cx| cx.notify());
                         }
                     }),
+                    diagnostic_summary: DiagnosticSummary::default(),
+                    _diagnostics_updated: cx.subscribe(
+                        &project,
+                        |view: &mut WorkspaceView, project, event, cx| {
+                            if matches!(
+                                event,
+                                project::Event::DiagnosticsUpdated { .. }
+                                    | project::Event::DiskBasedDiagnosticsFinished { .. }
+                            ) {
+                                view.refresh_diagnostic_summary(&project, cx);
+                            }
+                        },
+                    ),
                     window_handle: window.window_handle(),
                     window_active: window.is_window_active(),
                     last_cli_activity: None,
@@ -3625,6 +3704,7 @@ impl WorkspaceHost {
                     }
                 };
             view.update(cx, |view, cx| {
+                view.refresh_diagnostic_summary(&project, cx);
                 let start_main_cli = should_start_main_cli(&chat_records);
                 for record in chat_records {
                     view.open_chat(record, None, window, cx);
@@ -3710,6 +3790,23 @@ impl WorkspaceHost {
                     }
                     cx.emit(ItemEvent::UpdateTab);
                 });
+                return;
+            }
+        }
+    }
+
+    /// Re-reads every open workspace's run commands, so a project's new run
+    /// script shows on the Run button without reselecting the workspace.
+    pub(crate) fn reload_run_configs(workspace: &mut Workspace, cx: &mut Context<Workspace>) {
+        for pane in workspace.panes().to_vec() {
+            let host = pane
+                .read(cx)
+                .items()
+                .find_map(|item| item.downcast::<WorkspaceHost>());
+            if let Some(host) = host {
+                for view in host.read(cx).views.values().cloned().collect::<Vec<_>>() {
+                    view.update(cx, |view, cx| view.load_run_config(cx));
+                }
                 return;
             }
         }

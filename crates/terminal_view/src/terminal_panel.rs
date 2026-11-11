@@ -1667,6 +1667,10 @@ impl Panel for TerminalPanel {
         2
     }
 
+    fn stacks_below_other_panels(&self, _cx: &App) -> bool {
+        true
+    }
+
     fn hide_button_setting(&self, _: &App) -> Option<workspace::HideStatusItem> {
         Some(workspace::HideStatusItem::new(|settings| {
             settings.terminal.get_or_insert_default().button = Some(false);

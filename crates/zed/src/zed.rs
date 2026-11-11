@@ -743,6 +743,7 @@ fn initialize_panels(window: &mut Window, cx: &mut Context<Workspace>) -> Task<a
     cx.spawn_in(window, async move |workspace_handle, cx| {
         let terminal_panel = TerminalPanel::load(workspace_handle.clone(), cx.clone());
         let git_panel = GitPanel::load(workspace_handle.clone(), cx.clone());
+        let outline_panel = OutlinePanel::load(workspace_handle.clone(), cx.clone());
         let mnemonic_workspace_panel =
             mnemonic_panels::WorkspacePanel::load(workspace_handle.clone(), cx.clone());
         let mnemonic_command_panel =
@@ -770,6 +771,7 @@ fn initialize_panels(window: &mut Window, cx: &mut Context<Workspace>) -> Task<a
         futures::join!(
             add_panel_when_ready(terminal_panel, workspace_handle.clone(), cx.clone()),
             add_panel_when_ready(git_panel, workspace_handle.clone(), cx.clone()),
+            add_panel_when_ready(outline_panel, workspace_handle.clone(), cx.clone()),
             add_panel_when_ready(mnemonic_workspace_panel, workspace_handle.clone(), cx.clone()),
             add_panel_when_ready(mnemonic_command_panel, workspace_handle.clone(), cx.clone()),
             add_panel_when_ready(mnemonic_coordinator_panel, workspace_handle.clone(), cx.clone()),

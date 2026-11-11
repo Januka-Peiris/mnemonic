@@ -7,7 +7,8 @@ use crate::models::{
     MnemonicWorkspaceConfig, TerminalSession,
 };
 use crate::repositories::{
-    activity_repository, settings_repository, terminal_repository, workspace_repository,
+    activity_repository, repository_settings_repository, settings_repository, terminal_repository,
+    workspace_repository,
 };
 use crate::services::{
     agent_profile_service, command_safety_service, hook_service, terminal_service,
@@ -15,13 +16,37 @@ use crate::services::{
 use crate::state::AppState;
 
 const CONFIG_RELATIVE_PATH: &str = ".mnemonic/config.json";
+pub const PROJECT_RUN_SCRIPT_KEY: &str = "run_script";
 
 pub fn get_workspace_mnemonic_config(
     state: &AppState,
     workspace_id: &str,
 ) -> Result<MnemonicWorkspaceConfig, String> {
     let root = workspace_root_path(state, workspace_id)?;
-    Ok(load_config_from_root(&root))
+    let mut config = load_config_from_root(&root);
+    if let Some(run_script) = project_run_script(state, workspace_id)? {
+        config.run = vec![run_script];
+    }
+    Ok(config)
+}
+
+/// The run script saved in the project's settings. When set it replaces the
+/// `run` commands from `.mnemonic/config.json`, the same way the project's
+/// base branch replaces the app-wide default.
+fn project_run_script(state: &AppState, workspace_id: &str) -> Result<Option<String>, String> {
+    let Some(repository_id) = workspace_repository::get_detail(&state.db, workspace_id)?
+        .and_then(|workspace| workspace.summary.repository_id)
+    else {
+        return Ok(None);
+    };
+    let script = repository_settings_repository::get_value(
+        &state.db,
+        &repository_id,
+        PROJECT_RUN_SCRIPT_KEY,
+    )?;
+    Ok(script
+        .map(|script| script.trim().to_string())
+        .filter(|script| !script.is_empty()))
 }
 
 pub fn run_workspace_setup(
@@ -389,7 +414,7 @@ fn plan_run_commands(
     }
     if config.run.is_empty() {
         return Err(format!(
-            "No run commands are configured in {CONFIG_RELATIVE_PATH}"
+            "No run script is set in the project's settings or in {CONFIG_RELATIVE_PATH}"
         ));
     }
     config
@@ -743,6 +768,55 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).expect("temp root");
         root
+    }
+
+    #[test]
+    fn project_run_script_replaces_config_run_commands() {
+        let dir = temp_root("project-run-script");
+        fs::create_dir_all(dir.join(".mnemonic")).expect("mnemonic dir");
+        fs::write(dir.join(CONFIG_RELATIVE_PATH), r#"{"run":["npm run dev"]}"#)
+            .expect("write config");
+        let state = crate::state::AppState::initialize(
+            dir.join("data"),
+            dir.join("cache"),
+            std::sync::Arc::new(crate::state::NoopEventEmitter),
+        )
+        .expect("app state");
+        let worktree_path = dir.display().to_string();
+        state
+            .db
+            .with_connection_mut(|connection| {
+                connection.execute(
+                    r#"
+                    INSERT INTO workspaces (
+                        id, name, repo, branch, agent, status, current_step, completed_steps,
+                        last_updated, description, current_task, merge_risk, last_rebase, base_branch,
+                        agent_session_id, agent_session_agent, agent_session_status, agent_session_model,
+                        agent_session_estimated_cost, agent_session_last_message, agent_session_started_at,
+                        worktree_path, recent_events, repository_id
+                    ) VALUES ('ws-1', 'ws-1', 'repo', 'branch', 'Codex', 'Waiting', 'Planning', '[]',
+                        'now', '', '', 'Low', '', 'main', '', '', '', '', '', '', '',
+                        ?1, '[]', 'repo-1')
+                    "#,
+                    rusqlite::params![worktree_path],
+                )?;
+                Ok(())
+            })
+            .expect("seed workspace");
+
+        let config = get_workspace_mnemonic_config(&state, "ws-1").expect("config");
+        assert_eq!(config.run, vec!["npm run dev"]);
+
+        repository_settings_repository::set_value(
+            &state.db,
+            "repo-1",
+            PROJECT_RUN_SCRIPT_KEY,
+            "pnpm dev\n",
+        )
+        .expect("save run script");
+        let config = get_workspace_mnemonic_config(&state, "ws-1").expect("config");
+        assert_eq!(config.run, vec!["pnpm dev"]);
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]

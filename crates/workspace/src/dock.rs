@@ -8,10 +8,10 @@ use client::proto;
 use db::kvp::KeyValueStore;
 
 use gpui::{
-    Action, Anchor, AnyView, App, Axis, Context, Entity, EntityId, EventEmitter, FocusHandle,
-    Focusable, IntoElement, KeyContext, MouseButton, MouseDownEvent, MouseUpEvent, ParentElement,
-    Render, SharedString, StyleRefinement, Styled, Subscription, WeakEntity, Window, deferred, div,
-    px,
+    Action, Anchor, AnyView, App, Axis, Context, DragMoveEvent, Entity, EntityId, EventEmitter,
+    FocusHandle, Focusable, IntoElement, KeyContext, MouseButton, MouseDownEvent, MouseUpEvent,
+    ParentElement, Render, SharedString, StyleRefinement, Styled, Subscription, WeakEntity, Window,
+    deferred, div, px,
 };
 use serde::{Deserialize, Serialize};
 use settings::{Settings, SettingsStore, TerminalDockPosition};
@@ -87,6 +87,11 @@ pub trait Panel: Focusable + EventEmitter<PanelEvent> + Render + Sized {
     fn is_agent_panel(&self) -> bool {
         false
     }
+    /// Whether this panel opens underneath the active panel of a side dock
+    /// instead of replacing it, so both show at once.
+    fn stacks_below_other_panels(&self, _cx: &App) -> bool {
+        false
+    }
     /// Returns metadata describing how to hide this panel's button from the
     /// status bar by writing to user settings. Implementors should return
     /// `None` if the panel button cannot be hidden through settings.
@@ -123,6 +128,7 @@ pub trait PanelHandle: Send + Sync {
     fn activation_priority(&self, cx: &App) -> u32;
     fn enabled(&self, cx: &App) -> bool;
     fn is_agent_panel(&self, cx: &App) -> bool;
+    fn stacks_below_other_panels(&self, cx: &App) -> bool;
     fn hide_button_setting(&self, cx: &App) -> Option<HideStatusItem>;
     fn move_to_next_position(&self, window: &mut Window, cx: &mut App) {
         let current_position = self.position(window, cx);
@@ -253,6 +259,10 @@ where
         self.read(cx).is_agent_panel()
     }
 
+    fn stacks_below_other_panels(&self, cx: &App) -> bool {
+        self.read(cx).stacks_below_other_panels(cx)
+    }
+
     fn hide_button_setting(&self, cx: &App) -> Option<HideStatusItem> {
         self.read(cx).hide_button_setting(cx)
     }
@@ -266,12 +276,33 @@ impl From<&dyn PanelHandle> for AnyView {
 
 /// A container with a fixed [`DockPosition`] adjacent to a certain widown edge.
 /// Can contain multiple panels and show/hide itself with all contents.
+/// Two panels shown in one side dock, one above the other. Held by entity id
+/// because panel indices shift as panels are added and removed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PanelStack {
+    top: EntityId,
+    bottom: EntityId,
+}
+
+#[derive(Clone)]
+struct DraggedStackDivider(EntityId);
+
+impl Render for DraggedStackDivider {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        gpui::Empty
+    }
+}
+
+const MIN_STACKED_PANEL_HEIGHT: Pixels = px(80.);
+
 pub struct Dock {
     position: DockPosition,
     panel_entries: Vec<PanelEntry>,
     workspace: WeakEntity<Workspace>,
     is_open: bool,
     active_panel_index: Option<usize>,
+    stack: Option<PanelStack>,
+    stacked_panel_height: Pixels,
     focus_handle: FocusHandle,
     focus_follows_mouse: FocusFollowsMouse,
     pub(crate) serialized_dock: Option<DockData>,
@@ -415,6 +446,8 @@ impl Dock {
                 workspace: workspace.downgrade(),
                 panel_entries: Default::default(),
                 active_panel_index: None,
+                stack: None,
+                stacked_panel_height: px(280.),
                 is_open: false,
                 focus_handle: focus_handle.clone(),
                 focus_follows_mouse: WorkspaceSettings::get_global(cx).focus_follows_mouse,
@@ -536,12 +569,130 @@ impl Dock {
     pub fn set_open(&mut self, open: bool, window: &mut Window, cx: &mut Context<Self>) {
         if open != self.is_open {
             self.is_open = open;
-            if let Some(active_panel) = self.active_panel_entry() {
-                active_panel.panel.set_active(open, window, cx);
+            for panel in self.shown_panels() {
+                panel.set_active(open, window, cx);
             }
 
             cx.notify();
         }
+    }
+
+    /// The panels this dock shows while open: the active one, or both halves
+    /// of a stack.
+    fn shown_panels(&self) -> Vec<Arc<dyn PanelHandle>> {
+        if let Some((top, bottom)) = self.stacked_entries() {
+            return vec![top.panel.clone(), bottom.panel.clone()];
+        }
+        self.active_panel_entry()
+            .map(|entry| entry.panel.clone())
+            .into_iter()
+            .collect()
+    }
+
+    fn entry_index(&self, panel_id: EntityId) -> Option<usize> {
+        self.panel_entries
+            .iter()
+            .position(|entry| entry.panel.panel_id() == panel_id)
+    }
+
+    fn stacked_entries(&self) -> Option<(&PanelEntry, &PanelEntry)> {
+        let stack = self.stack?;
+        let top = self.panel_entries.get(self.entry_index(stack.top)?)?;
+        let bottom = self.panel_entries.get(self.entry_index(stack.bottom)?)?;
+        Some((top, bottom))
+    }
+
+    /// The panel shown under another one in this dock, if any.
+    pub fn stacked_panel(&self) -> Option<&Arc<dyn PanelHandle>> {
+        self.stacked_entries().map(|(_, bottom)| &bottom.panel)
+    }
+
+    /// Hides the lower panel of a stack, leaving the upper one in the dock.
+    pub fn close_stacked_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(stack) = self.stack.take() else {
+            return;
+        };
+        if let Some(index) = self.entry_index(stack.bottom) {
+            self.panel_entries[index]
+                .panel
+                .clone()
+                .set_active(false, window, cx);
+        }
+        self.active_panel_index = self.entry_index(stack.top);
+        cx.notify();
+    }
+
+    /// In a side dock, opens a stacking panel under the active panel instead
+    /// of replacing it. Returns false when normal activation applies.
+    fn activate_stacked_panel(
+        &mut self,
+        panel_ix: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if self.position == DockPosition::Bottom {
+            return false;
+        }
+        let Some(panel) = self
+            .panel_entries
+            .get(panel_ix)
+            .map(|entry| entry.panel.clone())
+        else {
+            return false;
+        };
+        let panel_id = panel.panel_id();
+        let stacks = panel.stacks_below_other_panels(cx);
+        let new_stack = match self.stack {
+            Some(stack) if stack.top == panel_id || stack.bottom == panel_id => {
+                self.active_panel_index = Some(panel_ix);
+                cx.notify();
+                return true;
+            }
+            Some(stack) => {
+                let replaced = if stacks { stack.bottom } else { stack.top };
+                if let Some(index) = self.entry_index(replaced) {
+                    self.panel_entries[index]
+                        .panel
+                        .clone()
+                        .set_active(false, window, cx);
+                }
+                if stacks {
+                    PanelStack {
+                        top: stack.top,
+                        bottom: panel_id,
+                    }
+                } else {
+                    PanelStack {
+                        top: panel_id,
+                        bottom: stack.bottom,
+                    }
+                }
+            }
+            None => {
+                let Some(top) = self.active_panel_entry().map(|entry| entry.panel.clone()) else {
+                    return false;
+                };
+                if !stacks || top.panel_id() == panel_id || top.stacks_below_other_panels(cx) {
+                    return false;
+                }
+                PanelStack {
+                    top: top.panel_id(),
+                    bottom: panel_id,
+                }
+            }
+        };
+        self.stack = Some(new_stack);
+        self.active_panel_index = Some(panel_ix);
+        panel.set_active(true, window, cx);
+        cx.notify();
+        true
+    }
+
+    /// When panels are stacked the dock is as wide as its upper panel.
+    fn sizing_panel_index(&self) -> Option<usize> {
+        self.stack
+            .and_then(|stack| self.entry_index(stack.top))
+            .or(self.active_panel_index)
     }
 
     pub fn set_panel_zoomed(
@@ -699,6 +850,11 @@ impl Dock {
                     }
                     PanelEvent::Close => {
                         if this
+                            .stacked_panel()
+                            .is_some_and(|p| p.panel_id() == Entity::entity_id(panel))
+                        {
+                            this.close_stacked_panel(window, cx);
+                        } else if this
                             .visible_panel()
                             .is_some_and(|p| p.panel_id() == Entity::entity_id(panel))
                         {
@@ -783,6 +939,18 @@ impl Dock {
             .iter()
             .position(|entry| entry.panel.panel_id() == Entity::entity_id(panel))
         {
+            let removed_id = Entity::entity_id(panel);
+            if let Some(stack) = self.stack
+                && (stack.top == removed_id || stack.bottom == removed_id)
+            {
+                self.stack = None;
+                let remaining = if stack.top == removed_id {
+                    stack.bottom
+                } else {
+                    stack.top
+                };
+                self.active_panel_index = self.entry_index(remaining);
+            }
             if let Some(active_panel_index) = self.active_panel_index.as_mut() {
                 match panel_ix.cmp(active_panel_index) {
                     std::cmp::Ordering::Less => {
@@ -816,6 +984,9 @@ impl Dock {
     }
 
     pub fn activate_panel(&mut self, panel_ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if self.activate_stacked_panel(panel_ix, window, cx) {
+            return;
+        }
         if Some(panel_ix) != self.active_panel_index {
             if let Some(active_panel) = self.active_panel_entry() {
                 active_panel.panel.set_active(false, window, cx);
@@ -859,7 +1030,9 @@ impl Dock {
 
     pub fn active_panel_size(&self) -> Option<PanelSizeState> {
         if self.is_open {
-            self.active_panel_entry().map(|entry| entry.size_state)
+            self.sizing_panel_index()
+                .and_then(|index| self.panel_entries.get(index))
+                .map(|entry| entry.size_state)
         } else {
             None
         }
@@ -891,7 +1064,10 @@ impl Dock {
 
     pub fn stored_active_panel_size(&self, window: &Window, cx: &App) -> Option<Pixels> {
         if self.is_open {
-            self.active_panel_entry().map(|entry| {
+            let entry = self
+                .sizing_panel_index()
+                .and_then(|index| self.panel_entries.get(index));
+            entry.map(|entry| {
                 entry
                     .size_state
                     .size
@@ -966,7 +1142,7 @@ impl Dock {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if let Some(index) = self.active_panel_index
+        if let Some(index) = self.sizing_panel_index()
             && let Some(entry) = self.panel_entries.get_mut(index)
         {
             let (panel_key, size_state) =
@@ -1088,6 +1264,76 @@ impl Dock {
     }
 }
 
+impl Dock {
+    fn render_stacked_panels(
+        &self,
+        top: &PanelEntry,
+        bottom: &PanelEntry,
+        cx: &Context<Self>,
+    ) -> impl IntoElement {
+        let dock_id = cx.entity_id();
+        let divider = div()
+            .id("stacked-panel-resize-handle")
+            .absolute()
+            .top(-RESIZE_HANDLE_SIZE / 2.)
+            .left(px(0.))
+            .w_full()
+            .h(RESIZE_HANDLE_SIZE)
+            .cursor_row_resize()
+            .on_drag(DraggedStackDivider(dock_id), |divider, _, _, cx| {
+                cx.stop_propagation();
+                cx.new(|_| divider.clone())
+            })
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|_, _: &MouseDownEvent, _, cx| {
+                    cx.stop_propagation();
+                }),
+            )
+            .occlude();
+
+        v_flex()
+            .size_full()
+            .on_drag_move(cx.listener(
+                move |dock, event: &DragMoveEvent<DraggedStackDivider>, _, cx| {
+                    if event.drag(cx).0 != dock_id {
+                        return;
+                    }
+                    let bounds = event.bounds;
+                    let max_height = (bounds.size.height - MIN_STACKED_PANEL_HEIGHT)
+                        .max(MIN_STACKED_PANEL_HEIGHT);
+                    dock.stacked_panel_height = (bounds.bottom() - event.event.position.y)
+                        .max(MIN_STACKED_PANEL_HEIGHT)
+                        .min(max_height);
+                    cx.notify();
+                },
+            ))
+            .child(
+                div().flex_1().min_h_0().w_full().child(
+                    top.panel
+                        .to_any()
+                        .cached(StyleRefinement::default().v_flex().size_full()),
+                ),
+            )
+            .child(
+                div()
+                    .relative()
+                    .flex_none()
+                    .w_full()
+                    .h(self.stacked_panel_height)
+                    .border_t_1()
+                    .border_color(cx.theme().colors().border)
+                    .child(
+                        bottom
+                            .panel
+                            .to_any()
+                            .cached(StyleRefinement::default().v_flex().size_full()),
+                    )
+                    .child(divider),
+            )
+    }
+}
+
 impl Render for Dock {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let dispatch_context = Self::dispatch_context();
@@ -1172,8 +1418,11 @@ impl Render for Dock {
                     DockPosition::Right => this.border_l_1(),
                     DockPosition::Bottom => this.border_t_1(),
                 })
-                .child(
-                    div()
+                .child(match self.stacked_entries() {
+                    Some((top, bottom)) => self
+                        .render_stacked_panels(top, bottom, cx)
+                        .into_any_element(),
+                    None => div()
                         .map(|this| match self.position().axis() {
                             Axis::Horizontal => this.w_full().h_full(),
                             Axis::Vertical => this.h_full().w_full(),
@@ -1183,8 +1432,9 @@ impl Render for Dock {
                                 .panel
                                 .to_any()
                                 .cached(StyleRefinement::default().v_flex().size_full()),
-                        ),
-                )
+                        )
+                        .into_any_element(),
+                })
                 .when(self.resizable(cx), |this| {
                     this.child(create_resize_handle())
                 })
@@ -1240,10 +1490,25 @@ impl Render for PanelButtons {
                 let supports_flexible = panel.supports_flexible_size(cx);
                 let currently_flexible = panel.has_flexible_size(window, cx);
                 let dock_for_menu = dock_entity.clone();
+                let dock_for_button = dock_entity.clone();
                 let workspace_for_menu = workspace.clone();
 
-                let is_active_button = Some(i) == active_index && is_open;
-                let (action, tooltip) = if is_active_button {
+                let stack_role = dock.stack.and_then(|stack| {
+                    let panel_id = entry.panel.panel_id();
+                    if stack.bottom == panel_id {
+                        Some(true)
+                    } else if stack.top == panel_id {
+                        Some(false)
+                    } else {
+                        None
+                    }
+                });
+                let closes_stacked_panel = is_open && stack_role == Some(true);
+                let is_active_button = is_open && (Some(i) == active_index || stack_role.is_some());
+                let (action, tooltip) = if closes_stacked_panel {
+                    let tooltip: SharedString = format!("Close {icon_tooltip}").into();
+                    (entry.panel.toggle_action(window, cx), tooltip)
+                } else if is_active_button {
                     let action = dock.toggle_action();
 
                     let tooltip: SharedString =
@@ -1359,7 +1624,14 @@ impl Render for PanelButtons {
                                 .toggle_state(is_active_button)
                                 .on_click({
                                     let action = action.boxed_clone();
+                                    let dock = dock_for_button.clone();
                                     move |_, window, cx| {
+                                        if closes_stacked_panel {
+                                            dock.update(cx, |dock, cx| {
+                                                dock.close_stacked_panel(window, cx);
+                                            });
+                                            return;
+                                        }
                                         window.focus(&focus_handle, cx);
                                         window.dispatch_action(action.boxed_clone(), cx)
                                     }
@@ -1433,6 +1705,7 @@ pub mod test {
         pub default_size: Pixels,
         pub flexible: bool,
         pub activation_priority: u32,
+        pub stacks: bool,
     }
     actions!(test_only, [ToggleTestPanel]);
 
@@ -1448,6 +1721,7 @@ pub mod test {
                 default_size: px(300.),
                 flexible: false,
                 activation_priority,
+                stacks: false,
             }
         }
 
@@ -1545,6 +1819,10 @@ pub mod test {
 
         fn activation_priority(&self) -> u32 {
             self.activation_priority
+        }
+
+        fn stacks_below_other_panels(&self, _cx: &App) -> bool {
+            self.stacks
         }
     }
 
