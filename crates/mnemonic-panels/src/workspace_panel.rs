@@ -1,12 +1,12 @@
 use std::collections::{BTreeMap, HashMap};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use editor::Editor;
 use gpui::{
     Action, AnyElement, App, AppContext as _, ClipboardItem, Context, DismissEvent, Entity,
     EventEmitter, FocusHandle, Focusable, IntoElement, PathPromptOptions, Pixels, PromptLevel,
-    Render, SharedString, WeakEntity, Window, actions, px,
+    Render, SharedString, Subscription, Task, WeakEntity, Window, actions, px,
 };
 use mnemonic_bridge::AgentAttention;
 use mnemonic_core::models::{
@@ -763,27 +763,69 @@ impl WorkspacePanel {
                 return;
             };
 
-            let now = chrono::Utc::now().to_rfc3339();
-            match repo_scanner_service::build_repository(path, &now) {
-                Ok(repo) => {
-                    this.read_with(cx, |_this, cx| {
-                        let state = mnemonic_bridge::mnemonic_state(cx);
-                        repository_repository::upsert(&state.db, &repo).ok();
-                    })
-                    .ok();
-
-                    this.update(cx, |this, cx| {
-                        this.refresh(cx);
-                        cx.notify();
-                    })
-                    .ok();
-
-                    log::info!("Added project: {}", path.display());
+            this.update(cx, |this, cx| {
+                if let Err(err) = this.register_project(path, cx) {
+                    this.show_archive_toast(format!("Couldn't add {}: {err}", path.display()), cx);
                 }
-                Err(e) => {
-                    log::error!("Failed to register repository: {e}");
-                }
-            }
+            })
+            .log_err();
+        })
+        .detach();
+    }
+
+    fn register_project(&mut self, path: &Path, cx: &mut Context<Self>) -> Result<(), String> {
+        let now = chrono::Utc::now().to_rfc3339();
+        let repository = repo_scanner_service::build_repository(path, &now)?;
+        let state = mnemonic_bridge::mnemonic_state(cx);
+        repository_repository::upsert(&state.db, &repository)?;
+        self.refresh(cx);
+        cx.notify();
+        log::info!("Added project: {}", path.display());
+        Ok(())
+    }
+
+    fn open_github_clone_prompt(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+        let panel = cx.weak_entity();
+        workspace.update(cx, |workspace, cx| {
+            workspace.toggle_modal(window, cx, |window, cx| {
+                GitHubCloneModal::new(panel, window, cx)
+            });
+        });
+    }
+
+    /// Clones the repository into `~/dev/<name>` with `gh`, which uses the
+    /// signed-in account's credentials and preferred protocol, and adds it as
+    /// a project. A folder already holding that repository is added as is.
+    fn clone_project_from_github(&mut self, full_name: String, cx: &mut Context<Self>) {
+        let Some(name) = full_name.rsplit('/').next().map(str::to_string) else {
+            return;
+        };
+        let Some(home) = std::env::home_dir() else {
+            self.show_archive_toast("Couldn't find your home folder".to_string(), cx);
+            return;
+        };
+        let destination = home.join("dev").join(&name);
+        self.show_archive_toast(format!("Cloning {full_name} into ~/dev/{name}…"), cx);
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_spawn({
+                    let destination = destination.clone();
+                    let full_name = full_name.clone();
+                    async move { clone_with_gh(&full_name, &destination).await }
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                let result = result.and_then(|()| this.register_project(&destination, cx));
+                let message = match result {
+                    Ok(()) => format!("Added {full_name}"),
+                    Err(err) => format!("Couldn't add {full_name}: {err}"),
+                };
+                this.show_archive_toast(message, cx);
+            })
+            .log_err();
         })
         .detach();
     }
@@ -1211,20 +1253,40 @@ impl WorkspacePanel {
             .items_center()
             .border_t_1()
             .border_color(cx.theme().colors().border)
-            .child(
-                Button::new("add-project", "Add project")
-                    .style(ButtonStyle::Subtle)
-                    .label_size(LabelSize::Small)
-                    .color(Color::Muted)
-                    .start_icon(
-                        Icon::new(IconName::Plus)
-                            .size(IconSize::XSmall)
-                            .color(Color::Muted),
+            .child({
+                let this = cx.weak_entity();
+                PopoverMenu::new("add-project-menu")
+                    .anchor(gpui::Anchor::BottomLeft)
+                    .trigger(
+                        Button::new("add-project", "Add project")
+                            .style(ButtonStyle::Subtle)
+                            .label_size(LabelSize::Small)
+                            .color(Color::Muted)
+                            .start_icon(
+                                Icon::new(IconName::Plus)
+                                    .size(IconSize::XSmall)
+                                    .color(Color::Muted),
+                            ),
                     )
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.add_project(window, cx);
-                    })),
-            )
+                    .menu(move |window, cx| {
+                        let this = this.clone();
+                        Some(ContextMenu::build(window, cx, move |menu, _, _| {
+                            menu.entry("Local Folder…", None, {
+                                let this = this.clone();
+                                move |window, cx| {
+                                    this.update(cx, |this, cx| this.add_project(window, cx))
+                                        .log_err();
+                                }
+                            })
+                            .entry("From GitHub…", None, move |window, cx| {
+                                this.update(cx, |this, cx| {
+                                    this.open_github_clone_prompt(window, cx)
+                                })
+                                .log_err();
+                            })
+                        }))
+                    })
+            })
             .child(
                 IconButton::new("open-workspaces-settings", IconName::Settings)
                     .icon_size(IconSize::Small)
@@ -2294,6 +2356,240 @@ fn unique_workspace_name(name: &str, existing: &[String]) -> String {
         .unwrap_or_else(|| name.to_string())
 }
 
+/// `owner/repo` from `owner/repo`, a github.com URL (with or without
+/// `.git`), or an SSH remote like `git@github.com:owner/repo.git`.
+fn parse_github_repository(text: &str) -> Option<String> {
+    let text = text.trim().trim_end_matches('/');
+    let path = text
+        .strip_prefix("git@github.com:")
+        .or_else(|| {
+            let without_scheme = text.split_once("://").map_or(text, |(_, rest)| rest);
+            without_scheme
+                .strip_prefix("www.github.com/")
+                .or_else(|| without_scheme.strip_prefix("github.com/"))
+        })
+        .unwrap_or(text);
+    let path = path.trim_end_matches(".git");
+    let mut segments = path.split('/');
+    let owner = segments.next()?;
+    let repository = segments.next()?;
+    let valid = |segment: &str| {
+        !segment.is_empty()
+            && segment
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+    };
+    (valid(owner) && valid(repository)).then(|| format!("{owner}/{repository}"))
+}
+
+async fn clone_with_gh(full_name: &str, destination: &Path) -> Result<(), String> {
+    if destination.join(".git").exists() {
+        return Ok(());
+    }
+    if destination.exists() {
+        return Err(format!(
+            "{} already exists and isn't a git repository",
+            destination.display()
+        ));
+    }
+    if let Some(parent) = destination.parent() {
+        std::fs::create_dir_all(parent).map_err(|err| err.to_string())?;
+    }
+    let gh = environment_service::find_gh_path().unwrap_or_else(|| "gh".to_string());
+    let output = util::command::new_command(gh)
+        .arg("repo")
+        .arg("clone")
+        .arg(full_name)
+        .arg(destination)
+        .output()
+        .await
+        .map_err(|err| format!("couldn't run gh: {err}"))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
+    }
+}
+
+/// Repositories the signed-in GitHub account can reach, most recently
+/// pushed first.
+async fn list_github_repositories() -> Result<Vec<String>, String> {
+    let gh = environment_service::find_gh_path().unwrap_or_else(|| "gh".to_string());
+    let output = util::command::new_command(gh)
+        .arg("api")
+        .arg("user/repos?per_page=100&sort=pushed&affiliation=owner,collaborator,organization_member")
+        .arg("--jq")
+        .arg(".[].full_name")
+        .output()
+        .await
+        .map_err(|err| format!("couldn't run gh: {err}"))?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+    }
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect())
+}
+
+/// Number of matching repositories listed under the GitHub prompt.
+const GITHUB_REPOSITORY_MATCHES: usize = 8;
+
+/// "Add project > From GitHub": type `owner/repo` or a URL, or pick one of
+/// your repositories.
+struct GitHubCloneModal {
+    editor: Entity<Editor>,
+    panel: WeakEntity<WorkspacePanel>,
+    repositories: Option<Result<Vec<String>, String>>,
+    error: Option<SharedString>,
+    _subscription: Subscription,
+    _load: Task<()>,
+}
+
+impl GitHubCloneModal {
+    fn new(panel: WeakEntity<WorkspacePanel>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let editor = cx.new(|cx| {
+            let mut editor = Editor::single_line(window, cx);
+            editor.set_placeholder_text("owner/repo or https://github.com/owner/repo", window, cx);
+            editor
+        });
+        let subscription = cx.subscribe(&editor, |this, _, event: &editor::EditorEvent, cx| {
+            if matches!(event, editor::EditorEvent::BufferEdited) {
+                this.error = None;
+                cx.notify();
+            }
+        });
+        let load = cx.spawn(async move |this, cx| {
+            let repositories = cx.background_spawn(list_github_repositories()).await;
+            this.update(cx, |this, cx| {
+                this.repositories = Some(repositories);
+                cx.notify();
+            })
+            .log_err();
+        });
+        Self {
+            editor,
+            panel,
+            repositories: None,
+            error: None,
+            _subscription: subscription,
+            _load: load,
+        }
+    }
+
+    fn matches(&self, cx: &App) -> Vec<String> {
+        let Some(Ok(repositories)) = &self.repositories else {
+            return Vec::new();
+        };
+        let query = self.editor.read(cx).text(cx).trim().to_lowercase();
+        repositories
+            .iter()
+            .filter(|repository| repository.to_lowercase().contains(&query))
+            .take(GITHUB_REPOSITORY_MATCHES)
+            .cloned()
+            .collect()
+    }
+
+    fn clone_repository(&mut self, full_name: String, cx: &mut Context<Self>) {
+        self.panel
+            .update(cx, |panel, cx| panel.clone_project_from_github(full_name, cx))
+            .log_err();
+        cx.emit(DismissEvent);
+    }
+
+    fn cancel(&mut self, _: &menu::Cancel, _window: &mut Window, cx: &mut Context<Self>) {
+        cx.emit(DismissEvent);
+    }
+
+    fn confirm(&mut self, _: &menu::Confirm, _window: &mut Window, cx: &mut Context<Self>) {
+        let text = self.editor.read(cx).text(cx);
+        let chosen = parse_github_repository(&text)
+            .or_else(|| self.matches(cx).into_iter().next());
+        match chosen {
+            Some(full_name) => self.clone_repository(full_name, cx),
+            None => {
+                self.error = Some("Type owner/repo, a GitHub URL, or pick a repository".into());
+                cx.notify();
+            }
+        }
+    }
+}
+
+impl EventEmitter<DismissEvent> for GitHubCloneModal {}
+
+impl ModalView for GitHubCloneModal {}
+
+impl Focusable for GitHubCloneModal {
+    fn focus_handle(&self, cx: &App) -> FocusHandle {
+        self.editor.focus_handle(cx)
+    }
+}
+
+impl Render for GitHubCloneModal {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let matches = self.matches(cx);
+        let hint = match (&self.error, &self.repositories) {
+            (Some(error), _) => Label::new(error.clone()).color(Color::Error),
+            (None, None) => Label::new("Loading your repositories…").color(Color::Muted),
+            (None, Some(Err(err))) => {
+                Label::new(format!("Couldn't list repositories: {err}")).color(Color::Muted)
+            }
+            (None, Some(Ok(_))) => {
+                Label::new("Clones into ~/dev and adds it as a project.").color(Color::Muted)
+            }
+        };
+        v_flex()
+            .key_context("GitHubCloneModal")
+            .on_action(cx.listener(Self::cancel))
+            .on_action(cx.listener(Self::confirm))
+            .elevation_3(cx)
+            .w(px(480.))
+            .overflow_hidden()
+            .child(
+                div()
+                    .p_2()
+                    .border_b_1()
+                    .border_color(cx.theme().colors().border_variant)
+                    .child(self.editor.clone()),
+            )
+            .child(
+                v_flex()
+                    .p_1()
+                    .children(matches.into_iter().enumerate().map(|(index, full_name)| {
+                        h_flex()
+                            .id(("github-repository", index))
+                            .px_2()
+                            .h(px(26.))
+                            .gap_1p5()
+                            .items_center()
+                            .rounded_sm()
+                            .cursor_pointer()
+                            .hover(|style| style.bg(cx.theme().colors().ghost_element_hover))
+                            .child(
+                                Icon::new(IconName::Github)
+                                    .size(IconSize::XSmall)
+                                    .color(Color::Muted),
+                            )
+                            .child(Label::new(full_name.clone()).size(LabelSize::Small))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.clone_repository(full_name.clone(), cx);
+                            }))
+                    })),
+            )
+            .child(
+                h_flex()
+                    .bg(cx.theme().colors().editor_background)
+                    .border_t_1()
+                    .border_color(cx.theme().colors().border_variant)
+                    .w_full()
+                    .p_2()
+                    .child(hint.size(LabelSize::Small)),
+            )
+    }
+}
+
 /// One-line prompt for "New from issue / PR".
 struct IssuePromptModal {
     editor: Entity<Editor>,
@@ -2842,6 +3138,21 @@ fn free_workspace_ports(state: &mnemonic_core::state::AppState, workspace_id: &s
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_github_repository_references() {
+        let expected = Some("acme/app".to_string());
+        assert_eq!(parse_github_repository("acme/app"), expected);
+        assert_eq!(parse_github_repository("https://github.com/acme/app"), expected);
+        assert_eq!(parse_github_repository("https://github.com/acme/app.git/"), expected);
+        assert_eq!(parse_github_repository("git@github.com:acme/app.git"), expected);
+        assert_eq!(
+            parse_github_repository("https://github.com/acme/app/pull/12"),
+            expected
+        );
+        assert_eq!(parse_github_repository("app"), None);
+        assert_eq!(parse_github_repository("acme/my app"), None);
+    }
 
     #[test]
     fn first_message_becomes_descriptive_branch_slug() {
