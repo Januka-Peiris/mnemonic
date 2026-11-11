@@ -2485,9 +2485,8 @@ impl WorkspaceView {
     /// selected in the sidebar and its window is focused.
     fn is_on_screen(&self, cx: &App) -> bool {
         self.window_active
-            && cx
-                .try_global::<mnemonic_bridge::ActiveWorkspace>()
-                .is_some_and(|active| active.0.as_deref() == Some(self.workspace_id.as_str()))
+            && mnemonic_bridge::ActiveWorkspace::get(self.workspace.entity_id(), cx).as_deref()
+                == Some(self.workspace_id.as_str())
     }
 
     /// Flags a chat's finished turn, permission request, or error on the
@@ -3536,6 +3535,25 @@ impl Render for WorkspaceView {
     }
 }
 
+/// Every Mnemonic window, so features can reach workspaces open in any of
+/// them.
+#[derive(Default)]
+struct OpenWindows(Vec<WeakEntity<Workspace>>);
+
+impl gpui::Global for OpenWindows {}
+
+pub(crate) fn register_window(workspace: WeakEntity<Workspace>, cx: &mut App) {
+    let windows = cx.default_global::<OpenWindows>();
+    windows.0.retain(|window| window.upgrade().is_some());
+    windows.0.push(workspace);
+}
+
+pub(crate) fn open_windows(cx: &App) -> Vec<Entity<Workspace>> {
+    cx.try_global::<OpenWindows>()
+        .map(|windows| windows.0.iter().filter_map(WeakEntity::upgrade).collect())
+        .unwrap_or_default()
+}
+
 /// The display name of a chat's agent, from the id stored with the chat.
 pub(crate) fn chat_agent_label(agent_id: &str) -> &'static str {
     ChatAgent::from_agent_id(agent_id).label()
@@ -3942,6 +3960,62 @@ impl WorkspaceHost {
             }
         }
         false
+    }
+
+    /// When another window already has this workspace open, brings that
+    /// window forward and selects the workspace there, returning true. A
+    /// workspace lives in one window: opening it in a second would connect
+    /// a second copy of its agents to the same chats and terminals.
+    pub(crate) fn show_in_window_already_hosting(
+        this_window: &WeakEntity<Workspace>,
+        workspace_id: &str,
+        cx: &mut App,
+    ) -> bool {
+        let hosted_here = this_window
+            .upgrade()
+            .is_some_and(|workspace| Self::hosts(workspace.read(cx), workspace_id, cx));
+        if hosted_here {
+            return false;
+        }
+        let other = open_windows(cx).into_iter().find_map(|workspace| {
+            if workspace.entity_id() == this_window.entity_id() {
+                return None;
+            }
+            let view = Self::view_in(workspace.read(cx), workspace_id, cx)?;
+            Some((workspace, view.read(cx).window_handle))
+        });
+        let Some((other_workspace, window_handle)) = other else {
+            return false;
+        };
+        let workspace_id = workspace_id.to_string();
+        // Deferred because the caller is mid-update in its own window.
+        cx.defer(move |cx| {
+            window_handle
+                .update(cx, |_, window, cx| {
+                    window.activate_window();
+                    let panel = other_workspace.read(cx).panel::<crate::WorkspacePanel>(cx);
+                    if let Some(panel) = panel {
+                        panel.update(cx, |panel, cx| {
+                            panel.select_workspace(workspace_id, window, cx);
+                        });
+                    }
+                })
+                .log_err();
+        });
+        true
+    }
+
+    fn view_in(workspace: &Workspace, workspace_id: &str, cx: &App) -> Option<Entity<WorkspaceView>> {
+        workspace.panes().iter().find_map(|pane| {
+            pane.read(cx)
+                .items()
+                .find_map(|item| item.downcast::<WorkspaceHost>())
+                .and_then(|host| host.read(cx).views.get(workspace_id).cloned())
+        })
+    }
+
+    fn hosts(workspace: &Workspace, workspace_id: &str, cx: &App) -> bool {
+        Self::view_in(workspace, workspace_id, cx).is_some()
     }
 
     /// The agents of every workspace opened in this window, for sharing

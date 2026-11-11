@@ -464,6 +464,8 @@ struct StatusJson {
     this_node: Option<StatusNode>,
     #[serde(rename = "User", default)]
     users: Option<HashMap<String, StatusUser>>,
+    #[serde(rename = "Peer", default)]
+    peers: Option<HashMap<String, StatusNode>>,
 }
 
 #[derive(Deserialize)]
@@ -472,6 +474,14 @@ struct StatusNode {
     tailscale_ips: Option<Vec<String>>,
     #[serde(rename = "UserID", default)]
     user_id: Option<i64>,
+    #[serde(rename = "HostName", default)]
+    host_name: String,
+    #[serde(rename = "DNSName", default)]
+    dns_name: String,
+    #[serde(rename = "OS", default)]
+    os: String,
+    #[serde(rename = "Online", default)]
+    online: bool,
 }
 
 #[derive(Deserialize)]
@@ -513,6 +523,87 @@ fn parse_tailscale_status(output: &[u8]) -> Result<TailscaleSelf, String> {
             .map(|user| user.display_name.clone())
             .unwrap_or_default(),
     })
+}
+
+/// A machine on the tailnet that could run Mnemonic.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TailnetDevice {
+    /// The machine's MagicDNS name, used to reach it.
+    pub host: String,
+    /// The short machine name shown to people.
+    pub name: String,
+    pub ips: Vec<String>,
+    pub login: String,
+    pub owner_name: String,
+    pub online: bool,
+    pub is_this_machine: bool,
+}
+
+/// Every computer on the tailnet, this one first, then online machines,
+/// each group by name. Phones, tablets and tagged servers are left out:
+/// none of them can run Mnemonic or have a person's login to allow.
+pub fn tailnet_devices() -> Result<Vec<TailnetDevice>, String> {
+    let output = run_tailscale(&["status", "--json"])?;
+    parse_tailnet_devices(&output)
+}
+
+fn parse_tailnet_devices(output: &[u8]) -> Result<Vec<TailnetDevice>, String> {
+    let status: StatusJson = serde_json::from_slice(output)
+        .map_err(|err| format!("Couldn't read Tailscale's status: {err}"))?;
+    if status.backend_state != "Running" {
+        return Err("Tailscale isn't connected".to_string());
+    }
+    let users = status.users.unwrap_or_default();
+    let device = |node: StatusNode, is_this_machine: bool| -> Option<TailnetDevice> {
+        if matches!(
+            node.os.to_ascii_lowercase().as_str(),
+            "ios" | "android" | "tvos"
+        ) {
+            return None;
+        }
+        let user = node.user_id.and_then(|id| users.get(&id.to_string()));
+        let login = user
+            .map(|user| user.login_name.clone())
+            .filter(|login| !login.is_empty() && login != "tagged-devices")?;
+        let ips = node.tailscale_ips.unwrap_or_default();
+        let dns_name = node.dns_name.trim_end_matches('.').to_string();
+        let host = if dns_name.is_empty() {
+            ips.iter()
+                .find(|ip| ip.parse::<Ipv4Addr>().is_ok())?
+                .clone()
+        } else {
+            dns_name.clone()
+        };
+        let name = dns_name
+            .split('.')
+            .next()
+            .filter(|name| !name.is_empty())
+            .map(str::to_string)
+            .unwrap_or(node.host_name);
+        Some(TailnetDevice {
+            host,
+            name,
+            ips,
+            owner_name: user
+                .map(|user| user.display_name.clone())
+                .filter(|name| !name.is_empty())
+                .unwrap_or_else(|| login.clone()),
+            login,
+            online: node.online || is_this_machine,
+            is_this_machine,
+        })
+    };
+    let mut devices: Vec<TailnetDevice> = status
+        .peers
+        .unwrap_or_default()
+        .into_values()
+        .filter_map(|node| device(node, false))
+        .collect();
+    devices.sort_by(|a, b| b.online.cmp(&a.online).then_with(|| a.name.cmp(&b.name)));
+    if let Some(this_machine) = status.this_node.and_then(|node| device(node, true)) {
+        devices.insert(0, this_machine);
+    }
+    Ok(devices)
 }
 
 #[derive(Deserialize)]
@@ -790,5 +881,68 @@ mod tests {
             })
         );
         assert!(parse_tailscale_status(br#"{"BackendState": "Stopped"}"#).is_err());
+    }
+
+    #[test]
+    fn lists_tailnet_computers_with_their_owners_and_skips_phones_and_servers() {
+        let status = br#"{
+            "BackendState": "Running",
+            "Self": { "TailscaleIPs": ["100.64.0.1"], "UserID": 1, "HostName": "Jay's MacBook Pro",
+                      "DNSName": "jays-mbp.tail1234.ts.net.", "OS": "macOS" },
+            "Peer": {
+                "a": { "TailscaleIPs": ["100.64.0.2"], "UserID": 2, "DNSName": "alice-mbp.tail1234.ts.net.",
+                       "OS": "macOS", "Online": false },
+                "b": { "TailscaleIPs": ["100.64.0.3"], "UserID": 1, "DNSName": "jay-pc.tail1234.ts.net.",
+                       "OS": "windows", "Online": true },
+                "c": { "TailscaleIPs": ["100.64.0.4"], "UserID": 1, "DNSName": "jay-phone.tail1234.ts.net.",
+                       "OS": "iOS", "Online": true },
+                "d": { "TailscaleIPs": ["100.64.0.5"], "UserID": 3, "DNSName": "ci.tail1234.ts.net.",
+                       "OS": "linux", "Online": true }
+            },
+            "User": {
+                "1": { "LoginName": "jay@example.com", "DisplayName": "Jay" },
+                "2": { "LoginName": "alice@example.com", "DisplayName": "Alice" },
+                "3": { "LoginName": "tagged-devices", "DisplayName": "tagged-devices" }
+            }
+        }"#;
+        let devices = parse_tailnet_devices(status).expect("status parses");
+        let summary: Vec<(&str, &str, &str, bool, bool)> = devices
+            .iter()
+            .map(|device| {
+                (
+                    device.name.as_str(),
+                    device.host.as_str(),
+                    device.login.as_str(),
+                    device.online,
+                    device.is_this_machine,
+                )
+            })
+            .collect();
+        assert_eq!(
+            summary,
+            vec![
+                (
+                    "jays-mbp",
+                    "jays-mbp.tail1234.ts.net",
+                    "jay@example.com",
+                    true,
+                    true
+                ),
+                (
+                    "jay-pc",
+                    "jay-pc.tail1234.ts.net",
+                    "jay@example.com",
+                    true,
+                    false
+                ),
+                (
+                    "alice-mbp",
+                    "alice-mbp.tail1234.ts.net",
+                    "alice@example.com",
+                    false,
+                    false
+                ),
+            ]
+        );
     }
 }

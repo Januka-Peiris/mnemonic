@@ -1011,11 +1011,6 @@ pub struct WorkspacesSettingsContent {
 #[with_fallible_options]
 #[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema, MergeFrom, PartialEq)]
 pub struct TeamSettingsContent {
-    /// Whether teammates on your allow list can see your workspaces and
-    /// follow your agent chats, read-only, over Tailscale.
-    ///
-    /// Default: false
-    pub share: Option<bool>,
     /// The port your workspaces are shared on. Teammates use the same port
     /// unless a peer's host names another.
     ///
