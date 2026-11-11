@@ -1,23 +1,26 @@
 use std::collections::{BTreeMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use editor::Editor;
+use git_ui::project_diff::{BranchDiff, ProjectDiff};
 use gpui::{
-    actions, px, Action, Anchor, App, AppContext as _, Context, Entity, EventEmitter, Focusable,
-    FocusHandle, IntoElement, Pixels, PromptLevel, Render, SharedString, Task, WeakEntity, Window,
+    actions, px, Action, AnyElement, Anchor, App, AppContext as _, Context, Entity, EventEmitter,
+    Focusable, FocusHandle, IntoElement, Pixels, PromptLevel, Render, ScrollHandle, SharedString,
+    Task, WeakEntity, Window,
 };
 use mnemonic_core::models::{
-    WorkspaceCheckpoint, WorkspaceCheckpointRestorePlan, WorkspacePort, WorkspacePrComment,
-    WorkspacePrStatus, WorkspaceSummary,
+    ChangedFile, WorkspaceChangeScope, WorkspaceCheckpoint, WorkspaceCheckpointRestorePlan,
+    WorkspacePort, WorkspacePrComment, WorkspacePrStatus, WorkspaceSummary,
 };
 use mnemonic_core::services::{
-    checkpoint_service, conflict_detection_service, pr_draft_service, review_cockpit_service,
-    workspace_port_service, workspace_service,
+    checkpoint_service, conflict_detection_service, git_review_service, pr_draft_service,
+    review_cockpit_service, workspace_port_service, workspace_service,
 };
+use project::{Project, git_store::Repository};
 use ui::{
-    h_flex, v_flex, Button, ButtonStyle, Checkbox, ContextMenu, Icon, IconButton, IconName,
-    Label, PopoverMenu, TintColor, ToggleState, Tooltip, prelude::*,
+    h_flex, v_flex, Button, ButtonStyle, ContextMenu, DiffStat, Icon, IconButton, IconName,
+    Label, PopoverMenu, TintColor, Tooltip, prelude::*,
 };
 use std::time::{Duration, Instant};
 
@@ -26,6 +29,7 @@ use workspace::notifications::NotificationId;
 use workspace::{OpenOptions, Panel, Toast, Workspace};
 
 use crate::ActiveWorkspace;
+use crate::workspace_panel::WorkspacePanel;
 use crate::workspace_view::WorkspaceHost;
 
 actions!(mnemonic_workspace_detail_panel, [ToggleFocus]);
@@ -57,6 +61,121 @@ const PORTS_POLL_INTERVAL: Duration = Duration::from_secs(15);
 /// Changes tab keeps rendering an unchanged list. Catches in-place edits that
 /// keep the line counts and edits made in other workspaces.
 const CHANGE_ANNOTATIONS_RECHECK_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Above this many changed files the list groups rows under folder headers.
+const CHANGE_FOLDER_THRESHOLD: usize = 12;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ChangeGroup {
+    Uncommitted,
+    OnBranch,
+}
+
+impl ChangeGroup {
+    fn label(self) -> &'static str {
+        match self {
+            ChangeGroup::Uncommitted => "Uncommitted",
+            ChangeGroup::OnBranch => "On branch",
+        }
+    }
+}
+
+enum ChangeListEntry<'a> {
+    Group {
+        group: ChangeGroup,
+        count: usize,
+    },
+    Folder {
+        key: String,
+        directory: &'a str,
+        count: usize,
+        collapsed: bool,
+    },
+    File {
+        file: &'a ChangedFile,
+        in_folder: bool,
+    },
+}
+
+/// Splits a changed path into (directory, file name). Untracked directories
+/// arrive from git with a trailing slash.
+fn split_change_path(path: &str) -> (&str, &str) {
+    let trimmed = path.trim_end_matches('/');
+    trimmed.rsplit_once('/').unwrap_or(("", trimmed))
+}
+
+/// The Changes list rows in display order. Without a loaded scope the files
+/// are listed ungrouped rather than guessed into a group.
+fn change_list_entries<'a>(
+    files: &'a [ChangedFile],
+    uncommitted_paths: Option<&HashSet<String>>,
+    collapsed_folders: &HashSet<String>,
+) -> Vec<ChangeListEntry<'a>> {
+    let groups: Vec<(Option<ChangeGroup>, Vec<&'a ChangedFile>)> = match uncommitted_paths {
+        Some(uncommitted_paths) => {
+            let (uncommitted, on_branch): (Vec<_>, Vec<_>) = files
+                .iter()
+                .partition(|file| uncommitted_paths.contains(&file.path));
+            vec![
+                (Some(ChangeGroup::Uncommitted), uncommitted),
+                (Some(ChangeGroup::OnBranch), on_branch),
+            ]
+        }
+        None => vec![(None, files.iter().collect())],
+    };
+    let group_by_folder = files.len() > CHANGE_FOLDER_THRESHOLD;
+
+    let mut entries = Vec::new();
+    for (group, group_files) in groups {
+        if group_files.is_empty() {
+            continue;
+        }
+        if let Some(group) = group {
+            entries.push(ChangeListEntry::Group {
+                group,
+                count: group_files.len(),
+            });
+        }
+        if !group_by_folder {
+            entries.extend(group_files.into_iter().map(|file| ChangeListEntry::File {
+                file,
+                in_folder: false,
+            }));
+            continue;
+        }
+        let mut folders: BTreeMap<&'a str, Vec<&'a ChangedFile>> = BTreeMap::new();
+        for file in group_files {
+            folders
+                .entry(split_change_path(&file.path).0)
+                .or_default()
+                .push(file);
+        }
+        for (directory, folder_files) in folders {
+            if directory.is_empty() {
+                entries.extend(folder_files.into_iter().map(|file| ChangeListEntry::File {
+                    file,
+                    in_folder: false,
+                }));
+                continue;
+            }
+            let key = format!("{}:{directory}", group.map_or("", ChangeGroup::label));
+            let collapsed = collapsed_folders.contains(&key);
+            entries.push(ChangeListEntry::Folder {
+                key,
+                directory,
+                count: folder_files.len(),
+                collapsed,
+            });
+            if !collapsed {
+                entries.extend(folder_files.into_iter().map(|file| ChangeListEntry::File {
+                    file,
+                    in_folder: true,
+                }));
+            }
+        }
+    }
+    entries
+}
 
 /// Marker for PR state-change toasts.
 struct MnemonicPrToast;
@@ -125,6 +244,18 @@ pub struct WorkspaceDetailPanel {
     change_annotations_key: Option<(String, Vec<(String, u32, u32)>)>,
     change_annotations_checked_at: Option<Instant>,
     change_annotations_task: Option<Task<()>>,
+    /// False until this workspace's viewed marks load, so rows don't flash
+    /// as unviewed.
+    viewed_loaded: bool,
+    /// None until loaded, so files are never shown in the wrong group.
+    change_scope: Option<WorkspaceChangeScope>,
+    changes_focus_handle: FocusHandle,
+    changes_scroll_handle: ScrollHandle,
+    /// Highlighted row, by path so it survives list refreshes.
+    selected_change: Option<String>,
+    collapsed_change_folders: HashSet<String>,
+    /// Shows a merged workspace's file list instead of the merged summary.
+    show_merged_changes: bool,
 }
 
 impl WorkspaceDetailPanel {
@@ -158,6 +289,11 @@ impl WorkspaceDetailPanel {
                     this.change_annotations_key = None;
                     this.change_annotations_checked_at = None;
                     this.change_annotations_task = None;
+                    this.viewed_loaded = false;
+                    this.change_scope = None;
+                    this.selected_change = None;
+                    this.collapsed_change_folders.clear();
+                    this.show_merged_changes = false;
                 }
                 cx.notify();
             })
@@ -198,6 +334,13 @@ impl WorkspaceDetailPanel {
                 change_annotations_key: None,
                 change_annotations_checked_at: None,
                 change_annotations_task: None,
+                viewed_loaded: false,
+                change_scope: None,
+                changes_focus_handle: cx.focus_handle(),
+                changes_scroll_handle: ScrollHandle::new(),
+                selected_change: None,
+                collapsed_change_folders: HashSet::new(),
+                show_merged_changes: false,
             };
             panel.refresh(cx);
             panel
@@ -1059,8 +1202,11 @@ impl WorkspaceDetailPanel {
                     el.bg(cx.theme().colors().ghost_element_selected)
                 })
                 .hover(|style| style.bg(cx.theme().colors().ghost_element_hover))
-                .on_click(cx.listener(move |this, _, _, cx| {
+                .on_click(cx.listener(move |this, _, window, cx| {
                     this.tab = tab;
+                    if tab == DetailTab::Changes {
+                        this.changes_focus_handle.focus(window, cx);
+                    }
                     if tab == DetailTab::Checks && this.pr_status.is_none() && !this.pr_busy {
                         this.refresh_pr_status(cx);
                     }
@@ -1298,7 +1444,7 @@ impl WorkspaceDetailPanel {
         let generation = self.viewed_generation;
         let state = mnemonic_bridge::mnemonic_state(cx);
         self.change_annotations_task = Some(cx.spawn(async move |this, cx| {
-            let (viewed, overlaps) = cx
+            let (viewed, overlaps, scope) = cx
                 .background_spawn({
                     let workspace_id = workspace_id.clone();
                     async move {
@@ -1312,6 +1458,7 @@ impl WorkspaceDetailPanel {
                                 &state.db,
                                 &workspace_id,
                             ),
+                            git_review_service::get_workspace_change_scope(&state, &workspace_id),
                         )
                     }
                 })
@@ -1326,9 +1473,16 @@ impl WorkspaceDetailPanel {
                         log::error!("Failed to find files changed in other workspaces: {err}")
                     }
                 }
+                match scope {
+                    Ok(scope) => this.change_scope = Some(scope),
+                    Err(err) => log::error!("Failed to read uncommitted changes: {err}"),
+                }
                 if generation == this.viewed_generation && this.viewed_writes_pending == 0 {
                     match viewed {
-                        Ok(viewed) => this.viewed_files = viewed,
+                        Ok(viewed) => {
+                            this.viewed_files = viewed;
+                            this.viewed_loaded = true;
+                        }
                         Err(err) => log::error!("Failed to load viewed files: {err}"),
                     }
                 }
@@ -1338,15 +1492,14 @@ impl WorkspaceDetailPanel {
         }));
     }
 
-    fn toggle_file_viewed(&mut self, path: String, cx: &mut Context<Self>) {
+    /// Records that the file's current content was opened in the diff. The
+    /// mark clears itself once the file's content changes.
+    fn mark_file_viewed(&mut self, path: String, cx: &mut Context<Self>) {
         let Some(workspace_id) = self.current_workspace_id().map(str::to_string) else {
             return;
         };
-        let viewed = !self.viewed_files.contains(&path);
-        if viewed {
-            self.viewed_files.insert(path.clone());
-        } else {
-            self.viewed_files.remove(&path);
+        if !self.viewed_files.insert(path.clone()) {
+            return;
         }
         self.viewed_generation += 1;
         self.viewed_writes_pending += 1;
@@ -1362,7 +1515,7 @@ impl WorkspaceDetailPanel {
                         &state,
                         &workspace_id,
                         &path,
-                        viewed,
+                        true,
                     )
                 })
                 .await;
@@ -1380,163 +1533,508 @@ impl WorkspaceDetailPanel {
         cx.notify();
     }
 
-    fn render_changes(&self, ws: &WorkspaceSummary, cx: &mut Context<Self>) -> impl IntoElement {
-        let mut section = v_flex().w_full().flex_grow(1.0);
+    /// The project repository containing the workspace root, innermost first
+    /// so a nested repository wins over its parent.
+    fn repository_for_root(
+        project: &Entity<Project>,
+        root: &Path,
+        cx: &App,
+    ) -> Option<Entity<Repository>> {
+        project
+            .read(cx)
+            .repositories(cx)
+            .values()
+            .filter(|repository| root.starts_with(&repository.read(cx).work_directory_abs_path))
+            .max_by_key(|repository| {
+                repository
+                    .read(cx)
+                    .work_directory_abs_path
+                    .components()
+                    .count()
+            })
+            .cloned()
+    }
 
-        if ws.changed_files.is_empty() {
-            return section.child(
-                h_flex().px_2().py_2().child(
-                    Label::new("No changes")
-                        .size(LabelSize::XSmall)
-                        .color(Color::Muted),
-                ),
-            );
-        }
-
-        let viewed_count = ws
-            .changed_files
-            .iter()
-            .filter(|file| self.viewed_files.contains(&file.path))
-            .count();
-        let overlapping = ws
-            .changed_files
-            .iter()
-            .filter_map(|file| self.file_overlaps.get(&file.path))
-            .collect::<Vec<_>>();
-        section = section.child(
-            h_flex().px_2().h(px(22.)).gap_1().items_center().child(
-                Label::new(format!("{viewed_count}/{} viewed", ws.changed_files.len()))
-                    .size(LabelSize::XSmall)
-                    .color(Color::Muted),
-            ),
-        );
-        if !overlapping.is_empty() {
-            let mut workspace_names = overlapping
-                .iter()
-                .flat_map(|names| names.iter().map(String::as_str))
-                .collect::<Vec<_>>();
-            workspace_names.sort_unstable();
-            workspace_names.dedup();
-            let file_word = if overlapping.len() == 1 {
-                "file"
-            } else {
-                "files"
+    /// Opens (or reuses) the branch diff against the workspace's base branch,
+    /// scrolled to `relative_path` when given. False when it cannot be opened.
+    fn open_branch_diff(
+        &self,
+        relative_path: Option<&str>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(base_ref) = self
+            .change_scope
+            .as_ref()
+            .and_then(|scope| scope.base_ref.clone())
+        else {
+            return false;
+        };
+        let Some(root) = self.worktree_root() else {
+            return false;
+        };
+        let Some(workspace) = self.workspace.upgrade() else {
+            return false;
+        };
+        workspace.update(cx, |workspace, cx| {
+            let project = workspace.project().clone();
+            let Some(repository) = Self::repository_for_root(&project, &root, cx) else {
+                return false;
             };
-            section = section.child(
-                h_flex()
-                    .px_2()
-                    .py_0p5()
-                    .gap_1()
-                    .items_start()
-                    .child(
-                        Icon::new(IconName::Warning)
-                            .size(IconSize::XSmall)
-                            .color(Color::Warning),
-                    )
-                    .child(
-                        Label::new(format!(
-                            "{} {file_word} also changed in {}",
-                            overlapping.len(),
-                            workspace_names.join(", ")
-                        ))
-                        .size(LabelSize::XSmall)
-                        .color(Color::Warning),
-                    ),
+            let repo_path = relative_path.and_then(|relative_path| {
+                repository
+                    .read(cx)
+                    .abs_path_to_repo_path(&root.join(relative_path))
+            });
+            ProjectDiff::deploy_branch_diff_with_base_ref(
+                workspace,
+                project,
+                repository,
+                SharedString::from(base_ref),
+                repo_path,
+                window,
+                cx,
             );
-        }
+            true
+        })
+    }
 
-        for file in &ws.changed_files {
-            let additions = file.additions;
-            let deletions = file.deletions;
-            let (status_label, status_label_color) = Self::change_status_label(&file.status);
-            let path_for_open = file.path.clone();
-            let path_for_viewed = file.path.clone();
-            let viewed = self.viewed_files.contains(&file.path);
-            let overlap_tooltip = self
-                .file_overlaps
-                .get(&file.path)
-                .map(|names| format!("Also changed in {}", names.join(", ")));
-            section = section.child(
+    fn open_change(&mut self, path: String, window: &mut Window, cx: &mut Context<Self>) {
+        self.selected_change = Some(path.clone());
+        if !self.open_branch_diff(Some(&path), window, cx) {
+            self.open_changed_file(&path, window, cx);
+        }
+        self.mark_file_viewed(path, cx);
+        self.changes_focus_handle.focus(window, cx);
+        cx.notify();
+    }
+
+    fn review_all_changes(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.open_branch_diff(None, window, cx) {
+            window.dispatch_action(BranchDiff.boxed_clone(), cx);
+        }
+    }
+
+    fn archive_workspace(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(summary) = self.summary.as_ref() else {
+            return;
+        };
+        let (workspace_id, workspace_name) = (summary.id.clone(), summary.name.clone());
+        let Some(panel) = self
+            .workspace
+            .upgrade()
+            .and_then(|workspace| workspace.read(cx).panel::<WorkspacePanel>(cx))
+        else {
+            return;
+        };
+        panel.update(cx, |panel, cx| {
+            panel.confirm_archive(workspace_id, workspace_name, window, cx);
+        });
+    }
+
+    fn is_merged(&self, ws: &WorkspaceSummary) -> bool {
+        self.pr_status.as_ref().is_some_and(|status| {
+            status.workspace_id == ws.id
+                && status.found
+                && status.state.as_deref() == Some("MERGED")
+        })
+    }
+
+    fn change_entries<'a>(&self, ws: &'a WorkspaceSummary) -> Vec<ChangeListEntry<'a>> {
+        change_list_entries(
+            &ws.changed_files,
+            self.change_scope
+                .as_ref()
+                .map(|scope| &scope.uncommitted_paths),
+            &self.collapsed_change_folders,
+        )
+    }
+
+    fn toggle_change_folder(&mut self, key: String, cx: &mut Context<Self>) {
+        if !self.collapsed_change_folders.remove(&key) {
+            self.collapsed_change_folders.insert(key);
+        }
+        cx.notify();
+    }
+
+    fn move_change_selection(&mut self, forward: bool, cx: &mut Context<Self>) {
+        let Some(summary) = self.summary.as_ref() else {
+            return;
+        };
+        let file_rows = self
+            .change_entries(summary)
+            .into_iter()
+            .enumerate()
+            .filter_map(|(entry_index, entry)| match entry {
+                ChangeListEntry::File { file, .. } => Some((entry_index, file.path.clone())),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let last = file_rows.len().saturating_sub(1);
+        let current = self
+            .selected_change
+            .as_deref()
+            .and_then(|selected| file_rows.iter().position(|(_, path)| path == selected));
+        let next = match (current, forward) {
+            (Some(position), true) => (position + 1).min(last),
+            (Some(position), false) => position.saturating_sub(1),
+            (None, true) => 0,
+            (None, false) => last,
+        };
+        if let Some((entry_index, path)) = file_rows.into_iter().nth(next) {
+            self.selected_change = Some(path);
+            self.changes_scroll_handle.scroll_to_item(entry_index);
+            cx.notify();
+        }
+    }
+
+    fn select_next_change(
+        &mut self,
+        _: &menu::SelectNext,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.move_change_selection(true, cx);
+    }
+
+    fn select_previous_change(
+        &mut self,
+        _: &menu::SelectPrevious,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.move_change_selection(false, cx);
+    }
+
+    fn confirm_change(&mut self, _: &menu::Confirm, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(path) = self.selected_change.clone() {
+            self.open_change(path, window, cx);
+        }
+    }
+
+    fn render_merged_changes(&self, ws: &WorkspaceSummary, cx: &mut Context<Self>) -> AnyElement {
+        let base_branch = ws.branch_health.base_branch.trim();
+        let base_branch = if base_branch.is_empty() {
+            "the base branch"
+        } else {
+            base_branch
+        };
+        v_flex()
+            .w_full()
+            .px_2()
+            .py_3()
+            .gap_2()
+            .child(
                 h_flex()
-                    .px_2()
-                    .h(px(24.))
                     .gap_1p5()
                     .items_center()
-                    .w_full()
-                    .hover(|style| style.bg(cx.theme().colors().ghost_element_hover))
                     .child(
-                        Checkbox::new(
-                            SharedString::from(format!("viewed-{}", file.path)),
-                            if viewed {
-                                ToggleState::Selected
-                            } else {
-                                ToggleState::Unselected
-                            },
-                        )
-                        .tooltip(Tooltip::text(if viewed {
-                            "Viewed. Clears when the file changes again"
-                        } else {
-                            "Mark as viewed"
-                        }))
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.toggle_file_viewed(path_for_viewed.clone(), cx);
-                        })),
+                        Icon::new(IconName::Check)
+                            .size(IconSize::Small)
+                            .color(Color::Success),
+                    )
+                    .child(Label::new(format!("Merged into {base_branch}")).size(LabelSize::Small)),
+            )
+            .child(
+                h_flex()
+                    .gap_1()
+                    .child(
+                        Button::new("archive-merged-workspace", "Archive workspace")
+                            .style(ButtonStyle::Filled)
+                            .label_size(LabelSize::Small)
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.archive_workspace(window, cx);
+                            })),
                     )
                     .child(
-                        h_flex()
-                            .id(SharedString::from(format!("changed-{}", file.path)))
-                            .flex_grow(1.0)
-                            .min_w_0()
-                            .gap_1p5()
-                            .items_center()
-                            .cursor_pointer()
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                this.open_changed_file(&path_for_open, window, cx);
-                            }))
-                            .child(
-                                Label::new(status_label)
-                                    .size(LabelSize::XSmall)
-                                    .color(status_label_color),
-                            )
-                            .child(
-                                div().flex_grow(1.0).overflow_hidden().child(
-                                    Label::new(file.path.clone())
-                                        .size(LabelSize::XSmall)
-                                        .color(if viewed { Color::Muted } else { Color::Default })
-                                        .single_line(),
-                                ),
-                            )
-                            .when_some(overlap_tooltip, |el, tooltip| {
-                                el.child(
-                                    div()
-                                        .id(SharedString::from(format!("overlap-{}", file.path)))
-                                        .tooltip(Tooltip::text(tooltip))
-                                        .child(
-                                            Icon::new(IconName::Warning)
-                                                .size(IconSize::XSmall)
-                                                .color(Color::Warning),
-                                        ),
-                                )
-                            })
-                            .when(additions > 0, |el| {
-                                el.child(
-                                    Label::new(format!("+{additions}"))
-                                        .size(LabelSize::XSmall)
-                                        .color(Color::Created),
-                                )
-                            })
-                            .when(deletions > 0, |el| {
-                                el.child(
-                                    Label::new(format!("-{deletions}"))
-                                        .size(LabelSize::XSmall)
-                                        .color(Color::Deleted),
-                                )
-                            }),
+                        Button::new("show-merged-changes", "Show changes")
+                            .style(ButtonStyle::Subtle)
+                            .label_size(LabelSize::Small)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.show_merged_changes = true;
+                                cx.notify();
+                            })),
                     ),
-            );
+            )
+            .into_any_element()
+    }
+
+    fn render_change_file(
+        &self,
+        index: usize,
+        file: &ChangedFile,
+        in_folder: bool,
+        list_focused: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let (directory, file_name) = split_change_path(&file.path);
+        let (status_label, status_label_color) = Self::change_status_label(&file.status);
+        let deleted = status_label == "D";
+        let selected = self.selected_change.as_deref() == Some(file.path.as_str());
+        let unviewed = self.viewed_loaded && !self.viewed_files.contains(&file.path);
+        let overlap_tooltip = self
+            .file_overlaps
+            .get(&file.path)
+            .map(|names| format!("Also changed in {}", names.join(", ")));
+        let path_for_open = file.path.clone();
+        let colors = cx.theme().colors();
+
+        h_flex()
+            .id(("change-file", index))
+            .h(px(22.))
+            .w_full()
+            .pl(if in_folder { px(20.) } else { px(6.) })
+            .pr_2()
+            .gap_1p5()
+            .items_center()
+            .cursor_pointer()
+            .border_1()
+            .when(selected, |el| el.bg(cx.theme().status().info.alpha(0.08)))
+            .when(selected && list_focused, |el| {
+                el.border_color(colors.panel_focused_border)
+            })
+            .hover(|style| style.bg(colors.ghost_element_hover))
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.open_change(path_for_open.clone(), window, cx);
+            }))
+            .child(
+                div()
+                    .flex_none()
+                    .size(px(6.))
+                    .rounded_full()
+                    .when(unviewed, |el| el.bg(colors.text_accent)),
+            )
+            .child(
+                div().flex_none().w(px(10.)).child(
+                    Label::new(status_label)
+                        .size(LabelSize::XSmall)
+                        .color(status_label_color),
+                ),
+            )
+            .child(
+                h_flex()
+                    .id(("change-file-name", index))
+                    .min_w_0()
+                    .flex_1()
+                    .gap_1p5()
+                    .overflow_hidden()
+                    .tooltip(Tooltip::text(file.path.clone()))
+                    .child(
+                        div().flex_none().child(
+                            Label::new(file_name.to_string())
+                                .size(LabelSize::Small)
+                                .color(if deleted {
+                                    Color::Muted
+                                } else {
+                                    Color::Default
+                                })
+                                .when(deleted, |label| label.strikethrough())
+                                .single_line(),
+                        ),
+                    )
+                    .when(!in_folder && !directory.is_empty(), |el| {
+                        el.child(
+                            div().min_w_0().flex_1().child(
+                                Label::new(directory.to_string())
+                                    .size(LabelSize::XSmall)
+                                    .color(Color::Muted)
+                                    .truncate_start(),
+                            ),
+                        )
+                    }),
+            )
+            .when_some(overlap_tooltip, |el, tooltip| {
+                el.child(
+                    div()
+                        .id(("change-overlap", index))
+                        .flex_none()
+                        .tooltip(Tooltip::text(tooltip))
+                        .child(
+                            Icon::new(IconName::Warning)
+                                .size(IconSize::XSmall)
+                                .color(Color::Warning),
+                        ),
+                )
+            })
+            .when(file.additions > 0 || file.deletions > 0, |el| {
+                el.child(
+                    div().flex_none().child(
+                        DiffStat::new(
+                            ("change-stat", index),
+                            file.additions as usize,
+                            file.deletions as usize,
+                        )
+                        .label_size(LabelSize::XSmall),
+                    ),
+                )
+            })
+            .into_any_element()
+    }
+
+    fn render_changes(
+        &self,
+        ws: &WorkspaceSummary,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        if self.is_merged(ws) && !self.show_merged_changes {
+            return self.render_merged_changes(ws, cx);
         }
 
-        section
+        if ws.changed_files.is_empty() {
+            return v_flex()
+                .w_full()
+                .flex_grow(1.0)
+                .child(
+                    h_flex().px_2().py_2().child(
+                        Label::new("No changes")
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
+                    ),
+                )
+                .into_any_element();
+        }
+
+        let (total_additions, total_deletions) =
+            ws.changed_files
+                .iter()
+                .fold((0usize, 0usize), |(additions, deletions), file| {
+                    (
+                        additions.saturating_add(file.additions as usize),
+                        deletions.saturating_add(file.deletions as usize),
+                    )
+                });
+        let file_count = ws.changed_files.len();
+        let base_branch = ws.branch_health.base_branch.trim();
+        let review_tooltip = if base_branch.is_empty() {
+            "Open the full branch diff".to_string()
+        } else {
+            format!("Open the full branch diff against {base_branch}")
+        };
+
+        let header = h_flex()
+            .px_2()
+            .h(px(26.))
+            .gap_2()
+            .items_center()
+            .justify_between()
+            .border_b_1()
+            .border_color(cx.theme().colors().border_variant)
+            .child(
+                h_flex()
+                    .gap_2()
+                    .items_center()
+                    .child(
+                        Label::new(if file_count == 1 {
+                            "1 file".to_string()
+                        } else {
+                            format!("{file_count} files")
+                        })
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted),
+                    )
+                    .child(
+                        DiffStat::new("changes-total", total_additions, total_deletions)
+                            .label_size(LabelSize::XSmall),
+                    ),
+            )
+            .child(
+                Button::new("review-all-changes", "Review all")
+                    .style(ButtonStyle::Subtle)
+                    .label_size(LabelSize::XSmall)
+                    .tooltip(Tooltip::text(review_tooltip))
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.review_all_changes(window, cx);
+                    })),
+            );
+
+        let list_focused = self.changes_focus_handle.is_focused(window);
+        let mut list = v_flex()
+            .id("changes-list")
+            .key_context("MnemonicChangesList")
+            .track_focus(&self.changes_focus_handle)
+            .on_action(cx.listener(Self::select_next_change))
+            .on_action(cx.listener(Self::select_previous_change))
+            .on_action(cx.listener(Self::confirm_change))
+            .w_full()
+            .flex_1()
+            .min_h_0()
+            .pb_1()
+            .overflow_y_scroll()
+            .track_scroll(&self.changes_scroll_handle);
+
+        for (index, entry) in self.change_entries(ws).into_iter().enumerate() {
+            list = list.child(match entry {
+                ChangeListEntry::Group { group, count } => h_flex()
+                    .id(("change-group", index))
+                    .px_2()
+                    .pt_1()
+                    .h(px(24.))
+                    .gap_1()
+                    .items_center()
+                    .child(
+                        Label::new(group.label())
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
+                    )
+                    .child(
+                        Label::new(count.to_string())
+                            .size(LabelSize::XSmall)
+                            .color(Color::Placeholder),
+                    )
+                    .into_any_element(),
+                ChangeListEntry::Folder {
+                    key,
+                    directory,
+                    count,
+                    collapsed,
+                } => h_flex()
+                    .id(("change-folder", index))
+                    .px_2()
+                    .h(px(22.))
+                    .gap_1()
+                    .items_center()
+                    .cursor_pointer()
+                    .hover(|style| style.bg(cx.theme().colors().ghost_element_hover))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.toggle_change_folder(key.clone(), cx);
+                    }))
+                    .child(
+                        Icon::new(if collapsed {
+                            IconName::ChevronRight
+                        } else {
+                            IconName::ChevronDown
+                        })
+                        .size(IconSize::XSmall)
+                        .color(Color::Muted),
+                    )
+                    .child(
+                        div().min_w_0().flex_1().child(
+                            Label::new(directory.to_string())
+                                .size(LabelSize::XSmall)
+                                .color(Color::Muted)
+                                .truncate_start(),
+                        ),
+                    )
+                    .child(
+                        Label::new(count.to_string())
+                            .size(LabelSize::XSmall)
+                            .color(Color::Placeholder),
+                    )
+                    .into_any_element(),
+                ChangeListEntry::File { file, in_folder } => {
+                    self.render_change_file(index, file, in_folder, list_focused, cx)
+                }
+            });
+        }
+
+        v_flex()
+            .w_full()
+            .flex_1()
+            .min_h_0()
+            .child(header)
+            .child(list)
+            .into_any_element()
     }
 
     fn check_icon(check_status: &str, conclusion: Option<&str>) -> (IconName, Color) {
@@ -2608,7 +3106,7 @@ impl Panel for WorkspaceDetailPanel {
 }
 
 impl Render for WorkspaceDetailPanel {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.refresh(cx);
         self.maybe_refresh_change_annotations(cx);
 
@@ -2622,7 +3120,7 @@ impl Render for WorkspaceDetailPanel {
             Some(ws) => {
                 let body = match self.tab {
                     DetailTab::AllFiles => self.render_file_tree(cx).into_any_element(),
-                    DetailTab::Changes => self.render_changes(&ws, cx).into_any_element(),
+                    DetailTab::Changes => self.render_changes(&ws, window, cx),
                     DetailTab::Checks => self.render_checks(cx).into_any_element(),
                     DetailTab::Ports => self.render_ports(cx).into_any_element(),
                     DetailTab::Checkpoints => self.render_checkpoints(cx).into_any_element(),
@@ -2634,5 +3132,83 @@ impl Render for WorkspaceDetailPanel {
             }
             None => content.child(self.render_empty()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn changed(path: &str) -> ChangedFile {
+        ChangedFile {
+            path: path.to_string(),
+            additions: 1,
+            deletions: 0,
+            status: "modified".to_string(),
+        }
+    }
+
+    fn describe(entries: &[ChangeListEntry]) -> Vec<String> {
+        entries
+            .iter()
+            .map(|entry| match entry {
+                ChangeListEntry::Group { group, count } => format!("# {} {count}", group.label()),
+                ChangeListEntry::Folder {
+                    directory,
+                    count,
+                    collapsed,
+                    ..
+                } => format!(
+                    "> {directory} {count}{}",
+                    if *collapsed { " collapsed" } else { "" }
+                ),
+                ChangeListEntry::File { file, in_folder } => {
+                    format!("{}{}", if *in_folder { "  " } else { "" }, file.path)
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn changes_split_into_groups_and_fold_into_folders_past_threshold() {
+        let files = vec![changed("src/a.rs"), changed("README.md")];
+        let uncommitted = HashSet::from(["README.md".to_string()]);
+        assert_eq!(
+            describe(&change_list_entries(
+                &files,
+                Some(&uncommitted),
+                &HashSet::new()
+            )),
+            ["# Uncommitted 1", "README.md", "# On branch 1", "src/a.rs"],
+        );
+        assert_eq!(
+            describe(&change_list_entries(
+                &files,
+                Some(&HashSet::new()),
+                &HashSet::new()
+            )),
+            ["# On branch 2", "src/a.rs", "README.md"],
+        );
+
+        let mut files = (0..CHANGE_FOLDER_THRESHOLD)
+            .map(|index| changed(&format!("src/file_{index:02}.rs")))
+            .collect::<Vec<_>>();
+        files.push(changed("docs/guide.md"));
+        files.push(changed("Cargo.toml"));
+        let collapsed = HashSet::from(["On branch:src".to_string()]);
+        assert_eq!(
+            describe(&change_list_entries(
+                &files,
+                Some(&HashSet::new()),
+                &collapsed
+            )),
+            [
+                "# On branch 14",
+                "Cargo.toml",
+                "> docs 1",
+                "  docs/guide.md",
+                "> src 12 collapsed",
+            ],
+        );
     }
 }

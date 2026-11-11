@@ -60,7 +60,7 @@ pub use coordinator::{
 };
 pub use deep_link::{OpenDeepLinkInput, OpenDeepLinkResult};
 pub use environment::EnvironmentCheckItem;
-pub use git_review::{WorkspaceChangedFile, WorkspaceFileDiff};
+pub use git_review::{WorkspaceChangeScope, WorkspaceChangedFile, WorkspaceFileDiff};
 pub use hook_inspector::{WorkspaceHookCommand, WorkspaceHookEvent, WorkspaceHookInspector};
 // pub use local_llm::{LocalLlmModel, LocalLlmProfileDiagnostic, LocalLlmProfileDiagnosticCheck};
 pub use merge_readiness::{PreFlightCheck, WorkspaceMergeReadiness};

@@ -24,3 +24,15 @@ pub struct WorkspaceFileDiff {
     pub is_binary: bool,
     pub source: String,
 }
+
+/// Which changed files are uncommitted, and the ref committed work is
+/// compared against, for splitting a workspace's changes and opening its
+/// branch diff.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WorkspaceChangeScope {
+    /// Paths whose index or working tree differs from HEAD.
+    pub uncommitted_paths: std::collections::HashSet<String>,
+    /// `origin/<base>` when it exists, else `<base>`; None when neither
+    /// resolves to a commit.
+    pub base_ref: Option<String>,
+}
