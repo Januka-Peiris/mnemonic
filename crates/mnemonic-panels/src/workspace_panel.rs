@@ -51,6 +51,7 @@ const PR_STATUS_POLL_INTERVAL: Duration = Duration::from_secs(120);
 const CHANGED_FILES_REFRESH_INTERVAL: Duration = Duration::from_secs(10);
 const PROJECT_BASE_BRANCH_KEY: &str = "base_branch";
 const PROJECT_SETUP_SCRIPT_KEY: &str = "setup_script";
+const PROJECT_RUN_SCRIPT_KEY: &str = workspace_script_service::PROJECT_RUN_SCRIPT_KEY;
 const PROJECT_INIT_FILES_KEY: &str = "workspace_init_files";
 const WORKSPACE_ORDER_KEY: &str = "panel_workspace_order";
 use mnemonic_core::services::{
@@ -1135,8 +1136,9 @@ impl WorkspacePanel {
             return;
         };
         workspace.update(cx, |workspace, cx| {
+            let weak_workspace = cx.weak_entity();
             workspace.toggle_modal(window, cx, |window, cx| {
-                ProjectSettingsModal::new(&repository, window, cx)
+                ProjectSettingsModal::new(weak_workspace, &repository, window, cx)
             });
         });
     }
@@ -2767,16 +2769,19 @@ impl Render for IssuePromptModal {
 /// prepared in them. Saved per repository, next to the app-wide ones in
 /// Settings > Workspaces.
 struct ProjectSettingsModal {
+    workspace: WeakEntity<Workspace>,
     repository_id: String,
     project_name: String,
     base_branch: Entity<Editor>,
     setup_script: Entity<Editor>,
+    run_script: Entity<Editor>,
     init_files: Entity<Editor>,
     error: Option<SharedString>,
 }
 
 impl ProjectSettingsModal {
     fn new(
+        workspace: WeakEntity<Workspace>,
         repository: &DiscoveredRepository,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -2796,6 +2801,7 @@ impl ProjectSettingsModal {
         };
         let base_branch_value = load(PROJECT_BASE_BRANCH_KEY);
         let setup_script_value = load(PROJECT_SETUP_SCRIPT_KEY);
+        let run_script_value = load(PROJECT_RUN_SCRIPT_KEY);
         let init_files_value = load(PROJECT_INIT_FILES_KEY);
 
         let default_base_branch = WorkspacesSettings::get_global(cx)
@@ -2813,6 +2819,12 @@ impl ProjectSettingsModal {
             editor.set_text(setup_script_value, window, cx);
             editor
         });
+        let run_script = cx.new(|cx| {
+            let mut editor = Editor::auto_height(2, 8, window, cx);
+            editor.set_placeholder_text("pnpm dev", window, cx);
+            editor.set_text(run_script_value, window, cx);
+            editor
+        });
         let init_files = cx.new(|cx| {
             let mut editor = Editor::auto_height(2, 8, window, cx);
             editor.set_placeholder_text(".env.local", window, cx);
@@ -2821,10 +2833,12 @@ impl ProjectSettingsModal {
         });
 
         Self {
+            workspace,
             repository_id: repository.id.clone(),
             project_name: repository.name.clone(),
             base_branch,
             setup_script,
+            run_script,
             init_files,
             error,
         }
@@ -2854,6 +2868,7 @@ impl ProjectSettingsModal {
         let fields = [
             (PROJECT_BASE_BRANCH_KEY, self.base_branch.read(cx).text(cx)),
             (PROJECT_SETUP_SCRIPT_KEY, self.setup_script.read(cx).text(cx)),
+            (PROJECT_RUN_SCRIPT_KEY, self.run_script.read(cx).text(cx)),
             (PROJECT_INIT_FILES_KEY, self.init_files.read(cx).text(cx)),
         ];
         for (key, value) in fields {
@@ -2874,6 +2889,11 @@ impl ProjectSettingsModal {
                 return;
             }
         }
+        self.workspace
+            .update(cx, |workspace, cx| {
+                WorkspaceHost::reload_run_configs(workspace, cx);
+            })
+            .log_err();
         cx.emit(DismissEvent);
     }
 }
@@ -2935,14 +2955,19 @@ impl Render for ProjectSettingsModal {
                 &self.setup_script,
             ))
             .child(field(
+                "Run script",
+                "Started by the workspace's Run button, in a terminal at the bottom. Leave \
+                 empty to use the \"run\" commands from .mnemonic/config.json.",
+                &self.run_script,
+            ))
+            .child(field(
                 "Files to copy",
                 "Copied from the project root into each new workspace, one path per line.",
                 &self.init_files,
             ))
             .child(
                 Label::new(
-                    "Run and archive commands are read from .mnemonic/config.json in the \
-                     repository.",
+                    "Archive commands are read from .mnemonic/config.json in the repository.",
                 )
                 .size(LabelSize::XSmall)
                 .color(Color::Muted),

@@ -4438,7 +4438,15 @@ impl Workspace {
     pub fn close_panel<T: Panel>(&self, window: &mut Window, cx: &mut Context<Self>) {
         for dock in self.all_docks().iter() {
             dock.update(cx, |dock, cx| {
-                if dock.panel::<T>().is_some() {
+                let Some(panel) = dock.panel::<T>() else {
+                    return;
+                };
+                if dock
+                    .stacked_panel()
+                    .is_some_and(|stacked| stacked.panel_id() == panel.entity_id())
+                {
+                    dock.close_stacked_panel(window, cx);
+                } else {
                     dock.set_open(false, window, cx)
                 }
             })
@@ -12998,6 +13006,62 @@ mod tests {
             assert!(!pane.focus_handle(cx).is_focused(window));
             assert!(workspace.right_dock().read(cx).is_open());
             assert!(workspace.zoomed.is_none());
+        });
+    }
+
+    #[gpui::test]
+    async fn test_stacking_panel_opens_under_active_side_panel(cx: &mut gpui::TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+
+        let project = Project::test(fs, [], cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project, window, cx));
+
+        let (upper, lower) = workspace.update_in(cx, |workspace, window, cx| {
+            let upper = cx.new(|cx| TestPanel::new(DockPosition::Left, 100, cx));
+            let lower = cx.new(|cx| {
+                let mut panel = TestPanel::new(DockPosition::Left, 200, cx);
+                panel.stacks = true;
+                panel
+            });
+            workspace.add_panel(upper.clone(), window, cx);
+            workspace.add_panel(lower.clone(), window, cx);
+            (upper, lower)
+        });
+
+        let left_dock = workspace.read_with(cx, |workspace, _| workspace.left_dock().clone());
+        // Panels are ordered by activation priority, so the upper one is first.
+        left_dock.update_in(cx, |dock, window, cx| {
+            dock.activate_panel(0, window, cx);
+            dock.set_open(true, window, cx);
+            dock.activate_panel(1, window, cx);
+        });
+
+        left_dock.read_with(cx, |dock, cx| {
+            assert_eq!(
+                dock.stacked_panel().map(|panel| panel.panel_id()),
+                Some(lower.entity_id()),
+                "The stacking panel should open under the active one"
+            );
+            assert!(upper.read(cx).active, "The upper panel should stay shown");
+            assert!(lower.read(cx).active);
+        });
+
+        left_dock.update_in(cx, |dock, window, cx| dock.close_stacked_panel(window, cx));
+
+        left_dock.read_with(cx, |dock, cx| {
+            assert!(
+                dock.is_open(),
+                "Closing the lower panel keeps the dock open"
+            );
+            assert!(dock.stacked_panel().is_none());
+            assert_eq!(
+                dock.active_panel().map(|panel| panel.panel_id()),
+                Some(upper.entity_id())
+            );
+            assert!(upper.read(cx).active);
+            assert!(!lower.read(cx).active);
         });
     }
 

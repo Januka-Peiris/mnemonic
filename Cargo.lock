@@ -11374,6 +11374,7 @@ dependencies = [
  "agent_ui",
  "anyhow",
  "chrono",
+ "diagnostics",
  "editor",
  "futures 0.3.32",
  "git_ui",
