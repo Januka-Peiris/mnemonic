@@ -1,7 +1,8 @@
 use std::sync::{mpsc, Arc};
 
 use futures::StreamExt;
-use gpui::{actions, App, AppContext as _, Entity, EventEmitter, Global};
+use gpui::{actions, App, AppContext as _, Entity, EventEmitter, Global, Hsla};
+use theme::ActiveTheme as _;
 use mnemonic_core::state::{AppEventEmitter, AppState};
 
 actions!(
@@ -97,46 +98,89 @@ pub fn clear_agent_attention(workspace_id: &str) {
 }
 
 /// Last observed PR state per workspace ("open", "ready", "conflicts",
-/// "failed", "merged"), written by whichever component polls GitHub and read
-/// by the left panel's git icons.
-static PR_STATES: std::sync::Mutex<Option<std::collections::HashMap<String, String>>> =
-    std::sync::Mutex::new(None);
+/// "failed", "merged", "closed") and PR number, written by whichever
+/// component polls GitHub and read wherever the PR's state is shown.
+static PR_STATES: std::sync::Mutex<
+    Option<std::collections::HashMap<String, (String, Option<i64>)>>,
+> = std::sync::Mutex::new(None);
 
-pub fn record_pr_state(workspace_id: &str, state: &str) {
+/// Records the state, returning whether it differs from what was recorded.
+fn record_pr_state(workspace_id: &str, state: &str, number: Option<i64>) -> bool {
     let mut guard = PR_STATES
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    guard
+    let entry = (state.to_string(), number);
+    let previous = guard
         .get_or_insert_with(Default::default)
-        .insert(workspace_id.to_string(), state.to_string());
+        .insert(workspace_id.to_string(), entry.clone());
+    previous != Some(entry)
 }
 
 pub fn pr_state(workspace_id: &str) -> Option<String> {
     let guard = PR_STATES
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    guard.as_ref().and_then(|map| map.get(workspace_id).cloned())
+    guard
+        .as_ref()
+        .and_then(|map| map.get(workspace_id).map(|(state, _)| state.clone()))
 }
 
-pub fn clear_pr_state(workspace_id: &str) {
+pub fn pr_number(workspace_id: &str) -> Option<i64> {
+    let guard = PR_STATES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    guard
+        .as_ref()
+        .and_then(|map| map.get(workspace_id).and_then(|(_, number)| *number))
+}
+
+/// Returns whether a state was recorded.
+pub fn clear_pr_state(workspace_id: &str) -> bool {
     let mut guard = PR_STATES
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if let Some(map) = guard.as_mut() {
-        map.remove(workspace_id);
+    guard
+        .as_mut()
+        .is_some_and(|map| map.remove(workspace_id).is_some())
+}
+
+/// The colour a PR state is shown in. Merged is GitHub's purple, which no
+/// theme status colour stands for.
+pub fn pr_state_color(state: &str, cx: &App) -> Option<Hsla> {
+    let status = cx.theme().status();
+    match state {
+        "merged" => Some(gpui::rgb(0xa371f7).into()),
+        "ready" => Some(status.success),
+        "conflicts" | "failed" => Some(status.error),
+        "open" => Some(status.warning),
+        "closed" => Some(cx.theme().colors().text_muted),
+        _ => None,
     }
 }
 
-/// Classifies a GitHub PR status into the small state vocabulary used by
-/// the left panel's git icons, and records it.
+pub fn pr_state_label(state: &str) -> &'static str {
+    match state {
+        "merged" => "Merged",
+        "ready" => "Ready to merge",
+        "conflicts" => "Conflicts",
+        "failed" => "Checks failed",
+        "closed" => "Closed",
+        _ => "Open",
+    }
+}
+
+/// Classifies a GitHub PR status into the small state vocabulary above and
+/// records it, returning whether it changed so callers can repaint.
 pub fn record_pr_status(
     workspace_id: &str,
     status: &mnemonic_core::models::WorkspacePrStatus,
-) {
+) -> bool {
     let state = if !status.found {
         None
     } else if status.state.as_deref() == Some("MERGED") {
         Some("merged")
+    } else if status.state.as_deref() == Some("CLOSED") {
+        Some("closed")
     } else if status.mergeable.as_deref() == Some("CONFLICTING")
         || status.merge_state_status.as_deref() == Some("DIRTY")
     {
@@ -155,7 +199,7 @@ pub fn record_pr_status(
     };
 
     match state {
-        Some(state) => record_pr_state(workspace_id, state),
+        Some(state) => record_pr_state(workspace_id, state, status.number),
         None => clear_pr_state(workspace_id),
     }
 }
