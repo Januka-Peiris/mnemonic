@@ -695,6 +695,52 @@ fn compact_command_line(source: &str) -> String {
     }
 }
 
+/// What the agent said a command is for, from the `description` it gave
+/// with the call.
+fn tool_call_description(tool_call: &ToolCall) -> Option<String> {
+    let description = tool_call
+        .raw_input
+        .as_ref()?
+        .get("description")?
+        .as_str()?
+        .trim();
+    (!description.is_empty()).then(|| description.to_string())
+}
+
+/// Collapses text onto one line for a preview, dropping code fences and
+/// blank lines.
+fn one_line_preview(text: &str) -> String {
+    let mut preview = String::new();
+    for line in text.lines().map(str::trim) {
+        if line.is_empty() || line.starts_with("```") {
+            continue;
+        }
+        if !preview.is_empty() {
+            preview.push(' ');
+        }
+        preview.push_str(line);
+        if preview.len() > 300 {
+            break;
+        }
+    }
+    preview
+}
+
+/// The start of a failed tool call's output, which usually says why.
+fn tool_call_error_preview(tool_call: &ToolCall, cx: &App) -> Option<String> {
+    let text = tool_call
+        .content
+        .iter()
+        .filter_map(|content| match content {
+            ToolCallContent::ContentBlock(block) => Some(block.to_markdown(cx)),
+            ToolCallContent::Diff(_) | ToolCallContent::Terminal(_) => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let preview = one_line_preview(&text);
+    (!preview.is_empty()).then_some(preview)
+}
+
 fn full_path_for_empty_project_path(file: &dyn language::File, cx: &App) -> Option<String> {
     if file.path().file_name().is_some() {
         return None;
@@ -6808,6 +6854,9 @@ impl ThreadView {
         }
 
         let panel_bg = cx.theme().colors().panel_background;
+        let preview = (!is_open)
+            .then(|| one_line_preview(chunk.read(cx).source()))
+            .filter(|preview| !preview.is_empty());
 
         v_flex()
             .gap_1()
@@ -6821,6 +6870,8 @@ impl ThreadView {
                     .justify_between()
                     .child(
                         h_flex()
+                            .min_w_0()
+                            .flex_1()
                             .h(window.line_height() - px(2.))
                             .gap_1p5()
                             .overflow_hidden()
@@ -6831,10 +6882,14 @@ impl ThreadView {
                             )
                             .child(
                                 div()
+                                    .flex_none()
                                     .text_size(self.tool_name_font_size())
                                     .text_color(cx.theme().colors().text_muted)
                                     .child("Thinking"),
-                            ),
+                            )
+                            .when_some(preview, |this, preview| {
+                                this.child(self.render_activity_pill(preview, Color::Muted, cx))
+                            }),
                     )
                     .child(
                         Disclosure::new(("expand", entry_ix), is_open)
@@ -7184,6 +7239,31 @@ impl ThreadView {
         })
     }
 
+    /// A one-line excerpt in a rounded chip, beside an activity row's label.
+    fn render_activity_pill(&self, text: String, color: Color, cx: &Context<Self>) -> Div {
+        h_flex()
+            .min_w_0()
+            .flex_1()
+            .overflow_hidden()
+            .child(
+                div()
+                    .min_w_0()
+                    .max_w_full()
+                    .px_1p5()
+                    .rounded_sm()
+                    .bg(cx.theme().colors().element_background)
+                    .overflow_hidden()
+                    .child(
+                        Label::new(text)
+                            .buffer_font(cx)
+                            .size(LabelSize::XSmall)
+                            .color(color)
+                            .single_line()
+                            .truncate(),
+                    ),
+            )
+    }
+
     /// A collapsed shell command rendered as a single row, matching the other
     /// compact tool call rows, so a long transcript isn't a wall of command cards.
     fn render_compact_command_row(
@@ -7201,6 +7281,10 @@ impl ThreadView {
     ) -> Div {
         let group = SharedString::from(format!("{row_id}-group"));
         let command_line = compact_command_line(tool_call.label.read(cx).source());
+        let description = tool_call_description(tool_call);
+        let error_preview = failed
+            .then(|| tool_call_error_preview(tool_call, cx))
+            .flatten();
 
         let row = h_flex()
             .id(row_id.clone())
@@ -7224,13 +7308,25 @@ impl ThreadView {
                             .size(IconSize::Small)
                             .color(Color::Muted),
                     )
-                    .child(
-                        Label::new(command_line)
-                            .buffer_font(cx)
-                            .size(LabelSize::Small)
-                            .color(Color::Muted)
-                            .truncate(),
-                    ),
+                    .map(|this| match description {
+                        Some(description) => this
+                            .child(
+                                div().min_w_0().max_w(relative(0.6)).overflow_hidden().child(
+                                    Label::new(description)
+                                        .size(LabelSize::Small)
+                                        .single_line()
+                                        .truncate(),
+                                ),
+                            )
+                            .child(self.render_activity_pill(command_line, Color::Muted, cx)),
+                        None => this.child(
+                            Label::new(command_line)
+                                .buffer_font(cx)
+                                .size(LabelSize::Small)
+                                .color(Color::Muted)
+                                .truncate(),
+                        ),
+                    }),
             )
             .child(
                 h_flex()
@@ -7289,6 +7385,27 @@ impl ThreadView {
                 this.ml_4().mr_5()
             })
             .child(row)
+            .when_some(error_preview, |this, error_preview| {
+                this.child(
+                    h_flex()
+                        .w_full()
+                        .h(window.line_height() - px(2.))
+                        .px_1()
+                        .gap_1p5()
+                        .overflow_hidden()
+                        .child(
+                            Icon::new(IconName::XCircle)
+                                .size(IconSize::Small)
+                                .color(Color::Error),
+                        )
+                        .child(
+                            Label::new("Error")
+                                .size(LabelSize::Small)
+                                .color(Color::Error),
+                        )
+                        .child(self.render_activity_pill(error_preview, Color::Error, cx)),
+                )
+            })
     }
 
     fn render_terminal_tool_call(

@@ -2713,6 +2713,11 @@
   "agent_servers": {
     "claude-acp": {
       "type": "registry",
+      // Without this, Claude Code leaves its thinking out of the stream,
+      // so the chat can't show what the agent is working through.
+      "env": {
+        "CLAUDE_CODE_THINKING_DISPLAY": "summarized",
+      },
       "default_config_options": {
         "mode": "bypassPermissions",
       },
