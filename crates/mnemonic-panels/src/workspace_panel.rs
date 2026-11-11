@@ -769,8 +769,12 @@ impl WorkspacePanel {
                 None => (generate_workspace_name(&existing_names), None),
             };
 
-            let result = this.read_with(cx, |_this, cx| {
-                let state = mnemonic_bridge::mnemonic_state(cx);
+            let Some(state) = mnemonic_bridge::mnemonic_state_cloned() else {
+                return;
+            };
+            // Making the worktree and rescanning the repository run git, so
+            // this stays off the UI thread or the whole window freezes.
+            let result = cx.background_spawn(async move {
                 // Settings keys (DB): branch_prefix (default: OS username)
                 // and default_base_branch (default: main).
                 let branch_prefix = settings_repository::get_value(&state.db, "branch_prefix")
@@ -819,10 +823,11 @@ impl WorkspacePanel {
                     derived_from_branch: None,
                 };
                 workspace_service::create_workspace(&state, input)
-            });
+            })
+            .await;
 
             match result {
-                Ok(Ok(detail)) => {
+                Ok(detail) => {
                     log::info!("Created workspace: {}", detail.summary.id);
                     // New workspaces are chat-first: the saved chat session
                     // makes the workspace view open a Claude chat instead of
@@ -865,7 +870,7 @@ impl WorkspacePanel {
                     })
                     .ok();
                 }
-                Ok(Err(e)) => {
+                Err(e) => {
                     log::error!("Failed to create workspace: {e}");
                     if first_message.is_some() {
                         this.update_in(cx, |_, window, cx| {
@@ -880,7 +885,6 @@ impl WorkspacePanel {
                         .log_err();
                     }
                 }
-                Err(e) => log::error!("Failed to access state: {e}"),
             }
         })
         .detach();
