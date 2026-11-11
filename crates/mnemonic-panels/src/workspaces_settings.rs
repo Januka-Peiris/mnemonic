@@ -12,6 +12,7 @@ pub struct WorkspacesSettings {
     pub default_base_branch: String,
     pub auto_run_setup: bool,
     pub allow_risky_scripts: bool,
+    pub clone_location: String,
 }
 
 impl Settings for WorkspacesSettings {
@@ -27,6 +28,10 @@ impl Settings for WorkspacesSettings {
                 .unwrap_or_else(|| "main".to_string()),
             auto_run_setup: workspaces.auto_run_setup.unwrap_or(false),
             allow_risky_scripts: workspaces.allow_risky_scripts.unwrap_or(false),
+            clone_location: workspaces
+                .clone_location
+                .filter(|location| !location.trim().is_empty())
+                .unwrap_or_else(|| "~/dev".to_string()),
         }
     }
 }

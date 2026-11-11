@@ -997,6 +997,11 @@ pub struct WorkspacesSettingsContent {
     ///
     /// Default: false
     pub allow_risky_scripts: Option<bool>,
+    /// Folder that projects added from GitHub are cloned into. `~` is your
+    /// home folder.
+    ///
+    /// Default: "~/dev"
+    pub clone_location: Option<String>,
 }
 
 #[derive(

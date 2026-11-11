@@ -345,6 +345,24 @@ impl WorkspaceDetailPanel {
             panel
         });
 
+        // Picks up the selected workspace's refreshed changed files and state
+        // from the database; rendering itself never reads it.
+        panel.update(cx, |_, cx| {
+            cx.spawn(async move |this, cx| {
+                loop {
+                    cx.background_executor().timer(Duration::from_secs(2)).await;
+                    let updated = this.update(cx, |this, cx| {
+                        this.refresh(cx);
+                        cx.notify();
+                    });
+                    if updated.is_err() {
+                        break;
+                    }
+                }
+            })
+            .detach();
+        });
+
         // Load the embedded file tree asynchronously; ProjectPanel only
         // exposes an async constructor.
         let weak_workspace = workspace.weak_handle();
@@ -3177,7 +3195,6 @@ impl Panel for WorkspaceDetailPanel {
 
 impl Render for WorkspaceDetailPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        self.refresh(cx);
         self.maybe_refresh_change_annotations(cx);
 
         let content = v_flex()

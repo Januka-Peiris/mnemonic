@@ -16,60 +16,31 @@ use crate::state::AppState;
 mod ops;
 
 pub fn list_workspaces(state: &AppState) -> Result<Vec<WorkspaceSummary>, String> {
-    let workspaces = workspace_repository::list(&state.db)?;
-    spawn_changed_files_refresh(state, &workspaces);
-    Ok(workspaces)
+    workspace_repository::list(&state.db)
 }
 
-/// Recomputes and caches changed files for active workspaces in the
-/// background so the next list_workspaces poll returns fresh diff counters
-/// (get_workspace_changed_files persists what it computes). Single-flight
-/// guarded; per-workspace errors (missing worktree, deleted repo) are ignored.
-fn spawn_changed_files_refresh(state: &AppState, workspaces: &[WorkspaceSummary]) {
-    use std::sync::atomic::{AtomicBool, Ordering};
-    static REFRESHING: AtomicBool = AtomicBool::new(false);
-
-    let active: Vec<&WorkspaceSummary> = workspaces
-        .iter()
-        .filter(|workspace| workspace.status != "Merged")
-        .collect();
-    if active.is_empty() || REFRESHING.swap(true, Ordering::SeqCst) {
-        return;
+/// Re-diffs one workspace against its base and caches the result, so the
+/// next list_workspaces returns fresh changed files and line counts for it.
+/// Only the workspace being looked at is refreshed: diffing every worktree
+/// on every poll kept git busy for no one.
+pub fn refresh_workspace_changed_files(state: &AppState, workspace_id: &str) -> Result<(), String> {
+    let workspace = workspace_repository::get(&state.db, workspace_id)?;
+    let base = workspace.branch_health.base_branch.trim();
+    let root = workspace
+        .repository_path
+        .as_deref()
+        .or(workspace.workspace_root_path.as_deref());
+    if let Some(root) = root.filter(|_| !base.is_empty()) {
+        fetch_remote_base_if_stale(Path::new(root), base);
     }
-
-    let ids: Vec<String> = active
-        .iter()
-        .map(|workspace| workspace.id.clone())
-        .collect();
-    let mut base_refs: Vec<(String, String)> = active
-        .iter()
-        .filter_map(|workspace| {
-            let base = workspace.branch_health.base_branch.trim();
-            let root = workspace
-                .repository_path
-                .clone()
-                .or_else(|| workspace.workspace_root_path.clone())?;
-            (!base.is_empty()).then(|| (root, base.to_string()))
-        })
-        .collect();
-    base_refs.sort();
-    base_refs.dedup();
-
-    let state = state.clone();
-    std::thread::spawn(move || {
-        for (root, base) in base_refs {
-            fetch_remote_base_if_stale(Path::new(&root), &base);
-        }
-        for id in ids {
-            let _ = git_review_service::get_workspace_changed_files(&state, &id);
-        }
-        REFRESHING.store(false, Ordering::SeqCst);
-    });
+    git_review_service::get_workspace_changed_files(state, workspace_id)?;
+    Ok(())
 }
 
 /// Changed files are diffed against `origin/<base>`, which only moves on a
 /// fetch. Without this, merged work keeps showing as changed until someone
-/// fetches by hand. Throttled per repo and base because list_workspaces polls.
+/// fetches by hand. Throttled per repo and base because the selected workspace is
+/// refreshed on a timer.
 fn fetch_remote_base_if_stale(root: &Path, base: &str) {
     use std::collections::HashMap;
     use std::sync::Mutex;
