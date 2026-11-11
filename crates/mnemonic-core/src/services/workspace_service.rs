@@ -3,7 +3,7 @@ use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::models::{
-    AttachLinkedWorktreeInput, CreateChildWorkspaceInput, CreateWorkspaceInput,
+    ArchivedWorkspace, AttachLinkedWorktreeInput, CreateChildWorkspaceInput, CreateWorkspaceInput,
     DiscoveredRepository, LinkedWorktreeRef, RepositoryWorkspaceOptions, WorkspaceDetail,
     WorkspaceSummary,
 };
@@ -333,6 +333,55 @@ pub fn rename_unpublished_workspace(
     }
 
     workspace_repository::get(&state.db, workspace_id).map(Some)
+}
+
+/// Renames a workspace by hand. The branch is renamed with it while that is
+/// still safe (see `rename_unpublished_workspace`); once the branch is pushed
+/// or has a PR, only the name Mnemonic shows changes.
+pub fn rename_workspace(
+    state: &AppState,
+    workspace_id: &str,
+    new_name: &str,
+) -> Result<WorkspaceSummary, String> {
+    let name = new_name
+        .trim()
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() {
+                character.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>()
+        .split('-')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("-");
+    if name.is_empty() {
+        return Err("A workspace name needs at least one letter or number".to_string());
+    }
+    let summary = workspace_repository::get(&state.db, workspace_id)?;
+    if name == summary.name {
+        return Ok(summary);
+    }
+    if let Some(renamed) = rename_unpublished_workspace(state, workspace_id, &summary.name, &name)?
+    {
+        return Ok(renamed);
+    }
+    workspace_repository::update_name_and_branch(&state.db, workspace_id, &name, &summary.branch)?;
+    workspace_repository::get(&state.db, workspace_id)
+}
+
+pub fn list_archived_workspaces(state: &AppState) -> Result<Vec<ArchivedWorkspace>, String> {
+    ops::list_archived_workspaces(state)
+}
+
+pub fn restore_archived_workspace(
+    state: &AppState,
+    workspace_id: &str,
+) -> Result<WorkspaceSummary, String> {
+    ops::restore_archived_workspace(state, workspace_id)
 }
 
 pub fn pull_workspace_branch(state: &AppState, workspace_id: &str) -> Result<String, String> {

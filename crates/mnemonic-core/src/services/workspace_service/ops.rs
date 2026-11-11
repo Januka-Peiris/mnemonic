@@ -1,19 +1,22 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::models::{
-    AgentSessionSummary, BranchHealth, CreateChildWorkspaceInput, CreateWorkspaceInput,
-    WorkspaceDetail, WorkspaceSummary,
+    AgentSessionSummary, ArchivedWorkspace, BranchHealth, CreateChildWorkspaceInput,
+    CreateWorkspaceInput, WorkspaceDetail, WorkspaceSummary,
 };
 use crate::repositories::{
-    activity_repository, repository_repository, repository_settings_repository,
-    settings_repository, workspace_repository,
+    activity_repository, chat_session_repository, repository_repository,
+    repository_settings_repository, settings_repository, workspace_repository,
 };
 use crate::services::{
     git_worktree_service, pr_draft_service, repo_scanner_service, terminal_service,
     workspace_script_service,
 };
 use crate::state::AppState;
+
+/// Settings key holding the archived workspaces that can be restored.
+const ARCHIVED_WORKSPACES_KEY: &str = "archived_workspaces";
 
 pub(super) fn create_workspace(
     state: &AppState,
@@ -429,6 +432,7 @@ fn delete_workspace_impl(
     let remove_managed_worktree =
         remove_managed_worktree && detail.summary.worktree_managed_by_mnemonic;
     let mut worktree_cleanup_warning: Option<String> = None;
+    let mut archived_path: Option<PathBuf> = None;
 
     if let Err(err) = terminal_service::kill_embedded_workspace_session(workspace_id) {
         log::warn!(target: "mnemonic_lib", "kill embedded tmux session: {err} id={workspace_id}");
@@ -458,12 +462,13 @@ fn delete_workspace_impl(
                     }
                 } else {
                     match git_worktree_service::archive_mnemonic_worktree(&repo_path, &path) {
-                        Ok(archived_path) => {
+                        Ok(destination) => {
                             log::info!(
                                 target: "mnemonic_lib",
                                 "git worktree move: ok from={path} to={}",
-                                archived_path.display()
+                                destination.display()
                             );
+                            archived_path = Some(destination);
                         }
                         Err(err) => {
                             return Err(format!(
@@ -500,6 +505,15 @@ fn delete_workspace_impl(
 
     log::info!(target: "mnemonic_lib", "sqlite delete workspace row: id={workspace_id}");
     workspace_repository::delete(&state.db, workspace_id)?;
+
+    if let Some(archived_path) = archived_path {
+        if let Err(err) = remember_archived_workspace(state, &detail, &archived_path) {
+            log::warn!(
+                target: "mnemonic_lib",
+                "archived workspace {workspace_id} cannot be restored from Mnemonic: {err}"
+            );
+        }
+    }
 
     if let Some(repo_path) = detail.summary.repository_path.as_deref() {
         let _ = git_worktree_service::prune_worktrees(Path::new(repo_path));
@@ -546,6 +560,132 @@ fn delete_workspace_impl(
 
     log::info!(target: "mnemonic_lib", "delete_workspace finished: id={workspace_id}");
     Ok(())
+}
+
+fn load_archived_workspaces(state: &AppState) -> Result<Vec<ArchivedWorkspace>, String> {
+    let Some(json) = settings_repository::get_value(&state.db, ARCHIVED_WORKSPACES_KEY)? else {
+        return Ok(Vec::new());
+    };
+    serde_json::from_str(&json).map_err(|err| format!("Failed to read archived workspaces: {err}"))
+}
+
+fn save_archived_workspaces(
+    state: &AppState,
+    archived: &[ArchivedWorkspace],
+) -> Result<(), String> {
+    let json = serde_json::to_string(archived)
+        .map_err(|err| format!("Failed to save archived workspaces: {err}"))?;
+    settings_repository::set_value(&state.db, ARCHIVED_WORKSPACES_KEY, &json)
+}
+
+/// Records what restoring needs: the workspace row and its chats, which
+/// archiving deletes. Entries whose archive folder is gone are dropped, and
+/// the changed files and events are left out because they are recomputed.
+fn remember_archived_workspace(
+    state: &AppState,
+    detail: &WorkspaceDetail,
+    archived_path: &Path,
+) -> Result<(), String> {
+    let chat_sessions = chat_session_repository::list_for_workspace(&state.db, &detail.summary.id)?;
+    let mut detail = detail.clone();
+    detail.summary.changed_files.clear();
+    detail.recent_events.clear();
+
+    let mut archived = load_archived_workspaces(state)?;
+    archived.retain(|entry| {
+        entry.detail.summary.id != detail.summary.id && Path::new(&entry.archived_path).is_dir()
+    });
+    archived.push(ArchivedWorkspace {
+        detail,
+        chat_sessions,
+        archived_path: archived_path.to_string_lossy().to_string(),
+    });
+    save_archived_workspaces(state, &archived)
+}
+
+/// Archived workspaces whose worktree is still in the archive folder.
+pub(super) fn list_archived_workspaces(state: &AppState) -> Result<Vec<ArchivedWorkspace>, String> {
+    Ok(load_archived_workspaces(state)?
+        .into_iter()
+        .filter(|entry| Path::new(&entry.archived_path).is_dir())
+        .collect())
+}
+
+/// Moves an archived workspace's worktree back and recreates the workspace
+/// and its chats as they were when it was archived.
+pub(super) fn restore_archived_workspace(
+    state: &AppState,
+    workspace_id: &str,
+) -> Result<WorkspaceSummary, String> {
+    let mut archived = load_archived_workspaces(state)?;
+    let index = archived
+        .iter()
+        .position(|entry| entry.detail.summary.id == workspace_id)
+        .ok_or_else(|| format!("Archived workspace {workspace_id} was not found"))?;
+    let entry = archived.remove(index);
+    let worktree_path = entry
+        .detail
+        .summary
+        .workspace_root_path
+        .clone()
+        .unwrap_or_else(|| entry.detail.worktree_path.clone());
+    let repo_path = entry
+        .detail
+        .summary
+        .repository_path
+        .clone()
+        .ok_or_else(|| "The archived workspace has no repository path recorded".to_string())?;
+    if Path::new(&worktree_path).exists() {
+        return Err(format!("Cannot restore: {worktree_path} already exists"));
+    }
+
+    git_worktree_service::restore_archived_worktree(
+        &repo_path,
+        &entry.archived_path,
+        &worktree_path,
+    )?;
+    if let Err(err) = workspace_repository::insert(&state.db, &entry.detail) {
+        if let Err(revert_err) = git_worktree_service::restore_archived_worktree(
+            &repo_path,
+            &worktree_path,
+            &entry.archived_path,
+        ) {
+            log::error!(
+                target: "mnemonic_lib",
+                "failed to move {worktree_path} back into the archive after a failed restore: {revert_err}"
+            );
+        }
+        return Err(err);
+    }
+    for record in &entry.chat_sessions {
+        if let Err(err) = chat_session_repository::insert(&state.db, record) {
+            log::error!(target: "mnemonic_lib", "failed to restore chat session {}: {err}", record.id);
+        }
+    }
+    if let Err(err) = save_archived_workspaces(state, &archived) {
+        log::error!(target: "mnemonic_lib", "failed to update archived workspaces: {err}");
+    }
+    if let Err(err) = activity_repository::record(
+        &state.db,
+        workspace_id,
+        &entry.detail.summary.repo,
+        Some(&entry.detail.summary.branch),
+        "Workspace restored",
+        "success",
+        None,
+    ) {
+        log::error!(target: "mnemonic_lib", "failed to record workspace restore: {err}");
+    }
+    if let Some(repository_id) = entry.detail.summary.repository_id.as_deref() {
+        if let Err(err) = repo_scanner_service::refresh_repository_by_id(state, repository_id) {
+            log::warn!(
+                target: "mnemonic_lib",
+                "refresh_repository_by_id after restore failed: repository_id={repository_id} err={err}"
+            );
+        }
+    }
+
+    workspace_repository::get(&state.db, workspace_id)
 }
 
 pub(super) fn create_child_workspace(

@@ -82,9 +82,16 @@ fn change_scope_at(
         .into_iter()
         .map(|file| file.path)
         .collect();
+    let base_ref = resolve_base_ref(root, base_branch);
+    let behind_by = base_ref
+        .as_deref()
+        .and_then(|base_ref| git(root, &["rev-list", "--count", &format!("HEAD..{base_ref}")]).ok())
+        .and_then(|count| count.trim().parse().ok())
+        .unwrap_or(0);
     Ok(WorkspaceChangeScope {
         uncommitted_paths,
-        base_ref: resolve_base_ref(root, base_branch),
+        base_ref,
+        behind_by,
     })
 }
 
@@ -596,6 +603,11 @@ mod tests {
         write("committed.txt", "branch work\n")?;
         git(&root, &["add", "committed.txt"])?;
         git(&root, &["commit", "--quiet", "-m", "branch work"])?;
+        git(&root, &["checkout", "--quiet", "main"])?;
+        write("later.txt", "landed on main afterwards\n")?;
+        git(&root, &["add", "later.txt"])?;
+        git(&root, &["commit", "--quiet", "-m", "later"])?;
+        git(&root, &["checkout", "--quiet", "feature"])?;
         write("edited.txt", "two\n")?;
         write("new.txt", "untracked\n")?;
 
@@ -607,6 +619,7 @@ mod tests {
         uncommitted.sort();
         assert_eq!(uncommitted, vec!["edited.txt", "new.txt"]);
         assert_eq!(scope.base_ref.as_deref(), Some("main"));
+        assert_eq!(scope.behind_by, 1);
         Ok(())
     }
 

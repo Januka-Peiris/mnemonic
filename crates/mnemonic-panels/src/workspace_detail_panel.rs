@@ -912,6 +912,30 @@ impl WorkspaceDetailPanel {
         });
     }
 
+    /// Asks the workspace's agent to merge the latest base branch in. The
+    /// agent does it so that conflicts and uncommitted work are handled where
+    /// the user can see them.
+    fn update_from_base(&mut self, cx: &mut Context<Self>) {
+        let Some(summary) = &self.summary else {
+            return;
+        };
+        let Some(base_ref) = self
+            .change_scope
+            .as_ref()
+            .and_then(|scope| scope.base_ref.clone())
+        else {
+            return;
+        };
+        let workspace_id = summary.id.clone();
+        let prompt = format!(
+            "Bring this branch up to date with `{base_ref}`: run `git fetch origin`, then merge \
+             `{base_ref}` into the current branch. If uncommitted changes block the merge, \
+             commit them first. If there are conflicts, resolve them keeping the intent of both \
+             sides and commit the merge. Do not push."
+        );
+        self.dispatch_instruction(&workspace_id, prompt, "update from base", cx);
+    }
+
     /// Sends a one-shot "fix the failing CI" instruction into the
     /// workspace's claude terminal, so the fix is visible as it happens.
     fn fix_errors_via_agent(&mut self, cx: &mut Context<Self>) {
@@ -1075,7 +1099,10 @@ impl WorkspaceDetailPanel {
     fn render_header(&self, ws: &WorkspaceSummary, cx: &mut Context<Self>) -> impl IntoElement {
         let status_color = self.status_color(&ws.status, cx);
         let ahead = ws.branch_health.ahead_by;
-        let behind = ws.branch_health.behind_by;
+        let behind = self
+            .change_scope
+            .as_ref()
+            .map_or(0, |scope| scope.behind_by);
 
         v_flex()
             .px_2()
@@ -1173,6 +1200,19 @@ impl WorkspaceDetailPanel {
                             Label::new(format!("↑{ahead} ↓{behind}"))
                                 .size(LabelSize::XSmall)
                                 .color(Color::Muted),
+                        )
+                    })
+                    .when(behind > 0, |el| {
+                        el.child(
+                            Button::new("update-from-base", "Update")
+                                .style(ButtonStyle::Subtle)
+                                .label_size(LabelSize::XSmall)
+                                .tooltip(Tooltip::text(
+                                    "Ask the agent to merge the latest base branch into this one",
+                                ))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.update_from_base(cx);
+                                })),
                         )
                     }),
             )

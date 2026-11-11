@@ -35,4 +35,6 @@ pub struct WorkspaceChangeScope {
     /// `origin/<base>` when it exists, else `<base>`; None when neither
     /// resolves to a commit.
     pub base_ref: Option<String>,
+    /// Commits on `base_ref` that the workspace's branch does not have yet.
+    pub behind_by: u32,
 }
