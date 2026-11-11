@@ -666,6 +666,27 @@ enum ToolCallLayout {
     Floating,
 }
 
+/// Terminal command labels are stored as a fenced code block (```\n...\n```).
+fn command_text_from_label(source: &str) -> &str {
+    source
+        .strip_prefix("```\n")
+        .and_then(|text| text.strip_suffix("\n```"))
+        .unwrap_or(source)
+}
+
+fn compact_command_line(source: &str) -> String {
+    let mut lines = command_text_from_label(source)
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty());
+    let first_line = lines.next().unwrap_or_default();
+    if lines.next().is_some() {
+        format!("{first_line} …")
+    } else {
+        first_line.to_string()
+    }
+}
+
 fn full_path_for_empty_project_path(file: &dyn language::File, cx: &App) -> Option<String> {
     if file.path().file_name().is_some() {
         return None;
@@ -6885,14 +6906,8 @@ impl ThreadView {
         window: &Window,
         cx: &Context<Self>,
     ) -> Div {
-        // The label's markdown source is a fenced code block (```\n...\n```);
-        // strip the fences so the copy button yields just the command text.
-        let command_source = command.read(cx).source();
-        let command_text = command_source
-            .strip_prefix("```\n")
-            .and_then(|s| s.strip_suffix("\n```"))
-            .unwrap_or(&command_source)
-            .to_string();
+        // Strip the fences so the copy button yields just the command text.
+        let command_text = command_text_from_label(command.read(cx).source()).to_string();
 
         let mut style = MarkdownStyle::themed(MarkdownFont::Agent, window, cx).with_buffer_font(cx);
         style.container_style.text.font_size = Some(rems_from_px(12.).into());
@@ -6934,6 +6949,145 @@ impl ThreadView {
             .when(is_preview, |this| this.pt_1().children(run_command_label))
             .child(markdown_element)
             .child(div().absolute().top_1().right_1().child(copy_button))
+    }
+
+    fn render_terminal_stop_button(
+        &self,
+        terminal: &Entity<acp_thread::Terminal>,
+        cx: &Context<Self>,
+    ) -> IconButton {
+        IconButton::new(
+            SharedString::from(format!("stop-terminal-{}", terminal.entity_id())),
+            IconName::Stop,
+        )
+        .icon_size(IconSize::Small)
+        .icon_color(Color::Error)
+        .tooltip(move |_window, cx| {
+            Tooltip::with_meta(
+                "Stop This Command",
+                None,
+                "Also possible by placing your cursor inside the terminal and using regular terminal bindings.",
+                cx,
+            )
+        })
+        .on_click({
+            let terminal = terminal.clone();
+            cx.listener(move |this, _event, _window, cx| {
+                terminal.update(cx, |terminal, cx| {
+                    terminal.stop_by_user(cx);
+                });
+                if AgentSettings::get_global(cx).cancel_generation_on_terminal_stop {
+                    this.cancel_generation(cx);
+                }
+            })
+        })
+    }
+
+    /// A collapsed shell command rendered as a single row, matching the other
+    /// compact tool call rows, so a long transcript isn't a wall of command cards.
+    fn render_compact_command_row(
+        &self,
+        row_id: SharedString,
+        tool_call: &ToolCall,
+        is_running: bool,
+        failed: bool,
+        exit_code: Option<i32>,
+        time_elapsed: Option<Duration>,
+        stop_button: Option<IconButton>,
+        layout: ToolCallLayout,
+        window: &Window,
+        cx: &Context<Self>,
+    ) -> Div {
+        let group = SharedString::from(format!("{row_id}-group"));
+        let command_line = compact_command_line(tool_call.label.read(cx).source());
+
+        let row = h_flex()
+            .id(row_id.clone())
+            .group(&group)
+            .w_full()
+            .h(window.line_height() - px(2.))
+            .px_1()
+            .gap_1p5()
+            .justify_between()
+            .rounded(rems_from_px(3.))
+            .cursor_pointer()
+            .hover(|style| style.bg(cx.theme().colors().element_hover.opacity(0.5)))
+            .child(
+                h_flex()
+                    .min_w_0()
+                    .flex_1()
+                    .gap_1p5()
+                    .overflow_hidden()
+                    .child(
+                        Icon::new(IconName::ToolTerminal)
+                            .size(IconSize::Small)
+                            .color(Color::Muted),
+                    )
+                    .child(
+                        Label::new(command_line)
+                            .buffer_font(cx)
+                            .size(LabelSize::Small)
+                            .color(Color::Muted)
+                            .truncate(),
+                    ),
+            )
+            .child(
+                h_flex()
+                    .flex_none()
+                    .gap_1()
+                    .pr_0p5()
+                    .when_some(time_elapsed, |this, time_elapsed| {
+                        this.child(
+                            Label::new(format!("({})", duration_alt_display(time_elapsed)))
+                                .buffer_font(cx)
+                                .size(LabelSize::XSmall)
+                                .color(Color::Muted),
+                        )
+                    })
+                    .when(is_running, |this| {
+                        this.child(
+                            Icon::new(IconName::ArrowCircle)
+                                .size(IconSize::XSmall)
+                                .color(Color::Muted)
+                                .with_rotate_animation(2),
+                        )
+                    })
+                    .children(stop_button)
+                    .when(failed, |this| {
+                        this.child(
+                            div()
+                                .id(SharedString::from(format!("{row_id}-error")))
+                                .child(
+                                    Icon::new(IconName::Close)
+                                        .size(IconSize::Small)
+                                        .color(Color::Error),
+                                )
+                                .when_some(exit_code, |this, code| {
+                                    this.tooltip(Tooltip::text(format!("Exited with code {code}")))
+                                }),
+                        )
+                    })
+                    .child(
+                        Disclosure::new(SharedString::from(format!("{row_id}-disclosure")), false)
+                            .opened_icon(IconName::ChevronUp)
+                            .closed_icon(IconName::ChevronDown)
+                            .visible_on_hover(&group),
+                    ),
+            )
+            .on_click(cx.listener({
+                let tool_call_id = tool_call.id.clone();
+                move |this, _event, _window, cx| {
+                    this.expanded_tool_calls.insert(tool_call_id.clone());
+                    cx.notify();
+                }
+            }));
+
+        v_flex()
+            .my_1()
+            .when(layout == ToolCallLayout::Standalone, |this| {
+                this.ml_4().mr_5()
+            })
+            .child(row)
     }
 
     fn render_terminal_tool_call(
@@ -6981,6 +7135,30 @@ impl ThreadView {
             started_at.elapsed()
         };
 
+        let is_expanded = self.expanded_tool_calls.contains(&tool_call.id);
+
+        // A permission prompt must stay fully visible, so only collapse once
+        // there is nothing for the user to decide.
+        if !is_expanded && !needs_confirmation {
+            let is_running = !command_finished;
+            return self
+                .render_compact_command_row(
+                    SharedString::from(format!("terminal-tool-compact-{}", terminal.entity_id())),
+                    tool_call,
+                    is_running,
+                    tool_failed || command_failed,
+                    output
+                        .and_then(|output| output.exit_status)
+                        .map(|status| status.code().unwrap_or(-1)),
+                    Some(time_elapsed).filter(|elapsed| *elapsed > Duration::from_secs(10)),
+                    is_running.then(|| self.render_terminal_stop_button(terminal, cx)),
+                    layout,
+                    window,
+                    cx,
+                )
+                .into_any();
+        }
+
         let header_id =
             SharedString::from(format!("terminal-tool-header-{}", terminal.entity_id()));
         let header_group = SharedString::from(format!(
@@ -7006,8 +7184,6 @@ impl ThreadView {
             window,
             cx,
         );
-
-        let is_expanded = self.expanded_tool_calls.contains(&tool_call.id);
 
         let header = h_flex()
             .id(header_id)
@@ -7069,48 +7245,30 @@ impl ThreadView {
                         Icon::new(IconName::ArrowCircle)
                             .size(IconSize::XSmall)
                             .color(Color::Muted)
-                            .with_rotate_animation(2)
+                            .with_rotate_animation(2),
                     )
-                    .child(div().h(relative(0.6)).ml_1p5().child(Divider::vertical().color(DividerColor::Border)))
                     .child(
-                        IconButton::new(
-                            SharedString::from(format!("stop-terminal-{}", terminal.entity_id())),
-                            IconName::Stop
-                        )
-                        .icon_size(IconSize::Small)
-                        .icon_color(Color::Error)
-                        .tooltip(move |_window, cx| {
-                            Tooltip::with_meta(
-                                "Stop This Command",
-                                None,
-                                "Also possible by placing your cursor inside the terminal and using regular terminal bindings.",
-                                cx,
-                            )
-                        })
-                        .on_click({
-                            let terminal = terminal.clone();
-                            cx.listener(move |this, _event, _window, cx| {
-                                terminal.update(cx, |terminal, cx| {
-                                    terminal.stop_by_user(cx);
-                                });
-                                if AgentSettings::get_global(cx).cancel_generation_on_terminal_stop {
-                                    this.cancel_generation(cx);
-                                }
-                            })
-                        }),
+                        div()
+                            .h(relative(0.6))
+                            .ml_1p5()
+                            .child(Divider::vertical().color(DividerColor::Border)),
                     )
+                    .child(self.render_terminal_stop_button(terminal, cx))
             })
             .when(truncated_output, |header| {
                 let tooltip = if let Some(output) = output {
                     if output_line_count + 10 > terminal::MAX_SCROLL_HISTORY_LINES {
-                       format!("Output exceeded terminal max lines and was \
-                            truncated, the model received the first {}.", format_file_size(output.content.len() as u64, true))
+                        format!(
+                            "Output exceeded terminal max lines and was \
+                            truncated, the model received the first {}.",
+                            format_file_size(output.content.len() as u64, true)
+                        )
                     } else {
                         format!(
                             "Output is {} long, and to avoid unexpected token usage, \
                                 only {} was sent back to the agent.",
                             format_file_size(output.original_content_len as u64, true),
-                             format_file_size(output.content.len() as u64, true)
+                            format_file_size(output.content.len() as u64, true)
                         )
                     }
                 } else {
@@ -7150,8 +7308,7 @@ impl ThreadView {
                             )))
                         }),
                 )
-            })
-;
+            });
 
         let terminal_view = self
             .entry_view_state
@@ -7338,13 +7495,33 @@ impl ThreadView {
             })
             .unwrap_or_else(|| (false, false, focus_handle.clone()));
 
-        let use_card_layout = needs_confirmation || is_edit || is_terminal_tool;
-
         let has_image_content = tool_call.content.iter().any(|c| c.image().is_some());
         let is_collapsible = !tool_call.content.is_empty() && !needs_confirmation;
         let mut is_open = self.expanded_tool_calls.contains(&tool_call.id);
 
         is_open |= needs_confirmation;
+
+        if is_terminal_tool && !is_open {
+            return self.render_compact_command_row(
+                SharedString::from(format!("tool-call-compact-command-{entry_ix}")),
+                tool_call,
+                matches!(
+                    tool_call.status,
+                    ToolCallStatus::Pending | ToolCallStatus::InProgress
+                ),
+                failed_or_canceled,
+                None,
+                None,
+                None,
+                layout,
+                window,
+                cx,
+            );
+        }
+
+        // A collapsed edit only shows its label, so it gets the same plain row
+        // as other tool calls rather than an empty bordered card.
+        let use_card_layout = needs_confirmation || (is_edit && is_open) || is_terminal_tool;
 
         let should_show_raw_input = !is_terminal_tool && !is_edit && !has_image_content;
 
@@ -7610,13 +7787,36 @@ impl ThreadView {
             })
             .map(|this| {
                 if is_terminal_tool {
-                    this.child(self.render_collapsible_command(
-                        card_header_id.clone(),
-                        true,
-                        tool_call.label.clone(),
-                        window,
-                        cx,
-                    ))
+                    this.child(
+                        h_flex()
+                            .items_start()
+                            .bg(self.tool_card_header_bg(cx))
+                            .child(
+                                div().flex_1().min_w_0().child(self.render_collapsible_command(
+                                    card_header_id.clone(),
+                                    true,
+                                    tool_call.label.clone(),
+                                    window,
+                                    cx,
+                                )),
+                            )
+                            .when(!needs_confirmation, |this| {
+                                this.child(
+                                    div().p_1().child(
+                                        Disclosure::new(("collapse-command", entry_ix), true)
+                                            .opened_icon(IconName::ChevronUp)
+                                            .closed_icon(IconName::ChevronDown)
+                                            .on_click(cx.listener({
+                                                let id = tool_call.id.clone();
+                                                move |this: &mut Self, _, _, cx| {
+                                                    this.expanded_tool_calls.remove(&id);
+                                                    cx.notify();
+                                                }
+                                            })),
+                                    ),
+                                )
+                            }),
+                    )
                 } else {
                     this.child(
                         h_flex()
@@ -10944,6 +11144,19 @@ mod tests {
         acp::AvailableCommand::new(name, "").meta(acp_thread::meta_with_command_category(
             acp_thread::CommandCategory::Mcp,
         ))
+    }
+
+    #[test]
+    fn test_compact_command_line_shows_first_line_without_fences() {
+        assert_eq!(
+            compact_command_line("cargo check -p agent_ui"),
+            "cargo check -p agent_ui"
+        );
+        assert_eq!(compact_command_line("```\ngit status\n```"), "git status");
+        assert_eq!(
+            compact_command_line("```\n\n  cd crates\n  cargo test\n```"),
+            "cd crates …"
+        );
     }
 
     #[test]
