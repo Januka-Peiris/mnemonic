@@ -55,6 +55,47 @@ pub fn clear_agent_activity(workspace_id: &str) {
     }
 }
 
+/// Something an agent did in a workspace while nobody was looking at it,
+/// shown on the workspace's sidebar row until the user opens it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AgentAttention {
+    /// A turn finished, or the agent is waiting for permission.
+    NeedsAttention,
+    /// The agent stopped with an error or refused.
+    Error,
+}
+
+static AGENT_ATTENTION: std::sync::Mutex<
+    Option<std::collections::HashMap<String, AgentAttention>>,
+> = std::sync::Mutex::new(None);
+
+pub fn set_agent_attention(workspace_id: &str, attention: AgentAttention) {
+    let mut guard = AGENT_ATTENTION
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    guard
+        .get_or_insert_with(Default::default)
+        .insert(workspace_id.to_string(), attention);
+}
+
+pub fn agent_attention(workspace_id: &str) -> Option<AgentAttention> {
+    let guard = AGENT_ATTENTION
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    guard
+        .as_ref()
+        .and_then(|map| map.get(workspace_id).copied())
+}
+
+pub fn clear_agent_attention(workspace_id: &str) {
+    let mut guard = AGENT_ATTENTION
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(map) = guard.as_mut() {
+        map.remove(workspace_id);
+    }
+}
+
 /// Last observed PR state per workspace ("open", "ready", "conflicts",
 /// "failed", "merged"), written by whichever component polls GitHub and read
 /// by the left panel's git icons.

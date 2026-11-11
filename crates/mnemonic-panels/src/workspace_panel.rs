@@ -2,11 +2,13 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::time::Duration;
 
+use editor::Editor;
 use gpui::{
-    actions, px, Action, App, AppContext as _, Context, Entity, EventEmitter, Focusable,
-    FocusHandle, IntoElement, PathPromptOptions, Pixels, PromptLevel, Render, SharedString,
-    WeakEntity, Window,
+    Action, AnyElement, App, AppContext as _, Context, DismissEvent, Entity, EventEmitter,
+    FocusHandle, Focusable, IntoElement, PathPromptOptions, Pixels, PromptLevel, Render,
+    SharedString, WeakEntity, Window, actions, px,
 };
+use mnemonic_bridge::AgentAttention;
 use mnemonic_core::models::{
     ActivityItem, ChatSessionRecord, CreateWorkspaceInput, DiscoveredRepository, WorkspaceSummary,
 };
@@ -43,14 +45,24 @@ impl Render for DragGhostView {
 
 const PROJECT_ORDER_KEY: &str = "panel_project_order";
 const WORKSPACE_ORDER_KEY: &str = "panel_workspace_order";
-use mnemonic_core::services::{repo_scanner_service, workspace_port_service, workspace_service};
-use ui::{Tooltip, h_flex, v_flex, Icon, IconButton, IconName, Label, prelude::*};
+use mnemonic_core::services::{
+    environment_service, repo_scanner_service, workspace_port_service, workspace_script_service,
+    workspace_service,
+};
+use ui::{
+    CommonAnimationExt as _, Icon, IconButton, IconName, Label, Tooltip, h_flex, prelude::*, v_flex,
+};
+use util::ResultExt as _;
 use workspace::dock::{DockPosition, PanelEvent};
-use workspace::{Panel, Workspace};
+use workspace::notifications::NotificationId;
+use workspace::{ModalView, Panel, Toast, Workspace};
 
 use crate::workspace_view::WorkspaceHost;
 
 actions!(mnemonic_workspace_panel, [ToggleFocus]);
+
+/// Marker for archive toasts.
+struct MnemonicArchiveToast;
 
 const WORKSPACE_PANEL_KEY: &str = "MnemonicWorkspacePanel";
 
@@ -275,7 +287,7 @@ impl WorkspacePanel {
         }
     }
 
-    fn select_workspace(
+    pub(crate) fn select_workspace(
         &mut self,
         ws_id: String,
         window: &mut Window,
@@ -296,10 +308,11 @@ impl WorkspacePanel {
         }
     }
 
-    /// Archive after confirmation: stops the agent session and run commands,
-    /// frees the workspace's ports, moves the worktree into the archive
-    /// folder, keeps the branch.
-    fn confirm_archive(
+    /// Archive after confirmation: runs the configured teardown commands in
+    /// the workspace's view, stops the agent session and run commands, frees
+    /// the workspace's ports, moves the worktree into the archive folder,
+    /// keeps the branch.
+    pub(crate) fn confirm_archive(
         &mut self,
         ws_id: String,
         ws_name: String,
@@ -310,8 +323,9 @@ impl WorkspacePanel {
             PromptLevel::Warning,
             &format!("Archive {ws_name}?"),
             Some(
-                "Stops the agent session and run commands, frees the workspace's ports, \
-                 and moves the worktree into the archive folder. Nothing is deleted.",
+                "Runs any teardown commands from .mnemonic/config.json, stops the agent \
+                 session and run commands, frees the workspace's ports, and moves the \
+                 worktree into the archive folder. Nothing is deleted.",
             ),
             &["Archive", "Cancel"],
             cx,
@@ -324,6 +338,44 @@ impl WorkspacePanel {
             let Some(state) = mnemonic_bridge::mnemonic_state_cloned() else {
                 return;
             };
+            let teardown = {
+                let state = state.clone();
+                let ws_id = ws_id.clone();
+                cx.background_spawn(async move {
+                    workspace_script_service::prepare_workspace_teardown_commands(&state, &ws_id)
+                })
+                .await
+            };
+            match teardown {
+                Ok((root, plans)) if !plans.is_empty() => {
+                    let teardown_task = this
+                        .update_in(cx, |this, window, cx| {
+                            this.select_workspace(ws_id.clone(), window, cx);
+                            let workspace = this.workspace.upgrade()?;
+                            workspace.update(cx, |workspace, cx| {
+                                WorkspaceHost::run_teardown_for_workspace(
+                                    workspace, &ws_id, root, plans, window, cx,
+                                )
+                            })
+                        })
+                        .ok()
+                        .flatten();
+                    match teardown_task {
+                        Some(task) => task.await,
+                        None => log::warn!("Archive {ws_id}: no open view to run teardown in"),
+                    }
+                }
+                Ok(_) => {}
+                Err(err) => {
+                    this.update(cx, |this, cx| {
+                        this.show_archive_toast(
+                            format!("{ws_name}: teardown not run: {err}; archiving anyway"),
+                            cx,
+                        );
+                    })
+                    .log_err();
+                }
+            }
             this.update(cx, |this, cx| {
                 if let Some(workspace) = this.workspace.upgrade() {
                     workspace.update(cx, |workspace, cx| {
@@ -382,6 +434,17 @@ impl WorkspacePanel {
             .ok();
         })
         .detach();
+    }
+
+    fn show_archive_toast(&self, message: String, cx: &mut Context<Self>) {
+        if let Some(workspace) = self.workspace.upgrade() {
+            workspace.update(cx, |workspace, cx| {
+                workspace.show_toast(
+                    Toast::new(NotificationId::unique::<MnemonicArchiveToast>(), message),
+                    cx,
+                );
+            });
+        }
     }
 
     /// Switches the Zed project's visible worktree to the selected
@@ -464,9 +527,13 @@ impl WorkspacePanel {
         .detach();
     }
 
+    /// Creates a workspace in the project. A seed names it after an issue
+    /// and sends the issue to its Claude chat as an app instruction, which
+    /// never renames the branch.
     fn add_worktree(
         &mut self,
         project_name: String,
+        seed: Option<WorkspaceSeed>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -484,7 +551,13 @@ impl WorkspacePanel {
                 return;
             };
 
-            let workspace_name = generate_workspace_name(&existing_names);
+            let (workspace_name, first_message) = match seed {
+                Some(seed) => (
+                    unique_workspace_name(&seed.name, &existing_names),
+                    Some(seed.message),
+                ),
+                None => (generate_workspace_name(&existing_names), None),
+            };
 
             let result = this.read_with(cx, |_this, cx| {
                 let state = mnemonic_bridge::mnemonic_state(cx);
@@ -549,12 +622,98 @@ impl WorkspacePanel {
                     this.update_in(cx, |this, window, cx| {
                         this.refresh(cx);
                         this.select_workspace(detail.summary.id.clone(), window, cx);
+                        let (Some(message), Some(workspace)) =
+                            (first_message, this.workspace.upgrade())
+                        else {
+                            return;
+                        };
+                        let dispatched = workspace.update(cx, |workspace, cx| {
+                            WorkspaceHost::dispatch_to_workspace_agent(
+                                workspace,
+                                &detail.summary.id,
+                                message,
+                                cx,
+                            )
+                        });
+                        if !dispatched {
+                            log::error!("No chat received the issue for {}", detail.summary.id);
+                        }
                     })
                     .ok();
                 }
-                Ok(Err(e)) => log::error!("Failed to create workspace: {e}"),
+                Ok(Err(e)) => {
+                    log::error!("Failed to create workspace: {e}");
+                    if first_message.is_some() {
+                        this.update_in(cx, |_, window, cx| {
+                            let _dismissed = window.prompt(
+                                PromptLevel::Critical,
+                                "Couldn't create workspace",
+                                Some(&e),
+                                &["OK"],
+                                cx,
+                            );
+                        })
+                        .log_err();
+                    }
+                }
                 Err(e) => log::error!("Failed to access state: {e}"),
             }
+        })
+        .detach();
+    }
+
+    fn open_issue_prompt(
+        &mut self,
+        project_name: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+        let panel = cx.weak_entity();
+        workspace.update(cx, |workspace, cx| {
+            workspace.toggle_modal(window, cx, |window, cx| {
+                IssuePromptModal::new(panel, project_name, window, cx)
+            });
+        });
+    }
+
+    /// Fetches the issue or PR off the UI thread, then creates a workspace
+    /// seeded with it.
+    fn add_worktree_from_issue(
+        &mut self,
+        project_name: String,
+        reference: IssueReference,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(repo_path) = self
+            .repositories
+            .iter()
+            .find(|repo| repo.name == project_name)
+            .map(|repo| repo.path.clone())
+        else {
+            log::error!("Repository not found for project: {project_name}");
+            return;
+        };
+        cx.spawn_in(window, async move |this, cx| {
+            let seed = cx
+                .background_spawn(async move { reference.resolve(&repo_path) })
+                .await;
+            this.update_in(cx, |this, window, cx| match seed {
+                Ok(seed) => this.add_worktree(project_name, Some(seed), window, cx),
+                Err(err) => {
+                    let _dismissed = window.prompt(
+                        PromptLevel::Critical,
+                        "Couldn't load the issue",
+                        Some(&err),
+                        &["OK"],
+                        cx,
+                    );
+                }
+            })
+            .log_err();
         })
         .detach();
     }
@@ -727,6 +886,7 @@ impl WorkspacePanel {
         };
 
         let project_for_add = project.to_string();
+        let project_for_issue = project.to_string();
         let drag_data = DraggedProject {
             name: project.to_string(),
         };
@@ -782,13 +942,26 @@ impl WorkspacePanel {
                 .child(div().flex_grow(1.0))
                 .child(
                     IconButton::new(
+                        SharedString::from(format!("add-worktree-from-issue-{project}")),
+                        IconName::Github,
+                    )
+                    .icon_size(IconSize::XSmall)
+                    .icon_color(Color::Muted)
+                    .tooltip(Tooltip::text("New from issue / PR…"))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        cx.stop_propagation();
+                        this.open_issue_prompt(project_for_issue.clone(), window, cx);
+                    })),
+                )
+                .child(
+                    IconButton::new(
                         SharedString::from(format!("add-worktree-{project}")),
                         IconName::Plus,
                     )
                     .icon_size(IconSize::XSmall)
                     .tooltip(Tooltip::text("New Worktree"))
                     .on_click(cx.listener(move |this, _, window, cx| {
-                        this.add_worktree(project_for_add.clone(), window, cx);
+                        this.add_worktree(project_for_add.clone(), None, window, cx);
                     })),
                 ),
         );
@@ -861,19 +1034,7 @@ impl WorkspacePanel {
             .on_click(cx.listener(move |this, _, window, cx| {
                 this.select_workspace(ws_id.clone(), window, cx);
             }))
-            .child({
-                // Live attention dot: green while claude is producing
-                // output, amber when it has gone quiet (waiting on you),
-                // muted when no session has run yet.
-                let dot_color = match mnemonic_bridge::last_agent_activity(&ws.id) {
-                    Some(at) if at.elapsed() < Duration::from_secs(4) => {
-                        cx.theme().status().success
-                    }
-                    Some(_) => cx.theme().status().warning,
-                    None => cx.theme().colors().text_muted,
-                };
-                div().w(px(7.)).h(px(7.)).rounded_full().bg(dot_color)
-            })
+            .child(self.render_agent_indicator(&ws.id, cx))
             .child({
                 // Git icon colored by PR state: amber=open, green=ready to
                 // merge, red=conflicts/failed checks, accent=merged.
@@ -920,6 +1081,62 @@ impl WorkspacePanel {
                     );
                 })),
             )
+    }
+
+    /// Error (red) and needs-attention (accent) alerts stay until the
+    /// workspace is opened and win over the running spinner; otherwise a
+    /// muted dot.
+    fn render_agent_indicator(&self, workspace_id: &str, cx: &App) -> AnyElement {
+        let running = self.workspace.upgrade().is_some_and(|workspace| {
+            WorkspaceHost::workspace_agent_busy(workspace.read(cx), workspace_id, cx)
+        });
+        let (indicator, tooltip) = match mnemonic_bridge::agent_attention(workspace_id) {
+            Some(AgentAttention::Error) => (
+                div()
+                    .size(px(7.))
+                    .rounded_full()
+                    .bg(cx.theme().status().error)
+                    .into_any_element(),
+                "Agent stopped with an error",
+            ),
+            Some(AgentAttention::NeedsAttention) => (
+                div()
+                    .size(px(7.))
+                    .rounded_full()
+                    .bg(cx.theme().colors().text_accent)
+                    .into_any_element(),
+                "Agent finished or needs your input",
+            ),
+            None if running => (
+                Icon::new(IconName::ArrowCircle)
+                    .size(IconSize::XSmall)
+                    .color(Color::Muted)
+                    .with_keyed_rotate_animation(
+                        SharedString::from(format!("agent-running-{workspace_id}")),
+                        2,
+                    )
+                    .into_any_element(),
+                "Agent running",
+            ),
+            None => (
+                div()
+                    .size(px(7.))
+                    .rounded_full()
+                    .bg(cx.theme().colors().text_muted)
+                    .into_any_element(),
+                "Agent idle",
+            ),
+        };
+        h_flex()
+            .id(SharedString::from(format!(
+                "agent-indicator-{workspace_id}"
+            )))
+            .size(px(12.))
+            .flex_none()
+            .justify_center()
+            .tooltip(Tooltip::text(tooltip))
+            .child(indicator)
+            .into_any_element()
     }
 
     fn render_empty(&self) -> impl IntoElement {
@@ -1087,6 +1304,294 @@ pub(crate) fn branch_slug_from_message(text: &str) -> Option<String> {
     Some(slug).filter(|slug| !slug.is_empty())
 }
 
+/// A workspace started from an issue: its name (also the branch's last
+/// segment) and the instruction sent to its Claude chat.
+#[derive(Debug, PartialEq, Eq)]
+struct WorkspaceSeed {
+    name: String,
+    message: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GitHubItemKind {
+    Issue,
+    PullRequest,
+}
+
+impl GitHubItemKind {
+    fn gh_command(self) -> &'static str {
+        match self {
+            Self::Issue => "issue",
+            Self::PullRequest => "pr",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Issue => "issue",
+            Self::PullRequest => "pull request",
+        }
+    }
+}
+
+/// What the user typed into "New from issue / PR".
+#[derive(Debug, PartialEq, Eq)]
+enum IssueReference {
+    /// A GitHub issue or PR URL, passed to `gh` as is.
+    GitHub { kind: GitHubItemKind, url: String },
+    /// `#123` or `123`: an issue, or failing that a PR, in the project's
+    /// repository.
+    GitHubNumber(u64),
+    /// A Linear issue URL. Nothing is fetched: the title comes from the
+    /// URL's slug.
+    Linear {
+        url: String,
+        identifier: String,
+        title: String,
+    },
+}
+
+impl IssueReference {
+    fn parse(text: &str) -> Option<Self> {
+        let text = text.trim();
+        if let Ok(number) = text.trim_start_matches('#').parse::<u64>() {
+            return Some(Self::GitHubNumber(number));
+        }
+        let url = text.split(['?', '#']).next()?.trim_end_matches('/');
+        let without_scheme = url.split_once("://").map_or(url, |(_, rest)| rest);
+        let mut segments = without_scheme.split('/');
+        let host = segments.next()?.trim_start_matches("www.");
+        let segments: Vec<&str> = segments.collect();
+        match (host, segments.as_slice()) {
+            ("github.com", [_owner, _repo, kind, number, ..]) if number.parse::<u64>().is_ok() => {
+                let kind = match *kind {
+                    "issues" => GitHubItemKind::Issue,
+                    "pull" => GitHubItemKind::PullRequest,
+                    _ => return None,
+                };
+                Some(Self::GitHub {
+                    kind,
+                    url: url.to_string(),
+                })
+            }
+            ("linear.app", [_team, "issue", identifier, rest @ ..]) if !identifier.is_empty() => {
+                let title = rest
+                    .first()
+                    .map(|slug| slug.replace('-', " "))
+                    .filter(|title| !title.trim().is_empty())
+                    .unwrap_or_else(|| identifier.to_string());
+                Some(Self::Linear {
+                    url: url.to_string(),
+                    identifier: identifier.to_string(),
+                    title,
+                })
+            }
+            _ => None,
+        }
+    }
+
+    /// Fetches a GitHub item's title and body with `gh`; blocking.
+    fn resolve(self, repo_path: &str) -> Result<WorkspaceSeed, String> {
+        match self {
+            Self::GitHub { kind, url } => fetch_github_item(kind, &url, repo_path),
+            Self::GitHubNumber(number) => {
+                let target = number.to_string();
+                fetch_github_item(GitHubItemKind::Issue, &target, repo_path).or_else(|issue_err| {
+                    fetch_github_item(GitHubItemKind::PullRequest, &target, repo_path)
+                        .map_err(|_| issue_err)
+                })
+            }
+            Self::Linear {
+                url,
+                identifier,
+                title,
+            } => Ok(issue_seed(
+                &identifier.to_lowercase(),
+                &title,
+                "Linear issue",
+                &url,
+                "",
+            )),
+        }
+    }
+}
+
+fn fetch_github_item(
+    kind: GitHubItemKind,
+    target: &str,
+    repo_path: &str,
+) -> Result<WorkspaceSeed, String> {
+    let gh = environment_service::find_gh_path().unwrap_or_else(|| "gh".to_string());
+    let output = std::process::Command::new(&gh)
+        .args([
+            kind.gh_command(),
+            "view",
+            target,
+            "--json",
+            "title,body,number,url",
+        ])
+        .current_dir(repo_path)
+        .output()
+        .map_err(|err| format!("Couldn't run gh: {err}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "gh {} view {target} failed: {}",
+            kind.gh_command(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let item: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .map_err(|err| format!("Couldn't read gh output: {err}"))?;
+    let field = |name: &str| {
+        item.get(name)
+            .and_then(|value| value.as_str())
+            .unwrap_or("")
+    };
+    let number = item
+        .get("number")
+        .and_then(|value| value.as_u64())
+        .ok_or_else(|| "gh returned no issue number".to_string())?;
+    Ok(issue_seed(
+        &number.to_string(),
+        field("title"),
+        &format!("GitHub {}", kind.label()),
+        field("url"),
+        field("body"),
+    ))
+}
+
+/// Names the workspace `<id>-<slug of title>` and asks the agent to
+/// implement the item.
+fn issue_seed(id: &str, title: &str, kind: &str, url: &str, body: &str) -> WorkspaceSeed {
+    let name = match branch_slug_from_message(title) {
+        Some(slug) => format!("{id}-{slug}"),
+        None => id.to_string(),
+    };
+    let mut message = format!("Please implement this {kind}: {title}\n{url}");
+    if !body.trim().is_empty() {
+        message.push_str("\n\n");
+        message.push_str(body.trim());
+    }
+    WorkspaceSeed { name, message }
+}
+
+/// `name`, or `name-2`, `name-3`... when a workspace already uses it.
+fn unique_workspace_name(name: &str, existing: &[String]) -> String {
+    let taken = |candidate: &str| existing.iter().any(|existing| existing == candidate);
+    if !taken(name) {
+        return name.to_string();
+    }
+    (2..)
+        .map(|counter| format!("{name}-{counter}"))
+        .find(|candidate| !taken(candidate))
+        .unwrap_or_else(|| name.to_string())
+}
+
+/// One-line prompt for "New from issue / PR".
+struct IssuePromptModal {
+    editor: Entity<Editor>,
+    panel: WeakEntity<WorkspacePanel>,
+    project_name: String,
+    error: Option<SharedString>,
+}
+
+impl IssuePromptModal {
+    fn new(
+        panel: WeakEntity<WorkspacePanel>,
+        project_name: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let editor = cx.new(|cx| {
+            let mut editor = Editor::single_line(window, cx);
+            editor.set_placeholder_text(
+                "https://github.com/owner/repo/issues/123 or #123",
+                window,
+                cx,
+            );
+            editor
+        });
+        Self {
+            editor,
+            panel,
+            project_name,
+            error: None,
+        }
+    }
+
+    fn cancel(&mut self, _: &menu::Cancel, _window: &mut Window, cx: &mut Context<Self>) {
+        cx.emit(DismissEvent);
+    }
+
+    fn confirm(&mut self, _: &menu::Confirm, window: &mut Window, cx: &mut Context<Self>) {
+        let text = self.editor.read(cx).text(cx);
+        if text.trim().is_empty() {
+            cx.emit(DismissEvent);
+            return;
+        }
+        let Some(reference) = IssueReference::parse(&text) else {
+            self.error = Some("Not a GitHub issue or PR URL, #number, or Linear issue URL".into());
+            cx.notify();
+            return;
+        };
+        let project_name = self.project_name.clone();
+        self.panel
+            .update(cx, |panel, cx| {
+                panel.add_worktree_from_issue(project_name, reference, window, cx);
+            })
+            .log_err();
+        cx.emit(DismissEvent);
+    }
+}
+
+impl EventEmitter<DismissEvent> for IssuePromptModal {}
+
+impl ModalView for IssuePromptModal {}
+
+impl Focusable for IssuePromptModal {
+    fn focus_handle(&self, cx: &App) -> FocusHandle {
+        self.editor.focus_handle(cx)
+    }
+}
+
+impl Render for IssuePromptModal {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let hint = match &self.error {
+            Some(error) => Label::new(error.clone())
+                .size(LabelSize::Small)
+                .color(Color::Error),
+            None => Label::new(format!(
+                "New workspace in {} from a GitHub issue or PR, or a Linear issue URL.",
+                self.project_name
+            ))
+            .size(LabelSize::Small)
+            .color(Color::Muted),
+        };
+        v_flex()
+            .key_context("IssuePromptModal")
+            .on_action(cx.listener(Self::cancel))
+            .on_action(cx.listener(Self::confirm))
+            .elevation_3(cx)
+            .w_96()
+            .overflow_hidden()
+            .child(
+                div()
+                    .p_2()
+                    .border_b_1()
+                    .border_color(cx.theme().colors().border_variant)
+                    .child(self.editor.clone()),
+            )
+            .child(
+                h_flex()
+                    .bg(cx.theme().colors().editor_background)
+                    .rounded_b_sm()
+                    .w_full()
+                    .p_2()
+                    .child(hint),
+            )
+    }
+}
+
 impl Focusable for WorkspacePanel {
     fn focus_handle(&self, _cx: &App) -> FocusHandle {
         self.focus_handle.clone()
@@ -1233,6 +1738,60 @@ mod tests {
         );
         assert_eq!(branch_slug_from_message("ok, just do it"), None);
         assert_eq!(branch_slug_from_message("/model claude-opus-5-5"), None);
+    }
+
+    #[test]
+    fn issue_input_is_recognized() {
+        assert_eq!(
+            IssueReference::parse("https://github.com/acme/app/issues/42#issuecomment-1"),
+            Some(IssueReference::GitHub {
+                kind: GitHubItemKind::Issue,
+                url: "https://github.com/acme/app/issues/42".to_string(),
+            })
+        );
+        assert_eq!(
+            IssueReference::parse("github.com/acme/app/pull/7/files"),
+            Some(IssueReference::GitHub {
+                kind: GitHubItemKind::PullRequest,
+                url: "github.com/acme/app/pull/7/files".to_string(),
+            })
+        );
+        assert_eq!(
+            IssueReference::parse(" #123 "),
+            Some(IssueReference::GitHubNumber(123))
+        );
+        assert_eq!(
+            IssueReference::parse("https://linear.app/acme/issue/ENG-12/fix-login-redirect"),
+            Some(IssueReference::Linear {
+                url: "https://linear.app/acme/issue/ENG-12/fix-login-redirect".to_string(),
+                identifier: "ENG-12".to_string(),
+                title: "fix login redirect".to_string(),
+            })
+        );
+        assert_eq!(IssueReference::parse("https://github.com/acme/app"), None);
+        assert_eq!(IssueReference::parse("fix the login page"), None);
+    }
+
+    #[test]
+    fn issue_workspace_is_named_after_number_and_title() {
+        let seed = issue_seed(
+            "42",
+            "Login redirect loops on Safari",
+            "GitHub issue",
+            "https://github.com/acme/app/issues/42",
+            "Steps to reproduce",
+        );
+        assert_eq!(seed.name, "42-login-redirect-loops-safari");
+        assert!(
+            seed.message
+                .contains("https://github.com/acme/app/issues/42")
+        );
+        assert!(seed.message.ends_with("Steps to reproduce"));
+        assert!(!is_generated_workspace_name(&seed.name));
+        assert_eq!(
+            unique_workspace_name("42-login", &["42-login".to_string()]),
+            "42-login-2"
+        );
     }
 
     #[test]

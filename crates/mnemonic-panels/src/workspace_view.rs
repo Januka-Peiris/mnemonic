@@ -3,23 +3,32 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use agent_client_protocol::schema as acp;
-use agent_ui::{Agent, AgentConnectionStore, AgentThreadSource, ConversationView};
-use editor::Editor;
-use gpui::{
-    Anchor, App, AppContext as _, Context, DragMoveEvent, Empty, Entity, EntityId, EventEmitter,
-    Focusable, FocusHandle, IntoElement, Pixels, Render, SharedString, Subscription, WeakEntity,
-    Window, actions, px,
+use agent_settings::AgentSettings;
+use agent_ui::{
+    Agent, AgentConnectionStore, AgentNotification, AgentNotificationEvent, AgentThreadSource,
+    ConversationView,
 };
+use editor::Editor;
+use futures::future::Either;
+use gpui::{
+    Anchor, AnyWindowHandle, App, AppContext as _, Context, DragMoveEvent, Empty, Entity, EntityId,
+    EventEmitter, FocusHandle, Focusable, IntoElement, Pixels, Render, SharedString, Subscription,
+    WeakEntity, Window, WindowHandle, actions, px,
+};
+use mnemonic_bridge::AgentAttention;
 use mnemonic_core::models::{ChatSessionRecord, WorkspaceSummary};
 use mnemonic_core::repositories::{chat_session_repository, workspace_repository};
+use mnemonic_core::services::workspace_script_service::RunCommandPlan;
 use mnemonic_core::services::{
     checkpoint_service, terminal_service, workspace_script_service, workspace_service,
 };
 use project::{AgentId, Project};
+use settings::{NotifyWhenAgentWaiting, Settings as _};
 use task::{RevealStrategy, Shell, SpawnInTerminal, TaskId};
 use terminal::Terminal;
 use terminal_view::TerminalView;
 use util::path_list::PathList;
+use util::ResultExt as _;
 use util::shell_builder::ShellBuilder;
 use ui::{
     Button, ButtonStyle, ContextMenu, Icon, IconButton, IconName, Label, PopoverMenu, TintColor,
@@ -59,6 +68,9 @@ const ENTER_DELAY_MILLIS: u64 = 250;
 /// running. Claude Code redraws its spinner continuously while working, so
 /// output going quiet for this long means it's waiting for input.
 const AGENT_IDLE_AFTER: Duration = Duration::from_secs(4);
+
+/// Archive waits at most this long for the workspace's teardown commands.
+const TEARDOWN_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Restart waits this long after killing the run commands so a dev server
 /// has released its port before the new one binds it.
@@ -113,18 +125,33 @@ enum AgentProvider {
     Codex,
 }
 
-/// The ACP agents a workspace chat can run.
+/// The ACP agents a workspace chat can run. Each id must be a registry
+/// agent listed under `agent_servers` in the default settings.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum ChatAgent {
     Claude,
     Codex,
+    Gemini,
+    OpenCode,
+    Cursor,
 }
 
 impl ChatAgent {
+    const ALL: [Self; 5] = [
+        Self::Claude,
+        Self::Codex,
+        Self::Gemini,
+        Self::OpenCode,
+        Self::Cursor,
+    ];
+
     fn agent_id(self) -> &'static str {
         match self {
             Self::Claude => "claude-acp",
             Self::Codex => "codex-acp",
+            Self::Gemini => "gemini",
+            Self::OpenCode => "opencode",
+            Self::Cursor => "cursor",
         }
     }
 
@@ -132,14 +159,25 @@ impl ChatAgent {
         match self {
             Self::Claude => "Claude",
             Self::Codex => "Codex",
+            Self::Gemini => "Gemini",
+            Self::OpenCode => "OpenCode",
+            Self::Cursor => "Cursor",
         }
     }
 
     fn from_agent_id(agent_id: &str) -> Self {
-        if agent_id == Self::Codex.agent_id() {
-            Self::Codex
-        } else {
-            Self::Claude
+        Self::ALL
+            .into_iter()
+            .find(|agent| agent.agent_id() == agent_id)
+            .unwrap_or(Self::Claude)
+    }
+
+    /// The CLI tab offered when this agent's chat can't start.
+    fn cli_fallback(self) -> Option<NewSession> {
+        match self {
+            Self::Claude => Some(NewSession::ClaudeCli),
+            Self::Codex => Some(NewSession::CodexCli),
+            Self::Gemini | Self::OpenCode | Self::Cursor => None,
         }
     }
 }
@@ -418,6 +456,17 @@ pub struct WorkspaceView {
     run_command_count: usize,
     run_tooltip: SharedString,
     run_starting: bool,
+    /// The window this view lives in, for bringing it forward from a
+    /// notification.
+    window_handle: AnyWindowHandle,
+    window_active: bool,
+    /// Agent CLI output time, kept apart from chat activity because only a
+    /// CLI going quiet is read as its turn ending.
+    last_cli_activity: Option<Instant>,
+    cli_quiet_reported: bool,
+    notification_windows: Vec<WindowHandle<AgentNotification>>,
+    notification_subscriptions: Vec<Subscription>,
+    _window_activation: Subscription,
     focus_handle: FocusHandle,
 }
 
@@ -723,6 +772,8 @@ impl WorkspaceView {
             if matches!(event, terminal::Event::Wakeup) {
                 if is_agent {
                     this.last_agent_activity = Some(Instant::now());
+                    this.last_cli_activity = this.last_agent_activity;
+                    this.cli_quiet_reported = false;
                     mnemonic_bridge::record_agent_activity(&this.workspace_id);
                     this.schedule_idle_check(cx);
                 }
@@ -968,6 +1019,103 @@ impl WorkspaceView {
         .detach();
     }
 
+    /// Runs the workspace's teardown commands one after another in visible
+    /// terminal tabs. A failure or running past `TEARDOWN_TIMEOUT` raises a
+    /// toast; the returned task always completes so archiving can continue.
+    pub(crate) fn run_teardown_commands(
+        &mut self,
+        root: PathBuf,
+        plans: Vec<RunCommandPlan>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::Task<()> {
+        let project = self.project.clone();
+        let workspace_id = self.workspace_id.clone();
+        let deadline = Instant::now() + TEARDOWN_TIMEOUT;
+        cx.spawn_in(window, async move |this, cx| {
+            let mut outcome = Ok(());
+            for plan in &plans {
+                let (command, args) = ShellBuilder::new(&Shell::System, cfg!(windows))
+                    .build(Some(plan.command.clone()), &[]);
+                let spawn_task = SpawnInTerminal {
+                    id: TaskId(format!("mnemonic-teardown-{workspace_id}-{}", plan.index)),
+                    full_label: plan.title.clone(),
+                    label: plan.title.clone(),
+                    command: Some(command),
+                    args,
+                    command_label: plan.command.clone(),
+                    cwd: Some(root.clone()),
+                    shell: Shell::System,
+                    reveal: RevealStrategy::Always,
+                    use_new_terminal: true,
+                    allow_concurrent_runs: true,
+                    ..Default::default()
+                };
+                let terminal = match project.update(cx, |project, cx| {
+                    project.create_terminal_task(spawn_task, cx)
+                }) {
+                    Ok(task) => task.await,
+                    Err(err) => Err(err),
+                };
+                let terminal = match terminal {
+                    Ok(terminal) => terminal,
+                    Err(err) => {
+                        outcome = Err(format!("couldn't start {}: {err}", plan.title));
+                        break;
+                    }
+                };
+                this.update_in(cx, |this, window, cx| {
+                    this.push_terminal(
+                        &plan.title,
+                        None,
+                        None,
+                        false,
+                        terminal.clone(),
+                        window,
+                        cx,
+                    );
+                })
+                .log_err();
+
+                let completion =
+                    terminal.read_with(cx, |terminal, cx| terminal.wait_for_completed_task(cx));
+                let timeout = cx
+                    .background_executor()
+                    .timer(deadline.saturating_duration_since(Instant::now()));
+                match futures::future::select(completion, timeout).await {
+                    Either::Left((Some(status), _)) if !status.success() => {
+                        outcome = Err(match status.code() {
+                            Some(code) => format!("{} exited with code {code}", plan.title),
+                            None => format!("{} was interrupted", plan.title),
+                        });
+                        break;
+                    }
+                    Either::Left(_) => {}
+                    Either::Right(_) => {
+                        terminal.update(cx, |terminal, _| terminal.kill_active_task());
+                        outcome = Err(format!(
+                            "{} didn't finish within {} minutes",
+                            plan.title,
+                            TEARDOWN_TIMEOUT.as_secs() / 60
+                        ));
+                        break;
+                    }
+                }
+            }
+
+            if let Err(err) = outcome {
+                log::warn!("Teardown for workspace {workspace_id}: {err}");
+                this.update(cx, |this, cx| {
+                    this.show_workspace_toast(
+                        format!("{}: teardown {err}; archiving anyway", this.workspace_name),
+                        cx,
+                    );
+                })
+                .log_err();
+            }
+        })
+    }
+
     fn render_run_controls(&self, cx: &mut Context<Self>) -> AnyElement {
         if self.has_run_terminals() {
             return h_flex()
@@ -1117,7 +1265,7 @@ impl WorkspaceView {
         let app_messages = initial_prompt.iter().cloned().collect();
 
         let view = cx.new(|cx| {
-            ConversationView::new(
+            let mut view = ConversationView::new(
                 server,
                 connection_store,
                 agent,
@@ -1132,7 +1280,9 @@ impl WorkspaceView {
                 AgentThreadSource::AgentPanel,
                 window,
                 cx,
-            )
+            );
+            view.suppress_notifications();
+            view
         });
 
         let view_id = view.entity_id();
@@ -1215,6 +1365,7 @@ impl WorkspaceView {
                         this.checkpoint_new_user_message(&thread, cx);
                         this.name_workspace_from_thread(view_id, &thread, cx);
                     }
+                    this.raise_thread_attention(view_id, &thread, event, cx);
                 }),
             ]
         } else {
@@ -1614,12 +1765,197 @@ impl WorkspaceView {
                 this.idle_check_scheduled = false;
                 if this.agent_is_running() {
                     this.schedule_idle_check(cx);
+                } else {
+                    this.report_cli_quiet(cx);
                 }
                 cx.notify();
             })
             .ok();
         })
         .detach();
+    }
+
+    /// Whether the user can see this workspace right now: it is the one
+    /// selected in the sidebar and its window is focused.
+    fn is_on_screen(&self, cx: &App) -> bool {
+        self.window_active
+            && cx
+                .try_global::<mnemonic_bridge::ActiveWorkspace>()
+                .is_some_and(|active| active.0.as_deref() == Some(self.workspace_id.as_str()))
+    }
+
+    /// Flags a chat's finished turn, permission request, or error on the
+    /// sidebar and with a system notification, unless the workspace is on
+    /// screen.
+    fn raise_thread_attention(
+        &mut self,
+        view_id: EntityId,
+        thread: &Entity<acp_thread::AcpThread>,
+        event: &acp_thread::AcpThreadEvent,
+        cx: &mut Context<Self>,
+    ) {
+        let (attention, caption, icon) = match event {
+            acp_thread::AcpThreadEvent::Stopped(acp::StopReason::Cancelled) => return,
+            acp_thread::AcpThreadEvent::Stopped(_) => {
+                // A queued instruction was sent as the turn ended.
+                if thread.read(cx).status() == acp_thread::ThreadStatus::Generating {
+                    return;
+                }
+                (AgentAttention::NeedsAttention, "Finished", IconName::Check)
+            }
+            acp_thread::AcpThreadEvent::ToolAuthorizationRequested(_) => (
+                AgentAttention::NeedsAttention,
+                "Needs your permission",
+                IconName::Info,
+            ),
+            acp_thread::AcpThreadEvent::Error | acp_thread::AcpThreadEvent::Refusal => (
+                AgentAttention::Error,
+                "Stopped with an error",
+                IconName::Warning,
+            ),
+            _ => return,
+        };
+        if self.is_on_screen(cx) {
+            return;
+        }
+        mnemonic_bridge::set_agent_attention(&self.workspace_id, attention);
+        self.notify_workspace_panel(cx);
+        let source = self
+            .chat_index(view_id)
+            .and_then(|index| self.sessions.get(index))
+            .map(|session| session.title.clone())
+            .unwrap_or_default();
+        self.show_attention_notification(source, SharedString::from(caption), icon, cx);
+    }
+
+    /// An agent CLI that has gone quiet is waiting at its prompt. Only the
+    /// sidebar is flagged: terminal output is too coarse a signal to raise
+    /// system notifications on.
+    fn report_cli_quiet(&mut self, cx: &mut Context<Self>) {
+        let went_quiet = self
+            .last_cli_activity
+            .is_some_and(|at| at.elapsed() >= AGENT_IDLE_AFTER);
+        if !went_quiet || self.cli_quiet_reported {
+            return;
+        }
+        self.cli_quiet_reported = true;
+        if self.is_on_screen(cx) {
+            return;
+        }
+        if mnemonic_bridge::agent_attention(&self.workspace_id).is_none() {
+            mnemonic_bridge::set_agent_attention(
+                &self.workspace_id,
+                AgentAttention::NeedsAttention,
+            );
+            self.notify_workspace_panel(cx);
+        }
+    }
+
+    /// Pops up Zed's agent notification naming this workspace, honoring the
+    /// `notify_when_agent_waiting` setting. A newer alert replaces an older
+    /// one.
+    fn show_attention_notification(
+        &mut self,
+        source: SharedString,
+        caption: SharedString,
+        icon: IconName,
+        cx: &mut Context<Self>,
+    ) {
+        self.dismiss_notifications(cx);
+        let screens = match AgentSettings::get_global(cx).notify_when_agent_waiting {
+            NotifyWhenAgentWaiting::PrimaryScreen => cx.primary_display().into_iter().collect(),
+            NotifyWhenAgentWaiting::AllScreens => cx.displays(),
+            NotifyWhenAgentWaiting::Never => Vec::new(),
+        };
+        for screen in screens {
+            let options = AgentNotification::window_options(screen, cx);
+            let title = self.workspace_name.clone();
+            let caption = caption.clone();
+            let source = source.clone();
+            let Some(window) = cx
+                .open_window(options, |_window, cx| {
+                    cx.new(|_cx| AgentNotification::new(title, Some(caption), icon, Some(source)))
+                })
+                .log_err()
+            else {
+                continue;
+            };
+            let Some(pop_up) = window.entity(cx).log_err() else {
+                continue;
+            };
+            self.notification_subscriptions.push(cx.subscribe(
+                &pop_up,
+                |this, _, event: &AgentNotificationEvent, cx| match event {
+                    AgentNotificationEvent::Accepted => this.open_from_notification(cx),
+                    AgentNotificationEvent::Dismissed => this.dismiss_notifications(cx),
+                },
+            ));
+            self.notification_windows.push(window);
+        }
+    }
+
+    /// Brings the app forward and selects this workspace in the sidebar.
+    fn open_from_notification(&mut self, cx: &mut Context<Self>) {
+        self.dismiss_notifications(cx);
+        cx.activate(true);
+        let window_handle = self.window_handle;
+        let workspace = self.workspace.clone();
+        let workspace_id = self.workspace_id.clone();
+        cx.defer(move |cx| {
+            window_handle
+                .update(cx, |_, window, cx| {
+                    window.activate_window();
+                    let panel = workspace
+                        .upgrade()
+                        .and_then(|workspace| workspace.read(cx).panel::<WorkspacePanel>(cx));
+                    if let Some(panel) = panel {
+                        panel.update(cx, |panel, cx| {
+                            panel.select_workspace(workspace_id, window, cx);
+                        });
+                    }
+                })
+                .log_err();
+        });
+    }
+
+    fn dismiss_notifications(&mut self, cx: &mut Context<Self>) {
+        self.notification_subscriptions.clear();
+        for window in self.notification_windows.drain(..) {
+            window
+                .update(cx, |_, window, _| window.remove_window())
+                .log_err();
+        }
+    }
+
+    /// Clears this workspace's sidebar alert and pop-ups once the user is
+    /// looking at it.
+    pub(crate) fn mark_seen(&mut self, cx: &mut Context<Self>) {
+        self.dismiss_notifications(cx);
+        if mnemonic_bridge::agent_attention(&self.workspace_id).is_some() {
+            mnemonic_bridge::clear_agent_attention(&self.workspace_id);
+            self.notify_workspace_panel(cx);
+        }
+    }
+
+    fn window_activation_changed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.window_active = window.is_window_active();
+        if self.is_on_screen(cx) {
+            self.mark_seen(cx);
+        }
+    }
+
+    /// Repaints the sidebar row. Deferred because this view can be updated
+    /// from inside a workspace update.
+    fn notify_workspace_panel(&self, cx: &mut Context<Self>) {
+        let workspace = self.workspace.clone();
+        cx.defer(move |cx| {
+            let panel = workspace
+                .upgrade()
+                .and_then(|workspace| workspace.read(cx).panel::<WorkspacePanel>(cx));
+            if let Some(panel) = panel {
+                panel.update(cx, |_, cx| cx.notify());
+            }
+        });
     }
 
     fn send_to_agent(&mut self, _: &Send, window: &mut Window, cx: &mut Context<Self>) {
@@ -2086,17 +2422,20 @@ impl WorkspaceView {
                                     this.restart_chat(record_id.clone(), window, cx);
                                 })),
                         )
-                        .child(
-                            Button::new(
-                                "chat-open-cli-instead",
-                                format!("Open {} CLI instead", agent.label()),
+                        .when_some(agent.cli_fallback(), |el, cli| {
+                            el.child(
+                                Button::new(
+                                    "chat-open-cli-instead",
+                                    format!("Open {} CLI instead", agent.label()),
+                                )
+                                .label_size(LabelSize::Small)
+                                .on_click(cx.listener(
+                                    move |this, _, window, cx| {
+                                        this.add_session(cli, window, cx);
+                                    },
+                                )),
                             )
-                            .label_size(LabelSize::Small)
-                            .on_click(cx.listener(move |this, _, window, cx| match agent {
-                                ChatAgent::Claude => this.add_claude_terminal(window, cx),
-                                ChatAgent::Codex => this.add_codex_terminal(window, cx),
-                            })),
-                        ),
+                        }),
                 )
             })
             .child(div().flex_grow(1.0).min_h(px(0.)).child(chat.view.clone()))
@@ -2404,14 +2743,17 @@ impl WorkspaceView {
                     .menu(move |window, cx| {
                         let this = this.clone();
                         Some(ContextMenu::build(window, cx, move |menu, _, _| {
-                            let entries: [(&str, NewSession); 5] = [
-                                ("Claude chat", NewSession::Chat(ChatAgent::Claude)),
-                                ("Codex chat", NewSession::Chat(ChatAgent::Codex)),
+                            let chats = ChatAgent::ALL.into_iter().map(|agent| {
+                                (format!("{} chat", agent.label()), NewSession::Chat(agent))
+                            });
+                            let terminals = [
                                 ("Claude CLI", NewSession::ClaudeCli),
                                 ("Codex CLI", NewSession::CodexCli),
                                 ("Shell", NewSession::Shell),
-                            ];
-                            entries.into_iter().fold(menu, |menu, (label, kind)| {
+                            ]
+                            .into_iter()
+                            .map(|(label, kind)| (label.to_string(), kind));
+                            chats.chain(terminals).fold(menu, |menu, (label, kind)| {
                                 let this = this.clone();
                                 menu.entry(label, None, move |window, cx| {
                                     this.update(cx, |this, cx| this.add_session(kind, window, cx))
@@ -2566,6 +2908,18 @@ impl WorkspaceHost {
             });
 
             let view = cx.new(|cx| WorkspaceView {
+                _window_activation: cx.observe_window_activation(
+                    window,
+                    |view: &mut WorkspaceView, window, cx| {
+                        view.window_activation_changed(window, cx);
+                    },
+                ),
+                window_handle: window.window_handle(),
+                window_active: window.is_window_active(),
+                last_cli_activity: None,
+                cli_quiet_reported: false,
+                notification_windows: Vec::new(),
+                notification_subscriptions: Vec::new(),
                 workspace_id: summary.id.clone(),
                 workspace_name: SharedString::from(summary.name.clone()),
                 worktree_path,
@@ -2622,7 +2976,10 @@ impl WorkspaceHost {
 
         self.active = Some(summary.id.clone());
         if let Some(view) = self.views.get(&summary.id) {
-            view.update(cx, |view, cx| view.load_run_config(cx));
+            view.update(cx, |view, cx| {
+                view.load_run_config(cx);
+                view.mark_seen(cx);
+            });
             let focus_handle = view.focus_handle(cx);
             window.focus(&focus_handle, cx);
         }
@@ -2681,6 +3038,31 @@ impl WorkspaceHost {
                 return;
             }
         }
+    }
+
+    /// Runs teardown commands in the given workspace's view, which must
+    /// already be open in this window. Returns None when it isn't.
+    pub(crate) fn run_teardown_for_workspace(
+        workspace: &mut Workspace,
+        workspace_id: &str,
+        root: PathBuf,
+        plans: Vec<RunCommandPlan>,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
+    ) -> Option<gpui::Task<()>> {
+        for pane in workspace.panes().to_vec() {
+            let host = pane
+                .read(cx)
+                .items()
+                .find_map(|item| item.downcast::<WorkspaceHost>());
+            if let Some(host) = host {
+                let view = host.read(cx).views.get(workspace_id).cloned()?;
+                return Some(view.update(cx, |view, cx| {
+                    view.run_teardown_commands(root, plans, window, cx)
+                }));
+            }
+        }
+        None
     }
 
     /// Opens (or refocuses) the review claude session for the given

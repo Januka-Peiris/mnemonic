@@ -52,7 +52,7 @@ pub(crate) struct RawMnemonicWorkspaceConfig {
     pub setup: Vec<String>,
     #[serde(default)]
     pub run: Vec<String>,
-    #[serde(default)]
+    #[serde(default, alias = "archive")]
     pub teardown: Vec<String>,
     #[serde(default)]
     pub hooks: RawMnemonicWorkspaceHooks,

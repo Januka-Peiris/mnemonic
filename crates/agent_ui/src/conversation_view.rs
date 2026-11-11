@@ -556,6 +556,9 @@ pub struct ConversationView {
     focus_handle: FocusHandle,
     notifications: Vec<WindowHandle<AgentNotification>>,
     notification_subscriptions: HashMap<WindowHandle<AgentNotification>, Vec<Subscription>>,
+    /// Set by hosts outside the agent panel that raise their own
+    /// notifications; this view's pop-ups would open the agent panel instead.
+    notifications_suppressed: bool,
     auth_task: Option<Task<()>>,
     loading_status: Option<SharedString>,
     /// When settings change, use this to see if the theme has changed (which
@@ -616,6 +619,10 @@ impl ConversationView {
     pub fn root_thread(&self, cx: &App) -> Option<Entity<AcpThread>> {
         self.root_thread_view()
             .map(|view| view.read(cx).thread.clone())
+    }
+
+    pub fn suppress_notifications(&mut self) {
+        self.notifications_suppressed = true;
     }
 
     pub fn has_load_error(&self) -> bool {
@@ -834,6 +841,7 @@ impl ConversationView {
             ),
             notifications: Vec::new(),
             notification_subscriptions: HashMap::default(),
+            notifications_suppressed: false,
             auth_task: None,
             loading_status: None,
             last_theme_id: Some(cx.theme().id.clone()),
@@ -2676,7 +2684,7 @@ impl ConversationView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if !self.notifications.is_empty() {
+        if self.notifications_suppressed || !self.notifications.is_empty() {
             return;
         }
 
