@@ -320,6 +320,7 @@ impl Render for TitleBar {
                                 )
                         })
                 })
+                .children(self.render_pr_state(cx))
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                 .into_any_element(),
         );
@@ -429,6 +430,43 @@ impl Render for TitleBar {
 }
 
 impl TitleBar {
+    /// The selected Mnemonic workspace's PR, coloured by its GitHub state.
+    fn render_pr_state(&self, cx: &App) -> Option<AnyElement> {
+        let workspace_id = cx
+            .try_global::<mnemonic_bridge::ActiveWorkspace>()?
+            .0
+            .clone()?;
+        let state = mnemonic_bridge::pr_state(&workspace_id)?;
+        let color = mnemonic_bridge::pr_state_color(&state, cx)?;
+        let label = mnemonic_bridge::pr_state_label(&state);
+        let text = match mnemonic_bridge::pr_number(&workspace_id) {
+            Some(number) => format!("#{number} {label}"),
+            None => label.to_string(),
+        };
+        Some(
+            h_flex()
+                .ml_1()
+                .h(px(20.))
+                .px_1p5()
+                .gap_1()
+                .rounded_sm()
+                .bg(color.opacity(0.2))
+                .border_1()
+                .border_color(color.opacity(0.5))
+                .child(
+                    Icon::new(IconName::PullRequest)
+                        .size(IconSize::XSmall)
+                        .color(Color::Custom(color)),
+                )
+                .child(
+                    Label::new(text)
+                        .size(LabelSize::Small)
+                        .color(Color::Custom(color)),
+                )
+                .into_any_element(),
+        )
+    }
+
     pub fn new(
         id: impl Into<ElementId>,
         workspace: &Workspace,

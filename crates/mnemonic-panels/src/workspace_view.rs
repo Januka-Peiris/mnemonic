@@ -2802,7 +2802,9 @@ impl WorkspaceView {
         if !self.auto_fix_enabled {
             return false;
         }
-        mnemonic_bridge::record_pr_status(&self.workspace_id, status);
+        if mnemonic_bridge::record_pr_status(&self.workspace_id, status) {
+            cx.refresh_windows();
+        }
         if !status.found {
             self.auto_fix_state = SharedString::from("waiting for a PR");
             cx.notify();

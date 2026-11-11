@@ -414,7 +414,9 @@ impl WorkspaceDetailPanel {
                 this.pr_busy = false;
                 match result {
                     Ok(status) => {
-                        mnemonic_bridge::record_pr_status(&workspace_id_for_record, &status);
+                        if mnemonic_bridge::record_pr_status(&workspace_id_for_record, &status) {
+                            cx.refresh_windows();
+                        }
                         // A status fetched for a workspace the user has since
                         // switched away from must not drive this panel's Merge.
                         if this.current_workspace_id() == Some(workspace_id_for_record.as_str()) {
@@ -1054,9 +1056,41 @@ impl WorkspaceDetailPanel {
         (format!("{number} Open"), TintColor::Warning)
     }
 
-    fn render_pr_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_pr_button(&self, cx: &mut Context<Self>) -> AnyElement {
         let busy = self.pr_busy;
         match self.pr_status.as_ref().filter(|status| status.found) {
+            Some(status) if status.state.as_deref() == Some("MERGED") => {
+                let (label, _) = Self::pr_button_appearance(status);
+                let url = status.url.clone();
+                let color = mnemonic_bridge::pr_state_color("merged", cx)
+                    .unwrap_or(cx.theme().status().info);
+                h_flex()
+                    .id("pr-state-merged")
+                    .h(px(22.))
+                    .px_2()
+                    .gap_1()
+                    .rounded_sm()
+                    .cursor_pointer()
+                    .bg(color.opacity(0.25))
+                    .border_1()
+                    .border_color(color.opacity(0.6))
+                    .child(
+                        Icon::new(IconName::PullRequest)
+                            .size(IconSize::XSmall)
+                            .color(Color::Custom(color)),
+                    )
+                    .child(
+                        Label::new(label)
+                            .size(LabelSize::Small)
+                            .color(Color::Custom(color)),
+                    )
+                    .on_click(move |_, _, cx| {
+                        if let Some(url) = url.as_deref() {
+                            cx.open_url(url);
+                        }
+                    })
+                    .into_any_element()
+            }
             Some(status) => {
                 let (label, tint) = Self::pr_button_appearance(status);
                 let url = status.url.clone();
@@ -1069,6 +1103,7 @@ impl WorkspaceDetailPanel {
                             cx.open_url(url);
                         }
                     }))
+                    .into_any_element()
             }
             None => {
                 let keep_ci_green = WorkspacesSettings::get_global(cx).keep_ci_green;
@@ -1085,6 +1120,7 @@ impl WorkspaceDetailPanel {
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.create_pr_per_settings(cx);
                     }))
+                    .into_any_element()
             }
         }
     }
@@ -1118,6 +1154,8 @@ impl WorkspaceDetailPanel {
 
     fn render_header(&self, ws: &WorkspaceSummary, cx: &mut Context<Self>) -> impl IntoElement {
         let status_color = self.status_color(&ws.status, cx);
+        let pr_color = mnemonic_bridge::pr_state(&ws.id)
+            .and_then(|state| mnemonic_bridge::pr_state_color(&state, cx));
         let ahead = ws.branch_health.ahead_by;
         let behind = self
             .change_scope
@@ -1130,6 +1168,9 @@ impl WorkspaceDetailPanel {
             .gap_1()
             .border_b_1()
             .border_color(cx.theme().colors().border)
+            .when_some(pr_color, |el, color| {
+                el.bg(color.opacity(0.12)).border_color(color.opacity(0.5))
+            })
             .child(
                 h_flex()
                     .gap_1p5()

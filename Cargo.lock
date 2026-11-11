@@ -11336,6 +11336,7 @@ dependencies = [
  "mnemonic-core",
  "paths",
  "serde_json",
+ "theme",
 ]
 
 [[package]]

@@ -47,12 +47,13 @@ impl Render for DragGhostView {
 
 const PROJECT_ORDER_KEY: &str = "panel_project_order";
 const HIDDEN_PROJECTS_KEY: &str = "panel_hidden_projects";
+const PR_STATUS_POLL_INTERVAL: Duration = Duration::from_secs(120);
 const PROJECT_BASE_BRANCH_KEY: &str = "base_branch";
 const PROJECT_SETUP_SCRIPT_KEY: &str = "setup_script";
 const PROJECT_INIT_FILES_KEY: &str = "workspace_init_files";
 const WORKSPACE_ORDER_KEY: &str = "panel_workspace_order";
 use mnemonic_core::services::{
-    environment_service, repo_scanner_service, workspace_port_service, workspace_script_service,
+    environment_service, pr_draft_service, repo_scanner_service, workspace_port_service, workspace_script_service,
     workspace_service,
 };
 use settings::Settings as _;
@@ -135,6 +136,56 @@ impl WorkspacePanel {
             };
             panel.refresh(cx);
             panel
+        });
+
+        // Keeps every workspace's PR state current, not only the selected
+        // one's, so a merge on GitHub shows in the list without opening it.
+        panel.update(cx, |_, cx| {
+            cx.spawn(async move |this, cx| {
+                loop {
+                    let Ok(workspace_ids) = this.read_with(cx, |this, _| {
+                        this.workspaces
+                            .iter()
+                            .map(|workspace| workspace.id.clone())
+                            .collect::<Vec<_>>()
+                    }) else {
+                        break;
+                    };
+                    let changed = match mnemonic_bridge::mnemonic_state_cloned() {
+                        Some(state) => {
+                            cx.background_spawn(async move {
+                                let mut changed = false;
+                                for workspace_id in workspace_ids {
+                                    match pr_draft_service::get_workspace_pr_status(
+                                        &state,
+                                        &workspace_id,
+                                    ) {
+                                        Ok(status) => {
+                                            changed |= mnemonic_bridge::record_pr_status(
+                                                &workspace_id,
+                                                &status,
+                                            );
+                                        }
+                                        Err(err) => log::debug!(
+                                            "PR status for {workspace_id} unavailable: {err}"
+                                        ),
+                                    }
+                                }
+                                changed
+                            })
+                            .await
+                        }
+                        None => false,
+                    };
+                    if changed {
+                        cx.update(|cx| cx.refresh_windows());
+                    }
+                    cx.background_executor()
+                        .timer(PR_STATUS_POLL_INTERVAL)
+                        .await;
+                }
+            })
+            .detach();
         });
 
         // Periodic repaint so the attention dots track live agent activity.
@@ -1614,6 +1665,11 @@ impl WorkspacePanel {
             (!linked_names.is_empty()).then(|| format!("Linked to {}", linked_names.join(", ")));
 
         let row_group = SharedString::from(format!("workspace-row-{}", ws.id));
+        let pr_state = mnemonic_bridge::pr_state(&ws.id);
+        let pr_color = pr_state
+            .as_deref()
+            .and_then(|state| mnemonic_bridge::pr_state_color(state, cx));
+        let merged_color = pr_color.filter(|_| pr_state.as_deref() == Some("merged"));
         let row = h_flex()
             .id(SharedString::from(ws.id.clone()))
             .group(row_group.clone())
@@ -1625,6 +1681,7 @@ impl WorkspacePanel {
             .w_full()
             .cursor_pointer()
             .rounded_md()
+            .when_some(merged_color, |el, color| el.bg(color.opacity(0.12)))
             .when(is_selected, |el| {
                 el.bg(cx.theme().colors().ghost_element_selected)
             })
@@ -1656,24 +1713,29 @@ impl WorkspacePanel {
             }))
             .child(self.render_agent_indicator(&ws.id, cx))
             .child({
-                // Git icon colored by PR state: amber=open, green=ready to
-                // merge, red=conflicts/failed checks, accent=merged.
-                let icon_color = match mnemonic_bridge::pr_state(&ws.id).as_deref() {
-                    Some("merged") => Color::Accent,
-                    Some("ready") => Color::Success,
-                    Some("conflicts") | Some("failed") => Color::Error,
-                    Some("open") => Color::Warning,
-                    _ => {
-                        if is_selected {
-                            Color::Default
-                        } else {
-                            Color::Muted
-                        }
-                    }
+                let icon_color = match pr_color {
+                    Some(color) => Color::Custom(color),
+                    None if is_selected => Color::Default,
+                    None => Color::Muted,
                 };
-                Icon::new(IconName::FileGit)
-                    .size(IconSize::XSmall)
-                    .color(icon_color)
+                let icon = div()
+                    .id(SharedString::from(format!("pr-state-{}", ws.id)))
+                    .child(
+                        Icon::new(IconName::FileGit)
+                            .size(IconSize::XSmall)
+                            .color(icon_color),
+                    );
+                match pr_state.as_deref() {
+                    Some(state) => {
+                        let label = mnemonic_bridge::pr_state_label(state);
+                        let tooltip = match mnemonic_bridge::pr_number(&ws.id) {
+                            Some(number) => format!("PR #{number}: {label}"),
+                            None => format!("PR: {label}"),
+                        };
+                        icon.tooltip(Tooltip::text(tooltip))
+                    }
+                    None => icon,
+                }
             })
             .child(
                 div().flex_grow(1.0).overflow_hidden().child(
