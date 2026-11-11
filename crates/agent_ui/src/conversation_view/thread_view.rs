@@ -18,6 +18,8 @@ use crate::completion_provider::AvailableSkill;
 use crate::message_editor::SharedSessionCapabilities;
 
 use db::kvp::KeyValueStore;
+use gpui::DragMoveEvent;
+use gpui::Global;
 use gpui::List;
 use gpui::Stateful;
 use gpui::TaskExt;
@@ -584,11 +586,17 @@ pub struct ThreadView {
     /// Tracks which context compaction entries (by entry index) have their
     /// summary expanded.
     expanded_compactions: HashSet<usize>,
+    /// Finished turns whose folded work (tool calls and interim messages) the
+    /// user has opened, keyed by the index of the turn's first entry.
+    expanded_turns: HashSet<usize>,
     pub subagent_scroll_handles: RefCell<HashMap<acp::SessionId, ScrollHandle>>,
     pub edits_expanded: bool,
     pub plan_expanded: bool,
     pub queue_expanded: bool,
     pub editor_expanded: bool,
+    /// The height the message editor was dragged to, if any. Without one it
+    /// grows with its text.
+    editor_height: Option<Pixels>,
     pub should_be_following: bool,
     pub editing_message: Option<usize>,
     pub local_queued_messages: Vec<QueuedMessage>,
@@ -988,11 +996,15 @@ impl ThreadView {
             auto_expanded_thinking_block: None,
             user_toggled_thinking_blocks: HashSet::default(),
             expanded_compactions: HashSet::default(),
+            expanded_turns: HashSet::default(),
             subagent_scroll_handles: RefCell::new(HashMap::default()),
             edits_expanded: false,
             plan_expanded: false,
             queue_expanded: true,
             editor_expanded: false,
+            editor_height: cx
+                .try_global::<MessageEditorHeight>()
+                .and_then(|height| height.0),
             should_be_following: false,
             editing_message: None,
             local_queued_messages: Vec::new(),
@@ -2219,28 +2231,45 @@ impl ThreadView {
 
     pub fn set_editor_is_expanded(&mut self, is_expanded: bool, cx: &mut Context<Self>) {
         self.editor_expanded = is_expanded;
-        self.message_editor.update(cx, |editor, cx| {
-            if is_expanded {
-                editor.set_mode(
-                    EditorMode::Full {
-                        scale_ui_elements_with_buffer_font_size: false,
-                        show_active_line_background: false,
-                        sizing_behavior: SizingBehavior::ExcludeOverscrollMargin,
-                    },
-                    cx,
-                )
-            } else {
-                let agent_settings = AgentSettings::get_global(cx);
-                editor.set_mode(
-                    EditorMode::AutoHeight {
-                        min_lines: agent_settings.message_editor_min_lines,
-                        max_lines: Some(agent_settings.set_message_editor_max_lines()),
-                    },
-                    cx,
-                )
-            }
-        });
+        self.update_message_editor_mode(cx);
         cx.notify();
+    }
+
+    /// Sets the height the message editor was dragged to, or clears it so
+    /// the editor grows with its text again. New threads start at it too.
+    fn set_editor_height(&mut self, height: Option<Pixels>, cx: &mut Context<Self>) {
+        self.editor_height = height;
+        cx.set_global(MessageEditorHeight(height));
+        self.update_message_editor_mode(cx);
+        cx.notify();
+    }
+
+    /// The message editor grows with its text, unless it has a container to
+    /// fill: an empty thread, the expanded state, or a dragged height.
+    fn update_message_editor_mode(&mut self, cx: &mut Context<Self>) {
+        let has_messages = self.list_state.item_count() > 0;
+        let mode = if !has_messages {
+            EditorMode::Full {
+                scale_ui_elements_with_buffer_font_size: false,
+                show_active_line_background: false,
+                sizing_behavior: SizingBehavior::Default,
+            }
+        } else if self.editor_expanded || self.editor_height.is_some() {
+            EditorMode::Full {
+                scale_ui_elements_with_buffer_font_size: false,
+                show_active_line_background: false,
+                sizing_behavior: SizingBehavior::ExcludeOverscrollMargin,
+            }
+        } else {
+            let agent_settings = AgentSettings::get_global(cx);
+            EditorMode::AutoHeight {
+                min_lines: agent_settings.message_editor_min_lines,
+                max_lines: Some(agent_settings.set_message_editor_max_lines()),
+            }
+        };
+        self.message_editor.update(cx, |editor, cx| {
+            editor.set_mode(mode, cx);
+        });
     }
 
     pub fn handle_title_editor_event(
@@ -4070,9 +4099,14 @@ impl ThreadView {
 
         let max_content_width = AgentSettings::get_global(cx).max_content_width;
         let has_messages = self.list_state.item_count() > 0;
-        let fills_container = !has_messages || editor_expanded;
+        // Expanding wins over a dragged height, which comes back on minimize.
+        let dragged_height = self
+            .editor_height
+            .filter(|_| has_messages && !editor_expanded);
+        let fills_container = !has_messages || editor_expanded || dragged_height.is_some();
 
         h_flex()
+            .relative()
             .p_2()
             .bg(editor_bg_color)
             .justify_center()
@@ -4080,12 +4114,33 @@ impl ThreadView {
             .map(|this| {
                 if has_messages {
                     this.on_action(cx.listener(Self::expand_message_editor))
-                        .border_t_1()
-                        .border_color(cx.theme().colors().border)
                         .when(editor_expanded, |this| this.h(vh(0.8, window)))
+                        .when_some(dragged_height, |this, height| this.h(height))
                 } else {
                     this.flex_1().size_full()
                 }
+            })
+            .when(has_messages && !editor_expanded, |this| {
+                this.child(
+                    div()
+                        .id("message-editor-resize-handle")
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .right_0()
+                        .h(px(5.))
+                        .cursor_row_resize()
+                        .hover(|style| style.bg(cx.theme().colors().border_focused))
+                        .on_drag(MessageEditorDrag, |_, _, _, cx| {
+                            cx.stop_propagation();
+                            cx.new(|_| MessageEditorDrag)
+                        })
+                        .on_click(cx.listener(|this, event: &ClickEvent, _, cx| {
+                            if event.click_count() == 2 {
+                                this.set_editor_height(None, cx);
+                            }
+                        })),
+                )
             })
             .child(
                 v_flex()
@@ -4096,6 +4151,14 @@ impl ThreadView {
                     .flex_grow_0()
                     .justify_between()
                     .gap_2()
+                    // With a thread above it the editor is a card of its own,
+                    // rather than a band across the bottom of the view.
+                    .when(has_messages, |this| {
+                        this.p_2()
+                            .rounded_lg()
+                            .border_1()
+                            .border_color(cx.theme().colors().border)
+                    })
                     .child(
                         v_flex()
                             .relative()
@@ -5480,7 +5543,32 @@ impl ThreadView {
             cx.processor(move |this, index: usize, window, cx| {
                 let entries = this.thread.read(cx).entries();
                 if let Some(entry) = entries.get(index) {
-                    let rendered = this.render_entry(index, entries.len(), entry, window, cx);
+                    let rendered = match this.turn_fold(index, entries, cx) {
+                        TurnFold::Hidden => return Empty.into_any(),
+                        TurnFold::Visible => {
+                            this.render_entry(index, entries.len(), entry, window, cx)
+                        }
+                        TurnFold::Summary {
+                            turn_start,
+                            tool_calls,
+                            messages,
+                            expanded,
+                        } => v_flex()
+                            .w_full()
+                            .child(Self::render_turn_summary(
+                                turn_start, tool_calls, messages, expanded, cx,
+                            ))
+                            .when(expanded, |this_element| {
+                                this_element.child(this.render_entry(
+                                    index,
+                                    entries.len(),
+                                    entry,
+                                    window,
+                                    cx,
+                                ))
+                            })
+                            .into_any_element(),
+                    };
                     centered_container(rendered.into_any_element()).into_any_element()
                 } else if this.generating_indicator_in_list {
                     let confirmation = entries
@@ -5495,6 +5583,136 @@ impl ThreadView {
         )
         .with_sizing_behavior(gpui::ListSizingBehavior::Auto)
         .flex_grow_1()
+    }
+
+    /// How a finished turn's work is folded. Once a turn has produced its
+    /// answer, the tool calls and interim messages that led to it collapse
+    /// into one summary row, so the thread reads as question and answer.
+    fn turn_fold(&self, entry_ix: usize, entries: &[AgentThreadEntry], cx: &App) -> TurnFold {
+        let is_work = |entry: &AgentThreadEntry| {
+            matches!(
+                entry,
+                AgentThreadEntry::ToolCall(_) | AgentThreadEntry::AssistantMessage(_)
+            )
+        };
+        let Some(entry) = entries.get(entry_ix) else {
+            return TurnFold::Visible;
+        };
+        if !is_work(entry) {
+            return TurnFold::Visible;
+        }
+
+        let turn_start = entries[..entry_ix]
+            .iter()
+            .rposition(|entry| matches!(entry, AgentThreadEntry::UserMessage(_)))
+            .unwrap_or(0);
+        let turn_end = entries[entry_ix..]
+            .iter()
+            .position(|entry| matches!(entry, AgentThreadEntry::UserMessage(_)))
+            .map_or(entries.len(), |offset| entry_ix + offset);
+
+        // The turn still running stays open so its progress can be followed.
+        let is_last_turn = turn_end == entries.len();
+        if is_last_turn && self.thread.read(cx).status() != ThreadStatus::Idle {
+            return TurnFold::Visible;
+        }
+
+        let has_text = |entry: &AgentThreadEntry| match entry {
+            AgentThreadEntry::AssistantMessage(message) => {
+                message.chunks.iter().any(|chunk| match chunk {
+                    AssistantMessageChunk::Message { block } => block
+                        .markdown()
+                        .is_some_and(|markdown| !markdown.read(cx).source().trim().is_empty()),
+                    AssistantMessageChunk::Thought { .. } => false,
+                })
+            }
+            _ => false,
+        };
+        let turn = &entries[turn_start..turn_end];
+        let Some(answer) = turn
+            .iter()
+            .rposition(has_text)
+            .map(|offset| turn_start + offset)
+        else {
+            return TurnFold::Visible;
+        };
+        if entry_ix >= answer {
+            return TurnFold::Visible;
+        }
+
+        let work = &entries[turn_start..answer];
+        let work_count = work.iter().filter(|entry| is_work(entry)).count();
+        if work_count < MIN_FOLDED_TURN_ENTRIES {
+            return TurnFold::Visible;
+        }
+
+        let expanded = self.expanded_turns.contains(&turn_start);
+        let is_first_work_entry = !entries[turn_start..entry_ix].iter().any(is_work);
+        if is_first_work_entry {
+            TurnFold::Summary {
+                turn_start,
+                tool_calls: work
+                    .iter()
+                    .filter(|entry| matches!(entry, AgentThreadEntry::ToolCall(_)))
+                    .count(),
+                messages: work.iter().filter(|entry| has_text(entry)).count(),
+                expanded,
+            }
+        } else if expanded {
+            TurnFold::Visible
+        } else {
+            TurnFold::Hidden
+        }
+    }
+
+    fn render_turn_summary(
+        turn_start: usize,
+        tool_calls: usize,
+        messages: usize,
+        expanded: bool,
+        cx: &Context<Self>,
+    ) -> impl IntoElement {
+        let plural = |count: usize, noun: &str| {
+            if count == 1 {
+                format!("{count} {noun}")
+            } else {
+                format!("{count} {noun}s")
+            }
+        };
+        let mut parts = Vec::new();
+        if tool_calls > 0 {
+            parts.push(plural(tool_calls, "tool call"));
+        }
+        if messages > 0 {
+            parts.push(plural(messages, "message"));
+        }
+
+        h_flex()
+            .id(("turn-summary", turn_start))
+            .mx_5()
+            .my_1()
+            .gap_1()
+            .cursor_pointer()
+            .child(
+                Icon::new(if expanded {
+                    IconName::ChevronDown
+                } else {
+                    IconName::ChevronRight
+                })
+                .size(IconSize::XSmall)
+                .color(Color::Muted),
+            )
+            .child(
+                Label::new(parts.join(", "))
+                    .size(LabelSize::Small)
+                    .color(Color::Muted),
+            )
+            .on_click(cx.listener(move |this, _, _, cx| {
+                if !this.expanded_turns.remove(&turn_start) {
+                    this.expanded_turns.insert(turn_start);
+                }
+                cx.notify();
+            }))
     }
 
     fn render_entry(
@@ -6333,24 +6551,7 @@ impl ThreadView {
     }
 
     pub(crate) fn sync_editor_mode_for_empty_state(&mut self, cx: &mut Context<Self>) {
-        let has_messages = self.list_state.item_count() > 0;
-        let v2_empty_state = !has_messages;
-
-        let mode = if v2_empty_state {
-            EditorMode::Full {
-                scale_ui_elements_with_buffer_font_size: false,
-                show_active_line_background: false,
-                sizing_behavior: SizingBehavior::Default,
-            }
-        } else {
-            EditorMode::AutoHeight {
-                min_lines: AgentSettings::get_global(cx).message_editor_min_lines,
-                max_lines: Some(AgentSettings::get_global(cx).set_message_editor_max_lines()),
-            }
-        };
-        self.message_editor.update(cx, |editor, cx| {
-            editor.set_mode(mode, cx);
-        });
+        self.update_message_editor_mode(cx);
     }
 
     /// Ensures the list item count includes (or excludes) an extra item for the generating indicator
@@ -10734,6 +10935,39 @@ impl ThreadView {
     }
 }
 
+/// A turn folds only when that hides more than the summary row adds.
+const MIN_FOLDED_TURN_ENTRIES: usize = 2;
+
+enum TurnFold {
+    Visible,
+    /// The first folded entry, which carries the turn's summary row.
+    Summary {
+        turn_start: usize,
+        tool_calls: usize,
+        messages: usize,
+        expanded: bool,
+    },
+    Hidden,
+}
+
+/// Room for the toolbar row and a couple of lines of text.
+const MIN_DRAGGED_EDITOR_HEIGHT: Pixels = px(96.);
+
+/// The height the message editor was last dragged to, shared so a new thread
+/// starts at the height the previous one was left at.
+struct MessageEditorHeight(Option<Pixels>);
+
+impl Global for MessageEditorHeight {}
+
+/// Drag payload for the message editor's resize handle.
+struct MessageEditorDrag;
+
+impl Render for MessageEditorDrag {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        Empty
+    }
+}
+
 impl Render for ThreadView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let has_messages = self.list_state.item_count() > 0;
@@ -10959,6 +11193,19 @@ impl Render for ThreadView {
                 }
             }))
             .size_full()
+            .on_drag_move(cx.listener(
+                |this, event: &DragMoveEvent<MessageEditorDrag>, _window, cx| {
+                    // The message editor is the last thing in this view, so
+                    // its height is the distance from the cursor to the bottom.
+                    let height = event.bounds.bottom() - event.event.position.y;
+                    let max_height =
+                        (event.bounds.size.height * 0.8).max(MIN_DRAGGED_EDITOR_HEIGHT);
+                    this.set_editor_height(
+                        Some(height.clamp(MIN_DRAGGED_EDITOR_HEIGHT, max_height)),
+                        cx,
+                    );
+                },
+            ))
             .children(self.render_subagent_titlebar(cx))
             .child(conversation)
             .children(self.render_multi_root_callout(cx))
