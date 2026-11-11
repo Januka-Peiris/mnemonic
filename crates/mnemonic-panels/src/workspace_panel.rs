@@ -4,9 +4,9 @@ use std::time::Duration;
 
 use editor::Editor;
 use gpui::{
-    Action, AnyElement, App, AppContext as _, Context, DismissEvent, Entity, EventEmitter,
-    FocusHandle, Focusable, IntoElement, PathPromptOptions, Pixels, PromptLevel, Render,
-    SharedString, WeakEntity, Window, actions, px,
+    Action, AnyElement, App, AppContext as _, ClipboardItem, Context, DismissEvent, Entity,
+    EventEmitter, FocusHandle, Focusable, IntoElement, PathPromptOptions, Pixels, PromptLevel,
+    Render, SharedString, WeakEntity, Window, actions, px,
 };
 use mnemonic_bridge::AgentAttention;
 use mnemonic_core::models::{
@@ -50,7 +50,8 @@ use mnemonic_core::services::{
     workspace_service,
 };
 use ui::{
-    CommonAnimationExt as _, Icon, IconButton, IconName, Label, Tooltip, h_flex, prelude::*, v_flex,
+    CommonAnimationExt as _, ContextMenu, Icon, IconButton, IconName, Label, Tooltip, h_flex,
+    prelude::*, right_click_menu, v_flex,
 };
 use util::ResultExt as _;
 use workspace::dock::{DockPosition, PanelEvent};
@@ -59,7 +60,16 @@ use workspace::{ModalView, Panel, Toast, Workspace};
 
 use crate::workspace_view::WorkspaceHost;
 
-actions!(mnemonic_workspace_panel, [ToggleFocus]);
+actions!(
+    mnemonic_workspace_panel,
+    [
+        ToggleFocus,
+        /// Switch to the next workspace in the Projects panel.
+        SelectNextWorkspace,
+        /// Switch to the previous workspace in the Projects panel.
+        SelectPreviousWorkspace
+    ]
+);
 
 /// Marker for archive toasts.
 struct MnemonicArchiveToast;
@@ -305,6 +315,39 @@ impl WorkspacePanel {
                 WorkspaceHost::activate_workspace(workspace, &summary, window, cx);
                 Self::point_project_at_worktree(workspace, &summary, cx);
             });
+        }
+    }
+
+    /// Selects the workspace after or before the selected one, in the order
+    /// the panel lists them, wrapping around. Collapsed projects are skipped.
+    pub fn select_adjacent_workspace(
+        &mut self,
+        forward: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let visible_ids: Vec<String> = self
+            .grouped_workspaces()
+            .into_iter()
+            .filter(|(project, _)| !self.collapsed_projects.contains(project))
+            .flat_map(|(_, workspaces)| workspaces)
+            .map(|workspace| workspace.id.clone())
+            .collect();
+        if visible_ids.is_empty() {
+            return;
+        }
+        let selected = self
+            .selected_workspace_id
+            .as_ref()
+            .and_then(|selected| visible_ids.iter().position(|id| id == selected));
+        let next = match (selected, forward) {
+            (Some(index), true) => (index + 1) % visible_ids.len(),
+            (Some(index), false) => (index + visible_ids.len() - 1) % visible_ids.len(),
+            (None, true) => 0,
+            (None, false) => visible_ids.len() - 1,
+        };
+        if let Some(id) = visible_ids.get(next) {
+            self.select_workspace(id.clone(), window, cx);
         }
     }
 
@@ -994,8 +1037,18 @@ impl WorkspacePanel {
         };
         let drop_target_id = ws.id.clone();
         let drop_target_project = project.to_string();
+        let menu_id = SharedString::from(format!("workspace-menu-{}", ws.id));
+        let menu_workspace_id = ws.id.clone();
+        let menu_workspace_name = ws.name.clone();
+        let menu_branch = ws.branch.clone();
+        let menu_path = ws
+            .workspace_root_path
+            .clone()
+            .or_else(|| ws.repository_path.clone())
+            .or_else(|| ws.selected_worktree_path.clone());
+        let this = cx.weak_entity();
 
-        h_flex()
+        let row = h_flex()
             .id(SharedString::from(ws.id.clone()))
             .pl(px(28.))
             .pr_2()
@@ -1080,7 +1133,44 @@ impl WorkspacePanel {
                         cx,
                     );
                 })),
-            )
+            );
+
+        right_click_menu(menu_id)
+            .trigger(move |_, _, _| row)
+            .menu(move |window, cx| {
+                let this = this.clone();
+                let workspace_id = menu_workspace_id.clone();
+                let workspace_name = menu_workspace_name.clone();
+                let branch = menu_branch.clone();
+                let path = menu_path.clone();
+                ContextMenu::build(window, cx, move |mut menu, _, _| {
+                    if let Some(path) = path {
+                        menu = menu
+                            .entry("Reveal in Finder", None, {
+                                let path = path.clone();
+                                move |_, cx| cx.reveal_path(std::path::Path::new(&path))
+                            })
+                            .entry("Copy Path", None, move |_, cx| {
+                                cx.write_to_clipboard(ClipboardItem::new_string(path.clone()));
+                            });
+                    }
+                    menu.entry("Copy Branch Name", None, move |_, cx| {
+                        cx.write_to_clipboard(ClipboardItem::new_string(branch.clone()));
+                    })
+                    .separator()
+                    .entry("Archive…", None, move |window, cx| {
+                        this.update(cx, |this, cx| {
+                            this.confirm_archive(
+                                workspace_id.clone(),
+                                workspace_name.clone(),
+                                window,
+                                cx,
+                            );
+                        })
+                        .log_err();
+                    })
+                })
+            })
     }
 
     /// Error (red) and needs-attention (accent) alerts stay until the

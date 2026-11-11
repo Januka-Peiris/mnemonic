@@ -1,5 +1,7 @@
+use std::any::Any;
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use agent_client_protocol::schema as acp;
@@ -11,9 +13,9 @@ use agent_ui::{
 use editor::Editor;
 use futures::future::Either;
 use gpui::{
-    Anchor, AnyWindowHandle, App, AppContext as _, Context, DragMoveEvent, Empty, Entity, EntityId,
-    EventEmitter, FocusHandle, Focusable, IntoElement, Pixels, Render, SharedString, Subscription,
-    WeakEntity, Window, WindowHandle, actions, px,
+    Action as _, Anchor, AnyWindowHandle, App, AppContext as _, Context, DragMoveEvent, Empty,
+    Entity, EntityId, EventEmitter, ExternalPaths, FocusHandle, Focusable, IntoElement, Pixels,
+    Render, SharedString, Subscription, WeakEntity, Window, WindowHandle, actions, px,
 };
 use mnemonic_bridge::AgentAttention;
 use mnemonic_core::models::{ChatSessionRecord, WorkspaceSummary};
@@ -22,6 +24,7 @@ use mnemonic_core::services::workspace_script_service::RunCommandPlan;
 use mnemonic_core::services::{
     checkpoint_service, terminal_service, workspace_script_service, workspace_service,
 };
+use project::agent_server_store::AllAgentServersSettings;
 use project::{AgentId, Project};
 use settings::{NotifyWhenAgentWaiting, Settings as _};
 use task::{RevealStrategy, Shell, SpawnInTerminal, TaskId};
@@ -34,9 +37,12 @@ use ui::{
     Button, ButtonStyle, ContextMenu, Icon, IconButton, IconName, Label, PopoverMenu, TintColor,
     Tooltip, h_flex, prelude::*, v_flex,
 };
-use workspace::item::{Item, ItemEvent};
+use workspace::item::{Item, ItemEvent, ItemHandle};
 use workspace::notifications::NotificationId;
-use workspace::{Toast, Workspace, WorkspaceId};
+use workspace::{
+    ActivatePaneDown, ActivatePaneLeft, ActivatePaneRight, ActivatePaneUp, DraggedTab, Pane,
+    PaneGroup, PaneRenderContext, SplitDirection, SplitMode, Toast, Workspace, WorkspaceId, pane,
+};
 use zed_actions::mnemonic::AgentSessionKind;
 
 use crate::workspace_detail_panel::WorkspaceDetailPanel;
@@ -172,6 +178,16 @@ impl ChatAgent {
             .unwrap_or(Self::Claude)
     }
 
+    /// The agents offered for new chats: those listed under `agent_servers`
+    /// in the settings.
+    fn enabled(cx: &App) -> Vec<Self> {
+        let servers = AllAgentServersSettings::get_global(cx);
+        Self::ALL
+            .into_iter()
+            .filter(|agent| servers.contains_key(agent.agent_id()))
+            .collect()
+    }
+
     /// The CLI tab offered when this agent's chat can't start.
     fn cli_fallback(self) -> Option<NewSession> {
         match self {
@@ -219,6 +235,8 @@ pub(crate) enum SessionKind {
 
 pub(crate) struct WorkspaceSession {
     title: SharedString,
+    /// The session's tab, living in one of the workspace's panes.
+    item: Entity<SessionItem>,
     kind: SessionKind,
 }
 
@@ -250,13 +268,243 @@ impl WorkspaceSession {
             SessionKind::Terminal(_) => None,
         }
     }
+}
 
+enum SessionContent {
+    Terminal(Entity<TerminalView>),
+    Chat {
+        view: Entity<ConversationView>,
+        record_id: String,
+        agent: ChatAgent,
+    },
+}
+
+/// A session's tab in one of the workspace's panes. Terminals are wrapped
+/// instead of being added to the pane directly because `TerminalView` hands
+/// dropped tabs to the terminal panel.
+pub(crate) struct SessionItem {
+    item_id: EntityId,
+    title: SharedString,
+    content: SessionContent,
+    workspace_view: WeakEntity<WorkspaceView>,
+}
+
+impl EventEmitter<ItemEvent> for SessionItem {}
+
+impl Focusable for SessionItem {
     fn focus_handle(&self, cx: &App) -> FocusHandle {
-        match &self.kind {
-            SessionKind::Terminal(terminal) => terminal.view.focus_handle(cx),
-            SessionKind::Chat(chat) => chat.view.focus_handle(cx),
+        match &self.content {
+            SessionContent::Terminal(view) => view.focus_handle(cx),
+            SessionContent::Chat { view, .. } => view.focus_handle(cx),
         }
     }
+}
+
+impl Item for SessionItem {
+    type Event = ItemEvent;
+
+    fn tab_content_text(&self, _detail: usize, _cx: &App) -> SharedString {
+        self.title.clone()
+    }
+
+    fn tab_icon(&self, _window: &Window, _cx: &App) -> Option<Icon> {
+        Some(Icon::new(match &self.content {
+            SessionContent::Terminal(_) => IconName::Terminal,
+            SessionContent::Chat { .. } => IconName::Chat,
+        }))
+    }
+
+    fn to_item_events(event: &Self::Event, f: &mut dyn FnMut(ItemEvent)) {
+        f(*event)
+    }
+
+    fn handle_drop(
+        &self,
+        active_pane: &Pane,
+        dropped: &dyn Any,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> bool {
+        // Away from an edge the pane moves the tab into itself.
+        let (Some(tab), Some(direction)) = (
+            dropped.downcast_ref::<DraggedTab>(),
+            active_pane.drag_split_direction(),
+        ) else {
+            return false;
+        };
+        let workspace_view = self.workspace_view.clone();
+        let target_item = self.item_id;
+        let source_pane = tab.pane.clone();
+        let dragged_item = tab.item.item_id();
+        // The pane handling this drop is mid-update, so the split waits
+        // until it is done.
+        window.defer(cx, move |window, cx| {
+            workspace_view
+                .update(cx, |workspace_view, cx| {
+                    workspace_view.split_for_dropped_tab(
+                        target_item,
+                        source_pane,
+                        dragged_item,
+                        direction,
+                        window,
+                        cx,
+                    );
+                })
+                .log_err();
+        });
+        true
+    }
+}
+
+impl Render for SessionItem {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let (view, record_id, agent) = match &self.content {
+            SessionContent::Terminal(view) => {
+                return div().size_full().child(view.clone()).into_any_element();
+            }
+            SessionContent::Chat {
+                view,
+                record_id,
+                agent,
+            } => (view.clone(), record_id.clone(), *agent),
+        };
+        let failed = view.read(cx).has_load_error();
+        let workspace_view = self.workspace_view.clone();
+        v_flex()
+            .size_full()
+            .when(failed, |el| {
+                el.child(
+                    h_flex()
+                        .p_2()
+                        .gap_2()
+                        .border_b_1()
+                        .border_color(cx.theme().colors().border)
+                        .child(
+                            Label::new("This chat couldn't start.")
+                                .size(LabelSize::Small)
+                                .color(Color::Muted),
+                        )
+                        .child(
+                            Button::new("chat-start-new", "Start new chat")
+                                .label_size(LabelSize::Small)
+                                .on_click({
+                                    let workspace_view = workspace_view.clone();
+                                    move |_, window, cx| {
+                                        workspace_view
+                                            .update(cx, |workspace_view, cx| {
+                                                workspace_view.restart_chat(
+                                                    record_id.clone(),
+                                                    window,
+                                                    cx,
+                                                );
+                                            })
+                                            .log_err();
+                                    }
+                                }),
+                        )
+                        .when_some(agent.cli_fallback(), |el, cli| {
+                            el.child(
+                                Button::new(
+                                    "chat-open-cli-instead",
+                                    format!("Open {} CLI instead", agent.label()),
+                                )
+                                .label_size(LabelSize::Small)
+                                .on_click(move |_, window, cx| {
+                                    workspace_view
+                                        .update(cx, |workspace_view, cx| {
+                                            workspace_view.add_session(cli, window, cx);
+                                        })
+                                        .log_err();
+                                }),
+                            )
+                        }),
+                )
+            })
+            .child(div().flex_grow(1.0).min_h(px(0.)).child(view))
+            .into_any_element()
+    }
+}
+
+/// Whether a drag carries a workspace session's tab. The window's own panes
+/// refuse these, so a session can only be dropped inside its workspace.
+pub fn is_session_tab(dragged: &dyn Any) -> bool {
+    dragged
+        .downcast_ref::<DraggedTab>()
+        .is_some_and(|tab| tab.item.downcast::<SessionItem>().is_some())
+}
+
+/// Types files dropped on a workspace into the terminal under the cursor,
+/// or attaches them to the chat there. Returns false when no session is
+/// under the cursor.
+fn insert_dropped_paths(
+    view: &Entity<WorkspaceView>,
+    paths: &ExternalPaths,
+    window: &mut Window,
+    cx: &mut App,
+) -> bool {
+    let (terminal, chat, project) = {
+        let view = view.read(cx);
+        let pane = view
+            .center
+            .pane_at_pixel_position(window.mouse_position())
+            .unwrap_or(&view.active_pane);
+        let session = pane
+            .read(cx)
+            .active_item()
+            .and_then(|item| view.session_index(item.item_id()))
+            .and_then(|index| view.sessions.get(index));
+        (
+            session.and_then(WorkspaceSession::terminal).cloned(),
+            session
+                .and_then(WorkspaceSession::chat)
+                .map(|chat| chat.view.clone()),
+            view.project.upgrade(),
+        )
+    };
+    if let Some(terminal) = terminal {
+        terminal.update(cx, |terminal, cx| {
+            terminal.add_paths_to_terminal(paths.paths(), window, cx);
+        });
+        return true;
+    }
+    let (Some(chat), Some(project)) = (chat, project) else {
+        return false;
+    };
+    let tasks = paths
+        .paths()
+        .iter()
+        .map(|path| Workspace::project_path_for_path(project.clone(), path, false, cx))
+        .collect::<Vec<_>>();
+    window
+        .spawn(cx, async move |cx| {
+            let mut project_paths = Vec::new();
+            let mut added_worktrees = Vec::new();
+            for entry in futures::future::join_all(tasks).await {
+                if let Some((worktree, project_path)) = entry.log_err() {
+                    added_worktrees.push(worktree);
+                    project_paths.push(project_path);
+                }
+            }
+            chat.update_in(cx, |chat, window, cx| {
+                chat.insert_dragged_files(project_paths, added_worktrees, window, cx);
+            })
+            .log_err();
+        })
+        .detach();
+    true
+}
+
+/// Whether a dragged tab is one of the given workspace's sessions.
+fn is_session_tab_of(
+    workspace_view: &WeakEntity<WorkspaceView>,
+    dragged: &dyn Any,
+    cx: &App,
+) -> bool {
+    dragged.downcast_ref::<DraggedTab>().is_some_and(|tab| {
+        tab.item
+            .downcast::<SessionItem>()
+            .is_some_and(|item| &item.read(cx).workspace_view == workspace_view)
+    })
 }
 
 /// Instructions waiting for a chat to connect or finish its current turn,
@@ -422,8 +670,8 @@ impl Render for ComposerDrag {
 }
 
 /// The center view for a Mnemonic workspace. The workspace is the unit the
-/// user switches between; terminals (the agent's and any extra shells) live
-/// inside it as inner tabs, all rooted in the workspace's worktree.
+/// user switches between; its sessions (chats, agent CLIs and shells) are tabs
+/// in its own panes, all rooted in the workspace's worktree.
 pub struct WorkspaceView {
     workspace_id: String,
     workspace_name: SharedString,
@@ -432,7 +680,10 @@ pub struct WorkspaceView {
     project: WeakEntity<Project>,
     database_id: Option<WorkspaceId>,
     sessions: Vec<WorkspaceSession>,
+    /// The session showing in the focused pane.
     active_session: usize,
+    center: PaneGroup,
+    active_pane: Entity<Pane>,
     connection_store: Option<Entity<AgentConnectionStore>>,
     composer: Entity<Editor>,
     composer_height: Pixels,
@@ -467,7 +718,7 @@ pub struct WorkspaceView {
     notification_windows: Vec<WindowHandle<AgentNotification>>,
     notification_subscriptions: Vec<Subscription>,
     _window_activation: Subscription,
-    focus_handle: FocusHandle,
+    _pane_refresh: Subscription,
 }
 
 impl WorkspaceView {
@@ -720,40 +971,325 @@ impl WorkspaceView {
         .detach();
     }
 
-    /// Closes a terminal tab and kills its tmux session so it doesn't
-    /// linger.
-    fn close_terminal(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(SessionKind::Terminal(terminal)) = self.sessions.get(index).map(|s| &s.kind)
-        else {
-            return;
-        };
-        if let Some(session_name) = terminal.session_name.clone() {
-            let workspace_id = self.workspace_id.clone();
-            cx.background_spawn(async move {
-                if let Err(err) =
-                    terminal_service::kill_embedded_workspace_terminal(&workspace_id, &session_name)
-                {
-                    log::warn!("Failed to kill tmux session: {err}");
+    /// Releases what a closed session holds: a terminal's tmux session is
+    /// killed so it doesn't linger, and a chat is disconnected and forgotten
+    /// so it does not come back on restart.
+    fn dispose_session(&mut self, session: WorkspaceSession, cx: &mut Context<Self>) {
+        match session.kind {
+            SessionKind::Terminal(terminal) => {
+                let Some(session_name) = terminal.session_name else {
+                    return;
+                };
+                let workspace_id = self.workspace_id.clone();
+                cx.background_spawn(async move {
+                    if let Err(err) = terminal_service::kill_embedded_workspace_terminal(
+                        &workspace_id,
+                        &session_name,
+                    ) {
+                        log::warn!("Failed to kill tmux session: {err}");
+                    }
+                })
+                .detach();
+            }
+            SessionKind::Chat(chat) => {
+                let close_task = chat.view.update(cx, |view, cx| {
+                    view.as_connected()
+                        .map(|connected| connected.close_all_sessions(cx))
+                });
+                if let Some(close_task) = close_task {
+                    close_task.detach();
                 }
-            })
-            .detach();
+                let state = mnemonic_bridge::mnemonic_state(cx);
+                if let Err(err) = chat_session_repository::delete(&state.db, &chat.record_id) {
+                    log::error!("Failed to delete chat session: {err}");
+                }
+            }
         }
-        self.sessions.remove(index);
-        self.after_session_removed(index, window, cx);
     }
 
-    /// Keeps the same tab active after a tab is removed, when possible.
-    fn after_session_removed(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
-        if self.sessions.is_empty() {
-            self.active_session = 0;
-            cx.notify();
+    /// Closes a session's tab from code. Tabs the user closes arrive through
+    /// `handle_pane_event` instead.
+    fn remove_session(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if index >= self.sessions.len() {
             return;
         }
-        if index < self.active_session {
-            self.active_session -= 1;
+        let session = self.sessions.remove(index);
+        let item_id = session.item.entity_id();
+        if let Some(pane) = self.pane_for_item(item_id, cx) {
+            pane.update(cx, |pane, cx| {
+                pane.remove_item(item_id, false, true, window, cx);
+            });
         }
-        let next = self.active_session.min(self.sessions.len() - 1);
-        self.activate_session(next, window, cx);
+        self.dispose_session(session, cx);
+        self.sync_active_session(cx);
+        cx.notify();
+    }
+
+    fn session_index(&self, item_id: EntityId) -> Option<usize> {
+        self.sessions
+            .iter()
+            .position(|session| session.item.entity_id() == item_id)
+    }
+
+    fn pane_for_item(&self, item_id: EntityId, cx: &App) -> Option<Entity<Pane>> {
+        self.center
+            .panes()
+            .into_iter()
+            .find(|pane| pane.read(cx).items().any(|item| item.item_id() == item_id))
+            .cloned()
+    }
+
+    /// Points `active_session` at the tab showing in the focused pane.
+    fn sync_active_session(&mut self, cx: &App) {
+        let active_item = self
+            .active_pane
+            .read(cx)
+            .active_item()
+            .map(|item| item.item_id());
+        self.active_session = match active_item.and_then(|item_id| self.session_index(item_id)) {
+            Some(index) => index,
+            None => self
+                .active_session
+                .min(self.sessions.len().saturating_sub(1)),
+        };
+    }
+
+    /// Creates one of the workspace's session panes: a regular Zed pane, so
+    /// its tabs can be reordered, dragged between panes and split.
+    fn new_session_pane(
+        workspace: WeakEntity<Workspace>,
+        project: Entity<Project>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Entity<Pane> {
+        let this = cx.weak_entity();
+        let pane = cx.new(|cx| {
+            let mut pane = Pane::new(
+                workspace,
+                project,
+                Default::default(),
+                Some(Arc::new({
+                    let this = this.clone();
+                    move |dragged: &dyn Any, _window: &mut Window, cx: &mut App| {
+                        is_session_tab_of(&this, dragged, cx)
+                    }
+                })),
+                zed_actions::mnemonic::NewDefaultAgentSession.boxed_clone(),
+                false,
+                window,
+                cx,
+            );
+            pane.set_can_navigate(false, cx);
+            pane.display_nav_history_buttons(None);
+            pane.set_should_display_tab_bar(|_, _| true);
+            pane.set_can_toggle_zoom(false, cx);
+            pane.set_can_split(Some(Arc::new({
+                let this = this.clone();
+                move |pane, dragged, _window, cx| {
+                    let Some(tab) = dragged.downcast_ref::<DraggedTab>() else {
+                        return false;
+                    };
+                    is_session_tab_of(&this, dragged, cx)
+                        && (tab.pane != cx.entity() || pane.items_len() > 1)
+                }
+            })));
+            pane.set_render_tab_bar_buttons(cx, {
+                let this = this.clone();
+                move |pane, _window, cx| {
+                    let Some(view) = this.upgrade() else {
+                        return (None, None);
+                    };
+                    let controls = view.read(cx).render_pane_controls(
+                        this.clone(),
+                        cx.entity(),
+                        pane.items_len() > 1,
+                        cx,
+                    );
+                    (None, Some(controls))
+                }
+            });
+            pane
+        });
+        cx.subscribe_in(&pane, window, Self::handle_pane_event)
+            .detach();
+        pane
+    }
+
+    fn add_pane(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Option<Entity<Pane>> {
+        let project = self.project.upgrade()?;
+        Some(Self::new_session_pane(
+            self.workspace.clone(),
+            project,
+            window,
+            cx,
+        ))
+    }
+
+    fn handle_pane_event(
+        &mut self,
+        pane: &Entity<Pane>,
+        event: &pane::Event,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match event {
+            pane::Event::AddItem { .. } | pane::Event::ActivateItem { .. } => {
+                self.sync_active_session(cx);
+                cx.notify();
+            }
+            pane::Event::Focus => {
+                self.active_pane = pane.clone();
+                self.sync_active_session(cx);
+                cx.notify();
+            }
+            pane::Event::RemovedItem { item } => {
+                self.handle_item_removed(item.as_ref(), cx);
+            }
+            pane::Event::Remove { focus_on_pane } => {
+                // The last pane stays, and so does one a tab was moved back
+                // into before this event arrived.
+                if self.center.panes().len() <= 1 || pane.read(cx).items_len() > 0 {
+                    return;
+                }
+                self.center.remove(pane, cx).log_err();
+                if &self.active_pane == pane {
+                    let next_pane = focus_on_pane
+                        .clone()
+                        .filter(|pane| self.center.panes().contains(&pane))
+                        .unwrap_or_else(|| self.center.first_pane());
+                    self.active_pane = next_pane;
+                    if self.is_on_screen(cx) {
+                        window.focus(&self.active_pane.focus_handle(cx), cx);
+                    }
+                }
+                self.sync_active_session(cx);
+                cx.notify();
+            }
+            &pane::Event::Split { direction, .. } => {
+                self.split_active_tab(pane, direction, window, cx);
+            }
+            _ => {}
+        }
+    }
+
+    /// A tab left one of this workspace's panes: it either moved to another
+    /// of them or was closed.
+    fn handle_item_removed(&mut self, item: &dyn ItemHandle, cx: &mut Context<Self>) {
+        let item_id = item.item_id();
+        let Some(index) = self.session_index(item_id) else {
+            return;
+        };
+        if self.pane_for_item(item_id, cx).is_none() {
+            let session = self.sessions.remove(index);
+            self.dispose_session(session, cx);
+        }
+        self.sync_active_session(cx);
+        cx.notify();
+    }
+
+    /// Moves the pane's active tab into a new pane beside it. A session can
+    /// only be shown once, so splitting never duplicates a tab.
+    fn split_active_tab(
+        &mut self,
+        pane: &Entity<Pane>,
+        direction: SplitDirection,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if pane.read(cx).items_len() <= 1 {
+            return;
+        }
+        let Some(new_pane) = self.add_pane(window, cx) else {
+            return;
+        };
+        let Some(item) = pane.update(cx, |pane, cx| pane.take_active_item(window, cx)) else {
+            return;
+        };
+        new_pane.update(cx, |new_pane, cx| {
+            new_pane.add_item(item, true, true, None, window, cx);
+        });
+        self.center.split(pane, &new_pane, direction, cx);
+        self.active_pane = new_pane;
+        self.sync_active_session(cx);
+        cx.notify();
+    }
+
+    /// A session tab was dropped on the edge of another session: it moves
+    /// into a new pane on that side.
+    fn split_for_dropped_tab(
+        &mut self,
+        target_item: EntityId,
+        source_pane: Entity<Pane>,
+        dragged_item: EntityId,
+        direction: SplitDirection,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(target_pane) = self.pane_for_item(target_item, cx) else {
+            return;
+        };
+        if self.session_index(dragged_item).is_none() {
+            return;
+        }
+        if source_pane == target_pane && target_pane.read(cx).items_len() <= 1 {
+            return;
+        }
+        let Some(new_pane) = self.add_pane(window, cx) else {
+            return;
+        };
+        self.center.split(&target_pane, &new_pane, direction, cx);
+        workspace::move_item(&source_pane, &new_pane, dragged_item, 0, true, window, cx);
+        self.active_pane = new_pane;
+        self.sync_active_session(cx);
+        cx.notify();
+    }
+
+    /// Focuses the split next to the focused one. With no split on that
+    /// side the action carries on to the window's own panes.
+    fn activate_pane_in_direction(
+        &mut self,
+        direction: SplitDirection,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let pane = self
+            .center
+            .find_pane_in_direction(&self.active_pane, direction, cx)
+            .cloned();
+        match pane {
+            Some(pane) => window.focus(&pane.focus_handle(cx), cx),
+            None => cx.propagate(),
+        }
+    }
+
+    fn new_session_item(
+        &self,
+        title: SharedString,
+        content: SessionContent,
+        cx: &mut Context<Self>,
+    ) -> Entity<SessionItem> {
+        let workspace_view = cx.weak_entity();
+        cx.new(|cx| SessionItem {
+            item_id: cx.entity_id(),
+            title,
+            content,
+            workspace_view,
+        })
+    }
+
+    /// Shows a session that was just pushed onto `sessions` as a new tab in
+    /// the focused pane.
+    fn show_new_session(
+        &mut self,
+        item: Entity<SessionItem>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.active_session = self.sessions.len().saturating_sub(1);
+        self.active_pane.update(cx, |pane, cx| {
+            pane.add_item(Box::new(item), true, true, None, window, cx);
+        });
+        cx.notify();
     }
 
     fn push_terminal(
@@ -791,8 +1327,11 @@ impl WorkspaceView {
                 cx,
             )
         });
+        let title = SharedString::from(title.to_string());
+        let item = self.new_session_item(title.clone(), SessionContent::Terminal(view.clone()), cx);
         self.sessions.push(WorkspaceSession {
-            title: SharedString::from(title.to_string()),
+            title,
+            item: item.clone(),
             kind: SessionKind::Terminal(TerminalSession {
                 view,
                 provider,
@@ -801,7 +1340,7 @@ impl WorkspaceView {
                 _subscription: subscription,
             }),
         });
-        self.activate_session(self.sessions.len() - 1, window, cx);
+        self.show_new_session(item, window, cx);
     }
 
     /// Reads the workspace's run commands off the UI thread, so the Run
@@ -985,23 +1524,13 @@ impl WorkspaceView {
         while index > 0 {
             index -= 1;
             let is_run = matches!(
-                &self.sessions[index].kind,
-                SessionKind::Terminal(terminal) if terminal.run_command
+                self.sessions.get(index).map(|session| &session.kind),
+                Some(SessionKind::Terminal(terminal)) if terminal.run_command
             );
             if is_run {
-                self.sessions.remove(index);
-                if index < self.active_session {
-                    self.active_session -= 1;
-                }
+                self.remove_session(index, window, cx);
             }
         }
-        if self.sessions.is_empty() {
-            self.active_session = 0;
-            cx.notify();
-            return;
-        }
-        let next = self.active_session.min(self.sessions.len() - 1);
-        self.activate_session(next, window, cx);
     }
 
     fn restart_run_commands(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1116,7 +1645,7 @@ impl WorkspaceView {
         })
     }
 
-    fn render_run_controls(&self, cx: &mut Context<Self>) -> AnyElement {
+    fn render_run_controls(&self, this: &WeakEntity<Self>) -> AnyElement {
         if self.has_run_terminals() {
             return h_flex()
                 .gap_0p5()
@@ -1126,18 +1655,26 @@ impl WorkspaceView {
                         .label_size(LabelSize::XSmall)
                         .disabled(self.run_starting)
                         .tooltip(Tooltip::text("Stop and re-run the workspace's run commands"))
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            this.restart_run_commands(window, cx);
-                        })),
+                        .on_click({
+                            let this = this.clone();
+                            move |_, window, cx| {
+                                this.update(cx, |this, cx| this.restart_run_commands(window, cx))
+                                    .log_err();
+                            }
+                        }),
                 )
                 .child(
                     Button::new("workspace-run-stop", "Stop")
                         .style(ButtonStyle::Tinted(TintColor::Error))
                         .label_size(LabelSize::XSmall)
                         .tooltip(Tooltip::text("Stop the run commands and close their tabs"))
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            this.stop_run_commands(window, cx);
-                        })),
+                        .on_click({
+                            let this = this.clone();
+                            move |_, window, cx| {
+                                this.update(cx, |this, cx| this.stop_run_commands(window, cx))
+                                    .log_err();
+                            }
+                        }),
                 )
                 .into_any_element();
         }
@@ -1149,9 +1686,15 @@ impl WorkspaceView {
         .label_size(LabelSize::XSmall)
         .disabled(self.run_starting || self.run_command_count == 0)
         .tooltip(Tooltip::text(self.run_tooltip.clone()))
-        .on_click(cx.listener(|this, _, window, cx| {
-            this.start_run_commands("run_command", window, cx);
-        }))
+        .on_click({
+            let this = this.clone();
+            move |_, window, cx| {
+                this.update(cx, |this, cx| {
+                    this.start_run_commands("run_command", window, cx);
+                })
+                .log_err();
+            }
+        })
         .into_any_element()
     }
 
@@ -1176,9 +1719,16 @@ impl WorkspaceView {
         let Some(session) = self.sessions.get(index) else {
             return;
         };
+        let item = session.item.clone();
         self.active_session = index;
-        let focus_handle = session.focus_handle(cx);
-        window.focus(&focus_handle, cx);
+        if let Some(pane) = self.pane_for_item(item.entity_id(), cx) {
+            pane.update(cx, |pane, cx| {
+                if let Some(item_index) = pane.index_for_item(&item) {
+                    pane.activate_item(item_index, true, true, window, cx);
+                }
+            });
+            self.active_pane = pane;
+        }
         cx.notify();
     }
 
@@ -1228,19 +1778,17 @@ impl WorkspaceView {
         }
     }
 
-    /// Opens a chat tab for a saved chat session, resuming the agent's
-    /// session when one was recorded. An initial prompt is queued and sent
-    /// once the agent is connected and idle.
-    fn open_chat(
+    /// Starts the conversation for a saved chat session, resuming the
+    /// agent's session when one was recorded. An initial prompt is queued and
+    /// sent once the agent is connected and idle.
+    fn build_chat(
         &mut self,
-        record: ChatSessionRecord,
+        record: &ChatSessionRecord,
         initial_prompt: Option<String>,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) {
-        let Some(project) = self.project.upgrade() else {
-            return;
-        };
+    ) -> Option<ChatSession> {
+        let project = self.project.upgrade()?;
         let connection_store = match &self.connection_store {
             Some(store) => store.clone(),
             None => {
@@ -1272,7 +1820,7 @@ impl WorkspaceView {
                 resume_session_id,
                 None,
                 work_dirs,
-                Some(title.clone()),
+                Some(title),
                 None,
                 workspace,
                 project,
@@ -1290,29 +1838,55 @@ impl WorkspaceView {
             this.handle_chat_changed(view_id, cx);
         });
 
+        Some(ChatSession {
+            record_id: record.id.clone(),
+            agent: ChatAgent::from_agent_id(&record.agent),
+            is_review: record.is_review,
+            view,
+            stored_session_id: record.acp_session_id.clone(),
+            observed_thread: None,
+            pending_messages: {
+                let mut pending = PendingMessages::default();
+                if let Some(prompt) = initial_prompt {
+                    pending.push(prompt);
+                }
+                pending
+            },
+            app_messages,
+            awaiting_model: record.is_review && record.acp_session_id.is_none(),
+            thread_subscriptions: Vec::new(),
+            _subscriptions: vec![observation],
+        })
+    }
+
+    /// Opens a chat tab for a saved chat session.
+    fn open_chat(
+        &mut self,
+        record: ChatSessionRecord,
+        initial_prompt: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(chat) = self.build_chat(&record, initial_prompt, window, cx) else {
+            return;
+        };
+        let view_id = chat.view.entity_id();
+        let title = SharedString::from(record.title);
+        let item = self.new_session_item(
+            title.clone(),
+            SessionContent::Chat {
+                view: chat.view.clone(),
+                record_id: chat.record_id.clone(),
+                agent: chat.agent,
+            },
+            cx,
+        );
         self.sessions.push(WorkspaceSession {
             title,
-            kind: SessionKind::Chat(ChatSession {
-                record_id: record.id,
-                agent: ChatAgent::from_agent_id(&record.agent),
-                is_review: record.is_review,
-                view,
-                stored_session_id: record.acp_session_id.clone(),
-                observed_thread: None,
-                pending_messages: {
-                    let mut pending = PendingMessages::default();
-                    if let Some(prompt) = initial_prompt {
-                        pending.push(prompt);
-                    }
-                    pending
-                },
-                app_messages,
-                awaiting_model: record.is_review && record.acp_session_id.is_none(),
-                thread_subscriptions: Vec::new(),
-                _subscriptions: vec![observation],
-            }),
+            item: item.clone(),
+            kind: SessionKind::Chat(chat),
         });
-        self.activate_session(self.sessions.len() - 1, window, cx);
+        self.show_new_session(item, window, cx);
         self.handle_chat_changed(view_id, cx);
     }
 
@@ -1705,31 +2279,6 @@ impl WorkspaceView {
                     thread.read(cx).status() == acp_thread::ThreadStatus::Generating
                 })
             })
-    }
-
-    /// Closes a chat tab and forgets it, so it does not come back on
-    /// restart.
-    fn close_chat(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(chat) = self.sessions.get(index).and_then(WorkspaceSession::chat) else {
-            return;
-        };
-        let view = chat.view.clone();
-        let record_id = chat.record_id.clone();
-        self.sessions.remove(index);
-
-        let close_task = view.update(cx, |view, cx| {
-            view.as_connected()
-                .map(|connected| connected.close_all_sessions(cx))
-        });
-        if let Some(close_task) = close_task {
-            close_task.detach();
-        }
-        let state = mnemonic_bridge::mnemonic_state(cx);
-        if let Err(err) = chat_session_repository::delete(&state.db, &record_id) {
-            log::error!("Failed to delete chat session: {err}");
-        }
-
-        self.after_session_removed(index, window, cx);
     }
 
     /// Closes the agent connections of every chat in this workspace.
@@ -2338,7 +2887,7 @@ impl WorkspaceView {
         });
     }
 
-    fn render_status_chip(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_status_chip(&self, cx: &App) -> impl IntoElement {
         let running = self.agent_is_running() || self.any_chat_generating(cx);
         let (color, text) = if running {
             (cx.theme().status().success, "Running")
@@ -2389,56 +2938,25 @@ impl WorkspaceView {
         }
         record.acp_session_id = None;
 
-        self.sessions.remove(index);
-        self.open_chat(record, None, window, cx);
-        let last = self.sessions.len() - 1;
-        let reopened = self.sessions.remove(last);
-        self.sessions.insert(index, reopened);
+        let Some(chat) = self.build_chat(&record, None, window, cx) else {
+            return;
+        };
+        let view_id = chat.view.entity_id();
+        let content = SessionContent::Chat {
+            view: chat.view.clone(),
+            record_id: chat.record_id.clone(),
+            agent: chat.agent,
+        };
+        let Some(session) = self.sessions.get_mut(index) else {
+            return;
+        };
+        session.item.update(cx, |item, cx| {
+            item.content = content;
+            cx.notify();
+        });
+        session.kind = SessionKind::Chat(chat);
         self.activate_session(index, window, cx);
-    }
-
-    fn render_chat(&self, chat: &ChatSession, cx: &mut Context<Self>) -> impl IntoElement {
-        let failed = chat.view.read(cx).has_load_error();
-        let record_id = chat.record_id.clone();
-        let agent = chat.agent;
-        v_flex()
-            .size_full()
-            .when(failed, |el| {
-                el.child(
-                    h_flex()
-                        .p_2()
-                        .gap_2()
-                        .border_b_1()
-                        .border_color(cx.theme().colors().border)
-                        .child(
-                            Label::new("This chat couldn't start.")
-                                .size(LabelSize::Small)
-                                .color(Color::Muted),
-                        )
-                        .child(
-                            Button::new("chat-start-new", "Start new chat")
-                                .label_size(LabelSize::Small)
-                                .on_click(cx.listener(move |this, _, window, cx| {
-                                    this.restart_chat(record_id.clone(), window, cx);
-                                })),
-                        )
-                        .when_some(agent.cli_fallback(), |el, cli| {
-                            el.child(
-                                Button::new(
-                                    "chat-open-cli-instead",
-                                    format!("Open {} CLI instead", agent.label()),
-                                )
-                                .label_size(LabelSize::Small)
-                                .on_click(cx.listener(
-                                    move |this, _, window, cx| {
-                                        this.add_session(cli, window, cx);
-                                    },
-                                )),
-                            )
-                        }),
-                )
-            })
-            .child(div().flex_grow(1.0).min_h(px(0.)).child(chat.view.clone()))
+        self.handle_chat_changed(view_id, cx);
     }
 
     fn render_resize_handle(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -2649,90 +3167,90 @@ impl WorkspaceView {
             )
     }
 
-    fn render_terminal_tabs(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let mut tabs = h_flex()
-            .px_1()
-            .h(px(30.))
+    /// The buttons at the right of a pane's tab bar. Run, auto-fix and the
+    /// status chip belong to the whole workspace, so only its first pane
+    /// shows them.
+    fn render_pane_controls(
+        &self,
+        this: WeakEntity<Self>,
+        pane: Entity<Pane>,
+        can_split: bool,
+        cx: &App,
+    ) -> AnyElement {
+        let is_first_pane = self.center.first_pane() == pane;
+        h_flex()
+            .h_full()
+            .pr_1()
             .gap_0p5()
             .items_center()
-            .border_b_1()
-            .border_color(cx.theme().colors().border);
-
-        for (index, session) in self.sessions.iter().enumerate() {
-            let title = session.title.clone();
-            let is_chat = session.chat().is_some();
-            let active = index == self.active_session;
-            tabs = tabs.child(
-                h_flex()
-                    .id(("workspace-session-tab", index))
-                    .gap_0p5()
-                    .px_2()
-                    .py_0p5()
-                    .rounded_md()
-                    .cursor_pointer()
-                    .when(active, |el| {
-                        el.bg(cx.theme().colors().ghost_element_selected)
+            .when(is_first_pane, |el| {
+                el.child(self.render_run_controls(&this))
+                    .when(!self.auto_fix_state.is_empty(), |el| {
+                        el.child(
+                            Label::new(self.auto_fix_state.clone())
+                                .size(LabelSize::XSmall)
+                                .color(Color::Muted),
+                        )
                     })
-                    .hover(|style| style.bg(cx.theme().colors().ghost_element_hover))
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.activate_session(index, window, cx);
-                    }))
-                    .child(Label::new(title).size(LabelSize::XSmall).color(if active {
-                        Color::Default
-                    } else {
-                        Color::Muted
-                    }))
                     .child(
-                        IconButton::new(("workspace-close-session", index), IconName::Close)
-                            .icon_size(IconSize::XSmall)
-                            .icon_color(Color::Muted)
-                            .tooltip(Tooltip::text(if is_chat { "Close chat" } else { "Close this terminal" }))
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                cx.stop_propagation();
-                                if is_chat {
-                                    this.close_chat(index, window, cx);
-                                } else {
-                                    this.close_terminal(index, window, cx);
-                                }
-                            })),
-                    ),
-            );
-        }
-
-        tabs.child(div().flex_grow(1.0))
-            .child(self.render_run_controls(cx))
-            .when(!self.auto_fix_state.is_empty(), |el| {
+                        Button::new(
+                            "auto-fix-toggle",
+                            if self.auto_fix_enabled {
+                                "Auto-fix: on"
+                            } else {
+                                "Auto-fix"
+                            },
+                        )
+                        .style(if self.auto_fix_enabled {
+                            ButtonStyle::Tinted(TintColor::Accent)
+                        } else {
+                            ButtonStyle::Subtle
+                        })
+                        .label_size(LabelSize::XSmall)
+                        .tooltip(Tooltip::text(
+                            "Poll CI; when checks fail, instruct claude to fix and push until green",
+                        ))
+                        .on_click({
+                            let this = this.clone();
+                            move |_, _, cx| {
+                                this.update(cx, |this, cx| this.toggle_auto_fix(cx))
+                                    .log_err();
+                            }
+                        }),
+                    )
+                    .child(self.render_status_chip(cx))
+            })
+            .when(can_split, |el| {
+                let pane = pane.clone();
                 el.child(
-                    Label::new(self.auto_fix_state.clone())
-                        .size(LabelSize::XSmall)
-                        .color(Color::Muted),
+                    PopoverMenu::new("workspace-split-menu")
+                        .anchor(Anchor::TopRight)
+                        .trigger(
+                            IconButton::new("workspace-split", IconName::Split)
+                                .icon_size(IconSize::Small)
+                                .tooltip(Tooltip::text("Move this tab into a split")),
+                        )
+                        .menu(move |window, cx| {
+                            let pane = pane.clone();
+                            Some(ContextMenu::build(window, cx, move |menu, _, _| {
+                                [
+                                    ("Split Right", SplitDirection::Right),
+                                    ("Split Down", SplitDirection::Down),
+                                ]
+                                .into_iter()
+                                .fold(menu, |menu, (label, direction)| {
+                                    let pane = pane.clone();
+                                    menu.entry(label, None, move |window, cx| {
+                                        pane.update(cx, |pane, cx| {
+                                            pane.split(direction, SplitMode::MovePane, window, cx);
+                                        });
+                                    })
+                                })
+                            }))
+                        }),
                 )
             })
             .child(
-                Button::new(
-                    "auto-fix-toggle",
-                    if self.auto_fix_enabled {
-                        "Auto-fix: on"
-                    } else {
-                        "Auto-fix"
-                    },
-                )
-                .style(if self.auto_fix_enabled {
-                    ButtonStyle::Tinted(TintColor::Accent)
-                } else {
-                    ButtonStyle::Subtle
-                })
-                .label_size(LabelSize::XSmall)
-                .tooltip(Tooltip::text(
-                    "Poll CI; when checks fail, instruct claude to fix and push until green",
-                ))
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.toggle_auto_fix(cx);
-                })),
-            )
-            .child(self.render_status_chip(cx))
-            .child({
-                let this = cx.entity().downgrade();
                 PopoverMenu::new("workspace-add-session-menu")
                     .anchor(Anchor::TopRight)
                     .trigger(
@@ -2742,8 +3260,10 @@ impl WorkspaceView {
                     )
                     .menu(move |window, cx| {
                         let this = this.clone();
+                        let pane = pane.clone();
+                        let agents = ChatAgent::enabled(cx);
                         Some(ContextMenu::build(window, cx, move |menu, _, _| {
-                            let chats = ChatAgent::ALL.into_iter().map(|agent| {
+                            let chats = agents.into_iter().map(|agent| {
                                 (format!("{} chat", agent.label()), NewSession::Chat(agent))
                             });
                             let terminals = [
@@ -2755,35 +3275,51 @@ impl WorkspaceView {
                             .map(|(label, kind)| (label.to_string(), kind));
                             chats.chain(terminals).fold(menu, |menu, (label, kind)| {
                                 let this = this.clone();
+                                let pane = pane.clone();
                                 menu.entry(label, None, move |window, cx| {
-                                    this.update(cx, |this, cx| this.add_session(kind, window, cx))
-                                        .ok();
+                                    this.update(cx, |this, cx| {
+                                        this.active_pane = pane.clone();
+                                        this.add_session(kind, window, cx);
+                                    })
+                                    .log_err();
                                 })
                             })
                         }))
-                    })
-            })
+                    }),
+            )
+            .into_any_element()
     }
 }
 
 impl Focusable for WorkspaceView {
     fn focus_handle(&self, cx: &App) -> FocusHandle {
-        self.sessions
-            .get(self.active_session)
-            .map(|session| session.focus_handle(cx))
-            .unwrap_or_else(|| self.focus_handle.clone())
+        self.active_pane.focus_handle(cx)
     }
 }
 
 impl Render for WorkspaceView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let active_content = self.sessions.get(self.active_session).map(|session| {
-            match &session.kind {
-                SessionKind::Terminal(terminal) => terminal.view.clone().into_any_element(),
-                SessionKind::Chat(chat) => self.render_chat(chat, cx).into_any_element(),
-            }
-        });
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let show_composer = !self.active_is_chat();
+        let panes = self
+            .workspace
+            .update(cx, |workspace, cx| {
+                self.center
+                    .render(
+                        None,
+                        &PaneRenderContext {
+                            follower_states: &Default::default(),
+                            active_call: workspace.active_call(),
+                            active_pane: &self.active_pane,
+                            app_state: workspace.app_state(),
+                            project: workspace.project(),
+                            workspace: &workspace.weak_handle(),
+                        },
+                        window,
+                        cx,
+                    )
+                    .into_any_element()
+            })
+            .log_err();
 
         v_flex()
             .size_full()
@@ -2797,23 +3333,25 @@ impl Render for WorkspaceView {
                     cx.notify();
                 },
             ))
-            .child(self.render_terminal_tabs(cx))
+            .on_action(cx.listener(|this, _: &ActivatePaneLeft, window, cx| {
+                this.activate_pane_in_direction(SplitDirection::Left, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ActivatePaneRight, window, cx| {
+                this.activate_pane_in_direction(SplitDirection::Right, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ActivatePaneUp, window, cx| {
+                this.activate_pane_in_direction(SplitDirection::Up, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ActivatePaneDown, window, cx| {
+                this.activate_pane_in_direction(SplitDirection::Down, window, cx);
+            }))
             .child(
                 div()
                     .flex_grow(1.0)
                     .w_full()
                     .min_h(px(0.))
                     .overflow_hidden()
-                    .map(|el| match active_content {
-                        Some(content) => el.child(content),
-                        None => el.child(
-                            v_flex().size_full().items_center().justify_center().child(
-                                Label::new("Starting…")
-                                    .size(LabelSize::Small)
-                                    .color(Color::Muted),
-                            ),
-                        ),
-                    }),
+                    .children(panes),
             )
             .when(show_composer, |el| {
                 el.child(self.render_resize_handle(cx))
@@ -2872,7 +3410,7 @@ impl WorkspaceHost {
         };
 
         let workspace_handle = workspace.weak_handle();
-        let project = workspace.project().downgrade();
+        let project = workspace.project().clone();
         let database_id = workspace.database_id();
         host.update(cx, |host, cx| {
             host.set_active(summary, workspace_handle, project, database_id, window, cx);
@@ -2883,7 +3421,7 @@ impl WorkspaceHost {
         &mut self,
         summary: &WorkspaceSummary,
         workspace: WeakEntity<Workspace>,
-        project: WeakEntity<Project>,
+        project: Entity<Project>,
         database_id: Option<WorkspaceId>,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -2907,49 +3445,65 @@ impl WorkspaceHost {
                 editor
             });
 
-            let view = cx.new(|cx| WorkspaceView {
-                _window_activation: cx.observe_window_activation(
+            let view = cx.new(|cx| {
+                let pane = WorkspaceView::new_session_pane(
+                    workspace.clone(),
+                    project.clone(),
                     window,
-                    |view: &mut WorkspaceView, window, cx| {
-                        view.window_activation_changed(window, cx);
-                    },
-                ),
-                window_handle: window.window_handle(),
-                window_active: window.is_window_active(),
-                last_cli_activity: None,
-                cli_quiet_reported: false,
-                notification_windows: Vec::new(),
-                notification_subscriptions: Vec::new(),
-                workspace_id: summary.id.clone(),
-                workspace_name: SharedString::from(summary.name.clone()),
-                worktree_path,
-                workspace,
-                project,
-                database_id,
-                sessions: Vec::new(),
-                active_session: 0,
-                connection_store: None,
-                composer,
-                composer_height: px(110.),
-                claude_model: "claude-opus-5-5".to_string(),
-                codex_model: "gpt-6.1-sol".to_string(),
-                agent_effort: "high".to_string(),
-                claude_mode_index: INITIAL_CLAUDE_MODE_INDEX,
-                codex_mode_index: INITIAL_CODEX_MODE_INDEX,
-                review_provider: AgentProvider::Codex,
-                pending_image_paths: Vec::new(),
-                last_agent_activity: None,
-                idle_check_scheduled: false,
-                auto_fix_enabled: false,
-                auto_fix_attempts: 0,
-                last_auto_fix_at: None,
-                auto_fix_state: SharedString::default(),
-                auto_fix_task: None,
-                branch_rename_started: false,
-                run_command_count: 0,
-                run_tooltip: SharedString::from("Reading .mnemonic/config.json…"),
-                run_starting: false,
-                focus_handle: cx.focus_handle(),
+                    cx,
+                );
+                WorkspaceView {
+                    _window_activation: cx.observe_window_activation(
+                        window,
+                        |view: &mut WorkspaceView, window, cx| {
+                            view.window_activation_changed(window, cx);
+                        },
+                    ),
+                    // Panes are cached views: their tab bar buttons only pick
+                    // up this view's state when the panes are redrawn too.
+                    _pane_refresh: cx.observe_self(|view, cx| {
+                        for pane in view.center.panes() {
+                            pane.update(cx, |_, cx| cx.notify());
+                        }
+                    }),
+                    window_handle: window.window_handle(),
+                    window_active: window.is_window_active(),
+                    last_cli_activity: None,
+                    cli_quiet_reported: false,
+                    notification_windows: Vec::new(),
+                    notification_subscriptions: Vec::new(),
+                    workspace_id: summary.id.clone(),
+                    workspace_name: SharedString::from(summary.name.clone()),
+                    worktree_path,
+                    workspace,
+                    project: project.downgrade(),
+                    database_id,
+                    sessions: Vec::new(),
+                    active_session: 0,
+                    center: PaneGroup::new(pane.clone()),
+                    active_pane: pane,
+                    connection_store: None,
+                    composer,
+                    composer_height: px(110.),
+                    claude_model: "claude-opus-5-5".to_string(),
+                    codex_model: "gpt-6.1-sol".to_string(),
+                    agent_effort: "high".to_string(),
+                    claude_mode_index: INITIAL_CLAUDE_MODE_INDEX,
+                    codex_mode_index: INITIAL_CODEX_MODE_INDEX,
+                    review_provider: AgentProvider::Codex,
+                    pending_image_paths: Vec::new(),
+                    last_agent_activity: None,
+                    idle_check_scheduled: false,
+                    auto_fix_enabled: false,
+                    auto_fix_attempts: 0,
+                    last_auto_fix_at: None,
+                    auto_fix_state: SharedString::default(),
+                    auto_fix_task: None,
+                    branch_rename_started: false,
+                    run_command_count: 0,
+                    run_tooltip: SharedString::from("Reading .mnemonic/config.json…"),
+                    run_starting: false,
+                }
             });
             let state = mnemonic_bridge::mnemonic_state(cx);
             let chat_records =
@@ -3254,6 +3808,21 @@ impl Item for WorkspaceHost {
 
     fn to_item_events(event: &Self::Event, f: &mut dyn FnMut(ItemEvent)) {
         f(*event)
+    }
+
+    fn handle_drop(
+        &self,
+        _active_pane: &Pane,
+        dropped: &dyn Any,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> bool {
+        let (Some(paths), Some(view)) =
+            (dropped.downcast_ref::<ExternalPaths>(), self.active_view())
+        else {
+            return false;
+        };
+        insert_dropped_paths(view, paths, window, cx)
     }
 }
 

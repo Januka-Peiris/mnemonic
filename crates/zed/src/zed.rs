@@ -1166,6 +1166,22 @@ fn register_actions(
         )
         .register_action(
             |workspace: &mut Workspace,
+             _: &mnemonic_panels::SelectNextWorkspace,
+             window: &mut Window,
+             cx: &mut Context<Workspace>| {
+                select_adjacent_mnemonic_workspace(workspace, true, window, cx);
+            },
+        )
+        .register_action(
+            |workspace: &mut Workspace,
+             _: &mnemonic_panels::SelectPreviousWorkspace,
+             window: &mut Window,
+             cx: &mut Context<Workspace>| {
+                select_adjacent_mnemonic_workspace(workspace, false, window, cx);
+            },
+        )
+        .register_action(
+            |workspace: &mut Workspace,
              _: &mnemonic_bridge::CreatePullRequest,
              _window: &mut Window,
              cx: &mut Context<Workspace>| {
@@ -1464,6 +1480,24 @@ fn add_session_to_active_mnemonic_workspace(
     )
 }
 
+/// Deferred because selecting a workspace updates the window's workspace,
+/// which is already being updated while one of its actions runs.
+fn select_adjacent_mnemonic_workspace(
+    workspace: &mut Workspace,
+    forward: bool,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    let Some(panel) = workspace.panel::<mnemonic_panels::WorkspacePanel>(cx) else {
+        return;
+    };
+    window.defer(cx, move |window, cx| {
+        panel.update(cx, |panel, cx| {
+            panel.select_adjacent_workspace(forward, window, cx);
+        });
+    });
+}
+
 fn initialize_pane(
     workspace: &Workspace,
     pane: &Entity<Pane>,
@@ -1472,6 +1506,13 @@ fn initialize_pane(
 ) {
     let workspace_handle = cx.weak_entity();
     pane.update(cx, |pane, cx| {
+        // Without this the window's pane, which sits above a workspace's own
+        // panes, takes every session tab dropped inside the workspace.
+        pane.set_can_drop_predicate(Some(Arc::new(
+            |dragged: &dyn std::any::Any, _window: &mut Window, _cx: &mut App| {
+                !mnemonic_panels::is_session_tab(dragged)
+            },
+        )));
         pane.toolbar().update(cx, |toolbar, cx| {
             let multibuffer_hint = cx.new(|_| MultibufferHint::new());
             toolbar.add_item(multibuffer_hint, window, cx);

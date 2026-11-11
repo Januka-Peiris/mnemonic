@@ -2682,6 +2682,9 @@
   // Mnemonic: workspace chats run these ACP agents. Claude and Codex default
   // to their no-approval mode so unattended CI auto-fix runs never stall on a
   // prompt. Each is downloaded from the ACP registry on first use.
+  // The workspace "+" menu offers a chat for each agent listed here. To add
+  // Gemini, OpenCode or Cursor, list it in your settings, for example
+  // "gemini": { "type": "registry" } (ids: "gemini", "opencode", "cursor").
   "agent_servers": {
     "claude-acp": {
       "type": "registry",
@@ -2694,15 +2697,6 @@
       "default_config_options": {
         "mode": "full-access",
       },
-    },
-    "gemini": {
-      "type": "registry",
-    },
-    "opencode": {
-      "type": "registry",
-    },
-    "cursor": {
-      "type": "registry",
     },
   },
   "debugger": {
