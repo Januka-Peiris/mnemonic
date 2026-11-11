@@ -48,6 +48,7 @@ impl Render for DragGhostView {
 const PROJECT_ORDER_KEY: &str = "panel_project_order";
 const HIDDEN_PROJECTS_KEY: &str = "panel_hidden_projects";
 const PR_STATUS_POLL_INTERVAL: Duration = Duration::from_secs(120);
+const CHANGED_FILES_REFRESH_INTERVAL: Duration = Duration::from_secs(10);
 const PROJECT_BASE_BRANCH_KEY: &str = "base_branch";
 const PROJECT_SETUP_SCRIPT_KEY: &str = "setup_script";
 const PROJECT_INIT_FILES_KEY: &str = "workspace_init_files";
@@ -103,6 +104,7 @@ pub struct WorkspacePanel {
     /// Projects left out of the list until shown again from "Hidden (n)".
     hidden_projects: Option<Vec<String>>,
     showing_hidden_projects: bool,
+    changed_files_refresh: Option<Task<()>>,
     selected_workspace_id: Option<String>,
     showing_history: bool,
     activities: Vec<ActivityItem>,
@@ -128,6 +130,7 @@ impl WorkspacePanel {
                 collapsed_projects: Vec::new(),
                 hidden_projects: None,
                 showing_hidden_projects: false,
+                changed_files_refresh: None,
                 selected_workspace_id: None,
                 showing_history: false,
                 activities: Vec::new(),
@@ -188,12 +191,37 @@ impl WorkspacePanel {
             .detach();
         });
 
-        // Periodic repaint so the attention dots track live agent activity.
+        // Reloads the list from the database and repaints, so the attention
+        // dots track live agent activity. Rendering itself never reads the
+        // database.
         panel.update(cx, |_, cx| {
             cx.spawn(async move |this, cx| {
                 loop {
                     cx.background_executor().timer(Duration::from_secs(2)).await;
-                    if this.update(cx, |_, cx| cx.notify()).is_err() {
+                    let updated = this.update(cx, |this, cx| {
+                        this.refresh(cx);
+                        cx.notify();
+                    });
+                    if updated.is_err() {
+                        break;
+                    }
+                }
+            })
+            .detach();
+        });
+
+        // Only the selected workspace is re-diffed; the others keep their
+        // last counts until they are opened again.
+        panel.update(cx, |_, cx| {
+            cx.spawn(async move |this, cx| {
+                loop {
+                    cx.background_executor()
+                        .timer(CHANGED_FILES_REFRESH_INTERVAL)
+                        .await;
+                    if this
+                        .update(cx, |this, cx| this.refresh_selected_changed_files(cx))
+                        .is_err()
+                    {
                         break;
                     }
                 }
@@ -431,6 +459,39 @@ impl WorkspacePanel {
         cx.notify();
     }
 
+    /// Re-diffs the selected workspace in the background unless a refresh
+    /// is already running.
+    fn refresh_selected_changed_files(&mut self, cx: &mut Context<Self>) {
+        if self.changed_files_refresh.is_some() {
+            return;
+        }
+        let (Some(workspace_id), Some(state)) = (
+            self.selected_workspace_id.clone(),
+            mnemonic_bridge::mnemonic_state_cloned(),
+        ) else {
+            return;
+        };
+        self.changed_files_refresh = Some(cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_spawn({
+                    let workspace_id = workspace_id.clone();
+                    async move {
+                        workspace_service::refresh_workspace_changed_files(&state, &workspace_id)
+                    }
+                })
+                .await;
+            if let Err(err) = result {
+                log::debug!("Changed files for {workspace_id} not refreshed: {err}");
+            }
+            this.update(cx, |this, cx| {
+                this.changed_files_refresh = None;
+                this.refresh(cx);
+                cx.notify();
+            })
+            .log_err();
+        }));
+    }
+
     fn toggle_project(&mut self, project: &str) {
         if let Some(pos) = self.collapsed_projects.iter().position(|p| p == project) {
             self.collapsed_projects.remove(pos);
@@ -447,6 +508,7 @@ impl WorkspacePanel {
     ) {
         self.selected_workspace_id = Some(ws_id.clone());
         cx.set_global(crate::ActiveWorkspace(Some(ws_id.clone())));
+        self.refresh_selected_changed_files(cx);
         cx.notify();
 
         let Some(summary) = self.workspaces.iter().find(|ws| ws.id == ws_id).cloned() else {
@@ -3078,8 +3140,6 @@ impl Panel for WorkspacePanel {
 
 impl Render for WorkspacePanel {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        self.refresh(cx);
-
         let mut content = v_flex()
             .id("workspace-panel")
             .size_full()
