@@ -197,6 +197,9 @@ pub struct SettingsContent {
     /// Settings for Mnemonic workspaces: branches, pull requests, review and scripts.
     pub workspaces: Option<WorkspacesSettingsContent>,
 
+    /// Sharing workspaces and agent chats with teammates over Tailscale.
+    pub team: Option<TeamSettingsContent>,
+
     /// A map of log scopes to the desired log level.
     /// Useful for filtering out noisy logs or enabling more verbose logging.
     ///
@@ -1002,6 +1005,45 @@ pub struct WorkspacesSettingsContent {
     ///
     /// Default: "~/dev"
     pub clone_location: Option<String>,
+}
+
+/// Settings for sharing workspaces with teammates over Tailscale.
+#[with_fallible_options]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema, MergeFrom, PartialEq)]
+pub struct TeamSettingsContent {
+    /// Whether teammates on your allow list can see your workspaces and
+    /// follow your agent chats, read-only, over Tailscale.
+    ///
+    /// Default: false
+    pub share: Option<bool>,
+    /// The port your workspaces are shared on. Teammates use the same port
+    /// unless a peer's host names another.
+    ///
+    /// Default: 47231
+    pub port: Option<u16>,
+    /// The name teammates see for you. When empty, your Tailscale name is used.
+    ///
+    /// Default: ""
+    pub display_name: Option<String>,
+    /// Tailscale logins (such as "alice@example.com") allowed to see your
+    /// workspaces.
+    ///
+    /// Default: []
+    pub allow: Option<Vec<String>>,
+    /// Teammates whose workspaces are listed in the sidebar.
+    ///
+    /// Default: []
+    pub peers: Option<Vec<TeamPeerContent>>,
+}
+
+#[with_fallible_options]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema, MergeFrom, PartialEq)]
+pub struct TeamPeerContent {
+    /// The name shown in the sidebar.
+    pub name: Option<String>,
+    /// The teammate's Tailscale machine name or address, optionally with a
+    /// port, as in "alice-mbp" or "alice-mbp:47231".
+    pub host: Option<String>,
 }
 
 #[derive(

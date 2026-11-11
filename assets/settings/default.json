@@ -1777,6 +1777,22 @@
     // Whether workspace scripts may run commands that are flagged as risky.
     "allow_risky_scripts": false,
   },
+  // Sharing your workspaces and agent chats with teammates, read-only, over
+  // Tailscale. Each teammate runs Mnemonic and lists the others as peers.
+  "team": {
+    // Whether teammates on the allow list can see your workspaces.
+    "share": false,
+    // The port your workspaces are shared on.
+    "port": 47231,
+    // The name teammates see for you. When empty, your Tailscale name is used.
+    "display_name": "",
+    // Tailscale logins allowed to see your workspaces, such as
+    // "alice@example.com".
+    "allow": [],
+    // Teammates whose workspaces are listed in the sidebar, such as
+    // { "name": "Alice", "host": "alice-mbp" }.
+    "peers": [],
+  },
   // Settings specific to journaling
   "journal": {
     // The path of the directory where journal entries are stored

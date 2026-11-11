@@ -198,6 +198,56 @@ pub fn get_workspace_file_diff(
     })
 }
 
+/// All of a workspace's work as one unified diff: commits since the base
+/// branch's merge-base, plus uncommitted and untracked files.
+pub fn get_workspace_full_diff(state: &AppState, workspace_id: &str) -> Result<String, String> {
+    let (root, base_branch) = workspace_root_and_base(state, workspace_id)?;
+    ensure_git_worktree(&root)?;
+    full_diff_at(&root, &base_branch)
+}
+
+fn full_diff_at(root: &Path, base_branch: &str) -> Result<String, String> {
+    let base = merge_base(root, base_branch).unwrap_or_else(|| "HEAD".to_string());
+    let index_path = git(
+        root,
+        &["rev-parse", "--path-format=absolute", "--git-path", "index"],
+    )?;
+    let index_path = PathBuf::from(index_path.trim());
+    let scratch_index = std::env::temp_dir().join(format!(
+        "mnemonic-full-diff-{}-{}.index",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_nanos())
+            .unwrap_or_default()
+    ));
+    // Untracked files only show in a diff once they are in an index. Adding
+    // them to a copy keeps the workspace's own staging area untouched, and
+    // copying (rather than starting empty) keeps git's stat cache, so
+    // unchanged files aren't re-hashed.
+    if index_path.exists() {
+        fs::copy(&index_path, &scratch_index)
+            .map_err(|err| format!("Failed to copy the git index: {err}"))?;
+    }
+    let diff = git_with_index(root, &scratch_index, &["add", "--all"]).and_then(|_| {
+        git_with_index(
+            root,
+            &scratch_index,
+            &["diff", "--cached", "--no-color", "--no-ext-diff", &base],
+        )
+    });
+    if let Err(err) = fs::remove_file(&scratch_index) {
+        if err.kind() != std::io::ErrorKind::NotFound {
+            log::warn!(
+                target: "mnemonic_lib",
+                "failed to remove scratch index {}: {err}",
+                scratch_index.display()
+            );
+        }
+    }
+    diff
+}
+
 fn workspace_root_and_base(
     state: &AppState,
     workspace_id: &str,
@@ -558,6 +608,27 @@ fn git(root: &Path, args: &[&str]) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
+fn git_with_index(root: &Path, index: &Path, args: &[&str]) -> Result<String, String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(args)
+        .env("GIT_INDEX_FILE", index)
+        .output()
+        .map_err(|err| format!("failed to run git in {}: {err}", root.display()))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(if stderr.is_empty() {
+            format!("git command failed in {}", root.display())
+        } else {
+            stderr
+        });
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -620,6 +691,49 @@ mod tests {
         assert_eq!(uncommitted, vec!["edited.txt", "new.txt"]);
         assert_eq!(scope.base_ref.as_deref(), Some("main"));
         assert_eq!(scope.behind_by, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn full_diff_covers_commits_edits_and_untracked_files_without_staging_them(
+    ) -> Result<(), String> {
+        let root = std::env::temp_dir().join(format!(
+            "mnemonic-full-diff-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|elapsed| elapsed.as_nanos())
+                .unwrap_or_default()
+        ));
+        fs::create_dir_all(&root).map_err(|err| err.to_string())?;
+        let write = |path: &str, content: &str| {
+            fs::write(root.join(path), content).map_err(|err| err.to_string())
+        };
+        git(&root, &["init", "--quiet", "--initial-branch=main"])?;
+        git(
+            &root,
+            &["config", "user.email", "mnemonic-tests@example.com"],
+        )?;
+        git(&root, &["config", "user.name", "Mnemonic Tests"])?;
+        write("edited.txt", "one\n")?;
+        git(&root, &["add", "."])?;
+        git(&root, &["commit", "--quiet", "-m", "base"])?;
+        git(&root, &["checkout", "--quiet", "-b", "feature"])?;
+        write("committed.txt", "branch work\n")?;
+        git(&root, &["add", "committed.txt"])?;
+        git(&root, &["commit", "--quiet", "-m", "branch work"])?;
+        write("edited.txt", "two\n")?;
+        write("new.txt", "untracked\n")?;
+
+        let diff = full_diff_at(&root, "main");
+        let status = git(&root, &["status", "--porcelain=v1"]);
+        fs::remove_dir_all(&root).map_err(|err| err.to_string())?;
+        let diff = diff?;
+
+        assert!(diff.contains("+branch work"), "{diff}");
+        assert!(diff.contains("-one\n+two"), "{diff}");
+        assert!(diff.contains("+untracked"), "{diff}");
+        assert!(status?.contains("?? new.txt"));
         Ok(())
     }
 

@@ -3536,6 +3536,25 @@ impl Render for WorkspaceView {
     }
 }
 
+/// The display name of a chat's agent, from the id stored with the chat.
+pub(crate) fn chat_agent_label(agent_id: &str) -> &'static str {
+    ChatAgent::from_agent_id(agent_id).label()
+}
+
+pub(crate) struct LiveWorkspaceAgents {
+    pub workspace_id: String,
+    /// An agent CLI in a terminal has printed something recently.
+    pub terminal_agent_busy: bool,
+    pub chats: Vec<LiveChat>,
+}
+
+pub(crate) struct LiveChat {
+    pub record_id: String,
+    pub title: SharedString,
+    /// None until the agent has connected.
+    pub thread: Option<Entity<acp_thread::AcpThread>>,
+}
+
 /// The single center item that hosts workspace views. The left panel is the
 /// switcher: selecting a workspace swaps which view this item shows, instead
 /// of stacking one tab per workspace. Views are cached, so switching back is
@@ -3923,6 +3942,42 @@ impl WorkspaceHost {
             }
         }
         false
+    }
+
+    /// The agents of every workspace opened in this window, for sharing
+    /// with teammates.
+    pub(crate) fn live_agents(workspace: &Workspace, cx: &App) -> Vec<LiveWorkspaceAgents> {
+        let host = workspace.panes().iter().find_map(|pane| {
+            pane.read(cx)
+                .items()
+                .find_map(|item| item.downcast::<WorkspaceHost>())
+        });
+        let Some(host) = host else {
+            return Vec::new();
+        };
+        host.read(cx)
+            .views
+            .iter()
+            .map(|(workspace_id, view)| {
+                let view = view.read(cx);
+                LiveWorkspaceAgents {
+                    workspace_id: workspace_id.clone(),
+                    terminal_agent_busy: view.agent_is_running(),
+                    chats: view
+                        .sessions
+                        .iter()
+                        .filter_map(|session| {
+                            let chat = session.chat()?;
+                            Some(LiveChat {
+                                record_id: chat.record_id.clone(),
+                                title: session.title.clone(),
+                                thread: chat.view.read(cx).root_thread(cx),
+                            })
+                        })
+                        .collect(),
+                }
+            })
+            .collect()
     }
 
     /// Shows the given workspace in the host (creating the host and view if

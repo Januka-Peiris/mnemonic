@@ -22,4 +22,5 @@ streaming-iterator.workspace = true
 reqwest = { workspace = true, features = ["blocking", "json"] }
 uuid.workspace = true
 tungstenite = "0.24"
+tiny_http.workspace = true
 rand.workspace = true
