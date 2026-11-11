@@ -1,7 +1,6 @@
 use crate::{
-    CloseWindow, NewCenterTerminal, NewFile, NewTerminal, OpenInTerminal, OpenOptions,
-    OpenTerminal, OpenVisible, SplitDirection, ToggleFileFinder, ToggleProjectSymbols, ToggleZoom,
-    Workspace, WorkspaceItemBuilder, ZoomIn, ZoomOut,
+    CloseWindow, OpenInTerminal, OpenOptions, OpenTerminal, OpenVisible, SplitDirection,
+    ToggleZoom, Workspace, WorkspaceItemBuilder, ZoomIn, ZoomOut,
     focus_follows_mouse::FocusFollowsMouse as _,
     invalid_item_view::InvalidItemView,
     item::{
@@ -4231,19 +4230,7 @@ fn default_render_tab_bar_buttons(
                             .action("Codex Chat", session(AgentSessionKind::CodexChat))
                             .action("Claude CLI", session(AgentSessionKind::ClaudeCli))
                             .action("Codex CLI", session(AgentSessionKind::CodexCli))
-                            .action("Shell", session(AgentSessionKind::Shell))
-                            .separator()
-                            .action("New File", NewFile.boxed_clone())
-                            .action("Open File", ToggleFileFinder::default().boxed_clone())
-                            .separator()
-                            .action("Search Project", DeploySearch::default().boxed_clone())
-                            .action("Search Symbols", ToggleProjectSymbols.boxed_clone())
-                            .separator()
-                            .action("New Terminal", NewTerminal::default().boxed_clone())
-                            .action(
-                                "New Center Terminal",
-                                NewCenterTerminal::default().boxed_clone(),
-                            )
+                            .action("Terminal", session(AgentSessionKind::Shell))
                     }))
                 }),
         )

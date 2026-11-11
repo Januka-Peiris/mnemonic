@@ -8,7 +8,8 @@ use crate::repositories::{
     workspace_repository,
 };
 use crate::services::{
-    environment_service, git_review_service, hook_service, review_summary_service,
+    environment_service, git_review_service, hook_service, review_cockpit_service,
+    review_summary_service,
 };
 use crate::state::AppState;
 
@@ -352,7 +353,9 @@ pub fn rerun_failed_workspace_checks(
         return Err("No PR found for this branch".to_string());
     }
 
-    let mut run_ids: Vec<String> = Vec::new();
+    // Each run is re-run in the repository its check URL names, since gh
+    // would otherwise look for it in the upstream of a fork.
+    let mut run_ids: Vec<(String, String)> = Vec::new();
     for check in &status.checks {
         let failed = matches!(
             check.conclusion.as_deref(),
@@ -364,12 +367,15 @@ pub fn rerun_failed_workspace_checks(
         let Some(url) = check.url.as_deref() else {
             continue;
         };
-        let Some(rest) = url.split("/actions/runs/").nth(1) else {
+        let Some((repo_url, rest)) = url.split_once("/actions/runs/") else {
+            continue;
+        };
+        let Some(repo) = repo_url.strip_prefix("https://github.com/") else {
             continue;
         };
         let run_id: String = rest.chars().take_while(char::is_ascii_digit).collect();
-        if !run_id.is_empty() && !run_ids.contains(&run_id) {
-            run_ids.push(run_id);
+        if !run_id.is_empty() && !run_ids.iter().any(|(_, id)| id == &run_id) {
+            run_ids.push((repo.to_string(), run_id));
         }
     }
 
@@ -391,9 +397,9 @@ pub fn rerun_failed_workspace_checks(
 
     let mut errors = Vec::new();
     let mut rerun_count = 0;
-    for run_id in &run_ids {
+    for (repo, run_id) in &run_ids {
         let output = std::process::Command::new(gh_binary())
-            .args(["run", "rerun", run_id, "--failed"])
+            .args(["run", "rerun", run_id, "--failed", "--repo", repo])
             .current_dir(&work_dir)
             .output()
             .map_err(|err| format!("Failed to invoke gh: {err}"))?;
@@ -447,6 +453,7 @@ pub fn merge_workspace_pr(
     state: &AppState,
     workspace_id: &str,
     number: i64,
+    pr_url: Option<&str>,
     head_ref_oid: &str,
     method: &str,
 ) -> Result<String, String> {
@@ -458,13 +465,17 @@ pub fn merge_workspace_pr(
         );
     }
     let work_dir = workspace_work_dir(state, workspace_id)?;
+    // The URL names the repository as well as the PR. A bare number is
+    // resolved in whichever repository gh treats as the base, which for a
+    // fork is the upstream and so a different PR.
     let number_text = number.to_string();
+    let selector = pr_url.unwrap_or(&number_text);
     let gh = gh_binary();
     let output = std::process::Command::new(&gh)
         .args([
             "pr",
             "merge",
-            &number_text,
+            selector,
             method_flag,
             "--match-head-commit",
             head_ref_oid,
@@ -491,7 +502,7 @@ pub fn merge_workspace_pr(
         &[
             "pr",
             "view",
-            &number_text,
+            selector,
             "--json",
             "state",
             "--jq",
@@ -510,6 +521,53 @@ pub fn merge_workspace_pr(
     }
 }
 
+const PR_STATUS_FIELDS: &str = "number,title,url,state,isDraft,reviewDecision,mergeable,mergeStateStatus,headRefOid,statusCheckRollup";
+
+/// Runs `gh pr view` for the branch checked out in `work_dir`. gh looks in
+/// the repository it treats as the base, which for a fork is the upstream, so
+/// a PR opened against the fork itself is only found by naming `origin`.
+fn view_branch_pr(work_dir: &str) -> std::io::Result<std::process::Output> {
+    let gh = gh_binary();
+    let output = std::process::Command::new(&gh)
+        .args(["pr", "view", "--json", PR_STATUS_FIELDS])
+        .current_dir(work_dir)
+        .output()?;
+    if output.status.success() {
+        return Ok(output);
+    }
+
+    let Some((owner, repo)) =
+        review_cockpit_service::git_remote_owner_repo(std::path::Path::new(work_dir))
+    else {
+        return Ok(output);
+    };
+    let branch = match run_in_dir(work_dir, "git", &["rev-parse", "--abbrev-ref", "HEAD"]) {
+        Ok(branch) => branch,
+        Err(err) => {
+            log::debug!("Could not read the current branch for the PR lookup: {err}");
+            return Ok(output);
+        }
+    };
+    let origin_output = std::process::Command::new(&gh)
+        .args([
+            "pr",
+            "view",
+            &branch,
+            "--repo",
+            &format!("{owner}/{repo}"),
+            "--json",
+            PR_STATUS_FIELDS,
+        ])
+        .current_dir(work_dir)
+        .output()?;
+    // When neither lookup finds a PR, gh's first answer is the one to report.
+    Ok(if origin_output.status.success() {
+        origin_output
+    } else {
+        output
+    })
+}
+
 pub fn get_workspace_pr_status(
     state: &AppState,
     workspace_id: &str,
@@ -526,15 +584,7 @@ pub fn get_workspace_pr_status(
             .ok_or_else(|| "Workspace has no worktree path".to_string())?
     };
 
-    let output = std::process::Command::new(gh_binary())
-        .args([
-            "pr",
-            "view",
-            "--json",
-            "number,title,url,state,isDraft,reviewDecision,mergeable,mergeStateStatus,headRefOid,statusCheckRollup",
-        ])
-        .current_dir(&work_dir)
-        .output();
+    let output = view_branch_pr(&work_dir);
 
     let output = match output {
         Ok(output) => output,
