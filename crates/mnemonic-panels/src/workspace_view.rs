@@ -3573,6 +3573,38 @@ impl WorkspaceHost {
         }
     }
 
+    /// Applies a rename made from the Projects panel to the workspace's open
+    /// view, which then stops naming the workspace after its first message.
+    pub(crate) fn workspace_renamed(
+        workspace: &mut Workspace,
+        workspace_id: &str,
+        name: &str,
+        cx: &mut Context<Workspace>,
+    ) {
+        if let Some(panel) = workspace.panel::<WorkspaceDetailPanel>(cx) {
+            panel.update(cx, |_, cx| cx.notify());
+        }
+        for pane in workspace.panes().to_vec() {
+            let host = pane
+                .read(cx)
+                .items()
+                .find_map(|item| item.downcast::<WorkspaceHost>());
+            if let Some(host) = host {
+                host.update(cx, |host, cx| {
+                    if let Some(view) = host.views.get(workspace_id) {
+                        view.update(cx, |view, cx| {
+                            view.workspace_name = SharedString::from(name.to_string());
+                            view.branch_rename_started = true;
+                            cx.notify();
+                        });
+                    }
+                    cx.emit(ItemEvent::UpdateTab);
+                });
+                return;
+            }
+        }
+    }
+
     /// Kills the run commands of the given workspace's view, if it exists in
     /// this window.
     pub fn kill_run_commands_for_workspace(

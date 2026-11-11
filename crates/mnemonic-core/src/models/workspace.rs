@@ -78,6 +78,16 @@ pub struct WorkspaceDetail {
     pub recent_events: Vec<String>,
 }
 
+/// A workspace whose worktree sits in the archive folder, with what is
+/// needed to bring it back.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ArchivedWorkspace {
+    pub detail: WorkspaceDetail,
+    pub chat_sessions: Vec<super::ChatSessionRecord>,
+    pub archived_path: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CreateWorkspaceInput {

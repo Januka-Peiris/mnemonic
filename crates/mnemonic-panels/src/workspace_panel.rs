@@ -10,7 +10,8 @@ use gpui::{
 };
 use mnemonic_bridge::AgentAttention;
 use mnemonic_core::models::{
-    ActivityItem, ChatSessionRecord, CreateWorkspaceInput, DiscoveredRepository, WorkspaceSummary,
+    ActivityItem, ArchivedWorkspace, ChatSessionRecord, CreateWorkspaceInput, DiscoveredRepository,
+    WorkspaceSummary,
 };
 use mnemonic_core::repositories::{
     activity_repository, chat_session_repository, repository_repository, settings_repository,
@@ -81,6 +82,9 @@ pub struct WorkspacePanel {
     workspace: WeakEntity<Workspace>,
     repositories: Vec<DiscoveredRepository>,
     workspaces: Vec<WorkspaceSummary>,
+    archived: Vec<ArchivedWorkspace>,
+    /// Projects whose archived workspaces are listed.
+    expanded_archives: Vec<String>,
     collapsed_projects: Vec<String>,
     selected_workspace_id: Option<String>,
     showing_history: bool,
@@ -101,6 +105,8 @@ impl WorkspacePanel {
                 workspace: workspace.weak_handle(),
                 repositories: Vec::new(),
                 workspaces: Vec::new(),
+                archived: Vec::new(),
+                expanded_archives: Vec::new(),
                 collapsed_projects: Vec::new(),
                 selected_workspace_id: None,
                 showing_history: false,
@@ -142,6 +148,10 @@ impl WorkspacePanel {
         match workspace_service::list_workspaces(&state) {
             Ok(ws) => self.workspaces = ws,
             Err(e) => log::error!("Failed to list workspaces: {e}"),
+        }
+        match workspace_service::list_archived_workspaces(&state) {
+            Ok(archived) => self.archived = archived,
+            Err(e) => log::error!("Failed to list archived workspaces: {e}"),
         }
         match repository_repository::list(&state.db) {
             Ok(repos) => self.repositories = repos,
@@ -349,6 +359,95 @@ impl WorkspacePanel {
         if let Some(id) = visible_ids.get(next) {
             self.select_workspace(id.clone(), window, cx);
         }
+    }
+
+    /// Brings an archived workspace back: its worktree moves out of the
+    /// archive folder and it reopens with the chats it had.
+    fn restore_workspace(
+        &mut self,
+        workspace_id: String,
+        name: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(state) = mnemonic_bridge::mnemonic_state_cloned() else {
+            return;
+        };
+        cx.spawn_in(window, async move |this, cx| {
+            let result = cx
+                .background_spawn(async move {
+                    workspace_service::restore_archived_workspace(&state, &workspace_id)
+                })
+                .await;
+            this.update_in(cx, |this, window, cx| match result {
+                Ok(summary) => {
+                    this.refresh(cx);
+                    this.select_workspace(summary.id, window, cx);
+                }
+                Err(err) => {
+                    this.show_archive_toast(format!("{name}: couldn't restore: {err}"), cx);
+                }
+            })
+            .log_err();
+        })
+        .detach();
+    }
+
+    fn open_rename_prompt(
+        &mut self,
+        workspace_id: String,
+        current_name: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+        let panel = cx.weak_entity();
+        workspace.update(cx, |workspace, cx| {
+            workspace.toggle_modal(window, cx, |window, cx| {
+                RenameWorkspaceModal::new(panel, workspace_id, current_name, window, cx)
+            });
+        });
+    }
+
+    /// Renames the workspace off the UI thread, then updates its open view.
+    fn rename_workspace(
+        &mut self,
+        workspace_id: String,
+        new_name: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(state) = mnemonic_bridge::mnemonic_state_cloned() else {
+            return;
+        };
+        cx.spawn_in(window, async move |this, cx| {
+            let result = cx
+                .background_spawn(async move {
+                    workspace_service::rename_workspace(&state, &workspace_id, &new_name)
+                })
+                .await;
+            this.update(cx, |this, cx| match result {
+                Ok(summary) => {
+                    this.refresh(cx);
+                    if let Some(workspace) = this.workspace.upgrade() {
+                        workspace.update(cx, |workspace, cx| {
+                            WorkspaceHost::workspace_renamed(
+                                workspace,
+                                &summary.id,
+                                &summary.name,
+                                cx,
+                            );
+                        });
+                    }
+                    cx.notify();
+                }
+                Err(err) => this.show_archive_toast(format!("Couldn't rename: {err}"), cx),
+            })
+            .log_err();
+        })
+        .detach();
     }
 
     /// Archive after confirmation: runs the configured teardown commands in
@@ -1013,9 +1112,120 @@ impl WorkspacePanel {
             for ws in workspaces {
                 group = group.child(self.render_workspace_row(ws, project, cx));
             }
+            let archived: Vec<&ArchivedWorkspace> = self
+                .archived
+                .iter()
+                .filter(|entry| {
+                    let repo = entry.detail.summary.repo.as_str();
+                    (if repo.is_empty() { "ungrouped" } else { repo }) == project
+                })
+                .collect();
+            if !archived.is_empty() {
+                group = group.child(self.render_archived_section(project, &archived, cx));
+            }
         }
 
         group
+    }
+
+    /// A collapsed "Archived (n)" row under a project's workspaces that
+    /// expands to its archived workspaces, each with a restore button.
+    fn render_archived_section(
+        &self,
+        project: &str,
+        archived: &[&ArchivedWorkspace],
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let expanded = self.expanded_archives.iter().any(|name| name == project);
+        let project_owned = project.to_string();
+        let mut section = v_flex().w_full().child(
+            h_flex()
+                .id(SharedString::from(format!("archived-{project}")))
+                .pl(px(28.))
+                .pr_2()
+                .h(px(22.))
+                .gap_1()
+                .items_center()
+                .w_full()
+                .cursor_pointer()
+                .rounded_md()
+                .hover(|style| style.bg(cx.theme().colors().ghost_element_hover))
+                .on_click(cx.listener(move |this, _, _window, cx| {
+                    match this
+                        .expanded_archives
+                        .iter()
+                        .position(|name| name == &project_owned)
+                    {
+                        Some(position) => {
+                            this.expanded_archives.remove(position);
+                        }
+                        None => this.expanded_archives.push(project_owned.clone()),
+                    }
+                    cx.notify();
+                }))
+                .child(
+                    Icon::new(if expanded {
+                        IconName::ChevronDown
+                    } else {
+                        IconName::ChevronRight
+                    })
+                    .size(IconSize::XSmall)
+                    .color(Color::Muted),
+                )
+                .child(
+                    Label::new(format!("Archived ({})", archived.len()))
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted),
+                ),
+        );
+        if expanded {
+            for entry in archived {
+                let workspace_id = entry.detail.summary.id.clone();
+                let name = entry.detail.summary.name.clone();
+                section = section.child(
+                    h_flex()
+                        .pl(px(44.))
+                        .pr_2()
+                        .h(px(22.))
+                        .gap_1p5()
+                        .items_center()
+                        .w_full()
+                        .child(
+                            Icon::new(IconName::Archive)
+                                .size(IconSize::XSmall)
+                                .color(Color::Muted),
+                        )
+                        .child(
+                            div().flex_grow(1.0).overflow_hidden().child(
+                                Label::new(name.clone())
+                                    .size(LabelSize::Small)
+                                    .color(Color::Muted)
+                                    .single_line(),
+                            ),
+                        )
+                        .child(
+                            IconButton::new(
+                                SharedString::from(format!("restore-{workspace_id}")),
+                                IconName::RotateCcw,
+                            )
+                            .icon_size(IconSize::XSmall)
+                            .icon_color(Color::Muted)
+                            .tooltip(Tooltip::text("Restore workspace"))
+                            .on_click(cx.listener(
+                                move |this, _, window, cx| {
+                                    this.restore_workspace(
+                                        workspace_id.clone(),
+                                        name.clone(),
+                                        window,
+                                        cx,
+                                    );
+                                },
+                            )),
+                        ),
+                );
+            }
+        }
+        section
     }
 
     fn render_workspace_row(
@@ -1047,6 +1257,8 @@ impl WorkspacePanel {
             .or_else(|| ws.repository_path.clone())
             .or_else(|| ws.selected_worktree_path.clone());
         let this = cx.weak_entity();
+        let additions: u32 = ws.changed_files.iter().map(|file| file.additions).sum();
+        let deletions: u32 = ws.changed_files.iter().map(|file| file.deletions).sum();
 
         let row = h_flex()
             .id(SharedString::from(ws.id.clone()))
@@ -1116,6 +1328,22 @@ impl WorkspacePanel {
                         .single_line(),
                 ),
             )
+            .when(additions > 0 || deletions > 0, |el| {
+                el.child(
+                    h_flex()
+                        .gap_1()
+                        .child(
+                            Label::new(format!("+{additions}"))
+                                .size(LabelSize::XSmall)
+                                .color(Color::Created),
+                        )
+                        .child(
+                            Label::new(format!("-{deletions}"))
+                                .size(LabelSize::XSmall)
+                                .color(Color::Deleted),
+                        ),
+                )
+            })
             .child(
                 IconButton::new(
                     SharedString::from(format!("archive-{}", ws.id)),
@@ -1156,6 +1384,29 @@ impl WorkspacePanel {
                     }
                     menu.entry("Copy Branch Name", None, move |_, cx| {
                         cx.write_to_clipboard(ClipboardItem::new_string(branch.clone()));
+                    })
+                    .entry("Rename…", None, {
+                        let this = this.clone();
+                        let workspace_id = workspace_id.clone();
+                        let workspace_name = workspace_name.clone();
+                        move |window, cx| {
+                            let this = this.clone();
+                            let workspace_id = workspace_id.clone();
+                            let workspace_name = workspace_name.clone();
+                            // Opened once the menu has closed and given focus
+                            // back, so the prompt keeps it.
+                            window.defer(cx, move |window, cx| {
+                                this.update(cx, |this, cx| {
+                                    this.open_rename_prompt(
+                                        workspace_id,
+                                        workspace_name,
+                                        window,
+                                        cx,
+                                    );
+                                })
+                                .log_err();
+                            });
+                        }
                     })
                     .separator()
                     .entry("Archive…", None, move |window, cx| {
@@ -1678,6 +1929,95 @@ impl Render for IssuePromptModal {
                     .w_full()
                     .p_2()
                     .child(hint),
+            )
+    }
+}
+
+struct RenameWorkspaceModal {
+    editor: Entity<Editor>,
+    panel: WeakEntity<WorkspacePanel>,
+    workspace_id: String,
+}
+
+impl RenameWorkspaceModal {
+    fn new(
+        panel: WeakEntity<WorkspacePanel>,
+        workspace_id: String,
+        current_name: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let editor = cx.new(|cx| {
+            let mut editor = Editor::single_line(window, cx);
+            editor.set_text(current_name, window, cx);
+            editor.select_all(&editor::actions::SelectAll, window, cx);
+            editor
+        });
+        Self {
+            editor,
+            panel,
+            workspace_id,
+        }
+    }
+
+    fn cancel(&mut self, _: &menu::Cancel, _window: &mut Window, cx: &mut Context<Self>) {
+        cx.emit(DismissEvent);
+    }
+
+    fn confirm(&mut self, _: &menu::Confirm, window: &mut Window, cx: &mut Context<Self>) {
+        let name = self.editor.read(cx).text(cx);
+        if !name.trim().is_empty() {
+            let workspace_id = self.workspace_id.clone();
+            self.panel
+                .update(cx, |panel, cx| {
+                    panel.rename_workspace(workspace_id, name, window, cx);
+                })
+                .log_err();
+        }
+        cx.emit(DismissEvent);
+    }
+}
+
+impl EventEmitter<DismissEvent> for RenameWorkspaceModal {}
+
+impl ModalView for RenameWorkspaceModal {}
+
+impl Focusable for RenameWorkspaceModal {
+    fn focus_handle(&self, cx: &App) -> FocusHandle {
+        self.editor.focus_handle(cx)
+    }
+}
+
+impl Render for RenameWorkspaceModal {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        v_flex()
+            .key_context("RenameWorkspaceModal")
+            .on_action(cx.listener(Self::cancel))
+            .on_action(cx.listener(Self::confirm))
+            .elevation_3(cx)
+            .w_96()
+            .overflow_hidden()
+            .child(
+                div()
+                    .p_2()
+                    .border_b_1()
+                    .border_color(cx.theme().colors().border_variant)
+                    .child(self.editor.clone()),
+            )
+            .child(
+                h_flex()
+                    .bg(cx.theme().colors().editor_background)
+                    .rounded_b_sm()
+                    .w_full()
+                    .p_2()
+                    .child(
+                        Label::new(
+                            "Rename the workspace. Its branch is renamed too, until it has \
+                             been pushed or has a PR.",
+                        )
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
+                    ),
             )
     }
 }

@@ -178,6 +178,29 @@ pub fn archive_mnemonic_worktree(repo_path: &str, worktree_path: &str) -> Result
     Ok(destination)
 }
 
+/// Moves an archived worktree back to where it was before it was archived.
+pub fn restore_archived_worktree(
+    repo_path: &str,
+    archived_path: &str,
+    worktree_path: &str,
+) -> Result<(), String> {
+    let worktree_path = Path::new(worktree_path);
+    if let Some(parent) = worktree_path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|err| format!("Failed to create {}: {err}", parent.display()))?;
+    }
+    git(
+        Path::new(repo_path),
+        &[
+            "worktree",
+            "move",
+            path_arg(Path::new(archived_path)).as_str(),
+            path_arg(worktree_path).as_str(),
+        ],
+    )?;
+    Ok(())
+}
+
 /// Clears stale `git worktree` registrations after the checkout directory was removed manually.
 pub fn prune_worktrees(repo_path: &Path) -> Result<(), String> {
     git(repo_path, &["worktree", "prune"])?;

@@ -90,7 +90,7 @@ pub use terminal::{
     TerminalSessionState,
 };
 pub use workspace::{
-    AgentSessionSummary, AttachLinkedWorktreeInput, BranchHealth, ChangedFile,
+    AgentSessionSummary, ArchivedWorkspace, AttachLinkedWorktreeInput, BranchHealth, ChangedFile,
     CreateChildWorkspaceInput, CreateWorkspaceInput, LinkedWorktreeRef, RepositoryWorkspaceOptions,
     WorkspaceDetail, WorkspaceSummary,
 };
