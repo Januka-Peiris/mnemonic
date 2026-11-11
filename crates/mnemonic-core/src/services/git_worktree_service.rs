@@ -202,6 +202,62 @@ pub fn local_branch_exists(repo_path: &Path, branch: &str) -> Result<bool, Strin
     branch_exists(repo_path, branch)
 }
 
+/// The branch checked out in a worktree, or None when HEAD is detached.
+pub fn current_branch(worktree_path: &Path) -> Result<Option<String>, String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(worktree_path)
+        .args(["symbolic-ref", "--quiet", "--short", "HEAD"])
+        .output()
+        .map_err(|err| format!("failed to run git symbolic-ref: {err}"))?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+    let branch = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    Ok(Some(branch).filter(|branch| !branch.is_empty()))
+}
+
+/// Whether a branch has left this machine: it tracks an upstream, or a
+/// remote-tracking ref with the same name exists. Only local refs are
+/// consulted, so this works offline.
+pub fn branch_is_published(repo_path: &Path, branch: &str) -> Result<bool, String> {
+    let upstream = git(
+        repo_path,
+        &[
+            "for-each-ref",
+            "--format=%(upstream)",
+            &format!("refs/heads/{branch}"),
+        ],
+    )?;
+    if !upstream.is_empty() {
+        return Ok(true);
+    }
+    remote_branch_exists(repo_path, branch)
+}
+
+/// Whether a branch name is already used locally or on any known remote.
+pub fn branch_name_taken(repo_path: &Path, branch: &str) -> Result<bool, String> {
+    Ok(branch_exists(repo_path, branch)? || remote_branch_exists(repo_path, branch)?)
+}
+
+pub fn rename_branch(repo_path: &Path, old_branch: &str, new_branch: &str) -> Result<(), String> {
+    let new_branch = sanitize_branch(new_branch)?;
+    git(repo_path, &["branch", "-m", old_branch, &new_branch])?;
+    Ok(())
+}
+
+fn remote_branch_exists(repo_path: &Path, branch: &str) -> Result<bool, String> {
+    let remote_branches = git(
+        repo_path,
+        &[
+            "for-each-ref",
+            "--format=%(refname:lstrip=3)",
+            "refs/remotes",
+        ],
+    )?;
+    Ok(remote_branches.lines().any(|line| line.trim() == branch))
+}
+
 fn branch_exists(repo_path: &Path, branch: &str) -> Result<bool, String> {
     let output = Command::new("git")
         .arg("-C")

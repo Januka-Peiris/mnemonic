@@ -10,27 +10,30 @@ pub fn set_file_reviewed(
     reviewed: bool,
     reviewed_at: &str,
     notes: Option<&str>,
+    content_hash: Option<&str>,
 ) -> Result<(), String> {
     db.with_connection(|connection| {
         if reviewed {
             connection.execute(
                 r#"
-                INSERT INTO workspace_file_reviews (workspace_id, path, status, reviewed_at, reviewed_by, notes, updated_at)
-                VALUES (?1, ?2, 'reviewed', ?3, 'local', ?4, CURRENT_TIMESTAMP)
+                INSERT INTO workspace_file_reviews (workspace_id, path, status, reviewed_at, reviewed_by, notes, content_hash, updated_at)
+                VALUES (?1, ?2, 'reviewed', ?3, 'local', ?4, ?5, CURRENT_TIMESTAMP)
                 ON CONFLICT(workspace_id, path) DO UPDATE SET
                     status = 'reviewed', reviewed_at = excluded.reviewed_at,
-                    reviewed_by = 'local', notes = excluded.notes, updated_at = CURRENT_TIMESTAMP
+                    reviewed_by = 'local', notes = excluded.notes,
+                    content_hash = excluded.content_hash, updated_at = CURRENT_TIMESTAMP
                 "#,
-                params![workspace_id, path, reviewed_at, notes],
+                params![workspace_id, path, reviewed_at, notes, content_hash],
             )?;
         } else {
             connection.execute(
                 r#"
-                INSERT INTO workspace_file_reviews (workspace_id, path, status, reviewed_at, reviewed_by, notes, updated_at)
-                VALUES (?1, ?2, 'unreviewed', NULL, 'local', ?3, CURRENT_TIMESTAMP)
+                INSERT INTO workspace_file_reviews (workspace_id, path, status, reviewed_at, reviewed_by, notes, content_hash, updated_at)
+                VALUES (?1, ?2, 'unreviewed', NULL, 'local', ?3, NULL, CURRENT_TIMESTAMP)
                 ON CONFLICT(workspace_id, path) DO UPDATE SET
                     status = 'unreviewed', reviewed_at = NULL,
-                    reviewed_by = 'local', notes = excluded.notes, updated_at = CURRENT_TIMESTAMP
+                    reviewed_by = 'local', notes = excluded.notes,
+                    content_hash = NULL, updated_at = CURRENT_TIMESTAMP
                 "#,
                 params![workspace_id, path, notes],
             )?;
@@ -46,7 +49,7 @@ pub fn list_file_review_states(
     db.with_connection(|connection| {
         let mut stmt = connection.prepare(
             r#"
-            SELECT workspace_id, path, status, reviewed_at, reviewed_by, notes
+            SELECT workspace_id, path, status, reviewed_at, reviewed_by, notes, content_hash
             FROM workspace_file_reviews
             WHERE workspace_id = ?1
             ORDER BY path ASC
@@ -69,7 +72,7 @@ pub fn get_file_review_state(
         connection
             .query_row(
                 r#"
-                SELECT workspace_id, path, status, reviewed_at, reviewed_by, notes
+                SELECT workspace_id, path, status, reviewed_at, reviewed_by, notes, content_hash
                 FROM workspace_file_reviews
                 WHERE workspace_id = ?1 AND path = ?2
                 "#,
@@ -203,6 +206,7 @@ fn file_review_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkspaceFi
         reviewed_at: row.get("reviewed_at")?,
         reviewed_by: row.get("reviewed_by")?,
         notes: row.get("notes")?,
+        content_hash: row.get("content_hash")?,
     })
 }
 
@@ -246,13 +250,14 @@ mod tests {
             )?;
             Ok(())
         }).expect("workspace");
-        set_file_reviewed(&db, "ws", "src/lib.rs", true, "1", None).expect("reviewed");
+        set_file_reviewed(&db, "ws", "src/lib.rs", true, "1", None, None).expect("reviewed");
         let state = get_file_review_state(&db, "ws", "src/lib.rs")
             .expect("state")
             .expect("some");
         assert_eq!(state.status, "reviewed");
         assert_eq!(state.reviewed_at.as_deref(), Some("1"));
-        set_file_reviewed(&db, "ws", "src/lib.rs", false, "2", Some("later")).expect("unreviewed");
+        set_file_reviewed(&db, "ws", "src/lib.rs", false, "2", Some("later"), None)
+            .expect("unreviewed");
         let state = get_file_review_state(&db, "ws", "src/lib.rs")
             .expect("state")
             .expect("some");

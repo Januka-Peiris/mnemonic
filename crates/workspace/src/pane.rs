@@ -4218,7 +4218,15 @@ fn default_render_tab_bar_buttons(
                 .with_handle(pane.new_item_context_menu_handle.clone())
                 .menu(move |window, cx| {
                     Some(ContextMenu::build(window, cx, |menu, _, _| {
-                        menu.action("New File", NewFile.boxed_clone())
+                        use zed_actions::mnemonic::{AgentSessionKind, NewAgentSession};
+                        let session = |kind| NewAgentSession { kind }.boxed_clone();
+                        menu.action("Claude Chat", session(AgentSessionKind::ClaudeChat))
+                            .action("Codex Chat", session(AgentSessionKind::CodexChat))
+                            .action("Claude CLI", session(AgentSessionKind::ClaudeCli))
+                            .action("Codex CLI", session(AgentSessionKind::CodexCli))
+                            .action("Shell", session(AgentSessionKind::Shell))
+                            .separator()
+                            .action("New File", NewFile.boxed_clone())
                             .action("Open File", ToggleFileFinder::default().boxed_clone())
                             .separator()
                             .action("Search Project", DeploySearch::default().boxed_clone())
@@ -6993,7 +7001,9 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn test_double_click_pinned_tab_bar_empty_space_creates_new_tab(cx: &mut TestAppContext) {
+    async fn test_double_click_pinned_tab_bar_empty_space_opens_new_session(
+        cx: &mut TestAppContext,
+    ) {
         init_test(cx);
         let fs = FakeFs::new(cx.executor());
 
@@ -7002,17 +7012,17 @@ mod tests {
             cx.add_window_view(|window, cx| Workspace::test_new(project.clone(), window, cx));
         let pane = workspace.read_with(cx, |workspace, _| workspace.active_pane().clone());
 
-        // The real NewFile handler lives in editor::init, which isn't initialized
-        // in workspace tests. Register a global action handler that sets a flag so
-        // we can verify the action is dispatched without depending on the editor crate.
-        // TODO: If editor::init is ever available in workspace tests, remove this
-        // flag and assert the resulting tab bar state directly instead.
-        let new_file_dispatched = Rc::new(Cell::new(false));
+        // The real handler lives in the zed crate, which isn't available in
+        // workspace tests. Register a global action handler that sets a flag so
+        // we can verify the action is dispatched.
+        let new_session_dispatched = Rc::new(Cell::new(false));
         cx.update(|_, cx| {
-            let new_file_dispatched = new_file_dispatched.clone();
-            cx.on_action(move |_: &NewFile, _cx| {
-                new_file_dispatched.set(true);
-            });
+            let new_session_dispatched = new_session_dispatched.clone();
+            cx.on_action(
+                move |_: &zed_actions::mnemonic::NewDefaultAgentSession, _cx| {
+                    new_session_dispatched.set(true);
+                },
+            );
         });
 
         set_pinned_tabs_separate_row(cx, true);
@@ -7052,11 +7062,9 @@ mod tests {
 
         cx.run_until_parked();
 
-        // TODO: If editor::init is ever available in workspace tests, replace this
-        // with an assert_item_labels check that verifies a new tab is actually created.
         assert!(
-            new_file_dispatched.get(),
-            "Double-clicking pinned tab bar empty space should dispatch the new file action"
+            new_session_dispatched.get(),
+            "Double-clicking pinned tab bar empty space should dispatch the new session action"
         );
     }
 

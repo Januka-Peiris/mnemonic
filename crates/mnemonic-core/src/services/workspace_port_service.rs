@@ -50,7 +50,7 @@ pub fn list_workspace_ports(
     Ok(ports)
 }
 
-fn invalidate_workspace_port_cache(workspace_id: &str) {
+pub fn invalidate_workspace_port_cache(workspace_id: &str) {
     if let Some(cache) = PORT_CACHE.get() {
         if let Ok(mut cache) = cache.lock() {
             cache.remove(workspace_id);

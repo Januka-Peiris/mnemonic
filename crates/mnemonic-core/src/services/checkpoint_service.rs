@@ -1,5 +1,7 @@
-use std::path::PathBuf;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Mutex;
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -9,6 +11,19 @@ use crate::models::{
 };
 use crate::repositories::{activity_repository, workspace_repository};
 use crate::state::AppState;
+
+const CHECKPOINT_SUBJECT_MARKER: &str = "mnemonic checkpoint: ";
+const TURN_LABEL_MAX_CHARS: usize = 72;
+
+/// Serialises snapshot and restore work so concurrent sends can't race the
+/// "same as the newest checkpoint" check or restore mid-snapshot.
+static CHECKPOINT_LOCK: Mutex<()> = Mutex::new(());
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SnapshotMode {
+    OnlyIfDirty,
+    Always,
+}
 
 pub fn create_workspace_checkpoint(
     state: &AppState,
@@ -35,6 +50,7 @@ pub fn list_workspace_checkpoints(
         &root,
         &[
             "for-each-ref",
+            "--sort=-refname",
             "--sort=-creatordate",
             "--format=%(refname)%00%(objectname:short)%00%(creatordate:unix)%00%(subject)",
             &pattern,
@@ -80,33 +96,39 @@ pub fn get_workspace_checkpoint_restore_plan(
 ) -> Result<WorkspaceCheckpointRestorePlan, String> {
     let root = workspace_root_path(state, workspace_id)?;
     validate_checkpoint_ref(workspace_id, reference)?;
+    ensure_checkpoint_ref_exists(&root, reference)?;
     let status = git(&root, &["status", "--porcelain"])?;
     let current_dirty = !status.trim().is_empty();
-    let changed_file_count = status
-        .lines()
-        .filter(|line| !line.trim().is_empty())
-        .count();
-    let checkpoint_files = git(
+    let changed_file_count = non_empty_lines(&status).count();
+    let checkpoint_file_count = non_empty_lines(&git(
         &root,
-        &[
-            "diff-tree",
-            "--no-commit-id",
-            "--name-only",
-            "-r",
-            reference,
-        ],
-    )?;
-    let checkpoint_file_count = checkpoint_files
-        .lines()
-        .filter(|line| !line.trim().is_empty())
-        .count();
+        &["diff", "--name-only", &format!("{reference}^1"), reference],
+    )?)
+    .count();
+    let files_to_restore = non_empty_lines(&git(
+        &root,
+        &["diff", "--relative", "--name-only", reference],
+    )?)
+    .map(str::to_string)
+    .collect::<Vec<_>>();
+    let untracked = untracked_files(&root)?;
+    let overwritten = untracked_files_in_checkpoint(&root, reference, &untracked)?;
 
     let mut warnings = Vec::new();
-    if current_dirty {
-        warnings.push("Current workspace has uncommitted changes. Create a fresh checkpoint before restoring.".to_string());
+    if !overwritten.is_empty() {
+        warnings.push(format!(
+            "Restore is blocked: untracked files would be overwritten ({}). Move or commit them first.",
+            overwritten.join(", ")
+        ));
     }
-    if checkpoint_file_count == 0 {
-        warnings.push("Selected checkpoint does not report changed files.".to_string());
+    if !untracked.is_empty() {
+        warnings.push(format!(
+            "{} untracked file(s) are not part of checkpoints and will be left as they are.",
+            untracked.len()
+        ));
+    }
+    if files_to_restore.is_empty() {
+        warnings.push("Tracked files already match this checkpoint.".to_string());
     }
 
     Ok(WorkspaceCheckpointRestorePlan {
@@ -115,33 +137,95 @@ pub fn get_workspace_checkpoint_restore_plan(
         current_dirty,
         changed_file_count,
         checkpoint_file_count,
+        files_to_restore,
+        overwritten_untracked_files: overwritten,
         warnings,
         steps: vec![
-            "Create a new safety checkpoint for the current workspace state.".to_string(),
-            format!("Apply checkpoint changes from {reference}."),
-            "Refresh changed files, readiness, and the review cockpit.".to_string(),
-            "Keep the original checkpoint ref for manual recovery until cleanup.".to_string(),
+            "Save current uncommitted changes to tracked files as a new checkpoint.".to_string(),
+            format!("Restore tracked files and the index from {reference}."),
+            "Leave untracked files, commits, and the branch as they are.".to_string(),
+            "Keep every checkpoint ref for manual recovery.".to_string(),
         ],
     })
 }
 
+/// Rewrites tracked files and the index to the checkpoint's tree. Current
+/// uncommitted tracked changes are saved as a safety checkpoint first, and
+/// restore refuses when it would overwrite an untracked file, so nothing is
+/// lost that can't be restored again.
 pub fn restore_workspace_checkpoint(
     state: &AppState,
     workspace_id: &str,
     reference: &str,
 ) -> Result<WorkspaceCheckpointRestoreResult, String> {
     let root = workspace_root_path(state, workspace_id)?;
-    validate_checkpoint_ref(workspace_id, reference)?;
-    let plan = get_workspace_checkpoint_restore_plan(state, workspace_id, reference)?;
-    if plan.current_dirty {
-        return Err(
-            "Refusing to restore onto a dirty workspace. Create a checkpoint and clean or commit current changes first."
-                .to_string(),
+    let safety_reference = {
+        let _guard = lock_checkpoints();
+        restore_checkpoint_at(&root, workspace_id, reference)?
+    };
+
+    if let Ok(Some(workspace)) = workspace_repository::get_detail(&state.db, workspace_id) {
+        if let Some(safety_reference) = &safety_reference {
+            record_activity(
+                state,
+                workspace_id,
+                &workspace.summary.repo,
+                &workspace.summary.branch,
+                "Checkpoint created",
+                "info",
+                &format!("Reason: before restoring {reference}; ref: {safety_reference}"),
+            );
+        }
+        record_activity(
+            state,
+            workspace_id,
+            &workspace.summary.repo,
+            &workspace.summary.branch,
+            "Checkpoint restored",
+            "warning",
+            &format!(
+                "Ref: {reference}; mode: git restore --staged --worktree; checkpoint preserved."
+            ),
         );
     }
 
+    let message = match safety_reference {
+        Some(_) => "Checkpoint restored. Your previous changes were saved as a new checkpoint.",
+        None => "Checkpoint restored.",
+    };
+    Ok(WorkspaceCheckpointRestoreResult {
+        workspace_id: workspace_id.to_string(),
+        reference: reference.to_string(),
+        applied: true,
+        message: message.to_string(),
+    })
+}
+
+fn restore_checkpoint_at(
+    root: &Path,
+    workspace_id: &str,
+    reference: &str,
+) -> Result<Option<String>, String> {
+    validate_checkpoint_ref(workspace_id, reference)?;
+    ensure_checkpoint_ref_exists(root, reference)?;
+    let untracked = untracked_files(root)?;
+    let overwritten = untracked_files_in_checkpoint(root, reference, &untracked)?;
+    if !overwritten.is_empty() {
+        return Err(format!(
+            "Refusing to restore: untracked files would be overwritten ({}). Move or commit them first.",
+            overwritten.join(", ")
+        ));
+    }
+
+    let safety_reference = snapshot_worktree(
+        root,
+        workspace_id,
+        &format!("before restoring {reference}"),
+        SnapshotMode::OnlyIfDirty,
+    )?;
+
     git(
-        &root,
+        root,
         &[
             "restore",
             "--source",
@@ -151,28 +235,7 @@ pub fn restore_workspace_checkpoint(
             ".",
         ],
     )?;
-
-    if let Ok(Some(workspace)) = workspace_repository::get_detail(&state.db, workspace_id) {
-        let _ = activity_repository::record(
-            &state.db,
-            workspace_id,
-            &workspace.summary.repo,
-            Some(&workspace.summary.branch),
-            "Checkpoint restored",
-            "warning",
-            Some(&format!(
-                "Ref: {reference}; checkpoint files: {}; mode: git restore --staged --worktree; checkpoint preserved.",
-                plan.checkpoint_file_count
-            )),
-        );
-    }
-
-    Ok(WorkspaceCheckpointRestoreResult {
-        workspace_id: workspace_id.to_string(),
-        reference: reference.to_string(),
-        applied: true,
-        message: "Checkpoint tree restored into the workspace without committing.".to_string(),
-    })
+    Ok(safety_reference)
 }
 
 pub fn delete_workspace_checkpoint(
@@ -275,41 +338,203 @@ pub fn create_checkpoint_if_dirty(
     reason: &str,
 ) -> Result<Option<String>, String> {
     let root = workspace_root_path(state, workspace_id)?;
-    let status = git(&root, &["status", "--porcelain"])?;
-    let changed_file_count = status
+    let reference = {
+        let _guard = lock_checkpoints();
+        snapshot_worktree(&root, workspace_id, reason, SnapshotMode::OnlyIfDirty)?
+    };
+    if let Some(reference) = &reference {
+        record_checkpoint_created(state, workspace_id, reason, reference);
+    }
+    Ok(reference)
+}
+
+/// Checkpoints the worktree before an agent turn, labelled with a preview of
+/// the message. Unlike `create_checkpoint_if_dirty`, a clean worktree is
+/// checkpointed too (as its HEAD tree) so the first turn can be reverted.
+/// Returns None when tracked files match the newest checkpoint.
+pub fn create_turn_checkpoint(
+    state: &AppState,
+    workspace_id: &str,
+    message: &str,
+) -> Result<Option<String>, String> {
+    let root = workspace_root_path(state, workspace_id)?;
+    let label = turn_label(message);
+    let reference = {
+        let _guard = lock_checkpoints();
+        snapshot_worktree(&root, workspace_id, &label, SnapshotMode::Always)?
+    };
+    if let Some(reference) = &reference {
+        record_checkpoint_created(state, workspace_id, &label, reference);
+    }
+    Ok(reference)
+}
+
+/// The user-facing label stored in a checkpoint commit's subject.
+pub fn checkpoint_label(subject: &str) -> &str {
+    subject
+        .find(CHECKPOINT_SUBJECT_MARKER)
+        .and_then(|index| subject.get(index + CHECKPOINT_SUBJECT_MARKER.len()..))
+        .unwrap_or(subject)
+}
+
+/// Everything that changed in tracked files since the checkpoint, as a
+/// patch against the current worktree (what a restore would undo).
+pub fn get_workspace_changes_since_checkpoint(
+    state: &AppState,
+    workspace_id: &str,
+    reference: &str,
+) -> Result<WorkspaceCheckpointDiff, String> {
+    let root = workspace_root_path(state, workspace_id)?;
+    validate_checkpoint_ref(workspace_id, reference)?;
+    ensure_checkpoint_ref_exists(&root, reference)?;
+    let diff = git(&root, &["diff", "--relative", "--no-ext-diff", reference])?;
+    Ok(WorkspaceCheckpointDiff {
+        workspace_id: workspace_id.to_string(),
+        reference: reference.to_string(),
+        diff,
+    })
+}
+
+fn turn_label(message: &str) -> String {
+    let first_line = message
         .lines()
-        .filter(|line| !line.trim().is_empty())
-        .count();
-    if changed_file_count == 0 {
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("agent turn");
+    let mut label = first_line
+        .chars()
+        .take(TURN_LABEL_MAX_CHARS)
+        .collect::<String>();
+    if first_line.chars().count() > TURN_LABEL_MAX_CHARS || message.trim().lines().count() > 1 {
+        label.push_str("...");
+    }
+    label
+}
+
+fn lock_checkpoints() -> std::sync::MutexGuard<'static, ()> {
+    CHECKPOINT_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Stores the worktree's tracked state under a new checkpoint ref. Dirty
+/// worktrees are captured with `git stash create` (no refs, index, or files
+/// are changed); a clean one, with `SnapshotMode::Always`, as a commit of the
+/// HEAD tree. Untracked files are never captured.
+fn snapshot_worktree(
+    root: &Path,
+    workspace_id: &str,
+    reason: &str,
+    mode: SnapshotMode,
+) -> Result<Option<String>, String> {
+    let message = format!("{CHECKPOINT_SUBJECT_MARKER}{reason}");
+    let stash_oid = git(root, &["stash", "create", &message])?;
+    let oid = if !stash_oid.is_empty() {
+        stash_oid
+    } else if mode == SnapshotMode::Always {
+        git(
+            root,
+            &["commit-tree", "HEAD^{tree}", "-p", "HEAD", "-m", &message],
+        )?
+    } else {
+        return Ok(None);
+    };
+
+    let tree = git(root, &["rev-parse", &format!("{oid}^{{tree}}")])?;
+    if newest_checkpoint_tree(root, workspace_id)?.as_deref() == Some(tree.as_str()) {
         return Ok(None);
     }
 
-    let suffix = unique_suffix();
-    let checkpoint_ref = format!("refs/mnemonic/checkpoints/{workspace_id}/{suffix}");
-    let message = format!("mnemonic checkpoint: {reason}");
-    let oid = git(&root, &["stash", "create", &message])?;
-    let oid = oid.trim().to_string();
-    if oid.is_empty() {
-        return Ok(None);
-    }
-    git(&root, &["update-ref", &checkpoint_ref, &oid])?;
+    let checkpoint_ref = format!(
+        "refs/mnemonic/checkpoints/{workspace_id}/{}",
+        unique_suffix()
+    );
+    git(root, &["update-ref", &checkpoint_ref, &oid])?;
+    Ok(Some(checkpoint_ref))
+}
 
+fn newest_checkpoint_tree(root: &Path, workspace_id: &str) -> Result<Option<String>, String> {
+    let output = git(
+        root,
+        &[
+            "for-each-ref",
+            "--count=1",
+            "--sort=-refname",
+            "--sort=-creatordate",
+            "--format=%(tree)",
+            &format!("refs/mnemonic/checkpoints/{workspace_id}"),
+        ],
+    )?;
+    let tree = non_empty_lines(&output).next().map(str::to_string);
+    Ok(tree)
+}
+
+fn untracked_files(root: &Path) -> Result<Vec<String>, String> {
+    Ok(
+        non_empty_lines(&git(root, &["ls-files", "--others", "--exclude-standard"])?)
+            .map(str::to_string)
+            .collect(),
+    )
+}
+
+fn untracked_files_in_checkpoint(
+    root: &Path,
+    reference: &str,
+    untracked: &[String],
+) -> Result<Vec<String>, String> {
+    if untracked.is_empty() {
+        return Ok(Vec::new());
+    }
+    let checkpoint_paths = git(root, &["ls-tree", "-r", "--name-only", reference])?;
+    let checkpoint_paths = non_empty_lines(&checkpoint_paths).collect::<HashSet<_>>();
+    Ok(untracked
+        .iter()
+        .filter(|path| checkpoint_paths.contains(path.as_str()))
+        .cloned()
+        .collect())
+}
+
+fn non_empty_lines(output: &str) -> impl Iterator<Item = &str> {
+    output.lines().filter(|line| !line.trim().is_empty())
+}
+
+fn record_checkpoint_created(state: &AppState, workspace_id: &str, reason: &str, reference: &str) {
     if let Ok(Some(workspace)) = workspace_repository::get_detail(&state.db, workspace_id) {
-        let _ = activity_repository::record(
-            &state.db,
+        record_activity(
+            state,
             workspace_id,
             &workspace.summary.repo,
-            Some(&workspace.summary.branch),
+            &workspace.summary.branch,
             "Checkpoint created",
             "info",
-            Some(&format!(
-                "Reason: {reason}; files: {changed_file_count}; ref: {checkpoint_ref}; oid: {}",
-                &oid[..oid.len().min(12)]
-            )),
+            &format!("Reason: {reason}; ref: {reference}"),
         );
     }
+}
 
-    Ok(Some(checkpoint_ref))
+fn record_activity(
+    state: &AppState,
+    workspace_id: &str,
+    repo: &str,
+    branch: &str,
+    title: &str,
+    level: &str,
+    detail: &str,
+) {
+    if let Err(err) = activity_repository::record(
+        &state.db,
+        workspace_id,
+        repo,
+        Some(branch),
+        title,
+        level,
+        Some(detail),
+    ) {
+        log::warn!(
+            target: "mnemonic_lib",
+            "failed to record checkpoint activity for workspace {workspace_id}: {err}"
+        );
+    }
 }
 
 fn workspace_root_path(state: &AppState, workspace_id: &str) -> Result<PathBuf, String> {
@@ -332,11 +557,11 @@ fn validate_checkpoint_ref(workspace_id: &str, reference: &str) -> Result<(), St
     Ok(())
 }
 
-fn ensure_checkpoint_ref_exists(root: &PathBuf, reference: &str) -> Result<(), String> {
+fn ensure_checkpoint_ref_exists(root: &Path, reference: &str) -> Result<(), String> {
     git(root, &["rev-parse", "--verify", "--quiet", reference]).map(|_| ())
 }
 
-fn validate_branch_name(root: &PathBuf, branch: &str) -> Result<(), String> {
+fn validate_branch_name(root: &Path, branch: &str) -> Result<(), String> {
     let branch = branch.trim();
     if branch.is_empty() {
         return Err("Branch name is required".to_string());
@@ -344,7 +569,7 @@ fn validate_branch_name(root: &PathBuf, branch: &str) -> Result<(), String> {
     git(root, &["check-ref-format", "--branch", branch]).map(|_| ())
 }
 
-fn ensure_branch_does_not_exist(root: &PathBuf, branch: &str) -> Result<(), String> {
+fn ensure_branch_does_not_exist(root: &Path, branch: &str) -> Result<(), String> {
     let branch_ref = format!("refs/heads/{branch}");
     match git(root, &["rev-parse", "--verify", "--quiet", &branch_ref]) {
         Ok(_) => Err(format!("Branch {branch} already exists")),
@@ -352,7 +577,7 @@ fn ensure_branch_does_not_exist(root: &PathBuf, branch: &str) -> Result<(), Stri
     }
 }
 
-fn git(root: &PathBuf, args: &[&str]) -> Result<String, String> {
+fn git(root: &Path, args: &[&str]) -> Result<String, String> {
     let output = Command::new("git")
         .current_dir(root)
         .args(args)
@@ -385,5 +610,81 @@ mod tests {
         assert!(validate_checkpoint_ref("ws-1", "refs/mnemonic/checkpoints/ws-1/123").is_ok());
         assert!(validate_checkpoint_ref("ws-1", "refs/mnemonic/checkpoints/ws-2/123").is_err());
         assert!(validate_checkpoint_ref("ws-1", "refs/heads/main").is_err());
+    }
+
+    #[test]
+    fn restore_reverts_a_turn_and_keeps_current_changes_recoverable() -> Result<(), String> {
+        let root = test_repo("restore")?;
+        std::fs::write(root.join("a.txt"), "before turn").map_err(|err| err.to_string())?;
+        git(&root, &["add", "a.txt"])?;
+        git(&root, &["commit", "-m", "initial"])?;
+
+        let before_turn = snapshot_worktree(&root, "ws-1", "first turn", SnapshotMode::Always)?
+            .ok_or("a clean worktree should still be checkpointed before a turn")?;
+        assert_eq!(
+            snapshot_worktree(&root, "ws-1", "second turn", SnapshotMode::Always)?,
+            None,
+            "an unchanged worktree should not add a duplicate checkpoint"
+        );
+
+        std::fs::write(root.join("a.txt"), "agent edit").map_err(|err| err.to_string())?;
+        std::fs::write(root.join("new.txt"), "agent file").map_err(|err| err.to_string())?;
+        let safety = restore_checkpoint_at(&root, "ws-1", &before_turn)?
+            .ok_or("restoring a dirty worktree should save it as a checkpoint first")?;
+
+        assert_eq!(
+            std::fs::read_to_string(root.join("a.txt")).map_err(|err| err.to_string())?,
+            "before turn"
+        );
+        assert!(
+            root.join("new.txt").exists(),
+            "untracked files are left alone"
+        );
+        assert_eq!(
+            git(&root, &["show", &format!("{safety}:a.txt")])?,
+            "agent edit"
+        );
+        std::fs::remove_dir_all(&root).map_err(|err| err.to_string())
+    }
+
+    #[test]
+    fn restore_refuses_to_overwrite_untracked_files() -> Result<(), String> {
+        let root = test_repo("untracked")?;
+        std::fs::write(root.join("a.txt"), "committed").map_err(|err| err.to_string())?;
+        git(&root, &["add", "a.txt"])?;
+        git(&root, &["commit", "-m", "initial"])?;
+        std::fs::write(root.join("b.txt"), "staged").map_err(|err| err.to_string())?;
+        git(&root, &["add", "b.txt"])?;
+        let checkpoint = snapshot_worktree(&root, "ws-1", "turn", SnapshotMode::Always)?
+            .ok_or("a staged file should produce a checkpoint")?;
+
+        git(&root, &["rm", "--cached", "--quiet", "b.txt"])?;
+        std::fs::write(root.join("b.txt"), "local only").map_err(|err| err.to_string())?;
+
+        let error = restore_checkpoint_at(&root, "ws-1", &checkpoint)
+            .err()
+            .ok_or("restore should refuse")?;
+        assert!(error.contains("b.txt"), "unexpected error: {error}");
+        assert_eq!(
+            std::fs::read_to_string(root.join("b.txt")).map_err(|err| err.to_string())?,
+            "local only"
+        );
+        std::fs::remove_dir_all(&root).map_err(|err| err.to_string())
+    }
+
+    fn test_repo(tag: &str) -> Result<PathBuf, String> {
+        let root = std::env::temp_dir().join(format!(
+            "mnemonic-checkpoint-test-{tag}-{}-{}",
+            std::process::id(),
+            unique_suffix()
+        ));
+        std::fs::create_dir_all(&root).map_err(|err| err.to_string())?;
+        git(&root, &["init", "--quiet"])?;
+        git(
+            &root,
+            &["config", "user.email", "mnemonic-tests@example.com"],
+        )?;
+        git(&root, &["config", "user.name", "Mnemonic Tests"])?;
+        Ok(root)
     }
 }

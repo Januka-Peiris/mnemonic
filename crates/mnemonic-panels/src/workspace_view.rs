@@ -11,13 +11,16 @@ use gpui::{
     Window, actions, px,
 };
 use mnemonic_core::models::{ChatSessionRecord, WorkspaceSummary};
-use mnemonic_core::repositories::chat_session_repository;
-use mnemonic_core::services::terminal_service;
+use mnemonic_core::repositories::{chat_session_repository, workspace_repository};
+use mnemonic_core::services::{
+    checkpoint_service, terminal_service, workspace_script_service, workspace_service,
+};
 use project::{AgentId, Project};
 use task::{RevealStrategy, Shell, SpawnInTerminal, TaskId};
 use terminal::Terminal;
 use terminal_view::TerminalView;
 use util::path_list::PathList;
+use util::shell_builder::ShellBuilder;
 use ui::{
     Button, ButtonStyle, ContextMenu, Icon, IconButton, IconName, Label, PopoverMenu, TintColor,
     Tooltip, h_flex, prelude::*, v_flex,
@@ -25,6 +28,12 @@ use ui::{
 use workspace::item::{Item, ItemEvent};
 use workspace::notifications::NotificationId;
 use workspace::{Toast, Workspace, WorkspaceId};
+use zed_actions::mnemonic::AgentSessionKind;
+
+use crate::workspace_detail_panel::WorkspaceDetailPanel;
+use crate::workspace_panel::{
+    WorkspacePanel, branch_slug_from_message, is_generated_workspace_name,
+};
 
 /// Marker for auto-fix loop toasts.
 struct MnemonicAutoFixToast;
@@ -50,6 +59,10 @@ const ENTER_DELAY_MILLIS: u64 = 250;
 /// running. Claude Code redraws its spinner continuously while working, so
 /// output going quiet for this long means it's waiting for input.
 const AGENT_IDLE_AFTER: Duration = Duration::from_secs(4);
+
+/// Restart waits this long after killing the run commands so a dev server
+/// has released its port before the new one binds it.
+const RUN_RESTART_DELAY: Duration = Duration::from_millis(500);
 
 /// Auto-fix loop: how often to poll GitHub for check results.
 const AUTO_FIX_POLL_INTERVAL: Duration = Duration::from_secs(45);
@@ -139,6 +152,9 @@ pub(crate) struct ChatSession {
     stored_session_id: Option<String>,
     observed_thread: Option<EntityId>,
     pending_messages: PendingMessages,
+    /// Instructions the app sent (review prompts, Create PR, CI fixes), so
+    /// they are never mistaken for the user's first message.
+    app_messages: Vec<String>,
     /// A new review chat holds its prompt until it has been switched to the
     /// review model.
     awaiting_model: bool,
@@ -153,6 +169,8 @@ pub(crate) struct TerminalSession {
     provider: Option<AgentProvider>,
     /// The persistent tmux session backing this terminal, if any.
     session_name: Option<String>,
+    /// Started by Run from the workspace's `.mnemonic/config.json`.
+    run_command: bool,
     _subscription: Subscription,
 }
 
@@ -229,6 +247,14 @@ pub(crate) enum SessionSummary {
     Terminal { is_agent: bool },
 }
 
+/// Who wrote an instruction. Only text the user typed may name the
+/// workspace's branch; app-generated instructions never do.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum MessageSource {
+    User,
+    App,
+}
+
 /// Where a dispatched instruction came from. Composer text is typed while
 /// looking at a CLI tab, so it goes to that CLI; everything else (Create PR,
 /// Fix errors, auto-fix) prefers the workspace's chat.
@@ -248,6 +274,19 @@ pub(crate) fn releases_pending(event: &acp_thread::AcpThreadEvent) -> bool {
             | acp_thread::AcpThreadEvent::Error
             | acp_thread::AcpThreadEvent::Refusal
     )
+}
+
+/// The typed text of a user message, without mentions or attachments.
+fn user_message_text(message: &acp_thread::UserMessage) -> String {
+    message
+        .chunks
+        .iter()
+        .filter_map(|chunk| match chunk {
+            acp::ContentBlock::Text(text) => Some(text.text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Workspaces created chat-first have a primary chat; every other workspace
@@ -323,6 +362,18 @@ enum NewSession {
     Shell,
 }
 
+impl From<AgentSessionKind> for NewSession {
+    fn from(kind: AgentSessionKind) -> Self {
+        match kind {
+            AgentSessionKind::ClaudeChat => Self::Chat(ChatAgent::Claude),
+            AgentSessionKind::CodexChat => Self::Chat(ChatAgent::Codex),
+            AgentSessionKind::ClaudeCli => Self::ClaudeCli,
+            AgentSessionKind::CodexCli => Self::CodexCli,
+            AgentSessionKind::Shell => Self::Shell,
+        }
+    }
+}
+
 /// Drag payload for the composer resize handle.
 struct ComposerDrag;
 
@@ -361,6 +412,12 @@ pub struct WorkspaceView {
     last_auto_fix_at: Option<Instant>,
     auto_fix_state: SharedString,
     auto_fix_task: Option<gpui::Task<()>>,
+    /// Set once the placeholder name has been considered for renaming, so
+    /// later messages never rename the branch again.
+    branch_rename_started: bool,
+    run_command_count: usize,
+    run_tooltip: SharedString,
+    run_starting: bool,
     focus_handle: FocusHandle,
 }
 
@@ -369,6 +426,15 @@ impl WorkspaceView {
     /// persistent tmux session.
     fn spawn_primary_agent(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.spawn_agent_terminal("main", "agent", AgentProvider::Claude, None, window, cx);
+    }
+
+    fn add_session(&mut self, kind: NewSession, window: &mut Window, cx: &mut Context<Self>) {
+        match kind {
+            NewSession::Chat(agent) => self.add_chat(agent, window, cx),
+            NewSession::ClaudeCli => self.add_claude_terminal(window, cx),
+            NewSession::CodexCli => self.add_codex_terminal(window, cx),
+            NewSession::Shell => self.add_shell_terminal(window, cx),
+        }
     }
 
     /// Opens an additional Claude agent session in this workspace, with its
@@ -550,6 +616,7 @@ impl WorkspaceView {
                             &title,
                             Some(session_for_close),
                             Some(provider),
+                            false,
                             terminal,
                             window,
                             cx,
@@ -594,7 +661,7 @@ impl WorkspaceView {
             match terminal {
                 Ok(terminal) => {
                     this.update_in(cx, |this, window, cx| {
-                        this.push_terminal(&title, None, None, terminal, window, cx);
+                        this.push_terminal(&title, None, None, false, terminal, window, cx);
                     })
                     .ok();
                 }
@@ -645,6 +712,7 @@ impl WorkspaceView {
         title: &str,
         session_name: Option<String>,
         provider: Option<AgentProvider>,
+        run_command: bool,
         terminal: Entity<Terminal>,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -678,10 +746,265 @@ impl WorkspaceView {
                 view,
                 provider,
                 session_name,
+                run_command,
                 _subscription: subscription,
             }),
         });
         self.activate_session(self.sessions.len() - 1, window, cx);
+    }
+
+    /// Reads the workspace's run commands off the UI thread, so the Run
+    /// control reflects `.mnemonic/config.json` each time the workspace is
+    /// selected.
+    fn load_run_config(&mut self, cx: &mut Context<Self>) {
+        let state = mnemonic_bridge::mnemonic_state(cx);
+        let workspace_id = self.workspace_id.clone();
+        cx.spawn(async move |this, cx| {
+            let config = cx
+                .background_spawn(async move {
+                    workspace_script_service::get_workspace_mnemonic_config(&state, &workspace_id)
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                match config {
+                    Ok(config) => {
+                        this.run_command_count = config.run.len();
+                        this.run_tooltip = SharedString::from(match config.warning {
+                            Some(warning) => warning,
+                            None if config.run.is_empty() => {
+                                "Add \"run\" commands to .mnemonic/config.json to enable Run"
+                                    .to_string()
+                            }
+                            None => format!("Run {}", config.run.join(" + ")),
+                        });
+                    }
+                    Err(err) => {
+                        log::warn!("Failed to load workspace run config: {err}");
+                        this.run_command_count = 0;
+                        this.run_tooltip = SharedString::from(err);
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn has_run_terminals(&self) -> bool {
+        self.sessions.iter().any(|session| {
+            matches!(&session.kind, SessionKind::Terminal(terminal) if terminal.run_command)
+        })
+    }
+
+    /// Starts each configured run command in its own terminal tab, rooted in
+    /// the workspace. The core service only gates and hooks the commands; its
+    /// own start path runs them in headless PTYs this app never shows.
+    fn start_run_commands(
+        &mut self,
+        action_kind: &'static str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.run_starting {
+            return;
+        }
+        self.run_starting = true;
+        cx.notify();
+
+        let state = mnemonic_bridge::mnemonic_state(cx);
+        let workspace_id = self.workspace_id.clone();
+        let project = self.project.clone();
+        cx.spawn_in(window, async move |this, cx| {
+            let prepared = cx
+                .background_spawn({
+                    let state = state.clone();
+                    let workspace_id = workspace_id.clone();
+                    async move {
+                        workspace_script_service::prepare_workspace_run_commands(
+                            &state,
+                            &workspace_id,
+                            action_kind,
+                        )
+                    }
+                })
+                .await;
+            let (root, plans) = match prepared {
+                Ok(prepared) => prepared,
+                Err(err) => {
+                    this.update(cx, |this, cx| {
+                        this.run_starting = false;
+                        this.show_workspace_toast(
+                            format!("{}: couldn't run: {err}", this.workspace_name),
+                            cx,
+                        );
+                        cx.notify();
+                    })
+                    .ok();
+                    return;
+                }
+            };
+
+            let mut failures = Vec::new();
+            for plan in &plans {
+                let (command, args) = ShellBuilder::new(&Shell::System, cfg!(windows))
+                    .build(Some(plan.command.clone()), &[]);
+                let spawn_task = SpawnInTerminal {
+                    id: TaskId(format!("mnemonic-run-{workspace_id}-{}", plan.index)),
+                    full_label: plan.title.clone(),
+                    label: plan.title.clone(),
+                    command: Some(command),
+                    args,
+                    command_label: plan.command.clone(),
+                    cwd: Some(root.clone()),
+                    shell: Shell::System,
+                    reveal: RevealStrategy::Always,
+                    use_new_terminal: true,
+                    allow_concurrent_runs: true,
+                    ..Default::default()
+                };
+                let terminal = match project
+                    .update(cx, |project, cx| project.create_terminal_task(spawn_task, cx))
+                {
+                    Ok(task) => task.await,
+                    Err(err) => Err(err),
+                };
+                match terminal {
+                    Ok(terminal) => {
+                        this.update_in(cx, |this, window, cx| {
+                            this.push_terminal(&plan.title, None, None, true, terminal, window, cx);
+                        })
+                        .ok();
+                    }
+                    Err(err) => failures.push(format!("{}: {err}", plan.title)),
+                }
+            }
+
+            this.update(cx, |this, cx| {
+                this.run_starting = false;
+                if !failures.is_empty() {
+                    log::error!("Failed to start run commands: {}", failures.join("; "));
+                    this.show_workspace_toast(
+                        format!(
+                            "{}: couldn't start {}",
+                            this.workspace_name,
+                            failures.join("; ")
+                        ),
+                        cx,
+                    );
+                }
+                cx.notify();
+            })
+            .ok();
+
+            let finished = cx
+                .background_spawn(async move {
+                    workspace_script_service::finish_workspace_run_commands(
+                        &state,
+                        &workspace_id,
+                        action_kind,
+                        &plans,
+                    )
+                })
+                .await;
+            if let Err(err) = finished {
+                log::warn!("Post-run hooks failed: {err}");
+            }
+        })
+        .detach();
+    }
+
+    /// Kills the foreground process group of every run terminal; dropping a
+    /// terminal alone only signals its shell, which can leave a dev server
+    /// running.
+    pub(crate) fn kill_run_terminals(&self, cx: &mut Context<Self>) {
+        for session in &self.sessions {
+            if let SessionKind::Terminal(terminal) = &session.kind {
+                if terminal.run_command {
+                    let terminal = terminal.view.read(cx).terminal().clone();
+                    terminal.update(cx, |terminal, _| terminal.kill_active_task());
+                }
+            }
+        }
+    }
+
+    fn stop_run_commands(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.kill_run_terminals(cx);
+        let mut index = self.sessions.len();
+        while index > 0 {
+            index -= 1;
+            let is_run = matches!(
+                &self.sessions[index].kind,
+                SessionKind::Terminal(terminal) if terminal.run_command
+            );
+            if is_run {
+                self.sessions.remove(index);
+                if index < self.active_session {
+                    self.active_session -= 1;
+                }
+            }
+        }
+        if self.sessions.is_empty() {
+            self.active_session = 0;
+            cx.notify();
+            return;
+        }
+        let next = self.active_session.min(self.sessions.len() - 1);
+        self.activate_session(next, window, cx);
+    }
+
+    fn restart_run_commands(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.stop_run_commands(window, cx);
+        self.run_starting = true;
+        cx.notify();
+        cx.spawn_in(window, async move |this, cx| {
+            cx.background_executor().timer(RUN_RESTART_DELAY).await;
+            this.update_in(cx, |this, window, cx| {
+                this.run_starting = false;
+                this.start_run_commands("restart_run_command", window, cx);
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn render_run_controls(&self, cx: &mut Context<Self>) -> AnyElement {
+        if self.has_run_terminals() {
+            return h_flex()
+                .gap_0p5()
+                .child(
+                    Button::new("workspace-run-restart", "Restart")
+                        .style(ButtonStyle::Subtle)
+                        .label_size(LabelSize::XSmall)
+                        .disabled(self.run_starting)
+                        .tooltip(Tooltip::text("Stop and re-run the workspace's run commands"))
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.restart_run_commands(window, cx);
+                        })),
+                )
+                .child(
+                    Button::new("workspace-run-stop", "Stop")
+                        .style(ButtonStyle::Tinted(TintColor::Error))
+                        .label_size(LabelSize::XSmall)
+                        .tooltip(Tooltip::text("Stop the run commands and close their tabs"))
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.stop_run_commands(window, cx);
+                        })),
+                )
+                .into_any_element();
+        }
+        Button::new(
+            "workspace-run",
+            if self.run_starting { "Starting…" } else { "Run" },
+        )
+        .style(ButtonStyle::Subtle)
+        .label_size(LabelSize::XSmall)
+        .disabled(self.run_starting || self.run_command_count == 0)
+        .tooltip(Tooltip::text(self.run_tooltip.clone()))
+        .on_click(cx.listener(|this, _, window, cx| {
+            this.start_run_commands("run_command", window, cx);
+        }))
+        .into_any_element()
     }
 
     fn terminal_titles(&self) -> impl Iterator<Item = &SharedString> {
@@ -791,6 +1114,7 @@ impl WorkspaceView {
             .map(|path| PathList::new(&[path]));
         let title = SharedString::from(record.title.clone());
         let workspace = self.workspace.clone();
+        let app_messages = initial_prompt.iter().cloned().collect();
 
         let view = cx.new(|cx| {
             ConversationView::new(
@@ -832,6 +1156,7 @@ impl WorkspaceView {
                     }
                     pending
                 },
+                app_messages,
                 awaiting_model: record.is_review && record.acp_session_id.is_none(),
                 thread_subscriptions: Vec::new(),
                 _subscriptions: vec![observation],
@@ -881,10 +1206,14 @@ impl WorkspaceView {
                     }
                     cx.notify();
                 }),
-                cx.subscribe(&thread, move |this, _thread, event, cx| {
+                cx.subscribe(&thread, move |this, thread, event, cx| {
                     if releases_pending(event) {
                         this.flush_pending(view_id, cx);
                         cx.notify();
+                    }
+                    if matches!(event, acp_thread::AcpThreadEvent::NewEntry) {
+                        this.checkpoint_new_user_message(&thread, cx);
+                        this.name_workspace_from_thread(view_id, &thread, cx);
                     }
                 }),
             ]
@@ -927,6 +1256,188 @@ impl WorkspaceView {
                 self.flush_pending(view_id, cx);
             }
         }
+    }
+
+    /// Checkpoints the worktree when a chat turn starts, whether the message
+    /// was typed into the chat or sent by the app. Only live messages count
+    /// (the thread is generating); history replayed on resume arrives idle.
+    fn checkpoint_new_user_message(
+        &self,
+        thread: &Entity<acp_thread::AcpThread>,
+        cx: &mut Context<Self>,
+    ) {
+        let message = {
+            let thread = thread.read(cx);
+            if thread.status() != acp_thread::ThreadStatus::Generating {
+                return;
+            }
+            match thread.entries().last() {
+                Some(acp_thread::AgentThreadEntry::UserMessage(message)) => {
+                    user_message_text(message)
+                }
+                _ => return,
+            }
+        };
+        self.checkpoint_before_turn(message, cx);
+    }
+
+    /// Snapshots the worktree off the main thread so the coming agent turn
+    /// can be reverted from the Checkpoints tab. A failure is logged and
+    /// never holds up or fails the message being sent.
+    fn checkpoint_before_turn(&self, message: String, cx: &mut Context<Self>) {
+        let workspace_id = self.workspace_id.clone();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_spawn({
+                    let workspace_id = workspace_id.clone();
+                    async move {
+                        let Some(state) = mnemonic_bridge::mnemonic_state_cloned() else {
+                            return Ok(None);
+                        };
+                        checkpoint_service::create_turn_checkpoint(&state, &workspace_id, &message)
+                    }
+                })
+                .await;
+            match result {
+                Ok(Some(_)) => {
+                    this.update(cx, |this, cx| this.notify_checkpoints_changed(cx))
+                        .ok();
+                }
+                Ok(None) => {}
+                Err(err) => log::warn!(
+                    "Failed to checkpoint workspace {workspace_id} before an agent turn: {err}"
+                ),
+            }
+        })
+        .detach();
+    }
+
+    fn notify_checkpoints_changed(&self, cx: &mut Context<Self>) {
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+        let workspace_id = self.workspace_id.clone();
+        workspace.update(cx, |workspace, cx| {
+            if let Some(panel) = workspace.panel::<WorkspaceDetailPanel>(cx) {
+                panel.update(cx, |panel, cx| panel.checkpoints_changed(&workspace_id, cx));
+            }
+        });
+    }
+
+    /// Renames a placeholder-named workspace after the first meaningful
+    /// message the user typed into a work chat. Instructions the app sent are
+    /// skipped, and only messages sent live count (the thread is generating),
+    /// so replaying a resumed conversation never renames.
+    fn name_workspace_from_thread(
+        &mut self,
+        view_id: EntityId,
+        thread: &Entity<acp_thread::AcpThread>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.branch_rename_started || !is_generated_workspace_name(&self.workspace_name) {
+            return;
+        }
+        let Some(chat) = self
+            .chat_index(view_id)
+            .and_then(|index| self.sessions.get(index))
+            .and_then(WorkspaceSession::chat)
+            .filter(|chat| !chat.is_review)
+        else {
+            return;
+        };
+        let slug = {
+            let thread = thread.read(cx);
+            if thread.status() != acp_thread::ThreadStatus::Generating {
+                return;
+            }
+            let entries = thread.entries();
+            let first_meaningful = entries.iter().enumerate().find_map(|(index, entry)| {
+                let acp_thread::AgentThreadEntry::UserMessage(message) = entry else {
+                    return None;
+                };
+                let text = user_message_text(message);
+                if chat.app_messages.contains(&text) {
+                    return None;
+                }
+                branch_slug_from_message(&text).map(|slug| (index, slug))
+            });
+            match first_meaningful {
+                Some((index, slug)) if index + 1 == entries.len() => slug,
+                _ => return,
+            }
+        };
+        self.rename_placeholder_workspace(slug, cx);
+    }
+
+    /// Renames the workspace and its branch to `<prefix>/<slug>` off the main
+    /// thread. The core service refuses when the branch was pushed or a PR
+    /// exists; failures are logged and never affect the message being sent.
+    fn rename_placeholder_workspace(&mut self, slug: String, cx: &mut Context<Self>) {
+        if self.branch_rename_started || !is_generated_workspace_name(&self.workspace_name) {
+            return;
+        }
+        self.branch_rename_started = true;
+        if mnemonic_bridge::pr_state(&self.workspace_id).is_some() {
+            return;
+        }
+        let workspace_id = self.workspace_id.clone();
+        let expected_name = self.workspace_name.to_string();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_spawn(async move {
+                    let Some(state) = mnemonic_bridge::mnemonic_state_cloned() else {
+                        return Ok(None);
+                    };
+                    workspace_service::rename_unpublished_workspace(
+                        &state,
+                        &workspace_id,
+                        &expected_name,
+                        &slug,
+                    )
+                })
+                .await;
+            let summary = match result {
+                Ok(Some(summary)) => summary,
+                Ok(None) => return,
+                Err(err) => {
+                    log::error!("Failed to rename workspace branch: {err}");
+                    return;
+                }
+            };
+            log::info!("Renamed workspace to {} ({})", summary.name, summary.branch);
+            this.update(cx, |this, cx| {
+                this.workspace_name = SharedString::from(summary.name);
+                this.refresh_workspace_chrome(cx);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Redraws the surfaces that show the workspace name: the host tab and
+    /// the side panels, which reload from the database when rendered.
+    fn refresh_workspace_chrome(&self, cx: &mut Context<Self>) {
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+        workspace.update(cx, |workspace, cx| {
+            if let Some(panel) = workspace.panel::<WorkspacePanel>(cx) {
+                panel.update(cx, |_, cx| cx.notify());
+            }
+            if let Some(panel) = workspace.panel::<WorkspaceDetailPanel>(cx) {
+                panel.update(cx, |_, cx| cx.notify());
+            }
+            for pane in workspace.panes().to_vec() {
+                let host = pane
+                    .read(cx)
+                    .items()
+                    .find_map(|item| item.downcast::<WorkspaceHost>());
+                if let Some(host) = host {
+                    host.update(cx, |_, cx| cx.emit(ItemEvent::UpdateTab));
+                }
+            }
+        });
     }
 
     /// Sends the next queued instruction to a chat if its thread is idle.
@@ -1131,7 +1642,7 @@ impl WorkspaceView {
                 text = format!("{path} {text}");
             }
         }
-        self.dispatch_from(DispatchOrigin::Composer, text, cx);
+        self.dispatch_from(DispatchOrigin::Composer, MessageSource::User, text, cx);
         self.composer.update(cx, |composer, cx| composer.clear(window, cx));
     }
 
@@ -1195,10 +1706,16 @@ impl WorkspaceView {
     /// Targets the active tab when it's an agent session, otherwise the
     /// primary agent terminal.
     pub(crate) fn dispatch_to_agent(&mut self, text: String, cx: &mut Context<Self>) {
-        self.dispatch_from(DispatchOrigin::External, text, cx);
+        self.dispatch_from(DispatchOrigin::External, MessageSource::App, text, cx);
     }
 
-    fn dispatch_from(&mut self, origin: DispatchOrigin, text: String, cx: &mut Context<Self>) {
+    fn dispatch_from(
+        &mut self,
+        origin: DispatchOrigin,
+        source: MessageSource,
+        text: String,
+        cx: &mut Context<Self>,
+    ) {
         let index = match self.dispatch_target(origin, cx) {
             Some(DispatchTarget::Chat(index)) => {
                 let Some(chat) = self
@@ -1208,6 +1725,9 @@ impl WorkspaceView {
                 else {
                     return;
                 };
+                if source == MessageSource::App {
+                    chat.app_messages.push(text.clone());
+                }
                 chat.pending_messages.push(text);
                 let view_id = chat.view.entity_id();
                 self.flush_pending(view_id, cx);
@@ -1219,10 +1739,16 @@ impl WorkspaceView {
                 return;
             }
         };
+        if source == MessageSource::User {
+            if let Some(slug) = branch_slug_from_message(&text) {
+                self.rename_placeholder_workspace(slug, cx);
+            }
+        }
         let Some(agent_view) = self.sessions.get(index).and_then(WorkspaceSession::terminal)
         else {
             return;
         };
+        self.checkpoint_before_turn(text.clone(), cx);
         let terminal = agent_view.read(cx).terminal().clone();
 
         terminal.update(cx, |terminal, _| {
@@ -1429,7 +1955,12 @@ impl WorkspaceView {
         } else if CODEX_MODELS.iter().any(|(id, _)| *id == model) {
             self.codex_model = model.to_string();
         }
-        self.dispatch_from(DispatchOrigin::Composer, format!("/model {model}"), cx);
+        self.dispatch_from(
+            DispatchOrigin::Composer,
+            MessageSource::App,
+            format!("/model {model}"),
+            cx,
+        );
         cx.notify();
     }
 
@@ -1450,7 +1981,12 @@ impl WorkspaceView {
     /// /effort, and becomes the effort for new sessions.
     fn set_effort(&mut self, effort: &str, cx: &mut Context<Self>) {
         self.agent_effort = effort.to_string();
-        self.dispatch_from(DispatchOrigin::Composer, format!("/effort {effort}"), cx);
+        self.dispatch_from(
+            DispatchOrigin::Composer,
+            MessageSource::App,
+            format!("/effort {effort}"),
+            cx,
+        );
         cx.notify();
     }
 
@@ -1825,6 +2361,7 @@ impl WorkspaceView {
         }
 
         tabs.child(div().flex_grow(1.0))
+            .child(self.render_run_controls(cx))
             .when(!self.auto_fix_state.is_empty(), |el| {
                 el.child(
                     Label::new(self.auto_fix_state.clone())
@@ -1877,15 +2414,8 @@ impl WorkspaceView {
                             entries.into_iter().fold(menu, |menu, (label, kind)| {
                                 let this = this.clone();
                                 menu.entry(label, None, move |window, cx| {
-                                    this.update(cx, |this, cx| match kind {
-                                        NewSession::Chat(agent) => this.add_chat(agent, window, cx),
-                                        NewSession::ClaudeCli => {
-                                            this.add_claude_terminal(window, cx)
-                                        }
-                                        NewSession::CodexCli => this.add_codex_terminal(window, cx),
-                                        NewSession::Shell => this.add_shell_terminal(window, cx),
-                                    })
-                                    .ok();
+                                    this.update(cx, |this, cx| this.add_session(kind, window, cx))
+                                        .ok();
                                 })
                             })
                         }))
@@ -2061,6 +2591,10 @@ impl WorkspaceHost {
                 last_auto_fix_at: None,
                 auto_fix_state: SharedString::default(),
                 auto_fix_task: None,
+                branch_rename_started: false,
+                run_command_count: 0,
+                run_tooltip: SharedString::from("Reading .mnemonic/config.json…"),
+                run_starting: false,
                 focus_handle: cx.focus_handle(),
             });
             let state = mnemonic_bridge::mnemonic_state(cx);
@@ -2088,6 +2622,7 @@ impl WorkspaceHost {
 
         self.active = Some(summary.id.clone());
         if let Some(view) = self.views.get(&summary.id) {
+            view.update(cx, |view, cx| view.load_run_config(cx));
             let focus_handle = view.focus_handle(cx);
             window.focus(&focus_handle, cx);
         }
@@ -2122,6 +2657,27 @@ impl WorkspaceHost {
                     }
                     cx.notify();
                 });
+                return;
+            }
+        }
+    }
+
+    /// Kills the run commands of the given workspace's view, if it exists in
+    /// this window.
+    pub fn kill_run_commands_for_workspace(
+        workspace: &mut Workspace,
+        workspace_id: &str,
+        cx: &mut Context<Workspace>,
+    ) {
+        for pane in workspace.panes().to_vec() {
+            let host = pane
+                .read(cx)
+                .items()
+                .find_map(|item| item.downcast::<WorkspaceHost>());
+            if let Some(host) = host {
+                if let Some(view) = host.read(cx).views.get(workspace_id).cloned() {
+                    view.update(cx, |view, cx| view.kill_run_terminals(cx));
+                }
                 return;
             }
         }
@@ -2196,6 +2752,66 @@ impl WorkspaceHost {
                 let view = host.read(cx).views.get(workspace_id).cloned();
                 if let Some(view) = view {
                     view.update(cx, |view, cx| view.ensure_auto_fix_enabled(cx));
+                    return true;
+                }
+                return false;
+            }
+        }
+        false
+    }
+
+    /// Whether an agent in the given workspace is mid-turn: a chat is
+    /// generating or an agent terminal produced output recently.
+    pub fn workspace_agent_busy(workspace: &Workspace, workspace_id: &str, cx: &App) -> bool {
+        for pane in workspace.panes() {
+            let host = pane
+                .read(cx)
+                .items()
+                .find_map(|item| item.downcast::<WorkspaceHost>());
+            if let Some(host) = host {
+                return host.read(cx).views.get(workspace_id).is_some_and(|view| {
+                    let view = view.read(cx);
+                    view.agent_is_running() || view.any_chat_generating(cx)
+                });
+            }
+        }
+        false
+    }
+
+    /// Shows the given workspace in the host (creating the host and view if
+    /// they were closed) and opens a new session of the given kind in it.
+    /// Returns false when the workspace no longer exists.
+    pub fn add_session_for_workspace(
+        workspace: &mut Workspace,
+        workspace_id: &str,
+        kind: AgentSessionKind,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
+    ) -> bool {
+        let state = mnemonic_bridge::mnemonic_state(cx);
+        let summary = match workspace_repository::list(&state.db) {
+            Ok(summaries) => summaries
+                .into_iter()
+                .find(|summary| summary.id == workspace_id),
+            Err(err) => {
+                log::error!("Failed to list workspaces: {err}");
+                None
+            }
+        };
+        let Some(summary) = summary else {
+            return false;
+        };
+        Self::activate_workspace(workspace, &summary, window, cx);
+
+        for pane in workspace.panes().to_vec() {
+            let host = pane
+                .read(cx)
+                .items()
+                .find_map(|item| item.downcast::<WorkspaceHost>());
+            if let Some(host) = host {
+                let view = host.read(cx).views.get(workspace_id).cloned();
+                if let Some(view) = view {
+                    view.update(cx, |view, cx| view.add_session(kind.into(), window, cx));
                     return true;
                 }
                 return false;

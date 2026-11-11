@@ -1183,13 +1183,15 @@ impl ThreadView {
         cx: &mut Context<Self>,
     ) {
         match &event.view_event {
+            // Cards only open on their own while following the agent, so an
+            // unwatched thread stays a compact list of tool calls.
             ViewEvent::NewDiff(tool_call_id) => {
-                if AgentSettings::get_global(cx).expand_edit_card {
+                if AgentSettings::get_global(cx).expand_edit_card && self.is_following(cx) {
                     self.expanded_tool_calls.insert(tool_call_id.clone());
                 }
             }
             ViewEvent::NewTerminal(tool_call_id) => {
-                if AgentSettings::get_global(cx).expand_terminal_card {
+                if AgentSettings::get_global(cx).expand_terminal_card && self.is_following(cx) {
                     self.expanded_tool_calls.insert(tool_call_id.clone());
                 }
             }

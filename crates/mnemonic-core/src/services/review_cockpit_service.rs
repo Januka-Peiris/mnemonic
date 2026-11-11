@@ -4,6 +4,7 @@ use std::process::Command;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 use crate::models::{
     AgentPromptEntry, MarkWorkspaceFileReviewedInput, QueueAgentPromptInput,
@@ -11,8 +12,8 @@ use crate::models::{
 };
 use crate::repositories::{review_cockpit_repository, workspace_repository};
 use crate::services::{
-    agent_context_service, git_review_service, merge_readiness_service, review_summary_service,
-    terminal_service,
+    agent_context_service, environment_service, git_review_service, merge_readiness_service,
+    review_summary_service, terminal_service,
 };
 use crate::state::AppState;
 
@@ -44,6 +45,12 @@ pub fn mark_workspace_file_reviewed(
 ) -> Result<WorkspaceReviewCockpit, String> {
     workspace_repository::get_detail(&state.db, &input.workspace_id)?
         .ok_or_else(|| format!("Workspace {} was not found", input.workspace_id))?;
+    let content_hash = if input.reviewed {
+        let root = workspace_root(state, &input.workspace_id)?;
+        Some(file_content_hash(&root, &input.path))
+    } else {
+        None
+    };
     review_cockpit_repository::set_file_reviewed(
         &state.db,
         &input.workspace_id,
@@ -51,8 +58,68 @@ pub fn mark_workspace_file_reviewed(
         input.reviewed,
         &timestamp(),
         input.notes.as_deref(),
+        content_hash.as_deref(),
     )?;
     build_cockpit(state, &input.workspace_id, Some(&input.path), false)
+}
+
+/// Marks a changed file viewed (or not) against its current content, without
+/// rebuilding the review cockpit.
+pub fn set_workspace_file_viewed(
+    state: &AppState,
+    workspace_id: &str,
+    path: &str,
+    viewed: bool,
+) -> Result<(), String> {
+    let content_hash = if viewed {
+        let root = workspace_root(state, workspace_id)?;
+        Some(file_content_hash(&root, path))
+    } else {
+        None
+    };
+    review_cockpit_repository::set_file_reviewed(
+        &state.db,
+        workspace_id,
+        path,
+        viewed,
+        &timestamp(),
+        None,
+        content_hash.as_deref(),
+    )
+}
+
+/// Which of `changed_paths` are marked viewed and unchanged since the mark.
+/// Only marked files are hashed.
+pub fn list_workspace_viewed_files(
+    state: &AppState,
+    workspace_id: &str,
+    changed_paths: &[String],
+) -> Result<HashSet<String>, String> {
+    let root = workspace_root(state, workspace_id)?;
+    let changed_paths = changed_paths
+        .iter()
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
+    let review_states =
+        review_cockpit_repository::list_file_review_states(&state.db, workspace_id)?;
+    Ok(review_states
+        .into_iter()
+        .filter(|review| {
+            review.status == "reviewed" && changed_paths.contains(review.path.as_str())
+        })
+        .filter(|review| {
+            review.content_hash.as_deref() == Some(file_content_hash(&root, &review.path).as_str())
+        })
+        .map(|review| review.path)
+        .collect())
+}
+
+fn file_content_hash(root: &Path, path: &str) -> String {
+    match std::fs::read(root.join(path)) {
+        Ok(bytes) => format!("sha256:{:x}", Sha256::digest(&bytes)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => "deleted".to_string(),
+        Err(error) => format!("unreadable:{:?}", error.kind()),
+    }
 }
 
 pub fn refresh_workspace_pr_comments(
@@ -114,6 +181,183 @@ pub fn reopen_workspace_pr_thread(
     })?;
     run_thread_mutation(state, workspace_id, &thread_id, "unresolveReviewThread")?;
     refresh_workspace_pr_comments(state, workspace_id)
+}
+
+/// Fetches the unresolved review threads of the PR at `pr_url`, one entry per
+/// thread, straight from GitHub GraphQL. Replies are folded into the body.
+pub fn list_unresolved_review_threads(
+    state: &AppState,
+    workspace_id: &str,
+    pr_url: &str,
+) -> Result<Vec<WorkspacePrComment>, String> {
+    let (owner, repo, number) = parse_pr_url(pr_url)
+        .ok_or_else(|| format!("Could not read owner/repo/number from PR URL {pr_url}"))?;
+    let root = workspace_root(state, workspace_id)?;
+    let gh = find_gh_binary()?;
+    let query = r#"
+query($owner: String!, $repo: String!, $number: Int!) {
+  repository(owner: $owner, name: $repo) {
+    pullRequest(number: $number) {
+      reviewThreads(first: 100) {
+        nodes {
+          id
+          isResolved
+          isOutdated
+          viewerCanResolve
+          path
+          line
+          originalLine
+          comments(first: 50) {
+            nodes {
+              id
+              body
+              url
+              createdAt
+              author { login }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+"#;
+    let output = Command::new(&gh)
+        .current_dir(&root)
+        .arg("api")
+        .arg("graphql")
+        .arg("-f")
+        .arg(format!("query={query}"))
+        .arg("-f")
+        .arg(format!("owner={owner}"))
+        .arg("-f")
+        .arg(format!("repo={repo}"))
+        .arg("-F")
+        .arg(format!("number={number}"))
+        .output()
+        .map_err(|err| format!("Failed to run gh api graphql: {err}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(if stderr.is_empty() {
+            "Failed to fetch GitHub review threads.".to_string()
+        } else {
+            stderr
+        });
+    }
+    let value = serde_json::from_slice::<Value>(&output.stdout)
+        .map_err(|err| format!("Failed to parse GitHub review threads response: {err}"))?;
+    Ok(parse_unresolved_review_threads(workspace_id, &value))
+}
+
+/// Resolves a GitHub review thread by its GraphQL node id.
+pub fn resolve_review_thread(
+    state: &AppState,
+    workspace_id: &str,
+    thread_id: &str,
+) -> Result<(), String> {
+    run_thread_mutation(state, workspace_id, thread_id, "resolveReviewThread")
+}
+
+pub fn parse_unresolved_review_threads(
+    workspace_id: &str,
+    value: &Value,
+) -> Vec<WorkspacePrComment> {
+    let Some(threads) = value
+        .pointer("/data/repository/pullRequest/reviewThreads/nodes")
+        .and_then(Value::as_array)
+    else {
+        return Vec::new();
+    };
+    threads
+        .iter()
+        .filter_map(|thread| {
+            if thread.get("isResolved").and_then(Value::as_bool) != Some(false) {
+                return None;
+            }
+            let thread_id = thread.get("id")?.as_str()?.to_string();
+            let comments = thread.pointer("/comments/nodes")?.as_array()?;
+            let (first, replies) = comments.split_first()?;
+            let author_of = |comment: &Value| {
+                comment
+                    .pointer("/author/login")
+                    .and_then(Value::as_str)
+                    .unwrap_or("ghost")
+                    .to_string()
+            };
+            let body_of = |comment: &Value| {
+                comment
+                    .get("body")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .trim()
+                    .to_string()
+            };
+            let mut body = body_of(first);
+            for reply in replies {
+                let reply_body = body_of(reply);
+                if !reply_body.is_empty() {
+                    body.push_str(&format!(
+                        "\n\nReply from {}:\n{reply_body}",
+                        author_of(reply)
+                    ));
+                }
+            }
+            let outdated = thread
+                .get("isOutdated")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            Some(WorkspacePrComment {
+                workspace_id: workspace_id.to_string(),
+                provider: "github".to_string(),
+                comment_id: thread_id.clone(),
+                author: author_of(first),
+                body,
+                path: thread
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                line: thread
+                    .get("line")
+                    .and_then(Value::as_u64)
+                    .or_else(|| thread.get("originalLine").and_then(Value::as_u64))
+                    .and_then(|line| u32::try_from(line).ok()),
+                url: first.get("url").and_then(Value::as_str).map(str::to_string),
+                state: "open".to_string(),
+                created_at: first
+                    .get("createdAt")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                resolved_at: None,
+                comment_node_id: first.get("id").and_then(Value::as_str).map(str::to_string),
+                thread_id: Some(thread_id),
+                review_id: None,
+                thread_resolved: false,
+                thread_outdated: outdated,
+                thread_resolvable: thread
+                    .get("viewerCanResolve")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+            })
+        })
+        .collect()
+}
+
+/// Splits `https://<host>/<owner>/<repo>/pull/<number>` into its parts.
+fn parse_pr_url(url: &str) -> Option<(String, String, u64)> {
+    let path = url.split_once("://").map_or(url, |(_, rest)| rest);
+    let segments = path
+        .split(['/', '?', '#'])
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>();
+    let pull_index = segments.iter().position(|segment| *segment == "pull")?;
+    // Segment 0 is the host, so owner and repo need indices 1 and 2 at least.
+    if pull_index < 3 {
+        return None;
+    }
+    let owner = segments.get(pull_index - 2)?;
+    let repo = segments.get(pull_index - 1)?;
+    let number = segments.get(pull_index + 1)?.parse::<u64>().ok()?;
+    Some((owner.to_string(), repo.to_string(), number))
 }
 
 pub fn queue_review_agent_prompt(
@@ -669,17 +913,9 @@ fn workspace_root(state: &AppState, workspace_id: &str) -> Result<PathBuf, Strin
 }
 
 fn find_gh_binary() -> Result<String, String> {
-    for candidate in ["gh", "/opt/homebrew/bin/gh", "/usr/local/bin/gh"] {
-        if Command::new(candidate)
-            .arg("--version")
-            .output()
-            .map(|out| out.status.success())
-            .unwrap_or(false)
-        {
-            return Ok(candidate.to_string());
-        }
-    }
-    Err("GitHub CLI is required for PR comments. Install with: brew install gh".to_string())
+    environment_service::find_gh_path().ok_or_else(|| {
+        "GitHub CLI is required for PR comments. Install with: brew install gh".to_string()
+    })
 }
 
 fn git_remote_owner_repo(root: &Path) -> Option<(String, String)> {
@@ -750,6 +986,75 @@ mod tests {
     }
 
     #[test]
+    fn parses_unresolved_review_threads_from_graphql() {
+        let value = serde_json::json!({
+            "data": { "repository": { "pullRequest": { "reviewThreads": { "nodes": [
+                {
+                    "id": "PRRT_open",
+                    "isResolved": false,
+                    "isOutdated": false,
+                    "viewerCanResolve": true,
+                    "path": "src/lib.rs",
+                    "line": 12,
+                    "originalLine": 10,
+                    "comments": { "nodes": [
+                        { "id": "PRRC_1", "body": "Handle the error here", "url": "https://github.com/o/r/pull/7#discussion_r1", "createdAt": "2026-11-01T00:00:00Z", "author": { "login": "greptile-apps" } },
+                        { "id": "PRRC_2", "body": "Agreed", "url": "u2", "createdAt": "2026-11-01T01:00:00Z", "author": null }
+                    ]}
+                },
+                {
+                    "id": "PRRT_outdated",
+                    "isResolved": false,
+                    "isOutdated": true,
+                    "viewerCanResolve": true,
+                    "path": "src/old.rs",
+                    "line": null,
+                    "originalLine": 40,
+                    "comments": { "nodes": [
+                        { "id": "PRRC_3", "body": "Rename this", "url": "u3", "createdAt": "t", "author": { "login": "alice" } }
+                    ]}
+                },
+                {
+                    "id": "PRRT_done",
+                    "isResolved": true,
+                    "isOutdated": false,
+                    "viewerCanResolve": true,
+                    "path": "src/main.rs",
+                    "line": 3,
+                    "originalLine": 3,
+                    "comments": { "nodes": [
+                        { "id": "PRRC_4", "body": "Fixed", "url": "u4", "createdAt": "t", "author": { "login": "bob" } }
+                    ]}
+                }
+            ]}}}}
+        });
+        let threads = parse_unresolved_review_threads("ws", &value);
+        assert_eq!(threads.len(), 2);
+        assert_eq!(threads[0].thread_id.as_deref(), Some("PRRT_open"));
+        assert_eq!(threads[0].author, "greptile-apps");
+        assert_eq!(threads[0].path.as_deref(), Some("src/lib.rs"));
+        assert_eq!(threads[0].line, Some(12));
+        assert!(threads[0].body.starts_with("Handle the error here"));
+        assert!(threads[0].body.contains("Reply from ghost:\nAgreed"));
+        assert!(threads[0].thread_resolvable);
+        assert_eq!(threads[1].line, Some(40));
+        assert!(threads[1].thread_outdated);
+    }
+
+    #[test]
+    fn parses_pr_urls() {
+        assert_eq!(
+            parse_pr_url("https://github.com/owner/repo/pull/123"),
+            Some(("owner".to_string(), "repo".to_string(), 123))
+        );
+        assert_eq!(
+            parse_pr_url("https://ghe.example.com/team/app/pull/9#discussion"),
+            Some(("team".to_string(), "app".to_string(), 9))
+        );
+        assert_eq!(parse_pr_url("https://github.com/owner/repo"), None);
+    }
+
+    #[test]
     fn parses_github_remotes() {
         assert_eq!(
             parse_github_remote("git@github.com:owner/repo.git"),
@@ -797,5 +1102,49 @@ mod tests {
         assert_eq!(comments[0].thread_id.as_deref(), Some("thread-1"));
         assert!(comments[0].thread_resolved);
         assert_eq!(comments[0].state, "resolved");
+    }
+
+    #[test]
+    fn viewed_mark_clears_when_file_content_changes() {
+        let root = std::env::temp_dir().join(format!(
+            "mnemonic-core-viewed-{}-{}",
+            std::process::id(),
+            timestamp()
+        ));
+        std::fs::create_dir_all(&root).expect("worktree dir");
+        let state = AppState::initialize(
+            root.join("data"),
+            root.join("cache"),
+            std::sync::Arc::new(crate::state::NoopEventEmitter),
+        )
+        .expect("app state");
+        let worktree = root.join("worktree");
+        std::fs::create_dir_all(&worktree).expect("worktree");
+        std::fs::write(worktree.join("lib.rs"), "fn first() {}").expect("write");
+        state
+            .db
+            .with_connection(|connection| {
+                connection.execute(
+                    "INSERT INTO workspaces (id, name, repo, branch, agent, status, current_step, completed_steps, last_updated, description, current_task, merge_risk, last_rebase, base_branch, agent_session_id, agent_session_agent, agent_session_status, agent_session_model, agent_session_estimated_cost, agent_session_last_message, agent_session_started_at, worktree_path, recent_events) VALUES ('ws', 'WS', 'repo', 'b', 'Codex', 'Waiting', 'Planning', '[]', 'now', '', '', 'Low', '', 'main', '', '', '', '', '', '', '', ?1, '[]')",
+                    [worktree.to_string_lossy().to_string()],
+                )?;
+                Ok(())
+            })
+            .expect("workspace");
+        let changed = vec!["lib.rs".to_string()];
+
+        set_workspace_file_viewed(&state, "ws", "lib.rs", true).expect("mark viewed");
+        assert!(list_workspace_viewed_files(&state, "ws", &changed)
+            .expect("viewed")
+            .contains("lib.rs"));
+
+        std::fs::write(worktree.join("lib.rs"), "fn second() {}").expect("rewrite");
+        assert!(list_workspace_viewed_files(&state, "ws", &changed)
+            .expect("viewed")
+            .is_empty());
+
+        if let Err(error) = std::fs::remove_dir_all(&root) {
+            log::warn!("failed to remove {}: {error}", root.display());
+        }
     }
 }

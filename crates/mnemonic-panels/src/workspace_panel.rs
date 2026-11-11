@@ -43,7 +43,7 @@ impl Render for DragGhostView {
 
 const PROJECT_ORDER_KEY: &str = "panel_project_order";
 const WORKSPACE_ORDER_KEY: &str = "panel_workspace_order";
-use mnemonic_core::services::{repo_scanner_service, workspace_service};
+use mnemonic_core::services::{repo_scanner_service, workspace_port_service, workspace_service};
 use ui::{Tooltip, h_flex, v_flex, Icon, IconButton, IconName, Label, prelude::*};
 use workspace::dock::{DockPosition, PanelEvent};
 use workspace::{Panel, Workspace};
@@ -296,8 +296,9 @@ impl WorkspacePanel {
         }
     }
 
-    /// Archive after confirmation: stops the agent session, removes the
-    /// worktree from disk (clean worktrees only), keeps the branch.
+    /// Archive after confirmation: stops the agent session and run commands,
+    /// frees the workspace's ports, moves the worktree into the archive
+    /// folder, keeps the branch.
     fn confirm_archive(
         &mut self,
         ws_id: String,
@@ -309,8 +310,8 @@ impl WorkspacePanel {
             PromptLevel::Warning,
             &format!("Archive {ws_name}?"),
             Some(
-                "Stops the agent session and moves the worktree into the archive folder. \
-                 Nothing is deleted.",
+                "Stops the agent session and run commands, frees the workspace's ports, \
+                 and moves the worktree into the archive folder. Nothing is deleted.",
             ),
             &["Archive", "Cancel"],
             cx,
@@ -323,9 +324,22 @@ impl WorkspacePanel {
             let Some(state) = mnemonic_bridge::mnemonic_state_cloned() else {
                 return;
             };
+            this.update(cx, |this, cx| {
+                if let Some(workspace) = this.workspace.upgrade() {
+                    workspace.update(cx, |workspace, cx| {
+                        WorkspaceHost::kill_run_commands_for_workspace(workspace, &ws_id, cx);
+                    });
+                }
+            })
+            .ok();
             let result = {
                 let ws_id = ws_id.clone();
                 cx.background_spawn(async move {
+                    // Ports are matched by process cwd, so they must be freed
+                    // before the worktree moves into the archive folder.
+                    for warning in free_workspace_ports(&state, &ws_id) {
+                        log::warn!("Archive {ws_id}: {warning}");
+                    }
                     workspace_service::archive_workspace(&state, &ws_id)?;
                     if let Err(err) =
                         chat_session_repository::delete_for_workspace(&state.db, &ws_id)
@@ -1004,6 +1018,75 @@ fn generate_workspace_name(existing: &[String]) -> String {
     }
 }
 
+/// Whether a name is one `generate_workspace_name` produces, i.e. the
+/// workspace still has its placeholder name.
+pub(crate) fn is_generated_workspace_name(name: &str) -> bool {
+    let mut parts = name.split('-');
+    let (Some(adjective), Some(animal)) = (parts.next(), parts.next()) else {
+        return false;
+    };
+    let suffix_is_valid = match parts.next() {
+        None => true,
+        Some(counter) => {
+            parts.next().is_none()
+                && !counter.is_empty()
+                && counter.chars().all(|character| character.is_ascii_digit())
+        }
+    };
+    suffix_is_valid && NAME_ADJECTIVES.contains(&adjective) && NAME_ANIMALS.contains(&animal)
+}
+
+const SLUG_STOP_WORDS: &[&str] = &[
+    "a", "also", "an", "and", "are", "as", "at", "be", "but", "by", "can", "could", "do", "does", "for",
+    "from", "hello", "hey", "hi", "i", "im", "in", "into", "is", "it", "its", "just", "let",
+    "lets", "me", "my", "need", "of", "ok", "okay", "on", "or", "our", "please", "pls", "should",
+    "so", "some", "that", "the", "then", "these", "this", "those", "to", "us", "want", "we",
+    "will", "with", "would", "you", "your",
+];
+const SLUG_MAX_WORDS: usize = 5;
+const SLUG_MAX_CHARS: usize = 40;
+
+/// A branch-name slug for a workspace's first message, e.g. "Can you fix the
+/// model dropdown filter?" becomes "fix-model-dropdown-filter". None when
+/// nothing meaningful is left, or for slash commands like "/model opus".
+pub(crate) fn branch_slug_from_message(text: &str) -> Option<String> {
+    let text = text.trim();
+    if text.starts_with('/') {
+        return None;
+    }
+    let normalized: String = text
+        .to_lowercase()
+        .chars()
+        .filter(|character| !matches!(character, '\'' | '\u{2019}'))
+        .map(|character| {
+            if character.is_ascii_alphanumeric() {
+                character
+            } else {
+                ' '
+            }
+        })
+        .collect();
+
+    let mut slug = String::new();
+    let meaningful_words = normalized
+        .split_whitespace()
+        .filter(|word| !SLUG_STOP_WORDS.contains(word))
+        .take(SLUG_MAX_WORDS);
+    for word in meaningful_words {
+        if slug.is_empty() {
+            slug.extend(word.chars().take(SLUG_MAX_CHARS));
+        } else if slug.len() + 1 + word.len() <= SLUG_MAX_CHARS {
+            slug.push('-');
+            slug.push_str(word);
+        } else {
+            break;
+        }
+    }
+
+    let slug = slug.trim_matches('-').to_string();
+    Some(slug).filter(|slug| !slug.is_empty())
+}
+
 impl Focusable for WorkspacePanel {
     fn focus_handle(&self, _cx: &App) -> FocusHandle {
         self.focus_handle.clone()
@@ -1104,3 +1187,61 @@ impl Render for WorkspacePanel {
         content
     }
 }
+
+/// Kills every process listening on a port from inside the workspace's
+/// worktree, returning what could not be killed.
+fn free_workspace_ports(state: &mnemonic_core::state::AppState, workspace_id: &str) -> Vec<String> {
+    workspace_port_service::invalidate_workspace_port_cache(workspace_id);
+    let ports = match workspace_port_service::list_workspace_ports(state, workspace_id) {
+        Ok(ports) => ports,
+        Err(err) => return vec![format!("Couldn't list workspace ports: {err}")],
+    };
+    ports
+        .into_iter()
+        .filter_map(|port| {
+            workspace_port_service::kill_workspace_port_process(
+                state,
+                workspace_id,
+                port.port,
+                port.pid,
+            )
+            .err()
+            .map(|err| format!("Couldn't free port {}: {err}", port.port))
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn first_message_becomes_descriptive_branch_slug() {
+        assert_eq!(
+            branch_slug_from_message("Hey, can you please fix the model dropdown filter?"),
+            Some("fix-model-dropdown-filter".to_string())
+        );
+        assert_eq!(
+            branch_slug_from_message(
+                "Let's add retry logic to the uploader and also log every failure loudly"
+            ),
+            Some("add-retry-logic-uploader-log".to_string())
+        );
+        assert_eq!(
+            branch_slug_from_message("Refactor internationalization configuration loading"),
+            Some("refactor-internationalization".to_string())
+        );
+        assert_eq!(branch_slug_from_message("ok, just do it"), None);
+        assert_eq!(branch_slug_from_message("/model claude-opus-5-5"), None);
+    }
+
+    #[test]
+    fn only_generator_names_count_as_auto_named() {
+        assert!(is_generated_workspace_name("crisp-panda"));
+        assert!(is_generated_workspace_name("crisp-panda-3"));
+        assert!(!is_generated_workspace_name("fix-model-dropdown-filter"));
+        assert!(!is_generated_workspace_name("crisp-panda-fix"));
+        assert!(!is_generated_workspace_name("crisp"));
+    }
+}
+

@@ -1186,6 +1186,38 @@ fn register_actions(
         )
         .register_action(
             |workspace: &mut Workspace,
+             action: &zed_actions::mnemonic::NewAgentSession,
+             window: &mut Window,
+             cx: &mut Context<Workspace>| {
+                if !add_session_to_active_mnemonic_workspace(workspace, action.kind, window, cx) {
+                    struct NoActiveMnemonicWorkspace;
+                    workspace.show_toast(
+                        Toast::new(
+                            NotificationId::unique::<NoActiveMnemonicWorkspace>(),
+                            "Select a workspace to open a new session in.",
+                        ),
+                        cx,
+                    );
+                }
+            },
+        )
+        .register_action(
+            |workspace: &mut Workspace,
+             _: &zed_actions::mnemonic::NewDefaultAgentSession,
+             window: &mut Window,
+             cx: &mut Context<Workspace>| {
+                if !add_session_to_active_mnemonic_workspace(
+                    workspace,
+                    zed_actions::mnemonic::AgentSessionKind::ClaudeChat,
+                    window,
+                    cx,
+                ) {
+                    Editor::new_file(workspace, &NewFile, window, cx);
+                }
+            },
+        )
+        .register_action(
+            |workspace: &mut Workspace,
              _: &mnemonic_panels::ToggleWorkspaceDetailFocus,
              window: &mut Window,
              cx: &mut Context<Workspace>| {
@@ -1409,6 +1441,27 @@ fn register_actions(
         workspace.show_error(DebugError, cx);
         workspace.show_error(SecondDebugError, cx);
     });
+}
+
+fn add_session_to_active_mnemonic_workspace(
+    workspace: &mut Workspace,
+    kind: zed_actions::mnemonic::AgentSessionKind,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) -> bool {
+    let Some(workspace_id) = cx
+        .try_global::<mnemonic_bridge::ActiveWorkspace>()
+        .and_then(|active| active.0.clone())
+    else {
+        return false;
+    };
+    mnemonic_panels::WorkspaceHost::add_session_for_workspace(
+        workspace,
+        &workspace_id,
+        kind,
+        window,
+        cx,
+    )
 }
 
 fn initialize_pane(
