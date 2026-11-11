@@ -1186,7 +1186,7 @@ fn register_actions(
              _window: &mut Window,
              cx: &mut Context<Workspace>| {
                 if let Some(panel) = workspace.panel::<mnemonic_panels::WorkspaceDetailPanel>(cx) {
-                    panel.update(cx, |panel, cx| panel.create_pr(cx));
+                    panel.update(cx, |panel, cx| panel.create_pr_per_settings(cx));
                 }
             },
         )

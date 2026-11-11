@@ -652,6 +652,7 @@ fn main() {
         AppState::set_global(app_state.clone(), cx);
 
         mnemonic_bridge::init(cx);
+        mnemonic_panels::init(cx);
 
         auto_update::init(client.clone(), cx);
         dap_adapters::init(cx);

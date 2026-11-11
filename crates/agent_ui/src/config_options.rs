@@ -364,9 +364,22 @@ impl ConfigOptionSelector {
             IconName::ChevronDown
         };
 
+        // Options outside the well-known categories (Claude's "Fast mode" and
+        // "Ultracode", for example) are often plain On/Off, which reads as a
+        // bare "Off" unless the option's name is shown with it.
+        let value_name = self.current_value_name();
+        let label = match option.category {
+            Some(
+                acp::SessionConfigOptionCategory::Mode
+                | acp::SessionConfigOptionCategory::Model
+                | acp::SessionConfigOptionCategory::ThoughtLevel,
+            ) => value_name,
+            _ => format!("{}: {}", option.name, value_name),
+        };
+
         Button::new(
             ElementId::Name(format!("config-option-{}", option.id.0).into()),
-            self.current_value_name(),
+            label,
         )
         .label_size(LabelSize::Small)
         .color(Color::Muted)

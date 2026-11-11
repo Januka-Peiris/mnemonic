@@ -76,6 +76,7 @@ pub(crate) fn settings_data(cx: &App) -> Vec<SettingsPage> {
         version_control_page(),
         collaboration_page(),
         ai_page(),
+        workspaces_page(),
         network_page(),
         developer_page(cx),
     ]
@@ -8269,6 +8270,186 @@ fn ai_page() -> SettingsPage {
             context_servers_section(),
             edit_prediction_language_settings_section(),
             edit_prediction_display_sub_section()
+        ],
+    }
+}
+
+fn workspaces_page() -> SettingsPage {
+    fn branches_section() -> [SettingsPageItem; 3] {
+        [
+            SettingsPageItem::SectionHeader("Branches"),
+            SettingsPageItem::SettingItem(SettingItem {
+                title: "Branch Prefix",
+                description: "Prefix for the branches of new workspaces, as in prefix/workspace-name. When empty, your OS username is used.",
+                field: Box::new(SettingField {
+                    organization_override: None,
+                    json_path: Some("workspaces.branch_prefix"),
+                    pick: |settings_content| {
+                        settings_content.workspaces.as_ref()?.branch_prefix.as_ref()
+                    },
+                    write: |settings_content, value, _| {
+                        settings_content
+                            .workspaces
+                            .get_or_insert_default()
+                            .branch_prefix = value;
+                    },
+                }),
+                metadata: Some(Box::new(SettingsFieldMetadata {
+                    placeholder: Some("your-name"),
+                    ..Default::default()
+                })),
+                files: USER,
+            }),
+            SettingsPageItem::SettingItem(SettingItem {
+                title: "Default Base Branch",
+                description: "The branch new workspaces start from, unless the project sets its own in its project settings.",
+                field: Box::new(SettingField {
+                    organization_override: None,
+                    json_path: Some("workspaces.default_base_branch"),
+                    pick: |settings_content| {
+                        settings_content
+                            .workspaces
+                            .as_ref()?
+                            .default_base_branch
+                            .as_ref()
+                    },
+                    write: |settings_content, value, _| {
+                        settings_content
+                            .workspaces
+                            .get_or_insert_default()
+                            .default_base_branch = value;
+                    },
+                }),
+                metadata: Some(Box::new(SettingsFieldMetadata {
+                    placeholder: Some("main"),
+                    ..Default::default()
+                })),
+                files: USER,
+            }),
+        ]
+    }
+
+    fn pull_requests_section() -> [SettingsPageItem; 4] {
+        [
+            SettingsPageItem::SectionHeader("Pull Requests"),
+            SettingsPageItem::SettingItem(SettingItem {
+                title: "Merge Method",
+                description: "How pull requests are merged from the workspace panel.",
+                field: Box::new(SettingField {
+                    organization_override: None,
+                    json_path: Some("workspaces.merge_method"),
+                    pick: |settings_content| {
+                        settings_content.workspaces.as_ref()?.merge_method.as_ref()
+                    },
+                    write: |settings_content, value, _| {
+                        settings_content
+                            .workspaces
+                            .get_or_insert_default()
+                            .merge_method = value;
+                    },
+                }),
+                metadata: None,
+                files: USER,
+            }),
+            SettingsPageItem::SettingItem(SettingItem {
+                title: "Keep CI Green",
+                description: "Whether creating a pull request also starts watching its CI and has the agent fix failing checks until they pass.",
+                field: Box::new(SettingField {
+                    organization_override: None,
+                    json_path: Some("workspaces.keep_ci_green"),
+                    pick: |settings_content| {
+                        settings_content.workspaces.as_ref()?.keep_ci_green.as_ref()
+                    },
+                    write: |settings_content, value, _| {
+                        settings_content
+                            .workspaces
+                            .get_or_insert_default()
+                            .keep_ci_green = value;
+                    },
+                }),
+                metadata: None,
+                files: USER,
+            }),
+            SettingsPageItem::SettingItem(SettingItem {
+                title: "Review Agent",
+                description: "Which agent runs the review session started from a workspace's Review button.",
+                field: Box::new(SettingField {
+                    organization_override: None,
+                    json_path: Some("workspaces.review_agent"),
+                    pick: |settings_content| {
+                        settings_content.workspaces.as_ref()?.review_agent.as_ref()
+                    },
+                    write: |settings_content, value, _| {
+                        settings_content
+                            .workspaces
+                            .get_or_insert_default()
+                            .review_agent = value;
+                    },
+                }),
+                metadata: None,
+                files: USER,
+            }),
+        ]
+    }
+
+    fn scripts_section() -> [SettingsPageItem; 3] {
+        [
+            SettingsPageItem::SectionHeader("Scripts"),
+            SettingsPageItem::SettingItem(SettingItem {
+                title: "Run Setup Automatically",
+                description: "Whether to run the setup commands from .mnemonic/config.json when a workspace is created.",
+                field: Box::new(SettingField {
+                    organization_override: None,
+                    json_path: Some("workspaces.auto_run_setup"),
+                    pick: |settings_content| {
+                        settings_content
+                            .workspaces
+                            .as_ref()?
+                            .auto_run_setup
+                            .as_ref()
+                    },
+                    write: |settings_content, value, _| {
+                        settings_content
+                            .workspaces
+                            .get_or_insert_default()
+                            .auto_run_setup = value;
+                    },
+                }),
+                metadata: None,
+                files: USER,
+            }),
+            SettingsPageItem::SettingItem(SettingItem {
+                title: "Allow Risky Scripts",
+                description: "Whether workspace scripts may run commands that are flagged as risky.",
+                field: Box::new(SettingField {
+                    organization_override: None,
+                    json_path: Some("workspaces.allow_risky_scripts"),
+                    pick: |settings_content| {
+                        settings_content
+                            .workspaces
+                            .as_ref()?
+                            .allow_risky_scripts
+                            .as_ref()
+                    },
+                    write: |settings_content, value, _| {
+                        settings_content
+                            .workspaces
+                            .get_or_insert_default()
+                            .allow_risky_scripts = value;
+                    },
+                }),
+                metadata: None,
+                files: USER,
+            }),
+        ]
+    }
+
+    SettingsPage {
+        title: "Workspaces",
+        items: concat_sections![
+            branches_section(),
+            pull_requests_section(),
+            scripts_section()
         ],
     }
 }

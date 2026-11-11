@@ -5,7 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use editor::Editor;
 use git_ui::project_diff::{BranchDiff, ProjectDiff};
 use gpui::{
-    actions, px, Action, AnyElement, Anchor, App, AppContext as _, Context, Entity, EventEmitter,
+    actions, px, Action, Anchor, AnyElement, App, AppContext as _, Context, Entity, EventEmitter,
     Focusable, FocusHandle, IntoElement, Pixels, PromptLevel, Render, ScrollHandle, SharedString,
     Task, WeakEntity, Window,
 };
@@ -18,6 +18,7 @@ use mnemonic_core::services::{
     review_cockpit_service, workspace_port_service, workspace_service,
 };
 use project::{Project, git_store::Repository};
+use settings::{ReviewAgent, Settings as _};
 use ui::{
     h_flex, v_flex, Button, ButtonStyle, ContextMenu, DiffStat, Icon, IconButton, IconName,
     Label, PopoverMenu, TintColor, Tooltip, prelude::*,
@@ -31,6 +32,7 @@ use workspace::{OpenOptions, Panel, Toast, Workspace};
 use crate::ActiveWorkspace;
 use crate::workspace_panel::WorkspacePanel;
 use crate::workspace_view::WorkspaceHost;
+use crate::workspaces_settings::WorkspacesSettings;
 
 actions!(mnemonic_workspace_detail_panel, [ToggleFocus]);
 
@@ -206,8 +208,6 @@ pub struct WorkspaceDetailPanel {
     poll_fast_until: Option<Instant>,
     /// Feedback line for the last dispatched instruction (sent / failed).
     dispatch_note: Option<SharedString>,
-    /// Which provider the Review button uses: "codex" or "claude".
-    review_provider: String,
     /// Zed's full project panel, embedded as the "All files" tab so file
     /// browsing, right-click operations, and editing live in one panel.
     file_tree: Option<Entity<project_panel::ProjectPanel>>,
@@ -309,7 +309,6 @@ impl WorkspaceDetailPanel {
                 poll_scheduled: false,
                 poll_fast_until: None,
                 dispatch_note: None,
-                review_provider: "codex".to_string(),
                 file_tree: None,
                 ports: Vec::new(),
                 ports_error: None,
@@ -1069,13 +1068,32 @@ impl WorkspaceDetailPanel {
                         }
                     }))
             }
-            None => Button::new("create-pr", if busy { "Working…" } else { "Create PR" })
-                .style(ButtonStyle::Filled)
-                .label_size(LabelSize::Small)
-                .disabled(busy || self.summary.is_none())
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.create_pr(cx);
-                })),
+            None => {
+                let keep_ci_green = WorkspacesSettings::get_global(cx).keep_ci_green;
+                Button::new("create-pr", if busy { "Working…" } else { "Create PR" })
+                    .style(ButtonStyle::Filled)
+                    .label_size(LabelSize::Small)
+                    .disabled(busy || self.summary.is_none())
+                    .when(keep_ci_green, |button| {
+                        button.tooltip(Tooltip::text(
+                            "Create PR, then watch CI and have the agent fix failures until \
+                             green. Turn this off in Settings > Workspaces",
+                        ))
+                    })
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.create_pr_per_settings(cx);
+                    }))
+            }
+        }
+    }
+
+    /// Creates the PR, also starting the CI watch when the `keep_ci_green`
+    /// setting is on.
+    pub fn create_pr_per_settings(&mut self, cx: &mut Context<Self>) {
+        if WorkspacesSettings::get_global(cx).keep_ci_green {
+            self.create_pr_with_auto_fix(cx);
+        } else {
+            self.create_pr(cx);
         }
     }
 
@@ -1157,26 +1175,6 @@ impl WorkspaceDetailPanel {
                                         })),
                                     )
                                 },
-                            )
-                            .when(
-                                !self
-                                    .pr_status
-                                    .as_ref()
-                                    .is_some_and(|status| status.found),
-                                |el| {
-                                    el.child(
-                                        Button::new("create-pr-autofix", "+ Auto-fix")
-                                            .style(ButtonStyle::Tinted(TintColor::Accent))
-                                            .label_size(LabelSize::Small)
-                                            .disabled(self.pr_busy || self.summary.is_none())
-                                            .tooltip(Tooltip::text(
-                                                "Create PR, then watch CI and auto-fix until green",
-                                            ))
-                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                this.create_pr_with_auto_fix(cx);
-                                            })),
-                                    )
-                                },
                             ),
                     ),
             )
@@ -1227,6 +1225,10 @@ impl WorkspaceDetailPanel {
 
     fn render_tabs(&self, ws: &WorkspaceSummary, cx: &mut Context<Self>) -> impl IntoElement {
         let changes_count = ws.changed_files.len();
+        let review_agent = match WorkspacesSettings::get_global(cx).review_agent {
+            ReviewAgent::Codex => "Codex",
+            ReviewAgent::Claude => "Claude",
+        };
         let tab_button = |id: &'static str,
                           label: String,
                           tab: DetailTab,
@@ -1243,20 +1245,7 @@ impl WorkspaceDetailPanel {
                 })
                 .hover(|style| style.bg(cx.theme().colors().ghost_element_hover))
                 .on_click(cx.listener(move |this, _, window, cx| {
-                    this.tab = tab;
-                    if tab == DetailTab::Changes {
-                        this.changes_focus_handle.focus(window, cx);
-                    }
-                    if tab == DetailTab::Checks && this.pr_status.is_none() && !this.pr_busy {
-                        this.refresh_pr_status(cx);
-                    }
-                    if tab == DetailTab::Ports {
-                        this.refresh_ports(true, cx);
-                    }
-                    if tab == DetailTab::Checkpoints {
-                        this.refresh_checkpoints(cx);
-                    }
-                    cx.notify();
+                    this.select_tab(tab, window, cx);
                 }))
                 .child(
                     Label::new(label)
@@ -1297,75 +1286,47 @@ impl WorkspaceDetailPanel {
                 self.tab,
                 cx,
             ))
-            .child(tab_button(
-                "detail-tab-ports",
-                if self.ports.is_empty() {
-                    "Ports".to_string()
-                } else {
-                    format!("Ports {}", self.ports.len())
-                },
-                DetailTab::Ports,
-                self.tab,
-                cx,
-            ))
-            .child(tab_button(
-                "detail-tab-checkpoints",
-                "Checkpoints".to_string(),
-                DetailTab::Checkpoints,
-                self.tab,
-                cx,
-            ))
+            // Ports and Checkpoints are used less often, so they live in the
+            // overflow menu and only take a tab while they have something to
+            // show or are open.
+            .when(!self.ports.is_empty() || self.tab == DetailTab::Ports, |el| {
+                el.child(tab_button(
+                    "detail-tab-ports",
+                    if self.ports.is_empty() {
+                        "Ports".to_string()
+                    } else {
+                        format!("Ports {}", self.ports.len())
+                    },
+                    DetailTab::Ports,
+                    self.tab,
+                    cx,
+                ))
+            })
+            .when(self.tab == DetailTab::Checkpoints, |el| {
+                el.child(tab_button(
+                    "detail-tab-checkpoints",
+                    "Checkpoints".to_string(),
+                    DetailTab::Checkpoints,
+                    self.tab,
+                    cx,
+                ))
+            })
             .child(div().flex_grow(1.0))
             .child(
-                h_flex()
-                    .gap_0p5()
-                    .child(
-                        Button::new("start-review", "Review")
-                            .label_size(LabelSize::Small)
-                            .tooltip(Tooltip::text(
-                                "Open a review session that analyses your diff for bugs, security, and performance issues",
-                            ))
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.start_review(window, cx);
-                            })),
+                Button::new("start-review", "Review")
+                    .label_size(LabelSize::Small)
+                    .start_icon(
+                        Icon::new(IconName::Eye)
+                            .size(IconSize::XSmall)
+                            .color(Color::Muted),
                     )
-                    .child({
-                        let provider_label = if self.review_provider == "codex" {
-                            "Codex ⌄"
-                        } else {
-                            "Claude ⌄"
-                        };
-                        let weak = cx.weak_entity();
-                        PopoverMenu::new("review-provider-menu")
-                            .anchor(Anchor::BottomRight)
-                            .trigger(
-                                Button::new("review-provider", provider_label)
-                                    .label_size(LabelSize::XSmall)
-                                    .style(ButtonStyle::Subtle)
-                                    .tooltip(Tooltip::text("Change the review provider")),
-                            )
-                            .menu(move |window, cx| {
-                                let weak = weak.clone();
-                                Some(ContextMenu::build(window, cx, move |menu, _, _| {
-                                    let weak_codex = weak.clone();
-                                    let weak_claude = weak.clone();
-                                    menu.entry("Codex", None, move |_, cx| {
-                                        weak_codex
-                                            .update(cx, |this, cx| {
-                                                this.set_review_provider("codex", cx);
-                                            })
-                                            .ok();
-                                    })
-                                    .entry("Claude", None, move |_, cx| {
-                                        weak_claude
-                                            .update(cx, |this, cx| {
-                                                this.set_review_provider("claude", cx);
-                                            })
-                                            .ok();
-                                    })
-                                }))
-                            })
-                    }),
+                    .tooltip(Tooltip::text(format!(
+                        "Open a {review_agent} session that reviews your diff for bugs, security \
+                         and performance issues. Change the agent in Settings > Workspaces",
+                    )))
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.start_review(window, cx);
+                    })),
             )
             .child(
                 IconButton::new("refresh-pr-status", IconName::ArrowCircle)
@@ -1375,24 +1336,50 @@ impl WorkspaceDetailPanel {
                         this.refresh_pr_status(cx);
                     })),
             )
+            .child({
+                let this = cx.weak_entity();
+                PopoverMenu::new("detail-more-tabs")
+                    .anchor(Anchor::TopRight)
+                    .trigger(
+                        IconButton::new("detail-more-tabs-trigger", IconName::Ellipsis)
+                            .icon_size(IconSize::Small)
+                            .tooltip(Tooltip::text("Ports and checkpoints")),
+                    )
+                    .menu(move |window, cx| {
+                        let this = this.clone();
+                        Some(ContextMenu::build(window, cx, move |menu, _, _| {
+                            [
+                                ("Ports", DetailTab::Ports),
+                                ("Checkpoints", DetailTab::Checkpoints),
+                            ]
+                            .into_iter()
+                            .fold(menu, |menu, (label, tab)| {
+                                let this = this.clone();
+                                menu.entry(label, None, move |window, cx| {
+                                    this.update(cx, |this, cx| {
+                                        this.select_tab(tab, window, cx);
+                                    })
+                                    .ok();
+                                })
+                            })
+                        }))
+                    })
+            })
     }
 
-    fn set_review_provider(&mut self, provider: &str, cx: &mut Context<Self>) {
-        self.review_provider = provider.to_string();
-        // Push the choice to the workspace view so the next review uses it.
-        let Some(workspace_id) = self.summary.as_ref().map(|summary| summary.id.clone()) else {
-            cx.notify();
-            return;
-        };
-        if let Some(workspace) = self.workspace.upgrade() {
-            workspace.update(cx, |workspace, cx| {
-                WorkspaceHost::set_review_provider_for_workspace(
-                    workspace,
-                    &workspace_id,
-                    provider,
-                    cx,
-                );
-            });
+    fn select_tab(&mut self, tab: DetailTab, window: &mut Window, cx: &mut Context<Self>) {
+        self.tab = tab;
+        if tab == DetailTab::Changes {
+            self.changes_focus_handle.focus(window, cx);
+        }
+        if tab == DetailTab::Checks && self.pr_status.is_none() && !self.pr_busy {
+            self.refresh_pr_status(cx);
+        }
+        if tab == DetailTab::Ports {
+            self.refresh_ports(true, cx);
+        }
+        if tab == DetailTab::Checkpoints {
+            self.refresh_checkpoints(cx);
         }
         cx.notify();
     }

@@ -14,7 +14,8 @@ use mnemonic_core::models::{
     WorkspaceSummary,
 };
 use mnemonic_core::repositories::{
-    activity_repository, chat_session_repository, repository_repository, settings_repository,
+    activity_repository, chat_session_repository, repository_repository,
+    repository_settings_repository, settings_repository,
 };
 
 #[derive(Clone)]
@@ -45,14 +46,18 @@ impl Render for DragGhostView {
 }
 
 const PROJECT_ORDER_KEY: &str = "panel_project_order";
+const PROJECT_BASE_BRANCH_KEY: &str = "base_branch";
+const PROJECT_SETUP_SCRIPT_KEY: &str = "setup_script";
+const PROJECT_INIT_FILES_KEY: &str = "workspace_init_files";
 const WORKSPACE_ORDER_KEY: &str = "panel_workspace_order";
 use mnemonic_core::services::{
     environment_service, repo_scanner_service, workspace_port_service, workspace_script_service,
     workspace_service,
 };
+use settings::Settings as _;
 use ui::{
-    CommonAnimationExt as _, ContextMenu, Icon, IconButton, IconName, Label, Tooltip, h_flex,
-    prelude::*, right_click_menu, v_flex,
+    Button, ButtonStyle, CommonAnimationExt as _, ContextMenu, Icon, IconButton, IconName, Label,
+    PopoverMenu, Tooltip, h_flex, prelude::*, right_click_menu, v_flex,
 };
 use util::ResultExt as _;
 use workspace::dock::{DockPosition, PanelEvent};
@@ -60,6 +65,7 @@ use workspace::notifications::NotificationId;
 use workspace::{ModalView, Panel, Toast, Workspace};
 
 use crate::workspace_view::WorkspaceHost;
+use crate::workspaces_settings::WorkspacesSettings;
 
 actions!(
     mnemonic_workspace_panel,
@@ -711,13 +717,27 @@ impl WorkspacePanel {
                     .map(|value| value.trim().trim_matches('/').to_string())
                     .filter(|value| !value.is_empty())
                     .unwrap_or_else(default_branch_prefix);
-                let base_branch =
+                let default_base_branch =
                     settings_repository::get_value(&state.db, "default_base_branch")
                         .ok()
                         .flatten()
                         .map(|value| value.trim().to_string())
                         .filter(|value| !value.is_empty())
                         .unwrap_or_else(|| "main".to_string());
+                let project_base_branch = match repository_settings_repository::get_value(
+                    &state.db,
+                    &repo.id,
+                    PROJECT_BASE_BRANCH_KEY,
+                ) {
+                    Ok(value) => value
+                        .map(|value| value.trim().to_string())
+                        .filter(|value| !value.is_empty()),
+                    Err(err) => {
+                        log::error!("Failed to read the base branch of {}: {err}", repo.name);
+                        None
+                    }
+                };
+                let base_branch = project_base_branch.unwrap_or(default_base_branch);
                 let branch_name = format!("{branch_prefix}/{workspace_name}");
                 let input = CreateWorkspaceInput {
                     name: workspace_name,
@@ -817,6 +837,31 @@ impl WorkspacePanel {
         workspace.update(cx, |workspace, cx| {
             workspace.toggle_modal(window, cx, |window, cx| {
                 IssuePromptModal::new(panel, project_name, window, cx)
+            });
+        });
+    }
+
+    fn open_project_settings(
+        &mut self,
+        project_name: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+        let Some(repository) = self
+            .repositories
+            .iter()
+            .find(|repository| repository.name == project_name)
+            .cloned()
+        else {
+            log::error!("Repository not found for project: {project_name}");
+            return;
+        };
+        workspace.update(cx, |workspace, cx| {
+            workspace.toggle_modal(window, cx, |window, cx| {
+                ProjectSettingsModal::new(&repository, window, cx)
             });
         });
     }
@@ -981,7 +1026,6 @@ impl WorkspacePanel {
         h_flex()
             .px_2()
             .h(px(28.))
-            .justify_between()
             .items_center()
             .border_b_1()
             .border_color(cx.theme().colors().border)
@@ -990,25 +1034,45 @@ impl WorkspacePanel {
                     .size(LabelSize::Default)
                     .color(Color::Muted),
             )
+    }
+
+    fn render_footer(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        h_flex()
+            .px_1()
+            .h(px(32.))
+            .flex_none()
+            .justify_between()
+            .items_center()
+            .border_t_1()
+            .border_color(cx.theme().colors().border)
             .child(
-                h_flex()
-                    .gap_0p5()
-                    .child(
-                        IconButton::new("filter-projects", IconName::Filter)
-                            .icon_size(IconSize::Small)
-                            .tooltip(Tooltip::text("Filter"))
-                            .on_click(cx.listener(|_this, _, _window, _cx| {
-                                log::info!("Filter clicked");
-                            })),
+                Button::new("add-project", "Add project")
+                    .style(ButtonStyle::Subtle)
+                    .label_size(LabelSize::Small)
+                    .color(Color::Muted)
+                    .start_icon(
+                        Icon::new(IconName::Plus)
+                            .size(IconSize::XSmall)
+                            .color(Color::Muted),
                     )
-                    .child(
-                        IconButton::new("add-project", IconName::Plus)
-                            .icon_size(IconSize::Small)
-                            .tooltip(Tooltip::text("New Project"))
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.add_project(window, cx);
-                            })),
-                    ),
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.add_project(window, cx);
+                    })),
+            )
+            .child(
+                IconButton::new("open-workspaces-settings", IconName::Settings)
+                    .icon_size(IconSize::Small)
+                    .icon_color(Color::Muted)
+                    .tooltip(Tooltip::text("Workspaces settings"))
+                    .on_click(|_, window, cx| {
+                        window.dispatch_action(
+                            Box::new(zed_actions::OpenSettingsAt {
+                                path: "workspaces.branch_prefix".to_string(),
+                                target: None,
+                            }),
+                            cx,
+                        );
+                    }),
             )
     }
 
@@ -1029,6 +1093,11 @@ impl WorkspacePanel {
 
         let project_for_add = project.to_string();
         let project_for_issue = project.to_string();
+        let project_for_settings = project.to_string();
+        let has_repository = self
+            .repositories
+            .iter()
+            .any(|repository| repository.name == project);
         let drag_data = DraggedProject {
             name: project.to_string(),
         };
@@ -1082,26 +1151,59 @@ impl WorkspacePanel {
                         .color(Color::Muted),
                 )
                 .child(div().flex_grow(1.0))
-                .child(
-                    IconButton::new(
-                        SharedString::from(format!("add-worktree-from-issue-{project}")),
-                        IconName::Github,
-                    )
-                    .icon_size(IconSize::XSmall)
-                    .icon_color(Color::Muted)
-                    .tooltip(Tooltip::text("New from issue / PR…"))
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        cx.stop_propagation();
-                        this.open_issue_prompt(project_for_issue.clone(), window, cx);
-                    })),
-                )
+                .child({
+                    let this = cx.weak_entity();
+                    PopoverMenu::new(SharedString::from(format!("project-menu-{project}")))
+                        .anchor(gpui::Anchor::TopRight)
+                        .trigger(
+                            IconButton::new(
+                                SharedString::from(format!("project-menu-trigger-{project}")),
+                                IconName::Ellipsis,
+                            )
+                            .icon_size(IconSize::XSmall)
+                            .icon_color(Color::Muted)
+                            .tooltip(Tooltip::text("Project options")),
+                        )
+                        .menu(move |window, cx| {
+                            let this = this.clone();
+                            let project_for_issue = project_for_issue.clone();
+                            let project_for_settings = project_for_settings.clone();
+                            Some(ContextMenu::build(window, cx, move |menu, _, _| {
+                                menu.entry("New from Issue or PR…", None, {
+                                    let this = this.clone();
+                                    move |window, cx| {
+                                        this.update(cx, |this, cx| {
+                                            this.open_issue_prompt(
+                                                project_for_issue.clone(),
+                                                window,
+                                                cx,
+                                            );
+                                        })
+                                        .log_err();
+                                    }
+                                })
+                                .when(has_repository, |menu| {
+                                    menu.entry("Project Settings…", None, move |window, cx| {
+                                        this.update(cx, |this, cx| {
+                                            this.open_project_settings(
+                                                project_for_settings.clone(),
+                                                window,
+                                                cx,
+                                            );
+                                        })
+                                        .log_err();
+                                    })
+                                })
+                            }))
+                        })
+                })
                 .child(
                     IconButton::new(
                         SharedString::from(format!("add-worktree-{project}")),
                         IconName::Plus,
                     )
                     .icon_size(IconSize::XSmall)
-                    .tooltip(Tooltip::text("New Worktree"))
+                    .tooltip(Tooltip::text("New workspace"))
                     .on_click(cx.listener(move |this, _, window, cx| {
                         this.add_worktree(project_for_add.clone(), None, window, cx);
                     })),
@@ -1260,8 +1362,10 @@ impl WorkspacePanel {
         let additions: u32 = ws.changed_files.iter().map(|file| file.additions).sum();
         let deletions: u32 = ws.changed_files.iter().map(|file| file.deletions).sum();
 
+        let row_group = SharedString::from(format!("workspace-row-{}", ws.id));
         let row = h_flex()
             .id(SharedString::from(ws.id.clone()))
+            .group(row_group.clone())
             .pl(px(28.))
             .pr_2()
             .h(px(24.))
@@ -1351,6 +1455,7 @@ impl WorkspacePanel {
                 )
                 .icon_size(IconSize::XSmall)
                 .icon_color(Color::Muted)
+                .visible_on_hover(row_group)
                 .tooltip(Tooltip::text("Archive workspace"))
                 .on_click(cx.listener(move |this, _, window, cx| {
                     cx.stop_propagation();
@@ -1482,7 +1587,8 @@ impl WorkspacePanel {
 
     fn render_empty(&self) -> impl IntoElement {
         v_flex()
-            .size_full()
+            .w_full()
+            .flex_grow(1.0)
             .items_center()
             .justify_center()
             .gap_1()
@@ -1933,6 +2039,225 @@ impl Render for IssuePromptModal {
     }
 }
 
+/// Per-project settings: where new workspaces branch from and what is
+/// prepared in them. Saved per repository, next to the app-wide ones in
+/// Settings > Workspaces.
+struct ProjectSettingsModal {
+    repository_id: String,
+    project_name: String,
+    base_branch: Entity<Editor>,
+    setup_script: Entity<Editor>,
+    init_files: Entity<Editor>,
+    error: Option<SharedString>,
+}
+
+impl ProjectSettingsModal {
+    fn new(
+        repository: &DiscoveredRepository,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let state = mnemonic_bridge::mnemonic_state(cx);
+        let mut error = None;
+        let mut load = |key: &str| {
+            match repository_settings_repository::get_value(&state.db, &repository.id, key) {
+                Ok(value) => value.unwrap_or_default(),
+                Err(err) => {
+                    error = Some(SharedString::from(format!(
+                        "Couldn't load the saved settings: {err}"
+                    )));
+                    String::new()
+                }
+            }
+        };
+        let base_branch_value = load(PROJECT_BASE_BRANCH_KEY);
+        let setup_script_value = load(PROJECT_SETUP_SCRIPT_KEY);
+        let init_files_value = load(PROJECT_INIT_FILES_KEY);
+
+        let default_base_branch = WorkspacesSettings::get_global(cx)
+            .default_base_branch
+            .clone();
+        let base_branch = cx.new(|cx| {
+            let mut editor = Editor::single_line(window, cx);
+            editor.set_placeholder_text(&default_base_branch, window, cx);
+            editor.set_text(base_branch_value, window, cx);
+            editor
+        });
+        let setup_script = cx.new(|cx| {
+            let mut editor = Editor::auto_height(2, 8, window, cx);
+            editor.set_placeholder_text("pnpm install", window, cx);
+            editor.set_text(setup_script_value, window, cx);
+            editor
+        });
+        let init_files = cx.new(|cx| {
+            let mut editor = Editor::auto_height(2, 8, window, cx);
+            editor.set_placeholder_text(".env.local", window, cx);
+            editor.set_text(init_files_value, window, cx);
+            editor
+        });
+
+        Self {
+            repository_id: repository.id.clone(),
+            project_name: repository.name.clone(),
+            base_branch,
+            setup_script,
+            init_files,
+            error,
+        }
+    }
+
+    fn cancel(&mut self, _: &menu::Cancel, _window: &mut Window, cx: &mut Context<Self>) {
+        cx.emit(DismissEvent);
+    }
+
+    fn confirm(&mut self, _: &menu::Confirm, _window: &mut Window, cx: &mut Context<Self>) {
+        self.save(cx);
+    }
+
+    fn secondary_confirm(
+        &mut self,
+        _: &menu::SecondaryConfirm,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.save(cx);
+    }
+
+    /// Saves every field, clearing the ones left empty so the app-wide
+    /// defaults apply again.
+    fn save(&mut self, cx: &mut Context<Self>) {
+        let state = mnemonic_bridge::mnemonic_state(cx);
+        let fields = [
+            (PROJECT_BASE_BRANCH_KEY, self.base_branch.read(cx).text(cx)),
+            (PROJECT_SETUP_SCRIPT_KEY, self.setup_script.read(cx).text(cx)),
+            (PROJECT_INIT_FILES_KEY, self.init_files.read(cx).text(cx)),
+        ];
+        for (key, value) in fields {
+            let value = value.trim();
+            let result = if value.is_empty() {
+                repository_settings_repository::delete_value(&state.db, &self.repository_id, key)
+            } else {
+                repository_settings_repository::set_value(
+                    &state.db,
+                    &self.repository_id,
+                    key,
+                    value,
+                )
+            };
+            if let Err(err) = result {
+                self.error = Some(SharedString::from(format!("Couldn't save: {err}")));
+                cx.notify();
+                return;
+            }
+        }
+        cx.emit(DismissEvent);
+    }
+}
+
+impl EventEmitter<DismissEvent> for ProjectSettingsModal {}
+
+impl ModalView for ProjectSettingsModal {}
+
+impl Focusable for ProjectSettingsModal {
+    fn focus_handle(&self, cx: &App) -> FocusHandle {
+        self.base_branch.focus_handle(cx)
+    }
+}
+
+impl Render for ProjectSettingsModal {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let border = cx.theme().colors().border_variant;
+        let field_background = cx.theme().colors().editor_background;
+        let field = |title: &'static str, hint: &'static str, editor: &Entity<Editor>| {
+            v_flex()
+                .gap_1()
+                .child(Label::new(title).size(LabelSize::Small))
+                .child(
+                    div()
+                        .px_2()
+                        .py_1()
+                        .rounded_md()
+                        .border_1()
+                        .border_color(border)
+                        .bg(field_background)
+                        .child(editor.clone()),
+                )
+                .child(
+                    Label::new(hint)
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted),
+                )
+        };
+
+        v_flex()
+            .key_context("ProjectSettingsModal")
+            .on_action(cx.listener(Self::cancel))
+            .on_action(cx.listener(Self::confirm))
+            .on_action(cx.listener(Self::secondary_confirm))
+            .elevation_3(cx)
+            .w(rems(34.))
+            .p_3()
+            .gap_3()
+            .child(Label::new(format!("{} settings", self.project_name)))
+            .child(field(
+                "Base branch",
+                "New workspaces in this project start from this branch. Leave empty to use \
+                 the default from Settings > Workspaces.",
+                &self.base_branch,
+            ))
+            .child(field(
+                "Setup script",
+                "Runs in a terminal in each new workspace.",
+                &self.setup_script,
+            ))
+            .child(field(
+                "Files to copy",
+                "Copied from the project root into each new workspace, one path per line.",
+                &self.init_files,
+            ))
+            .child(
+                Label::new(
+                    "Run and archive commands are read from .mnemonic/config.json in the \
+                     repository.",
+                )
+                .size(LabelSize::XSmall)
+                .color(Color::Muted),
+            )
+            .child(
+                h_flex()
+                    .w_full()
+                    .gap_2()
+                    .justify_between()
+                    .items_center()
+                    .child(match &self.error {
+                        Some(error) => Label::new(error.clone())
+                            .size(LabelSize::Small)
+                            .color(Color::Error),
+                        None => Label::new(""),
+                    })
+                    .child(
+                        h_flex()
+                            .gap_1()
+                            .child(
+                                Button::new("project-settings-cancel", "Cancel")
+                                    .label_size(LabelSize::Small)
+                                    .on_click(cx.listener(|_, _, _, cx| {
+                                        cx.emit(DismissEvent);
+                                    })),
+                            )
+                            .child(
+                                Button::new("project-settings-save", "Save")
+                                    .style(ButtonStyle::Filled)
+                                    .label_size(LabelSize::Small)
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.save(cx);
+                                    })),
+                            ),
+                    ),
+            )
+    }
+}
+
 struct RenameWorkspaceModal {
     editor: Entity<Editor>,
     panel: WeakEntity<WorkspacePanel>,
@@ -2119,7 +2444,7 @@ impl Render for WorkspacePanel {
             content = content.child(self.render_empty());
         }
 
-        content
+        content.child(self.render_footer(cx))
     }
 }
 
