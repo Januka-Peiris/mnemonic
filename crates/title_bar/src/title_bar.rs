@@ -361,7 +361,6 @@ impl Render for TitleBar {
                 })
                 .gap_1()
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                .children(self.render_mnemonic_pr_controls(cx))
                 .child(self.render_call_controls(window, cx))
                 .children(self.render_connection_status(status, cx))
                 .child(self.update_version.clone())
@@ -944,6 +943,12 @@ impl TitleBar {
         let effective_repository = Some(repository);
 
         let worktree_label: SharedString = linked_worktree_name.unwrap_or_else(|| "main".into());
+        // Mnemonic names the folders of its managed workspaces `ws-<timestamp>`,
+        // which tells the reader nothing; the sidebar shows which workspace is
+        // open, so only the branch is worth the space here.
+        let is_managed_workspace_folder = worktree_label
+            .strip_prefix("ws-")
+            .is_some_and(|rest| !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit()));
 
         let (creation_in_progress, is_switch) = self
             .workspace
@@ -954,6 +959,7 @@ impl TitleBar {
             })
             .unwrap_or((None, false));
         let is_creating = creation_in_progress.is_some();
+        let show_worktree = is_creating || !is_managed_workspace_folder;
 
         let display_label: SharedString = if let Some(ref name) = creation_in_progress {
             if is_switch {
@@ -1061,14 +1067,16 @@ impl TitleBar {
         Some(
             h_flex()
                 .gap_px()
-                .child(worktree_button)
+                .when(show_worktree, |this| this.child(worktree_button))
                 .when_some(branch_picker, |this, branch_picker| {
-                    this.child(
-                        Label::new("/")
-                            .size(LabelSize::Small)
-                            .color(Color::Muted)
-                            .alpha(0.25),
-                    )
+                    this.when(show_worktree, |this| {
+                        this.child(
+                            Label::new("/")
+                                .size(LabelSize::Small)
+                                .color(Color::Muted)
+                                .alpha(0.25),
+                        )
+                    })
                     .child(branch_picker)
                 })
                 .into_any_element(),
@@ -1178,47 +1186,6 @@ impl TitleBar {
             }
             _ => None,
         }
-    }
-
-    /// Quick PR actions for the active Mnemonic workspace, dispatched as
-    /// global actions and handled by the workspace detail panel.
-    fn render_mnemonic_pr_controls(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
-        let has_active_workspace = cx
-            .try_global::<mnemonic_bridge::ActiveWorkspace>()
-            .is_some_and(|active| active.0.is_some());
-        if !has_active_workspace {
-            return None;
-        }
-        Some(
-            h_flex()
-                .gap_1()
-                .child(
-                    Button::new("titlebar-create-pr", "Create PR")
-                        .style(ButtonStyle::Filled)
-                        .label_size(LabelSize::Small)
-                        .on_click(|_, window, cx| {
-                            window.dispatch_action(
-                                mnemonic_bridge::CreatePullRequest.boxed_clone(),
-                                cx,
-                            );
-                        }),
-                )
-                .child(
-                    Button::new("titlebar-create-pr-autofix", "+ Auto-fix")
-                        .style(ButtonStyle::Tinted(TintColor::Accent))
-                        .label_size(LabelSize::Small)
-                        .tooltip(Tooltip::text(
-                            "Create PR, then watch CI and auto-fix until green",
-                        ))
-                        .on_click(|_, window, cx| {
-                            window.dispatch_action(
-                                mnemonic_bridge::CreatePullRequestWithAutoFix.boxed_clone(),
-                                cx,
-                            );
-                        }),
-                )
-                .into_any_element(),
-        )
     }
 
     pub fn render_sign_in_button(&mut self, _: &mut Context<Self>) -> Button {

@@ -26,7 +26,7 @@ use mnemonic_core::services::{
 };
 use project::agent_server_store::AllAgentServersSettings;
 use project::{AgentId, Project};
-use settings::{NotifyWhenAgentWaiting, Settings as _};
+use settings::{NotifyWhenAgentWaiting, ReviewAgent, Settings as _};
 use task::{RevealStrategy, Shell, SpawnInTerminal, TaskId};
 use terminal::Terminal;
 use terminal_view::TerminalView;
@@ -34,7 +34,7 @@ use util::path_list::PathList;
 use util::ResultExt as _;
 use util::shell_builder::ShellBuilder;
 use ui::{
-    Button, ButtonStyle, ContextMenu, Icon, IconButton, IconName, Label, PopoverMenu, TintColor,
+    Button, ButtonStyle, ContextMenu, Icon, IconButton, IconName, Label, PopoverMenu,
     Tooltip, h_flex, prelude::*, v_flex,
 };
 use workspace::item::{Item, ItemEvent, ItemHandle};
@@ -46,6 +46,7 @@ use workspace::{
 use zed_actions::mnemonic::AgentSessionKind;
 
 use crate::workspace_detail_panel::WorkspaceDetailPanel;
+use crate::workspaces_settings::WorkspacesSettings;
 use crate::workspace_panel::{
     WorkspacePanel, branch_slug_from_message, is_generated_workspace_name,
 };
@@ -109,6 +110,18 @@ const CODEX_MODELS: &[(&str, &str)] = &[
 
 /// Effort levels for the effort dropdown.
 const AGENT_EFFORTS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
+
+/// An effort value as shown in the composer, such as "High" for "high".
+fn effort_label(effort: &str) -> String {
+    if effort == "xhigh" {
+        return "Extra high".to_string();
+    }
+    let mut characters = effort.chars();
+    match characters.next() {
+        Some(first) => first.to_uppercase().chain(characters).collect(),
+        None => String::new(),
+    }
+}
 
 /// The modes shift+tab cycles a Claude session through: the base modes
 /// (default, acceptEdits, plan) then the optional ones, bypass before auto.
@@ -692,7 +705,6 @@ pub struct WorkspaceView {
     agent_effort: String,
     claude_mode_index: usize,
     codex_mode_index: usize,
-    review_provider: AgentProvider,
     pending_image_paths: Vec<String>,
     last_agent_activity: Option<Instant>,
     idle_check_scheduled: bool,
@@ -799,10 +811,11 @@ impl WorkspaceView {
             .sessions
             .iter()
             .any(|session| session.chat().is_some());
+        let review_agent = WorkspacesSettings::get_global(cx).review_agent;
         if chat_first {
-            let agent = match self.review_provider {
-                AgentProvider::Claude => ChatAgent::Claude,
-                AgentProvider::Codex => ChatAgent::Codex,
+            let agent = match review_agent {
+                ReviewAgent::Claude => ChatAgent::Claude,
+                ReviewAgent::Codex => ChatAgent::Codex,
             };
             let record = ChatSessionRecord {
                 id: uuid::Uuid::new_v4().to_string(),
@@ -822,7 +835,10 @@ impl WorkspaceView {
             return;
         }
 
-        let provider = self.review_provider;
+        let provider = match review_agent {
+            ReviewAgent::Claude => AgentProvider::Claude,
+            ReviewAgent::Codex => AgentProvider::Codex,
+        };
         self.spawn_agent_terminal("review", "review", provider, Some(prompt), window, cx);
     }
 
@@ -1650,9 +1666,8 @@ impl WorkspaceView {
             return h_flex()
                 .gap_0p5()
                 .child(
-                    Button::new("workspace-run-restart", "Restart")
-                        .style(ButtonStyle::Subtle)
-                        .label_size(LabelSize::XSmall)
+                    IconButton::new("workspace-run-restart", IconName::RotateCw)
+                        .icon_size(IconSize::Small)
                         .disabled(self.run_starting)
                         .tooltip(Tooltip::text("Stop and re-run the workspace's run commands"))
                         .on_click({
@@ -1664,9 +1679,9 @@ impl WorkspaceView {
                         }),
                 )
                 .child(
-                    Button::new("workspace-run-stop", "Stop")
-                        .style(ButtonStyle::Tinted(TintColor::Error))
-                        .label_size(LabelSize::XSmall)
+                    IconButton::new("workspace-run-stop", IconName::Stop)
+                        .icon_size(IconSize::Small)
+                        .icon_color(Color::Error)
                         .tooltip(Tooltip::text("Stop the run commands and close their tabs"))
                         .on_click({
                             let this = this.clone();
@@ -1684,6 +1699,11 @@ impl WorkspaceView {
         )
         .style(ButtonStyle::Subtle)
         .label_size(LabelSize::XSmall)
+        .start_icon(
+            Icon::new(IconName::PlayFilled)
+                .size(IconSize::XSmall)
+                .color(Color::Muted),
+        )
         .disabled(self.run_starting || self.run_command_count == 0)
         .tooltip(Tooltip::text(self.run_tooltip.clone()))
         .on_click({
@@ -2742,7 +2762,7 @@ impl WorkspaceView {
                     SharedString::from(format!("gave up after {AUTO_FIX_MAX_ATTEMPTS} attempts"));
                 self.show_workspace_toast(
                     format!(
-                        "{}: auto-fix gave up after {AUTO_FIX_MAX_ATTEMPTS} attempts — needs you",
+                        "{}: CI still failing after {AUTO_FIX_MAX_ATTEMPTS} fix attempts, needs you",
                         self.workspace_name
                     ),
                     cx,
@@ -2772,7 +2792,7 @@ impl WorkspaceView {
                 problems.push(format!("these CI checks failed: {}", failing.join(", ")));
             }
             let prompt = format!(
-                "CI status on this PR needs fixing (auto-fix attempt {}/{}): {}. \
+                "CI status on this PR needs fixing (attempt {}/{}): {}. \
                  Use `gh pr checks` and `gh run view --log-failed` to inspect the failures \
                  (and resolve any merge conflicts by merging the base branch), fix the \
                  problems, commit, and push.",
@@ -2787,7 +2807,7 @@ impl WorkspaceView {
             ));
             self.show_workspace_toast(
                 format!(
-                    "{}: CI failing — claude fixing ({}/{})",
+                    "{}: CI failing, agent fixing ({}/{})",
                     self.workspace_name, self.auto_fix_attempts, AUTO_FIX_MAX_ATTEMPTS
                 ),
                 cx,
@@ -2887,28 +2907,27 @@ impl WorkspaceView {
         });
     }
 
-    fn render_status_chip(&self, cx: &App) -> impl IntoElement {
+    /// Shown only while an agent is working; an idle workspace needs no chip.
+    fn render_status_chip(&self, cx: &App) -> Option<impl IntoElement> {
         let running = self.agent_is_running() || self.any_chat_generating(cx);
-        let (color, text) = if running {
-            (cx.theme().status().success, "Running")
-        } else {
-            (cx.theme().colors().text_muted, "Waiting")
-        };
-
-        h_flex()
-            .px_1p5()
-            .py_0p5()
-            .gap_1()
-            .items_center()
-            .rounded_md()
-            .border_1()
-            .border_color(cx.theme().colors().border)
-            .child(div().w(px(6.)).h(px(6.)).rounded_full().bg(color))
-            .child(
-                Label::new(text)
-                    .size(LabelSize::XSmall)
-                    .color(if running { Color::Default } else { Color::Muted }),
-            )
+        running.then(|| {
+            h_flex()
+                .px_1()
+                .gap_1()
+                .items_center()
+                .child(
+                    div()
+                        .w(px(6.))
+                        .h(px(6.))
+                        .rounded_full()
+                        .bg(cx.theme().status().success),
+                )
+                .child(
+                    Label::new("Running")
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted),
+                )
+        })
     }
 
     /// Replaces a chat whose saved session can no longer be resumed with a
@@ -3018,6 +3037,100 @@ impl WorkspaceView {
     }
 
     fn render_composer(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let chevron = || {
+            Icon::new(IconName::ChevronDown)
+                .size(IconSize::XSmall)
+                .color(Color::Muted)
+        };
+
+        let model_menu = {
+            let this = cx.weak_entity();
+            let models: &[(&str, &str)] = match self.active_provider() {
+                AgentProvider::Claude => CLAUDE_MODELS,
+                AgentProvider::Codex => CODEX_MODELS,
+            };
+            let models = models.to_vec();
+            PopoverMenu::new("composer-model-menu")
+                .anchor(Anchor::BottomLeft)
+                .trigger(
+                    Button::new("composer-model", self.model_label())
+                        .label_size(LabelSize::Small)
+                        .color(Color::Muted)
+                        .end_icon(chevron())
+                        .tooltip(Tooltip::text(
+                            "Model for the focused agent (switches it live) and for new \
+                             sessions",
+                        )),
+                )
+                .menu(move |window, cx| {
+                    let this = this.clone();
+                    let models = models.clone();
+                    Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
+                        for (model, label) in &models {
+                            let this = this.clone();
+                            let model = *model;
+                            menu = menu.entry(*label, None, move |_, cx| {
+                                this.update(cx, |this, cx| {
+                                    this.set_model(model, cx);
+                                })
+                                .ok();
+                            });
+                        }
+                        menu
+                    }))
+                })
+        };
+
+        let effort_menu = {
+            let this = cx.weak_entity();
+            PopoverMenu::new("composer-effort-menu")
+                .anchor(Anchor::BottomLeft)
+                .trigger(
+                    Button::new("composer-effort", effort_label(&self.agent_effort))
+                        .label_size(LabelSize::Small)
+                        .color(Color::Muted)
+                        .end_icon(chevron())
+                        .tooltip(Tooltip::text(
+                            "Effort for the focused agent (switches it live) and for new \
+                             sessions",
+                        )),
+                )
+                .menu(move |window, cx| {
+                    let this = this.clone();
+                    Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
+                        for effort in AGENT_EFFORTS {
+                            let this = this.clone();
+                            menu = menu.entry(effort_label(effort), None, move |_, cx| {
+                                this.update(cx, |this, cx| {
+                                    this.set_effort(effort, cx);
+                                })
+                                .ok();
+                            });
+                        }
+                        menu
+                    }))
+                })
+        };
+
+        let mode_button = Button::new(
+            "composer-mode",
+            format!("Mode: {}", self.agent_mode_label()),
+        )
+        .label_size(LabelSize::Small)
+        .color(Color::Muted)
+        .tooltip(Tooltip::text(
+            "Cycle the focused agent's mode: sends shift+tab, the same as pressing \
+             shift+tab in the terminal",
+        ))
+        .on_click(cx.listener(|this, _, _, cx| {
+            this.cycle_agent_mode(cx);
+        }));
+
+        // Claude's permission mode is the Mode chip itself. Codex's chip only
+        // covers plan vs default while its sessions always launch with
+        // approvals and the sandbox bypassed, so that is stated separately.
+        let codex_full_access = self.active_provider() == AgentProvider::Codex;
+
         v_flex()
             .key_context("MnemonicComposer")
             .on_action(cx.listener(Self::send_to_agent))
@@ -3027,141 +3140,67 @@ impl WorkspaceView {
             .border_color(cx.theme().colors().border)
             .bg(cx.theme().colors().panel_background)
             .p_2()
-            .gap_1p5()
             .w_full()
             .child(
-                h_flex()
-                    .gap_1()
-                    .items_center()
-                    .child(
-                        Button::new(
-                            "composer-mode",
-                            format!("Mode: {}", self.agent_mode_label()),
-                        )
-                        .style(ButtonStyle::Subtle)
-                        .label_size(LabelSize::XSmall)
-                        .tooltip(Tooltip::text(
-                            "Cycle the focused agent's mode: sends shift+tab, \
-                             the same as pressing shift+tab in the terminal",
-                        ))
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.cycle_agent_mode(cx);
-                        })),
-                    )
-                    .child({
-                        let this = cx.weak_entity();
-                        let models: &[(&str, &str)] = match self.active_provider() {
-                            AgentProvider::Claude => CLAUDE_MODELS,
-                            AgentProvider::Codex => CODEX_MODELS,
-                        };
-                        let models = models.to_vec();
-                        PopoverMenu::new("composer-model-menu")
-                            .anchor(Anchor::BottomLeft)
-                            .trigger(
-                                Button::new(
-                                    "composer-model",
-                                    format!("{} ⌄", self.model_label()),
-                                )
-                                .label_size(LabelSize::XSmall)
-                                .tooltip(Tooltip::text(
-                                    "Model for the focused agent (switches it live) and \
-                                     for new sessions",
-                                )),
-                            )
-                            .menu(move |window, cx| {
-                                let this = this.clone();
-                                let models = models.clone();
-                                Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
-                                    for (model, label) in &models {
-                                        let this = this.clone();
-                                        let model = *model;
-                                        menu = menu.entry(*label, None, move |_, cx| {
-                                            this.update(cx, |this, cx| {
-                                                this.set_model(model, cx);
-                                            })
-                                            .ok();
-                                        });
-                                    }
-                                    menu
-                                }))
-                            })
-                    })
-                    .child({
-                        let this = cx.weak_entity();
-                        PopoverMenu::new("composer-effort-menu")
-                            .anchor(Anchor::BottomLeft)
-                            .trigger(
-                                Button::new(
-                                    "composer-effort",
-                                    format!("{} ⌄", self.agent_effort.to_uppercase()),
-                                )
-                                .label_size(LabelSize::XSmall)
-                                .tooltip(Tooltip::text(
-                                    "Effort for the focused agent (switches it live) and \
-                                     for new sessions",
-                                )),
-                            )
-                            .menu(move |window, cx| {
-                                let this = this.clone();
-                                Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
-                                    for effort in AGENT_EFFORTS {
-                                        let this = this.clone();
-                                        menu = menu.entry(
-                                            effort.to_uppercase(),
-                                            None,
-                                            move |_, cx| {
-                                                this.update(cx, |this, cx| {
-                                                    this.set_effort(effort, cx);
-                                                })
-                                                .ok();
-                                            },
-                                        );
-                                    }
-                                    menu
-                                }))
-                            })
-                    }),
-            )
-            .child(
-                div()
-                    .id("composer-card")
+                v_flex()
                     .w_full()
-                    .h(self.composer_height)
-                    .p_1p5()
-                    .rounded_md()
+                    .rounded_lg()
                     .border_1()
                     .border_color(cx.theme().colors().border)
                     .bg(cx.theme().colors().editor_background)
-                    .overflow_y_scroll()
-                    .child(self.composer.clone()),
-            )
-            .child(
-                h_flex()
-                    .w_full()
-                    .justify_between()
-                    .items_center()
                     .child(
-                        Label::new("bypass permissions on")
-                            .size(LabelSize::XSmall)
-                            .color(Color::Muted),
+                        div()
+                            .id("composer-card")
+                            .w_full()
+                            .h(self.composer_height)
+                            .p_2()
+                            .overflow_y_scroll()
+                            .child(self.composer.clone()),
                     )
                     .child(
                         h_flex()
-                            .gap_1()
+                            .w_full()
+                            .px_1()
+                            .pb_1()
+                            .justify_between()
+                            .items_center()
                             .child(
-                                Button::new("interrupt-agent", "Interrupt")
-                                    .label_size(LabelSize::Small)
-                                    .on_click(cx.listener(|this, _, _window, cx| {
-                                        this.interrupt_agent(cx);
-                                    })),
+                                h_flex()
+                                    .gap_0p5()
+                                    .items_center()
+                                    .child(model_menu)
+                                    .child(effort_menu)
+                                    .child(mode_button)
+                                    .when(codex_full_access, |el| {
+                                        el.child(
+                                            Label::new("Full access")
+                                                .size(LabelSize::XSmall)
+                                                .color(Color::Muted),
+                                        )
+                                    }),
                             )
                             .child(
-                                Button::new("send-to-agent", "Send")
-                                    .style(ButtonStyle::Filled)
-                                    .label_size(LabelSize::Small)
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.send_now(window, cx);
-                                    })),
+                                h_flex()
+                                    .gap_1()
+                                    .items_center()
+                                    .child(
+                                        IconButton::new("interrupt-agent", IconName::Stop)
+                                            .icon_size(IconSize::Small)
+                                            .icon_color(Color::Muted)
+                                            .tooltip(Tooltip::text("Interrupt the agent"))
+                                            .on_click(cx.listener(|this, _, _window, cx| {
+                                                this.interrupt_agent(cx);
+                                            })),
+                                    )
+                                    .child(
+                                        IconButton::new("send-to-agent", IconName::ArrowUp)
+                                            .icon_size(IconSize::Small)
+                                            .style(ButtonStyle::Filled)
+                                            .tooltip(Tooltip::text("Send"))
+                                            .on_click(cx.listener(|this, _, window, cx| {
+                                                this.send_now(window, cx);
+                                            })),
+                                    ),
                             ),
                     ),
             )
@@ -3193,24 +3232,21 @@ impl WorkspaceView {
                         )
                     })
                     .child(
-                        Button::new(
-                            "auto-fix-toggle",
-                            if self.auto_fix_enabled {
-                                "Auto-fix: on"
+                        IconButton::new("auto-fix-toggle", IconName::CheckDouble)
+                            .icon_size(IconSize::Small)
+                            .icon_color(if self.auto_fix_enabled {
+                                Color::Accent
                             } else {
-                                "Auto-fix"
-                            },
-                        )
-                        .style(if self.auto_fix_enabled {
-                            ButtonStyle::Tinted(TintColor::Accent)
-                        } else {
-                            ButtonStyle::Subtle
-                        })
-                        .label_size(LabelSize::XSmall)
-                        .tooltip(Tooltip::text(
-                            "Poll CI; when checks fail, instruct claude to fix and push until green",
-                        ))
-                        .on_click({
+                                Color::Muted
+                            })
+                            .tooltip(Tooltip::text(if self.auto_fix_enabled {
+                                "Keeping CI green: watching this PR's checks and having the \
+                                 agent fix failures. Click to stop"
+                            } else {
+                                "Keep CI green: watch this PR's checks and have the agent fix \
+                                 and push until they pass"
+                            }))
+                            .on_click({
                             let this = this.clone();
                             move |_, _, cx| {
                                 this.update(cx, |this, cx| this.toggle_auto_fix(cx))
@@ -3218,7 +3254,7 @@ impl WorkspaceView {
                             }
                         }),
                     )
-                    .child(self.render_status_chip(cx))
+                    .children(self.render_status_chip(cx))
             })
             .when(can_split, |el| {
                 let pane = pane.clone();
@@ -3490,7 +3526,6 @@ impl WorkspaceHost {
                     agent_effort: "high".to_string(),
                     claude_mode_index: INITIAL_CLAUDE_MODE_INDEX,
                     codex_mode_index: INITIAL_CODEX_MODE_INDEX,
-                    review_provider: AgentProvider::Codex,
                     pending_image_paths: Vec::new(),
                     last_agent_activity: None,
                     idle_check_scheduled: false,
@@ -3674,34 +3709,6 @@ impl WorkspaceHost {
             }
         }
         false
-    }
-
-    /// Sets the review provider for a workspace view.
-    pub fn set_review_provider_for_workspace(
-        workspace: &mut Workspace,
-        workspace_id: &str,
-        provider: &str,
-        cx: &mut Context<Workspace>,
-    ) {
-        let target = match provider {
-            "claude" => AgentProvider::Claude,
-            _ => AgentProvider::Codex,
-        };
-        for pane in workspace.panes().to_vec() {
-            let host = pane
-                .read(cx)
-                .items()
-                .find_map(|item| item.downcast::<WorkspaceHost>());
-            if let Some(host) = host {
-                if let Some(view) = host.read(cx).views.get(workspace_id).cloned() {
-                    view.update(cx, |view, cx| {
-                        view.review_provider = target;
-                        cx.notify();
-                    });
-                }
-                return;
-            }
-        }
     }
 
     /// Turns on the CI auto-fix loop for the given workspace, if its view

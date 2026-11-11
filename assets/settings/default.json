@@ -1750,6 +1750,31 @@
     //   - "no": never allow data collection.
     "allow_data_collection": "default",
   },
+  // Settings for Mnemonic workspaces.
+  "workspaces": {
+    // Which agent runs the review session started from a workspace's
+    // Review button.
+    // "codex" - Review with Codex (default)
+    // "claude" - Review with Claude
+    "review_agent": "codex",
+    // Whether creating a pull request also starts watching its CI and has
+    // the agent fix failing checks until they pass.
+    "keep_ci_green": false,
+    // How pull requests are merged from the workspace panel:
+    // "squash" (default), "merge" or "rebase".
+    "merge_method": "squash",
+    // Prefix for the branches of new workspaces, as in "prefix/workspace-name".
+    // When empty, your OS username is used.
+    "branch_prefix": "",
+    // The branch new workspaces start from, unless the project sets its own
+    // in its project settings.
+    "default_base_branch": "main",
+    // Whether to run the setup commands from .mnemonic/config.json when a
+    // workspace is created.
+    "auto_run_setup": false,
+    // Whether workspace scripts may run commands that are flagged as risky.
+    "allow_risky_scripts": false,
+  },
   // Settings specific to journaling
   "journal": {
     // The path of the directory where journal entries are stored

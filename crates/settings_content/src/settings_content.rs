@@ -194,6 +194,9 @@ pub struct SettingsContent {
 
     pub journal: Option<JournalSettingsContent>,
 
+    /// Settings for Mnemonic workspaces: branches, pull requests, review and scripts.
+    pub workspaces: Option<WorkspacesSettingsContent>,
+
     /// A map of log scopes to the desired log level.
     /// Useful for filtering out noisy logs or enabling more verbose logging.
     ///
@@ -958,6 +961,83 @@ pub struct CursorShapeSettings {
     ///
     /// The default value follows the primary cursor_shape.
     pub insert: Option<VimInsertModeCursorShape>,
+}
+
+/// Settings for Mnemonic workspaces.
+#[with_fallible_options]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema, MergeFrom, PartialEq)]
+pub struct WorkspacesSettingsContent {
+    /// Which agent runs the review session started from a workspace's Review button.
+    ///
+    /// Default: "codex"
+    pub review_agent: Option<ReviewAgent>,
+    /// Whether creating a pull request also starts watching its CI and has
+    /// the agent fix failing checks until they pass.
+    ///
+    /// Default: false
+    pub keep_ci_green: Option<bool>,
+    /// How pull requests are merged from the workspace panel.
+    ///
+    /// Default: "squash"
+    pub merge_method: Option<MergeMethod>,
+    /// Prefix for the branches of new workspaces, as in `prefix/workspace-name`.
+    /// When empty, your OS username is used.
+    ///
+    /// Default: ""
+    pub branch_prefix: Option<String>,
+    /// The branch new workspaces start from, unless the project sets its own.
+    ///
+    /// Default: "main"
+    pub default_base_branch: Option<String>,
+    /// Whether to run the setup commands from `.mnemonic/config.json` when a workspace is created.
+    ///
+    /// Default: false
+    pub auto_run_setup: Option<bool>,
+    /// Whether workspace scripts may run commands that are flagged as risky.
+    ///
+    /// Default: false
+    pub allow_risky_scripts: Option<bool>,
+}
+
+#[derive(
+    Copy,
+    Clone,
+    Default,
+    Debug,
+    Serialize,
+    Deserialize,
+    JsonSchema,
+    MergeFrom,
+    PartialEq,
+    strum::VariantArray,
+    strum::VariantNames,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewAgent {
+    #[default]
+    Codex,
+    Claude,
+}
+
+#[derive(
+    Copy,
+    Clone,
+    Default,
+    Debug,
+    Serialize,
+    Deserialize,
+    JsonSchema,
+    MergeFrom,
+    PartialEq,
+    strum::VariantArray,
+    strum::VariantNames,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum MergeMethod {
+    #[default]
+    Squash,
+    Merge,
+    Rebase,
 }
 
 /// Settings specific to journaling
