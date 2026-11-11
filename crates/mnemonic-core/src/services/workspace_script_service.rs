@@ -321,6 +321,65 @@ pub fn finish_workspace_run_commands(
     }
 }
 
+/// Prepares the workspace's teardown commands for the host to run in its own
+/// terminals before archiving. Returns no plans when none are configured or
+/// the config can't be read, so archiving proceeds as it would without them.
+pub fn prepare_workspace_teardown_commands(
+    state: &AppState,
+    workspace_id: &str,
+) -> Result<(PathBuf, Vec<RunCommandPlan>), String> {
+    let root = workspace_root_path(state, workspace_id)?;
+    let config = load_config_from_root(&root);
+    let plans = match plan_teardown_commands(&config, risky_workspace_scripts_enabled(state)) {
+        Ok(plans) => plans,
+        Err(err) => {
+            insert_script_activity(
+                state,
+                workspace_id,
+                "Teardown commands not started",
+                "warning",
+                &err,
+            );
+            return Err(err);
+        }
+    };
+    for plan in &plans {
+        insert_script_activity(
+            state,
+            workspace_id,
+            "Teardown command started",
+            "info",
+            &format!("{} · {}", plan.title, plan.command),
+        );
+    }
+    Ok((root, plans))
+}
+
+fn plan_teardown_commands(
+    config: &MnemonicWorkspaceConfig,
+    risky_allowed: bool,
+) -> Result<Vec<RunCommandPlan>, String> {
+    if config.warning.is_some() {
+        return Ok(Vec::new());
+    }
+    config
+        .teardown
+        .iter()
+        .enumerate()
+        .map(|(index, command)| {
+            let title = command_title("Teardown", index, command);
+            if !risky_allowed && command_safety_service::is_risky_command(command) {
+                return Err(blocked_command_message(&title));
+            }
+            Ok(RunCommandPlan {
+                index,
+                title,
+                command: command.clone(),
+            })
+        })
+        .collect()
+}
+
 fn plan_run_commands(
     config: &MnemonicWorkspaceConfig,
     risky_allowed: bool,
@@ -818,6 +877,28 @@ mod tests {
 
         let empty = plan_run_commands(&MnemonicWorkspaceConfig::default(), false).unwrap_err();
         assert!(empty.contains(".mnemonic/config.json"));
+    }
+
+    #[test]
+    fn teardown_plan_reads_archive_alias_and_is_empty_when_unconfigured() {
+        let dir = temp_root("teardown");
+        fs::create_dir_all(dir.join(".mnemonic")).expect("mnemonic dir");
+        fs::write(
+            dir.join(CONFIG_RELATIVE_PATH),
+            r#"{"archive":["docker compose down", "rm -rf tmp"]}"#,
+        )
+        .expect("write config");
+        let config = load_config_from_root(&dir);
+        let _ = fs::remove_dir_all(dir);
+
+        let blocked = plan_teardown_commands(&config, false).unwrap_err();
+        assert!(blocked.contains("Teardown 2 · rm -rf tmp was blocked"));
+        let plans = plan_teardown_commands(&config, true).expect("risky allowed");
+        assert_eq!(plans[0].command, "docker compose down");
+
+        let unconfigured =
+            plan_teardown_commands(&MnemonicWorkspaceConfig::default(), false).expect("no plans");
+        assert!(unconfigured.is_empty());
     }
 
     #[test]

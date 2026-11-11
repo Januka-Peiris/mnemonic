@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Instant;
 
-use crate::models::{ChangedFile, WorkspaceChangedFile, WorkspaceFileDiff};
+use crate::models::{ChangedFile, WorkspaceChangeScope, WorkspaceChangedFile, WorkspaceFileDiff};
 use crate::repositories::workspace_repository;
 use crate::state::AppState;
 
@@ -60,6 +60,54 @@ pub fn get_workspace_changed_files(
         started.elapsed().as_millis()
     );
     Ok(files)
+}
+
+/// Uncommitted paths and the resolved base ref, via one `git status` and at
+/// most two `rev-parse`s, cheap enough to run on every Changes refresh.
+pub fn get_workspace_change_scope(
+    state: &AppState,
+    workspace_id: &str,
+) -> Result<WorkspaceChangeScope, String> {
+    let (root, base_branch) = workspace_root_and_base(state, workspace_id)?;
+    change_scope_at(workspace_id, &root, &base_branch)
+}
+
+fn change_scope_at(
+    workspace_id: &str,
+    root: &Path,
+    base_branch: &str,
+) -> Result<WorkspaceChangeScope, String> {
+    let porcelain = git(root, &["status", "--porcelain=v1", "-z"])?;
+    let uncommitted_paths = parse_porcelain(workspace_id, &porcelain)
+        .into_iter()
+        .map(|file| file.path)
+        .collect();
+    Ok(WorkspaceChangeScope {
+        uncommitted_paths,
+        base_ref: resolve_base_ref(root, base_branch),
+    })
+}
+
+/// Same preference as `merge_base`: the remote ref, then the local branch.
+fn resolve_base_ref(root: &Path, base_branch: &str) -> Option<String> {
+    let base = base_branch.trim();
+    if base.is_empty() {
+        return None;
+    }
+    [format!("origin/{base}"), base.to_string()]
+        .into_iter()
+        .find(|candidate| {
+            git(
+                root,
+                &[
+                    "rev-parse",
+                    "--verify",
+                    "--quiet",
+                    &format!("{candidate}^{{commit}}"),
+                ],
+            )
+            .is_ok()
+        })
 }
 
 pub fn get_workspace_file_diff(
@@ -518,6 +566,48 @@ mod tests {
             additions,
             deletions,
         }
+    }
+
+    #[test]
+    fn change_scope_splits_uncommitted_from_committed_and_resolves_base() -> Result<(), String> {
+        let root = std::env::temp_dir().join(format!(
+            "mnemonic-change-scope-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|elapsed| elapsed.as_nanos())
+                .unwrap_or_default()
+        ));
+        fs::create_dir_all(&root).map_err(|err| err.to_string())?;
+        let write = |path: &str, content: &str| {
+            fs::write(root.join(path), content).map_err(|err| err.to_string())
+        };
+        git(&root, &["init", "--quiet", "--initial-branch=main"])?;
+        git(
+            &root,
+            &["config", "user.email", "mnemonic-tests@example.com"],
+        )?;
+        git(&root, &["config", "user.name", "Mnemonic Tests"])?;
+        write("base.txt", "base\n")?;
+        write("edited.txt", "one\n")?;
+        git(&root, &["add", "."])?;
+        git(&root, &["commit", "--quiet", "-m", "base"])?;
+        git(&root, &["checkout", "--quiet", "-b", "feature"])?;
+        write("committed.txt", "branch work\n")?;
+        git(&root, &["add", "committed.txt"])?;
+        git(&root, &["commit", "--quiet", "-m", "branch work"])?;
+        write("edited.txt", "two\n")?;
+        write("new.txt", "untracked\n")?;
+
+        let scope = change_scope_at("ws-1", &root, "main");
+        fs::remove_dir_all(&root).map_err(|err| err.to_string())?;
+        let scope = scope?;
+
+        let mut uncommitted = scope.uncommitted_paths.into_iter().collect::<Vec<_>>();
+        uncommitted.sort();
+        assert_eq!(uncommitted, vec!["edited.txt", "new.txt"]);
+        assert_eq!(scope.base_ref.as_deref(), Some("main"));
+        Ok(())
     }
 
     #[test]

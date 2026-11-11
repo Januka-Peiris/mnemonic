@@ -150,6 +150,7 @@ impl ProjectDiff {
                         project,
                         intended_repo,
                         base_ref,
+                        None,
                         window,
                         cx,
                     );
@@ -196,6 +197,7 @@ impl ProjectDiff {
                             project.clone(),
                             repository.clone(),
                             base_ref,
+                            None,
                             window,
                             cx,
                         );
@@ -216,11 +218,14 @@ impl ProjectDiff {
         });
     }
 
-    fn deploy_branch_diff_with_base_ref(
+    /// Opens (or reuses) the branch diff against `base_ref` for
+    /// `intended_repo`, scrolled to `repo_path` when one is given.
+    pub fn deploy_branch_diff_with_base_ref(
         workspace: &mut Workspace,
         project: Entity<Project>,
         intended_repo: Entity<Repository>,
         base_ref: SharedString,
+        repo_path: Option<RepoPath>,
         window: &mut Window,
         cx: &mut Context<Workspace>,
     ) {
@@ -251,6 +256,12 @@ impl ProjectDiff {
                 });
             }
 
+            if let Some(repo_path) = repo_path {
+                existing.update(cx, |project_diff, cx| {
+                    project_diff.move_to_repo_path(&repo_path, window, cx);
+                });
+            }
+
             return;
         }
 
@@ -272,7 +283,18 @@ impl ProjectDiff {
                     .await?;
                 workspace
                     .update_in(cx, |workspace, window, cx| {
-                        workspace.add_item_to_active_pane(Box::new(this), None, true, window, cx);
+                        workspace.add_item_to_active_pane(
+                            Box::new(this.clone()),
+                            None,
+                            true,
+                            window,
+                            cx,
+                        );
+                        if let Some(repo_path) = repo_path {
+                            this.update(cx, |project_diff, cx| {
+                                project_diff.move_to_repo_path(&repo_path, window, cx);
+                            });
+                        }
                     })
                     .ok();
                 anyhow::Ok(())
@@ -665,6 +687,25 @@ impl ProjectDiff {
         self.move_to_path(path_key, window, cx)
     }
 
+    /// Scrolls to `repo_path` without knowing its status. Status decides
+    /// the sort prefix, and a committed-only file's branch status differs
+    /// from its (clean) working tree status, so the loaded key is looked up.
+    pub fn move_to_repo_path(
+        &mut self,
+        repo_path: &RepoPath,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let path = repo_path.as_ref().clone();
+        let multibuffer = self.multibuffer.read(cx);
+        let path_key = [CONFLICT_SORT_PREFIX, TRACKED_SORT_PREFIX, NEW_SORT_PREFIX]
+            .into_iter()
+            .map(|sort_prefix| PathKey::with_sort_prefix(sort_prefix, path.clone()))
+            .find(|path_key| multibuffer.location_for_path(path_key, cx).is_some())
+            .unwrap_or_else(|| PathKey::with_sort_prefix(TRACKED_SORT_PREFIX, path));
+        self.move_to_path(path_key, window, cx)
+    }
+
     fn move_to_beginning(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.editor.update(cx, |editor, cx| {
             editor.rhs_editor().update(cx, |editor, cx| {
@@ -945,7 +986,11 @@ impl ProjectDiff {
                 editor.focus_handle(cx).focus(window, cx);
             });
         }
-        if self.pending_scroll.as_ref() == Some(&path_key) {
+        if self
+            .pending_scroll
+            .as_ref()
+            .is_some_and(|pending| pending.path == path_key.path)
+        {
             self.move_to_path(path_key, window, cx);
         }
 
@@ -1023,6 +1068,9 @@ impl ProjectDiff {
         })?;
 
         let mut buffers_to_fold = Vec::new();
+        // A branch diff's first refresh runs before its tree diff loads and
+        // finds nothing; a scroll requested meanwhile must survive it.
+        let loaded_any = !entries.is_empty();
 
         for (path_key, entry) in entries {
             if let Some((buffer, diff, conflict_set)) = entry.load.await.log_err() {
@@ -1055,7 +1103,9 @@ impl ProjectDiff {
                         .update(cx, |editor, cx| editor.fold_buffers(buffers_to_fold, cx));
                 });
             }
-            this.pending_scroll.take();
+            if loaded_any {
+                this.pending_scroll.take();
+            }
             cx.notify();
         })?;
 
@@ -2821,6 +2871,64 @@ mod tests {
                     }))
                 )
             ])
+        );
+    }
+
+    #[gpui::test]
+    async fn test_branch_diff_deploy_scrolls_to_committed_only_path(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/project"),
+            json!({
+                ".git": {},
+                "a.txt": "C",
+                "d.txt": "created-in-head",
+            }),
+        )
+        .await;
+        fs.set_head_for_repo(
+            Path::new(path!("/project/.git")),
+            &[("a.txt", "B".into()), ("d.txt", "created-in-head".into())],
+            "sha",
+        );
+        fs.set_merge_base_content_for_repo(
+            Path::new(path!("/project/.git")),
+            &[("a.txt", "A".into())],
+        );
+        let project = Project::test(fs.clone(), [path!("/project").as_ref()], cx).await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+        cx.run_until_parked();
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            let repository = project.read(cx).active_repository(cx).unwrap();
+            ProjectDiff::deploy_branch_diff_with_base_ref(
+                workspace,
+                project.clone(),
+                repository,
+                "main".into(),
+                Some(RepoPath::new("d.txt").unwrap()),
+                window,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        let diff = workspace.update(cx, |workspace, cx| {
+            workspace.active_item_as::<ProjectDiff>(cx).unwrap()
+        });
+        let editor = diff.read_with(cx, |diff, cx| diff.editor.read(cx).rhs_editor().clone());
+        assert_state_with_diff(
+            &editor,
+            cx,
+            &"
+                - A
+                + C
+                + ˇcreated-in-head"
+                .unindent(),
         );
     }
 
