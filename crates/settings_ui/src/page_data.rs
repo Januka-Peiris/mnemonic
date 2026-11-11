@@ -8472,13 +8472,50 @@ fn workspaces_page() -> SettingsPage {
         ]
     }
 
+    fn team_section() -> [SettingsPageItem; 3] {
+        [
+            SettingsPageItem::SectionHeader("Team"),
+            SettingsPageItem::SettingItem(SettingItem {
+                title: "Share My Workspaces",
+                description: "Let teammates on your allow list (team.allow in settings.json) follow your workspaces and agent chats, read-only, over Tailscale. Chats can include anything your agents printed.",
+                field: Box::new(SettingField {
+                    organization_override: None,
+                    json_path: Some("team.share"),
+                    pick: |settings_content| settings_content.team.as_ref()?.share.as_ref(),
+                    write: |settings_content, value, _| {
+                        settings_content.team.get_or_insert_default().share = value;
+                    },
+                }),
+                metadata: None,
+                files: USER,
+            }),
+            SettingsPageItem::SettingItem(SettingItem {
+                title: "Display Name",
+                description: "The name teammates see for you. When empty, your Tailscale name is used.",
+                field: Box::new(SettingField {
+                    organization_override: None,
+                    json_path: Some("team.display_name"),
+                    pick: |settings_content| {
+                        settings_content.team.as_ref()?.display_name.as_ref()
+                    },
+                    write: |settings_content, value, _| {
+                        settings_content.team.get_or_insert_default().display_name = value;
+                    },
+                }),
+                metadata: None,
+                files: USER,
+            }),
+        ]
+    }
+
     SettingsPage {
         title: "Workspaces",
         items: concat_sections![
             projects_section(),
             branches_section(),
             pull_requests_section(),
-            scripts_section()
+            scripts_section(),
+            team_section()
         ],
     }
 }

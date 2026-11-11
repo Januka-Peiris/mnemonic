@@ -142,6 +142,13 @@ impl WorkspacePanel {
             panel
         });
 
+        crate::team::register_window(workspace.weak_handle(), cx);
+        if let Some(team) = crate::team::team_share(cx) {
+            panel.update(cx, |_, cx| {
+                cx.observe(&team, |_, _, cx| cx.notify()).detach();
+            });
+        }
+
         // Keeps every workspace's PR state current, not only the selected
         // one's, so a merge on GitHub shows in the list without opening it.
         panel.update(cx, |_, cx| {
@@ -3194,9 +3201,12 @@ impl Render for WorkspacePanel {
             if !hidden.is_empty() {
                 list = list.child(self.render_hidden_projects(&hidden, cx));
             }
+            list = list.children(crate::team::render_team_section(self.workspace.clone(), cx));
             content = content.child(list);
         } else {
-            content = content.child(self.render_empty());
+            content = content
+                .child(self.render_empty())
+                .children(crate::team::render_team_section(self.workspace.clone(), cx));
         }
 
         content.child(self.render_footer(cx))
