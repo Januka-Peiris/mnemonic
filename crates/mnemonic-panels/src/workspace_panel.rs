@@ -81,6 +81,9 @@ actions!(
 /// Marker for archive toasts.
 struct MnemonicArchiveToast;
 
+/// Marker for workspace link toasts.
+struct MnemonicLinkToast;
+
 const WORKSPACE_PANEL_KEY: &str = "MnemonicWorkspacePanel";
 
 pub struct WorkspacePanel {
@@ -89,6 +92,9 @@ pub struct WorkspacePanel {
     repositories: Vec<DiscoveredRepository>,
     workspaces: Vec<WorkspaceSummary>,
     archived: Vec<ArchivedWorkspace>,
+    /// Pairs of workspaces linked together, so each one's agents can use the
+    /// other's files.
+    workspace_links: Vec<(String, String)>,
     /// Projects whose archived workspaces are listed.
     expanded_archives: Vec<String>,
     collapsed_projects: Vec<String>,
@@ -112,6 +118,7 @@ impl WorkspacePanel {
                 repositories: Vec::new(),
                 workspaces: Vec::new(),
                 archived: Vec::new(),
+                workspace_links: Vec::new(),
                 expanded_archives: Vec::new(),
                 collapsed_projects: Vec::new(),
                 selected_workspace_id: None,
@@ -162,6 +169,10 @@ impl WorkspacePanel {
         match repository_repository::list(&state.db) {
             Ok(repos) => self.repositories = repos,
             Err(e) => log::error!("Failed to list repositories: {e}"),
+        }
+        match workspace_service::list_workspace_links(&state) {
+            Ok(links) => self.workspace_links = links,
+            Err(e) => log::error!("Failed to list workspace links: {e}"),
         }
         // Load persisted ordering.
         if self.project_order.is_empty() {
@@ -841,6 +852,55 @@ impl WorkspacePanel {
         });
     }
 
+    /// Links or unlinks two workspaces and says what that changes.
+    fn set_workspace_link(
+        &mut self,
+        workspace_id: &str,
+        other_workspace_id: &str,
+        linked: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let state = mnemonic_bridge::mnemonic_state(cx);
+        let result = if linked {
+            workspace_service::link_workspaces(&state, workspace_id, other_workspace_id)
+        } else {
+            workspace_service::unlink_workspaces(&state, workspace_id, other_workspace_id)
+        };
+        let name_of = |id: &str| {
+            self.workspaces
+                .iter()
+                .find(|workspace| workspace.id == id)
+                .map_or_else(|| id.to_string(), |workspace| workspace.name.clone())
+        };
+        let message = match result {
+            Ok(()) if linked => format!(
+                "Linked {} and {}. Sessions opened in either from now on can use the other's \
+                 files; reopen a chat that is already open to pick it up.",
+                name_of(workspace_id),
+                name_of(other_workspace_id)
+            ),
+            Ok(()) => format!(
+                "Unlinked {} and {}.",
+                name_of(workspace_id),
+                name_of(other_workspace_id)
+            ),
+            Err(err) => {
+                log::error!("Failed to change the workspace link: {err}");
+                format!("Couldn't change the link: {err}")
+            }
+        };
+        if let Some(workspace) = self.workspace.upgrade() {
+            workspace.update(cx, |workspace, cx| {
+                workspace.show_toast(
+                    Toast::new(NotificationId::unique::<MnemonicLinkToast>(), message),
+                    cx,
+                );
+            });
+        }
+        self.refresh(cx);
+        cx.notify();
+    }
+
     fn open_project_settings(
         &mut self,
         project_name: String,
@@ -1361,6 +1421,29 @@ impl WorkspacePanel {
         let this = cx.weak_entity();
         let additions: u32 = ws.changed_files.iter().map(|file| file.additions).sum();
         let deletions: u32 = ws.changed_files.iter().map(|file| file.deletions).sum();
+        let linked_ids = workspace_service::linked_workspace_ids(&self.workspace_links, &ws.id);
+        // Every other workspace, as (id, "project / name", linked), for the
+        // Link Workspace submenu.
+        let mut link_candidates: Vec<(String, String, bool)> = self
+            .workspaces
+            .iter()
+            .filter(|other| other.id != ws.id)
+            .map(|other| {
+                (
+                    other.id.clone(),
+                    format!("{} / {}", other.repo, other.name),
+                    linked_ids.contains(&other.id.as_str()),
+                )
+            })
+            .collect();
+        link_candidates.sort_by(|a, b| a.1.cmp(&b.1));
+        let linked_names: Vec<&str> = link_candidates
+            .iter()
+            .filter(|(_, _, linked)| *linked)
+            .map(|(_, label, _)| label.as_str())
+            .collect();
+        let linked_tooltip =
+            (!linked_names.is_empty()).then(|| format!("Linked to {}", linked_names.join(", ")));
 
         let row_group = SharedString::from(format!("workspace-row-{}", ws.id));
         let row = h_flex()
@@ -1432,6 +1515,18 @@ impl WorkspacePanel {
                         .single_line(),
                 ),
             )
+            .when_some(linked_tooltip, |el, tooltip| {
+                el.child(
+                    div()
+                        .id(SharedString::from(format!("linked-{}", ws.id)))
+                        .child(
+                            Icon::new(IconName::Link)
+                                .size(IconSize::XSmall)
+                                .color(Color::Muted),
+                        )
+                        .tooltip(Tooltip::text(tooltip)),
+                )
+            })
             .when(additions > 0 || deletions > 0, |el| {
                 el.child(
                     h_flex()
@@ -1476,6 +1571,7 @@ impl WorkspacePanel {
                 let workspace_name = menu_workspace_name.clone();
                 let branch = menu_branch.clone();
                 let path = menu_path.clone();
+                let link_candidates = link_candidates.clone();
                 ContextMenu::build(window, cx, move |mut menu, _, _| {
                     if let Some(path) = path {
                         menu = menu
@@ -1489,6 +1585,40 @@ impl WorkspacePanel {
                     }
                     menu.entry("Copy Branch Name", None, move |_, cx| {
                         cx.write_to_clipboard(ClipboardItem::new_string(branch.clone()));
+                    })
+                    .when(!link_candidates.is_empty(), |menu| {
+                        menu.submenu("Link Workspace", {
+                            let this = this.clone();
+                            let workspace_id = workspace_id.clone();
+                            move |menu, _, _| {
+                                link_candidates.iter().fold(
+                                    menu,
+                                    |menu, (other_workspace_id, label, linked)| {
+                                        let this = this.clone();
+                                        let workspace_id = workspace_id.clone();
+                                        let other_workspace_id = other_workspace_id.clone();
+                                        let linked = *linked;
+                                        menu.toggleable_entry(
+                                            label.clone(),
+                                            linked,
+                                            IconPosition::Start,
+                                            None,
+                                            move |_, cx| {
+                                                this.update(cx, |this, cx| {
+                                                    this.set_workspace_link(
+                                                        &workspace_id,
+                                                        &other_workspace_id,
+                                                        !linked,
+                                                        cx,
+                                                    );
+                                                })
+                                                .log_err();
+                                            },
+                                        )
+                                    },
+                                )
+                            }
+                        })
                     })
                     .entry("Rename…", None, {
                         let this = this.clone();

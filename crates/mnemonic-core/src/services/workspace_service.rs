@@ -7,7 +7,9 @@ use crate::models::{
     DiscoveredRepository, LinkedWorktreeRef, RepositoryWorkspaceOptions, WorkspaceDetail,
     WorkspaceSummary,
 };
-use crate::repositories::{activity_repository, repository_repository, workspace_repository};
+use crate::repositories::{
+    activity_repository, repository_repository, settings_repository, workspace_repository,
+};
 use crate::services::{git_review_service, git_worktree_service, repo_scanner_service};
 use crate::state::AppState;
 
@@ -373,6 +375,97 @@ pub fn rename_workspace(
     workspace_repository::get(&state.db, workspace_id)
 }
 
+/// Settings key holding the pairs of workspaces that are linked together.
+const WORKSPACE_LINKS_KEY: &str = "workspace_links";
+
+/// Every link between two workspaces. A link has no direction: the pair is
+/// stored once and applies to both.
+pub fn list_workspace_links(state: &AppState) -> Result<Vec<(String, String)>, String> {
+    let Some(json) = settings_repository::get_value(&state.db, WORKSPACE_LINKS_KEY)? else {
+        return Ok(Vec::new());
+    };
+    serde_json::from_str(&json).map_err(|err| format!("Failed to read workspace links: {err}"))
+}
+
+fn save_workspace_links(state: &AppState, links: &[(String, String)]) -> Result<(), String> {
+    let json = serde_json::to_string(links)
+        .map_err(|err| format!("Failed to save workspace links: {err}"))?;
+    settings_repository::set_value(&state.db, WORKSPACE_LINKS_KEY, &json)
+}
+
+fn is_link_between(link: &(String, String), workspace_id: &str, other_workspace_id: &str) -> bool {
+    (link.0 == workspace_id && link.1 == other_workspace_id)
+        || (link.0 == other_workspace_id && link.1 == workspace_id)
+}
+
+/// The ids of the workspaces linked to `workspace_id`.
+pub fn linked_workspace_ids<'a>(links: &'a [(String, String)], workspace_id: &str) -> Vec<&'a str> {
+    links
+        .iter()
+        .filter_map(|(first, second)| {
+            if first == workspace_id {
+                Some(second.as_str())
+            } else if second == workspace_id {
+                Some(first.as_str())
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+/// Links two workspaces, so the agents working in each can read and edit the
+/// other's files. Typically a frontend and a backend changing together.
+pub fn link_workspaces(
+    state: &AppState,
+    workspace_id: &str,
+    other_workspace_id: &str,
+) -> Result<(), String> {
+    if workspace_id == other_workspace_id {
+        return Err("A workspace cannot be linked to itself".to_string());
+    }
+    workspace_repository::get(&state.db, workspace_id)?;
+    workspace_repository::get(&state.db, other_workspace_id)?;
+
+    let mut links = list_workspace_links(state)?;
+    if links
+        .iter()
+        .any(|link| is_link_between(link, workspace_id, other_workspace_id))
+    {
+        return Ok(());
+    }
+    links.push((workspace_id.to_string(), other_workspace_id.to_string()));
+    save_workspace_links(state, &links)
+}
+
+pub fn unlink_workspaces(
+    state: &AppState,
+    workspace_id: &str,
+    other_workspace_id: &str,
+) -> Result<(), String> {
+    let mut links = list_workspace_links(state)?;
+    links.retain(|link| !is_link_between(link, workspace_id, other_workspace_id));
+    save_workspace_links(state, &links)
+}
+
+/// The workspaces linked to this one. A link to a workspace that no longer
+/// exists is skipped rather than removed, so restoring an archived workspace
+/// brings its links back.
+pub fn linked_workspaces(
+    state: &AppState,
+    workspace_id: &str,
+) -> Result<Vec<WorkspaceSummary>, String> {
+    let links = list_workspace_links(state)?;
+    let linked_ids = linked_workspace_ids(&links, workspace_id);
+    if linked_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    Ok(workspace_repository::list(&state.db)?
+        .into_iter()
+        .filter(|workspace| linked_ids.contains(&workspace.id.as_str()))
+        .collect())
+}
+
 pub fn list_archived_workspaces(state: &AppState) -> Result<Vec<ArchivedWorkspace>, String> {
     ops::list_archived_workspaces(state)
 }
@@ -491,7 +584,18 @@ fn parse_ahead_behind_counts(output: &str) -> (u32, u32) {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_ahead_behind_counts;
+    use super::{linked_workspace_ids, parse_ahead_behind_counts};
+
+    #[test]
+    fn a_link_is_seen_from_both_workspaces() {
+        let links = vec![
+            ("frontend".to_string(), "backend".to_string()),
+            ("docs".to_string(), "frontend".to_string()),
+        ];
+        assert_eq!(linked_workspace_ids(&links, "frontend"), ["backend", "docs"]);
+        assert_eq!(linked_workspace_ids(&links, "backend"), ["frontend"]);
+        assert!(linked_workspace_ids(&links, "unrelated").is_empty());
+    }
 
     #[test]
     fn parses_ahead_behind_counts() {

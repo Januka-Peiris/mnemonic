@@ -857,6 +857,7 @@ impl WorkspaceView {
         let workspace_id = self.workspace_id.clone();
         let workspace_name = self.workspace_name.to_string();
         let cwd = self.worktree_path.clone();
+        let linked_paths = self.linked_workspace_paths(cx);
         let project = self.project.clone();
         let session = session.to_string();
         let title = title.to_string();
@@ -882,6 +883,12 @@ impl WorkspaceView {
                                 .push("--dangerously-bypass-approvals-and-sandbox".to_string());
                         } else {
                             agent_args.push("--dangerously-skip-permissions".to_string());
+                        }
+                        // Both CLIs take --add-dir for folders outside the
+                        // working directory.
+                        for path in &linked_paths {
+                            agent_args.push("--add-dir".to_string());
+                            agent_args.push(path.to_string_lossy().into_owned());
                         }
                         match &cwd {
                             Some(dir) => terminal_service::embedded_workspace_terminal_command(
@@ -1801,6 +1808,22 @@ impl WorkspaceView {
     /// Starts the conversation for a saved chat session, resuming the
     /// agent's session when one was recorded. An initial prompt is queued and
     /// sent once the agent is connected and idle.
+    /// The folders of the workspaces linked to this one.
+    fn linked_workspace_paths(&self, cx: &App) -> Vec<PathBuf> {
+        let state = mnemonic_bridge::mnemonic_state(cx);
+        match workspace_service::linked_workspaces(&state, &self.workspace_id) {
+            Ok(workspaces) => workspaces
+                .into_iter()
+                .filter_map(|workspace| workspace.workspace_root_path)
+                .map(PathBuf::from)
+                .collect(),
+            Err(err) => {
+                log::error!("Failed to read linked workspaces: {err}");
+                Vec::new()
+            }
+        }
+    }
+
     fn build_chat(
         &mut self,
         record: &ChatSessionRecord,
@@ -1824,10 +1847,14 @@ impl WorkspaceView {
         let fs = project.read(cx).fs().clone();
         let server = agent.server(fs, agent::ThreadStore::global(cx));
         let resume_session_id = record.acp_session_id.clone().map(acp::SessionId::new);
-        let work_dirs = self
-            .worktree_path
-            .as_ref()
-            .map(|path| PathList::new(&[path]));
+        // The workspace's own folder comes first, which makes it the session's
+        // working directory; linked workspaces follow as extra folders the
+        // agent may read and edit.
+        let work_dirs = self.worktree_path.as_ref().map(|path| {
+            let mut paths = vec![path.clone()];
+            paths.extend(self.linked_workspace_paths(cx));
+            PathList::new(&paths)
+        });
         let title = SharedString::from(record.title.clone());
         let workspace = self.workspace.clone();
         let app_messages = initial_prompt.iter().cloned().collect();
