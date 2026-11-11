@@ -1657,7 +1657,7 @@ impl WorkspaceDetailPanel {
             return;
         };
         panel.update(cx, |panel, cx| {
-            panel.confirm_archive(workspace_id, workspace_name, window, cx);
+            panel.archive_workspace(workspace_id, workspace_name, window, cx);
         });
     }
 
