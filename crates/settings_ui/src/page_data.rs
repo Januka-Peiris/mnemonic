@@ -8275,6 +8275,34 @@ fn ai_page() -> SettingsPage {
 }
 
 fn workspaces_page() -> SettingsPage {
+    fn projects_section() -> [SettingsPageItem; 2] {
+        [
+            SettingsPageItem::SectionHeader("Projects"),
+            SettingsPageItem::SettingItem(SettingItem {
+                title: "Clone Location",
+                description: "Folder that projects added from GitHub are cloned into. ~ is your home folder.",
+                field: Box::new(SettingField {
+                    organization_override: None,
+                    json_path: Some("workspaces.clone_location"),
+                    pick: |settings_content| {
+                        settings_content.workspaces.as_ref()?.clone_location.as_ref()
+                    },
+                    write: |settings_content, value, _| {
+                        settings_content
+                            .workspaces
+                            .get_or_insert_default()
+                            .clone_location = value;
+                    },
+                }),
+                metadata: Some(Box::new(SettingsFieldMetadata {
+                    placeholder: Some("~/dev"),
+                    ..Default::default()
+                })),
+                files: USER,
+            }),
+        ]
+    }
+
     fn branches_section() -> [SettingsPageItem; 3] {
         [
             SettingsPageItem::SectionHeader("Branches"),
@@ -8447,6 +8475,7 @@ fn workspaces_page() -> SettingsPage {
     SettingsPage {
         title: "Workspaces",
         items: concat_sections![
+            projects_section(),
             branches_section(),
             pull_requests_section(),
             scripts_section()

@@ -1766,6 +1766,8 @@
     // Prefix for the branches of new workspaces, as in "prefix/workspace-name".
     // When empty, your OS username is used.
     "branch_prefix": "",
+    // Folder that projects added from GitHub are cloned into.
+    "clone_location": "~/dev",
     // The branch new workspaces start from, unless the project sets its own
     // in its project settings.
     "default_base_branch": "main",

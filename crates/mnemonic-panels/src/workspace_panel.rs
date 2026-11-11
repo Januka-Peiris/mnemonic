@@ -796,19 +796,24 @@ impl WorkspacePanel {
         });
     }
 
-    /// Clones the repository into `~/dev/<name>` with `gh`, which uses the
+    /// Clones the repository into the clone location setting with `gh`, which uses the
     /// signed-in account's credentials and preferred protocol, and adds it as
     /// a project. A folder already holding that repository is added as is.
     fn clone_project_from_github(&mut self, full_name: String, cx: &mut Context<Self>) {
         let Some(name) = full_name.rsplit('/').next().map(str::to_string) else {
             return;
         };
-        let Some(home) = std::env::home_dir() else {
-            self.show_archive_toast("Couldn't find your home folder".to_string(), cx);
-            return;
+        let location = WorkspacesSettings::get_global(cx).clone_location.clone();
+        let location = location.trim();
+        let folder = match location.strip_prefix('~') {
+            Some(rest) => util::paths::home_dir().join(rest.trim_start_matches('/')),
+            None => PathBuf::from(location),
         };
-        let destination = home.join("dev").join(&name);
-        self.show_archive_toast(format!("Cloning {full_name} into ~/dev/{name}…"), cx);
+        let destination = folder.join(&name);
+        self.show_archive_toast(
+            format!("Cloning {full_name} into {}…", destination.display()),
+            cx,
+        );
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_spawn({
@@ -2537,7 +2542,8 @@ impl Render for GitHubCloneModal {
                 Label::new(format!("Couldn't list repositories: {err}")).color(Color::Muted)
             }
             (None, Some(Ok(_))) => {
-                Label::new("Clones into ~/dev and adds it as a project.").color(Color::Muted)
+                Label::new("Clones into the folder set in Settings > Workspaces and adds it as a project.")
+                    .color(Color::Muted)
             }
         };
         v_flex()
