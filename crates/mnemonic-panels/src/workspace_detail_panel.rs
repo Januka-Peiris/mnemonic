@@ -527,6 +527,7 @@ impl WorkspaceDetailPanel {
             return;
         };
         let title = status.title.clone().unwrap_or_default();
+        let pr_url = status.url.clone();
         let state = mnemonic_bridge::mnemonic_state(cx);
         let method = pr_draft_service::configured_merge_method(&state);
         let short_head = head_ref_oid.chars().take(7).collect::<String>();
@@ -560,6 +561,7 @@ impl WorkspaceDetailPanel {
                         &state,
                         &workspace_id,
                         number,
+                        pr_url.as_deref(),
                         &head_ref_oid,
                         &method,
                     )

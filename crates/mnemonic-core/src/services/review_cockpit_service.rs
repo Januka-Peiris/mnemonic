@@ -918,7 +918,7 @@ fn find_gh_binary() -> Result<String, String> {
     })
 }
 
-fn git_remote_owner_repo(root: &Path) -> Option<(String, String)> {
+pub(crate) fn git_remote_owner_repo(root: &Path) -> Option<(String, String)> {
     let output = Command::new("git")
         .arg("-C")
         .arg(root)

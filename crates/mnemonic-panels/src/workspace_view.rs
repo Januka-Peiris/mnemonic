@@ -3305,7 +3305,7 @@ impl WorkspaceView {
                             let terminals = [
                                 ("Claude CLI", NewSession::ClaudeCli),
                                 ("Codex CLI", NewSession::CodexCli),
-                                ("Shell", NewSession::Shell),
+                                ("Terminal", NewSession::Shell),
                             ]
                             .into_iter()
                             .map(|(label, kind)| (label.to_string(), kind));
