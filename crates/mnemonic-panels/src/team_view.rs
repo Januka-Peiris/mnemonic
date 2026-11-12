@@ -1,4 +1,4 @@
-//! A read-only tab following one of a teammate's workspaces: its agent chat
+//! A read-only view, shown as a tab in the Team window, following one of a teammate's workspaces: its agent chat
 //! as it happens, and its diff on request.
 
 use std::sync::Arc;
@@ -8,8 +8,8 @@ use std::time::Duration;
 use editor::Editor;
 use futures::StreamExt as _;
 use gpui::{
-    App, AppContext as _, Context, Entity, EventEmitter, FocusHandle, Focusable, IntoElement,
-    ListAlignment, ListState, Render, SharedString, Subscription, Task, Window, list, px,
+    App, AppContext as _, Context, Entity, FocusHandle, Focusable, IntoElement, ListAlignment,
+    ListState, Render, SharedString, Subscription, Task, Window, list, px,
 };
 use language::{Buffer, LanguageRegistry};
 use markdown::{Markdown, MarkdownElement, MarkdownFont, MarkdownStyle};
@@ -19,12 +19,8 @@ use mnemonic_core::services::team_share_service::{
 };
 use ui::{Tooltip, prelude::*};
 use util::ResultExt as _;
-use workspace::Workspace;
-use workspace::item::{Item, ItemEvent};
 
-use crate::team::{
-    PeerState, PeerStatus, TeamShare, one_line_preview, render_agent_state, team_share,
-};
+use crate::team::{PeerState, PeerStatus, TeamShare, one_line_preview, render_agent_state};
 
 /// How long to wait before asking again for a chat that isn't open or a
 /// teammate that couldn't be reached.
@@ -164,31 +160,7 @@ pub(crate) struct TeamWorkspaceView {
 }
 
 impl TeamWorkspaceView {
-    /// Shows the teammate's workspace, reusing its tab if one is open.
-    pub(crate) fn open(
-        workspace: &mut Workspace,
-        host: String,
-        workspace_id: String,
-        window: &mut Window,
-        cx: &mut Context<Workspace>,
-    ) {
-        let existing = workspace.items_of_type::<Self>(cx).find(|view| {
-            let view = view.read(cx);
-            view.host == host && view.workspace_id == workspace_id
-        });
-        if let Some(existing) = existing {
-            workspace.activate_item(&existing, true, true, window, cx);
-            return;
-        }
-        let Some(team) = team_share(cx) else {
-            return;
-        };
-        let languages = workspace.project().read(cx).languages().clone();
-        let view = cx.new(|cx| Self::new(team, host, workspace_id, languages, cx));
-        workspace.add_item_to_active_pane(Box::new(view), None, true, window, cx);
-    }
-
-    fn new(
+    pub(crate) fn new(
         team: Entity<TeamShare>,
         host: String,
         workspace_id: String,
@@ -879,12 +851,12 @@ impl Focusable for TeamWorkspaceView {
     }
 }
 
-impl EventEmitter<ItemEvent> for TeamWorkspaceView {}
+impl TeamWorkspaceView {
+    pub(crate) fn matches(&self, host: &str, workspace_id: &str) -> bool {
+        self.host == host && self.workspace_id == workspace_id
+    }
 
-impl Item for TeamWorkspaceView {
-    type Event = ItemEvent;
-
-    fn tab_content_text(&self, _detail: usize, cx: &App) -> SharedString {
+    pub(crate) fn title(&self, cx: &App) -> SharedString {
         let peer_name = self
             .peer(cx)
             .map(|peer| peer.peer.name.clone())
@@ -895,17 +867,9 @@ impl Item for TeamWorkspaceView {
         }
     }
 
-    fn tab_icon(&self, _window: &Window, _cx: &App) -> Option<Icon> {
-        Some(Icon::new(IconName::UserGroup))
-    }
-
-    fn tab_tooltip_text(&self, cx: &App) -> Option<SharedString> {
+    pub(crate) fn tooltip(&self, cx: &App) -> Option<SharedString> {
         let shared = self.shared_workspace(cx)?;
         Some(format!("{} · {} (read-only)", shared.project, shared.branch).into())
-    }
-
-    fn to_item_events(event: &Self::Event, f: &mut dyn FnMut(ItemEvent)) {
-        f(*event)
     }
 }
 

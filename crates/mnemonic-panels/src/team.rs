@@ -29,8 +29,7 @@ use settings::{RegisterSetting, Settings, SettingsStore};
 use ui::{CommonAnimationExt as _, Tooltip, prelude::*};
 use workspace::Workspace;
 
-use crate::team_settings::TeamSettingsView;
-use crate::team_view::TeamWorkspaceView;
+use crate::team_settings::{TeamWindowTab, open_team_window};
 use crate::workspace_view::{LiveWorkspaceAgents, WorkspaceHost, chat_agent_label, open_windows};
 
 /// The `team` section of the settings file.
@@ -157,10 +156,16 @@ gpui::actions!(
     ]
 );
 
+fn open_team_window_from(workspace: &Workspace, tab: TeamWindowTab, cx: &mut App) {
+    let fs = workspace.app_state().fs.clone();
+    let languages = workspace.project().read(cx).languages().clone();
+    open_team_window(tab, fs, languages, cx);
+}
+
 pub fn init(cx: &mut App) {
     cx.observe_new(|workspace: &mut Workspace, _, _| {
-        workspace.register_action(|workspace, _: &OpenTeamSettings, window, cx| {
-            TeamSettingsView::open(workspace, window, cx);
+        workspace.register_action(|workspace, _: &OpenTeamSettings, _window, cx| {
+            open_team_window_from(workspace, TeamWindowTab::Settings, cx);
         });
     })
     .detach();
@@ -920,10 +925,10 @@ pub(crate) fn render_team_section(
         team_state.peers.is_empty() && matches!(team_state.sharing, SharingStatus::Off);
     let open_team_window = {
         let workspace = workspace.clone();
-        move |_: &gpui::ClickEvent, window: &mut gpui::Window, cx: &mut App| {
+        move |_: &gpui::ClickEvent, _window: &mut gpui::Window, cx: &mut App| {
             workspace
                 .update(cx, |workspace, cx| {
-                    TeamSettingsView::open(workspace, window, cx)
+                    open_team_window_from(workspace, TeamWindowTab::Settings, cx)
                 })
                 .ok();
         }
@@ -1135,12 +1140,14 @@ fn render_peer_workspace_row(
         .rounded_md()
         .hover(|style| style.bg(colors.ghost_element_hover))
         .tooltip(Tooltip::text(tooltip))
-        .on_click(move |_, window, cx| {
-            let host = host.clone();
-            let workspace_id = workspace_id.clone();
+        .on_click(move |_, _window, cx| {
+            let tab = TeamWindowTab::Teammate {
+                host: host.clone(),
+                workspace_id: workspace_id.clone(),
+            };
             workspace
                 .update(cx, |workspace, cx| {
-                    TeamWorkspaceView::open(workspace, host, workspace_id, window, cx);
+                    open_team_window_from(workspace, tab, cx)
                 })
                 .ok();
         })
