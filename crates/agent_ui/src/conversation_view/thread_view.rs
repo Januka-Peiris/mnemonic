@@ -574,6 +574,11 @@ pub struct ThreadView {
     pub last_token_limit_telemetry: Option<acp_thread::TokenUsageRatio>,
     thread_feedback: ThreadFeedbackState,
     pub list_state: ListState,
+    /// Lets a drag select text across the agent's messages.
+    pub(crate) selection_group: markdown::SelectionGroup,
+    /// Takes focus after a drag selects across messages, so Copy still
+    /// reaches this view when the message the drag began in is scrolled away.
+    selection_focus_handle: FocusHandle,
     pub session_capabilities: SharedSessionCapabilities,
     /// Tracks which tool calls have their content/output expanded.
     /// Used for showing/hiding tool call results, terminal output, etc.
@@ -1039,6 +1044,8 @@ impl ThreadView {
             expanded_tool_call_raw_inputs: HashSet::default(),
             collapsed_sandbox_authorization_details: HashSet::default(),
             expanded_thinking_blocks: HashSet::default(),
+            selection_group: markdown::SelectionGroup::new(),
+            selection_focus_handle: cx.focus_handle(),
             auto_expanded_thinking_block: None,
             user_toggled_thinking_blocks: HashSet::default(),
             expanded_compactions: HashSet::default(),
@@ -1084,6 +1091,16 @@ impl ThreadView {
             dismissed_skill_loading_issues: HashSet::default(),
         };
 
+        this.selection_group
+            .set_focus_target(this.selection_focus_handle.clone());
+        let list_state_for_selection = this.list_state.clone();
+        this.selection_group
+            .set_head_resolver(std::rc::Rc::new(move |window, _| {
+                list_item_at_y(&list_state_for_selection, window.mouse_position().y)
+            }));
+        for entry_ix in 0..this.thread.read(cx).entries().len() {
+            this.sync_selection_group_entry(entry_ix, cx);
+        }
         this.sync_generating_indicator(cx);
         this.sync_editor_mode_for_empty_state(cx);
         let list_state_for_scroll = this.list_state.clone();
@@ -5761,6 +5778,81 @@ impl ThreadView {
             }))
     }
 
+    /// Registers an entry's messages with the selection group, so a drag can
+    /// span them even when they are never painted.
+    pub(crate) fn sync_selection_group_entry(&self, entry_ix: usize, cx: &App) {
+        match self.thread.read(cx).entries().get(entry_ix) {
+            Some(AgentThreadEntry::UserMessage(message)) => {
+                self.selection_group.register_text(
+                    (entry_ix, 0),
+                    message.content.to_markdown(cx).to_string().into(),
+                );
+            }
+            Some(AgentThreadEntry::AssistantMessage(message)) => {
+                for (chunk_ix, chunk) in message.chunks.iter().enumerate() {
+                    let block = match chunk {
+                        AssistantMessageChunk::Message { block }
+                        | AssistantMessageChunk::Thought { block } => block,
+                    };
+                    if let Some(markdown) = block.markdown() {
+                        self.selection_group
+                            .register_markdown((entry_ix, chunk_ix), markdown);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// An always-rendered, invisible element that holds focus after a drag
+    /// selects across messages, copies the selection, and ends or clears the
+    /// drag when no message is painted to see the mouse event.
+    fn render_selection_focus_target(&self, cx: &Context<Self>) -> impl IntoElement {
+        let group = self.selection_group.clone();
+        div()
+            .absolute()
+            .size_0()
+            .key_context("Markdown")
+            .track_focus(&self.selection_focus_handle)
+            .on_action(cx.listener(|this, _: &markdown::Copy, _, cx| {
+                this.copy_group_selection(cx);
+            }))
+            .on_action(cx.listener(|this, _: &markdown::CopyAsMarkdown, _, cx| {
+                this.copy_group_selection(cx);
+            }))
+            .child(
+                gpui::canvas(
+                    |_, _, _| {},
+                    move |_, _, window, _| {
+                        window.on_mouse_event({
+                            let group = group.clone();
+                            move |event: &gpui::MouseDownEvent, phase, window, cx| {
+                                if phase == gpui::DispatchPhase::Capture
+                                    && event.button == gpui::MouseButton::Left
+                                {
+                                    group.clear_unhovered(None, window, cx);
+                                }
+                            }
+                        });
+                        window.on_mouse_event(move |_: &gpui::MouseUpEvent, phase, window, cx| {
+                            if phase == gpui::DispatchPhase::Capture {
+                                group.end_drag(None, window, cx);
+                            }
+                        });
+                    },
+                )
+                .size_0(),
+            )
+    }
+
+    fn copy_group_selection(&mut self, cx: &mut Context<Self>) {
+        if let Some(text) = self.selection_group.selected_text(cx) {
+            cx.write_to_clipboard(ClipboardItem::new_string(text));
+        } else {
+            cx.propagate();
+        }
+    }
+
     fn render_entry(
         &self,
         entry_ix: usize,
@@ -5991,6 +6083,10 @@ impl ThreadView {
 
                                     Some(
                                         self.render_markdown(md.clone(), style.clone(), cx)
+                                            .selection_group(
+                                                self.selection_group.clone(),
+                                                (entry_ix, chunk_ix),
+                                            )
                                             .into_any_element(),
                                     )
                                 })
@@ -6937,11 +7033,17 @@ impl ThreadView {
                                     this.track_scroll(&scroll_handle)
                                 })
                                 .overflow_hidden()
-                                .child(self.render_markdown(
-                                    chunk,
-                                    MarkdownStyle::themed(MarkdownFont::Agent, window, cx),
-                                    cx,
-                                )),
+                                .child(
+                                    self.render_markdown(
+                                        chunk,
+                                        MarkdownStyle::themed(MarkdownFont::Agent, window, cx),
+                                        cx,
+                                    )
+                                    .selection_group(
+                                        self.selection_group.clone(),
+                                        (entry_ix, chunk_ix),
+                                    ),
+                                ),
                         )
                         .when(is_constrained, |this| {
                             this.child(
@@ -6989,6 +7091,12 @@ impl ThreadView {
                                 _ => None,
                             },
                         );
+
+                    let group_selection = this
+                        .selection_group
+                        .spans_multiple_members(cx)
+                        .then(|| this.selection_group.selected_text(cx))
+                        .flatten();
 
                     let has_selection = chunks
                         .map(|chunks| {
@@ -7069,11 +7177,22 @@ impl ThreadView {
                             })
                             .separator()
                         })
-                        .action_disabled_when(
-                            !has_selection,
-                            "Copy Selection",
-                            Box::new(markdown::CopyAsMarkdown),
-                        )
+                        .map(|menu| match group_selection {
+                            // Copied now, since clicking the menu item is a
+                            // mouse down that clears the selection first.
+                            Some(text) => menu.entry(
+                                "Copy Selection",
+                                Some(Box::new(markdown::CopyAsMarkdown)),
+                                move |_, cx| {
+                                    cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
+                                },
+                            ),
+                            None => menu.action_disabled_when(
+                                !has_selection,
+                                "Copy Selection",
+                                Box::new(markdown::CopyAsMarkdown),
+                            ),
+                        })
                         .item(copy_this_agent_response)
                         .separator()
                         .item(scroll_item)
@@ -11366,6 +11485,7 @@ impl Render for ThreadView {
             ))
             .children(self.render_subagent_titlebar(cx))
             .child(conversation)
+            .child(self.render_selection_focus_target(cx))
             .children(self.render_multi_root_callout(cx))
             .children(self.render_activity_bar(window, cx))
             .when(self.show_external_source_prompt_warning, |this| {
@@ -11702,4 +11822,32 @@ pub(crate) fn reset_fast_mode_warnings(cx: &mut App) {
             .log_err();
     })
     .detach();
+}
+
+/// The list item at vertical position `y`, clamped to the first or last
+/// visible item when `y` is above or below the list. Items are laid out
+/// contiguously, so their padding counts as part of them.
+fn list_item_at_y(list_state: &ListState, y: Pixels) -> Option<usize> {
+    let first_visible = list_state.logical_scroll_top().item_ix;
+    if first_visible >= list_state.item_count() {
+        return None;
+    }
+    let viewport = list_state.viewport_bounds();
+    if y < viewport.top() {
+        return Some(first_visible);
+    }
+    let mut last_visible = first_visible;
+    for item_ix in first_visible..list_state.item_count() {
+        let Some(bounds) = list_state.bounds_for_item(item_ix) else {
+            break;
+        };
+        if item_ix > first_visible && bounds.top() >= viewport.bottom() {
+            break;
+        }
+        last_visible = item_ix;
+        if y < bounds.bottom() {
+            return Some(item_ix);
+        }
+    }
+    Some(last_visible)
 }

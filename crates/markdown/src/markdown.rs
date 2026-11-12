@@ -2,6 +2,7 @@ pub mod html;
 mod mermaid;
 pub mod parser;
 mod path_range;
+mod selection_group;
 
 use base64::Engine as _;
 use futures::FutureExt as _;
@@ -15,6 +16,7 @@ use mermaid::{
     MermaidState, ParsedMarkdownMermaidDiagram, extract_mermaid_diagrams, render_mermaid_diagram,
 };
 pub use path_range::{LineCol, PathWithRange};
+pub use selection_group::{HeadResolver, SelectionGroup, SelectionGroupOrder};
 use settings::Settings as _;
 use theme_settings::ThemeSettings;
 use util::maybe;
@@ -1181,6 +1183,7 @@ pub struct MarkdownElement {
     image_resolver: Option<Box<dyn Fn(&str) -> Option<ImageSource>>>,
     show_root_block_markers: bool,
     autoscroll: AutoscrollBehavior,
+    selection_group: Option<(SelectionGroup, SelectionGroupOrder)>,
 }
 
 impl MarkdownElement {
@@ -1200,6 +1203,7 @@ impl MarkdownElement {
             image_resolver: None,
             show_root_block_markers: false,
             autoscroll: AutoscrollBehavior::Propagate,
+            selection_group: None,
         }
     }
 
@@ -1276,6 +1280,13 @@ impl MarkdownElement {
 
     pub fn scroll_handle(mut self, scroll_handle: ScrollHandle) -> Self {
         self.autoscroll = AutoscrollBehavior::Controlled(scroll_handle);
+        self
+    }
+
+    /// Lets a drag that starts in this element continue into the other
+    /// elements of `group`, which are ordered by `order`.
+    pub fn selection_group(mut self, group: SelectionGroup, order: SelectionGroupOrder) -> Self {
+        self.selection_group = Some((group, order));
         self
     }
 
@@ -1666,8 +1677,20 @@ impl MarkdownElement {
             return;
         }
 
+        let entity_id = self.markdown.entity_id();
+        let group = self.selection_group.as_ref().map(|(group, order)| {
+            group.register_member(
+                entity_id,
+                *order,
+                self.markdown.downgrade(),
+                Some(hitbox.id),
+            );
+            group.clone()
+        });
+
         let is_hovering_clickable = hitbox.is_hovered(window)
             && !self.markdown.read(cx).selection.pending
+            && !group.as_ref().is_some_and(|group| group.is_dragging())
             && rendered_text
                 .source_index_for_position(window.mouse_position())
                 .ok()
@@ -1705,9 +1728,20 @@ impl MarkdownElement {
             }
         });
 
+        if let Some(group) = group.clone() {
+            self.on_mouse_event(window, cx, {
+                move |_markdown, event: &MouseDownEvent, phase, window, cx| {
+                    if phase.capture() && event.button == MouseButton::Left {
+                        group.clear_unhovered(Some(entity_id), window, cx);
+                    }
+                }
+            });
+        }
+
         self.on_mouse_event(window, cx, {
             let rendered_text = rendered_text.clone();
             let hitbox = hitbox.clone();
+            let group = group.clone();
             move |markdown, event: &MouseDownEvent, phase, window, cx| {
                 if hitbox.is_hovered(window) {
                     if phase.bubble() && event.button != MouseButton::Right {
@@ -1781,6 +1815,9 @@ impl MarkdownElement {
                                 pending: true,
                                 mode,
                             };
+                            if let Some(group) = group.as_ref() {
+                                group.begin_drag(entity_id, cx.weak_entity());
+                            }
                             window.focus(&markdown.focus_handle, cx);
                         }
 
@@ -1798,20 +1835,54 @@ impl MarkdownElement {
             let rendered_text = rendered_text.clone();
             let hitbox = hitbox.clone();
             let was_hovering_clickable = is_hovering_clickable;
+            let group = group.clone();
             move |markdown, event: &MouseMoveEvent, phase, window, cx| {
                 if phase.capture() {
                     return;
                 }
 
+                // The button can be released while no grouped element is
+                // painted, so the drag would otherwise never end.
+                let button_released = event.pressed_button != Some(MouseButton::Left);
+
                 if markdown.selection.pending {
+                    if let Some(group) = group.as_ref()
+                        && button_released
+                    {
+                        markdown.selection.pending = false;
+                        group.end_drag(Some((entity_id, markdown)), window, cx);
+                        cx.notify();
+                        return;
+                    }
                     let source_index = match rendered_text.source_index_for_position(event.position)
                     {
                         Ok(ix) | Err(ix) => ix,
                     };
                     markdown.selection.set_head(source_index, &rendered_text);
                     markdown.autoscroll_code_block(source_index, event.position);
-                    markdown.autoscroll_request = Some(source_index);
+                    // In a group, a pointer outside this element is selecting
+                    // a neighbour; scrolling back to this element's clamped
+                    // head would undo the user's own scrolling.
+                    let pointer_within_element = event.position.y >= hitbox.bounds.top()
+                        && event.position.y <= hitbox.bounds.bottom();
+                    if group.is_none() || pointer_within_element {
+                        markdown.autoscroll_request = Some(source_index);
+                    }
                     cx.notify();
+                } else if let Some(group) = group.as_ref()
+                    && let Some(member_is_after_anchor) = group.member_is_after_anchor(entity_id)
+                {
+                    if button_released {
+                        group.end_drag(Some((entity_id, markdown)), window, cx);
+                        cx.notify();
+                    } else if markdown.select_for_group_drag(
+                        member_is_after_anchor,
+                        event.position,
+                        hitbox.bounds,
+                        &rendered_text,
+                    ) {
+                        cx.notify();
+                    }
                 } else {
                     let is_hovering_clickable = hitbox.is_hovered(window)
                         && rendered_text
@@ -1867,6 +1938,17 @@ impl MarkdownElement {
                 }
             }
         });
+
+        if let Some(group) = group {
+            self.on_mouse_event(window, cx, {
+                move |markdown, _: &MouseUpEvent, phase, window, cx| {
+                    if phase.capture() && group.is_dragging() {
+                        group.end_drag(Some((entity_id, markdown)), window, cx);
+                        cx.notify();
+                    }
+                }
+            });
+        }
     }
 
     fn autoscroll(
@@ -2684,12 +2766,24 @@ impl Element for MarkdownElement {
         let mut context = KeyContext::default();
         context.add("Markdown");
         window.set_key_context(context);
+        let group = self
+            .selection_group
+            .as_ref()
+            .map(|(group, _)| group.clone());
         window.on_action(std::any::TypeId::of::<crate::Copy>(), {
             let entity = self.markdown.clone();
             let text = rendered_markdown.text.clone();
+            let group = group.clone();
             move |_, phase, window, cx| {
                 let text = text.clone();
                 if phase == DispatchPhase::Bubble {
+                    if let Some(group_text) = group
+                        .as_ref()
+                        .and_then(|group| group.selected_text_beyond(Some(entity.entity_id()), cx))
+                    {
+                        cx.write_to_clipboard(ClipboardItem::new_string(group_text));
+                        return;
+                    }
                     entity.update(cx, move |this, cx| this.copy(&text, window, cx))
                 }
             }
@@ -2698,12 +2792,50 @@ impl Element for MarkdownElement {
             let entity = self.markdown.clone();
             move |_, phase, window, cx| {
                 if phase == DispatchPhase::Bubble {
+                    if let Some(group_text) = group
+                        .as_ref()
+                        .and_then(|group| group.selected_text_beyond(Some(entity.entity_id()), cx))
+                    {
+                        entity.update(cx, |this, _| this.context_menu_selected_text = None);
+                        cx.write_to_clipboard(ClipboardItem::new_string(group_text));
+                        return;
+                    }
                     entity.update(cx, move |this, cx| this.copy_as_markdown(window, cx))
                 }
             }
         });
 
         self.paint_mouse_listeners(hitbox, &rendered_markdown.text, window, cx);
+        // Scrolling the list mid-drag moves members under a still pointer
+        // without any mouse move, so the span is recomputed from fresh bounds.
+        if let Some((group, _)) = self.selection_group.as_ref() {
+            let entity_id = self.markdown.entity_id();
+            let pointer = window.mouse_position();
+            if let Some(member_is_after_anchor) = group.member_is_after_anchor(entity_id) {
+                self.markdown.update(cx, |markdown, _| {
+                    markdown.select_for_group_drag(
+                        member_is_after_anchor,
+                        pointer,
+                        hitbox.bounds,
+                        &rendered_markdown.text,
+                    );
+                });
+            } else if group.is_anchor(entity_id) {
+                // No autoscroll request here: it would pull the list back
+                // against the wheel scroll that caused this paint.
+                self.markdown.update(cx, |markdown, _| {
+                    if markdown.selection.pending {
+                        let source_index =
+                            match rendered_markdown.text.source_index_for_position(pointer) {
+                                Ok(ix) | Err(ix) => ix,
+                            };
+                        markdown
+                            .selection
+                            .set_head(source_index, &rendered_markdown.text);
+                    }
+                });
+            }
+        }
         rendered_markdown.element.paint(window, cx);
         self.paint_search_highlights(&rendered_markdown.text, window, cx);
         self.paint_selection(&rendered_markdown.text, window, cx);

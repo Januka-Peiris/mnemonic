@@ -1555,6 +1555,7 @@ impl ConversationView {
                         );
                     });
                     active.update(cx, |active, cx| {
+                        active.sync_selection_group_entry(index, cx);
                         active.sync_editor_mode_for_empty_state(cx);
                         active.sync_generating_indicator(cx);
                     });
@@ -1569,6 +1570,7 @@ impl ConversationView {
                     });
                     list_state.remeasure_items(*index..*index + 1);
                     active.update(cx, |active, cx| {
+                        active.sync_selection_group_entry(*index, cx);
                         active.auto_expand_streaming_thought(cx);
                         active.sync_generating_indicator(cx);
                     });
@@ -1581,6 +1583,7 @@ impl ConversationView {
                     entry_view_state.update(cx, |view_state, _cx| view_state.remove(range.clone()));
                     list_state.splice(range.clone(), 0);
                     active.update(cx, |active, cx| {
+                        active.selection_group.remove_entries_from(range.start, cx);
                         active.sync_editor_mode_for_empty_state(cx);
                     });
                 }
