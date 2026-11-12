@@ -17,7 +17,7 @@ pub use workspace_detail_panel::WorkspaceDetailPanel;
 pub use workspace_panel::ToggleFocus as ToggleWorkspacePanelFocus;
 pub use workspace_panel::WorkspacePanel;
 pub use workspace_panel::{SelectNextWorkspace, SelectPreviousWorkspace};
-pub use workspace_view::{WorkspaceHost, WorkspaceView, is_session_tab};
+pub use workspace_view::{SessionPaneToolbar, WorkspaceHost, WorkspaceView, is_session_tab};
 pub use team::TeamSettings;
 pub use workspaces_settings::WorkspacesSettings;
 

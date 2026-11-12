@@ -40,10 +40,11 @@ use ui::{
     Tooltip, h_flex, prelude::*, v_flex,
 };
 use workspace::item::{Item, ItemEvent, ItemHandle};
-use workspace::notifications::NotificationId;
+use workspace::notifications::{DetachAndPromptErr as _, NotificationId};
 use workspace::{
     ActivatePaneDown, ActivatePaneLeft, ActivatePaneRight, ActivatePaneUp, DraggedTab, Pane,
-    Member, PaneAxis, PaneGroup, PaneRenderContext, SplitDirection, SplitMode, Toast, Workspace,
+    Member, PaneAxis, PaneGroup, PaneRenderContext, SaveIntent, SplitDirection, SplitMode, Toast,
+    Workspace,
     WorkspaceId, pane,
 };
 use zed_actions::mnemonic::AgentSessionKind;
@@ -441,6 +442,16 @@ impl Render for SessionItem {
     }
 }
 
+/// Adds the editor toolbar (search, breadcrumbs and the rest) to a pane.
+/// Set by the app, which owns the toolbar items, so files opened in a
+/// workspace's own panes get the same toolbar as the window's.
+#[derive(Clone)]
+pub struct SessionPaneToolbar(
+    pub Arc<dyn Fn(&Workspace, &Entity<Pane>, &mut Window, &mut Context<Workspace>)>,
+);
+
+impl gpui::Global for SessionPaneToolbar {}
+
 /// Whether a drag carries a workspace session's tab. The window's own panes
 /// refuse these, so a session can only be dropped inside its workspace.
 pub fn is_session_tab(dragged: &dyn Any) -> bool {
@@ -517,10 +528,32 @@ fn is_session_tab_of(
     cx: &App,
 ) -> bool {
     dragged.downcast_ref::<DraggedTab>().is_some_and(|tab| {
-        tab.item
-            .downcast::<SessionItem>()
-            .is_some_and(|item| &item.read(cx).workspace_view == workspace_view)
+        match tab.item.downcast::<SessionItem>() {
+            Some(item) => &item.read(cx).workspace_view == workspace_view,
+            None => workspace_view.upgrade().is_some_and(|view| {
+                view.read(cx)
+                    .pane_for_item(tab.item.item_id(), cx)
+                    .is_some()
+            }),
+        }
     })
+}
+
+/// The tabs to close when a newly opened file takes a workspace's file slot.
+/// Another editor of the same file always goes: it shares the new editor's
+/// buffer, so no edits are lost. The slot's previous file (its id and
+/// whether it has unsaved changes) goes only when it has none.
+fn files_to_close(
+    same_path_item: Option<EntityId>,
+    current_file: Option<(EntityId, bool)>,
+) -> Vec<EntityId> {
+    let mut close: Vec<EntityId> = same_path_item.into_iter().collect();
+    if let Some((item_id, false)) = current_file {
+        if !close.contains(&item_id) {
+            close.push(item_id);
+        }
+    }
+    close
 }
 
 /// Instructions waiting for a chat to connect or finish its current turn,
@@ -702,6 +735,8 @@ pub struct WorkspaceView {
     active_pane: Entity<Pane>,
     /// The strip along the bottom that shells and Run output open in.
     terminal_pane: Option<Entity<Pane>>,
+    /// The tab files open in, replaced by each file opened after it.
+    file_item: Option<EntityId>,
     connection_store: Option<Entity<AgentConnectionStore>>,
     composer: Entity<Editor>,
     composer_height: Pixels,
@@ -1100,6 +1135,7 @@ impl WorkspaceView {
         cx: &mut Context<Self>,
     ) -> Entity<Pane> {
         let this = cx.weak_entity();
+        let toolbar_workspace = workspace.clone();
         let pane = cx.new(|cx| {
             let mut pane = Pane::new(
                 workspace,
@@ -1149,6 +1185,16 @@ impl WorkspaceView {
         });
         cx.subscribe_in(&pane, window, Self::handle_pane_event)
             .detach();
+        if let Some(toolbar) = cx.try_global::<SessionPaneToolbar>().cloned() {
+            let pane = pane.clone();
+            // Deferred because a pane is created while the workspace is
+            // being updated.
+            window.defer(cx, move |window, cx| {
+                toolbar_workspace
+                    .update(cx, |workspace, cx| (toolbar.0)(workspace, &pane, window, cx))
+                    .log_err();
+            });
+        }
         pane
     }
 
@@ -1327,6 +1373,93 @@ impl WorkspaceView {
             pane.add_item(Box::new(item), true, true, None, window, cx);
         });
         cx.notify();
+    }
+
+    /// Takes a tab that opened in the window's own pane into this
+    /// workspace's tabs. Files share one tab at the front; anything else
+    /// becomes an ordinary tab.
+    pub(crate) fn adopt_item(
+        &mut self,
+        item: Box<dyn ItemHandle>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(project_path) = item.project_path(cx) else {
+            self.active_pane.update(cx, |pane, cx| {
+                pane.add_item(item, true, true, None, window, cx);
+            });
+            cx.notify();
+            return;
+        };
+        let item_id = item.item_id();
+        let same_path_item = self.center.panes().into_iter().find_map(|pane| {
+            pane.read(cx)
+                .items()
+                .find(|existing| {
+                    existing.item_id() != item_id
+                        && existing.project_path(cx).as_ref() == Some(&project_path)
+                })
+                .map(|existing| existing.item_id())
+        });
+        let current_file = self.file_item.and_then(|file_id| {
+            let pane = self.pane_for_item(file_id, cx)?;
+            let dirty = pane
+                .read(cx)
+                .items()
+                .find(|existing| existing.item_id() == file_id)?
+                .is_dirty(cx);
+            Some((file_id, dirty))
+        });
+        let first_pane = self.center.first_pane();
+        first_pane.update(cx, |pane, cx| {
+            pane.add_item(item, true, true, Some(0), window, cx);
+        });
+        self.file_item = Some(item_id);
+        for close_id in files_to_close(same_path_item, current_file) {
+            if let Some(pane) = self.pane_for_item(close_id, cx) {
+                pane.update(cx, |pane, cx| {
+                    pane.remove_item(close_id, false, true, window, cx);
+                });
+            }
+        }
+        cx.notify();
+    }
+
+    /// Saves the focused file. The window's save actions only reach the
+    /// window's own active tab, which is the whole workspace.
+    fn save_active_item(
+        &mut self,
+        save_intent: SaveIntent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(item) = self.active_pane.read(cx).active_item() else {
+            return;
+        };
+        if self.session_index(item.item_id()).is_some() {
+            cx.propagate();
+            return;
+        }
+        let Some(project) = self.project.upgrade() else {
+            return;
+        };
+        let pane = self.active_pane.downgrade();
+        cx.spawn_in(window, async move |_, cx| {
+            Pane::save_item(project, &pane, item.as_ref(), save_intent, cx)
+                .await
+                .map(|_| ())
+        })
+        .detach_and_prompt_err("Failed to save", window, cx, |_, _, _| None);
+    }
+
+    /// The composer types into CLI sessions: chats have their own, and a
+    /// file tab takes none.
+    fn shows_composer(&self, cx: &App) -> bool {
+        let active_item = self.active_pane.read(cx).active_item();
+        if active_item.is_some_and(|item| self.session_index(item.item_id()).is_none()) {
+            return false;
+        }
+        !self.active_is_chat()
     }
 
     fn push_terminal(
@@ -3851,7 +3984,7 @@ impl Focusable for WorkspaceView {
 
 impl Render for WorkspaceView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let show_composer = !self.active_is_chat();
+        let show_composer = self.shows_composer(cx);
         let panes = self
             .workspace
             .update(cx, |workspace, cx| {
@@ -3885,6 +4018,22 @@ impl Render for WorkspaceView {
                     cx.notify();
                 },
             ))
+            .on_action(cx.listener(|this, action: &workspace::Save, window, cx| {
+                this.save_active_item(
+                    action.save_intent.unwrap_or(SaveIntent::Save),
+                    window,
+                    cx,
+                );
+            }))
+            .on_action(cx.listener(|this, _: &workspace::FormatAndSave, window, cx| {
+                this.save_active_item(SaveIntent::FormatAndSave, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &workspace::SaveWithoutFormat, window, cx| {
+                this.save_active_item(SaveIntent::SaveWithoutFormat, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &workspace::SaveAs, window, cx| {
+                this.save_active_item(SaveIntent::SaveAs, window, cx);
+            }))
             .on_action(cx.listener(|this, _: &ActivatePaneLeft, window, cx| {
                 this.activate_pane_in_direction(SplitDirection::Left, window, cx);
             }))
@@ -4088,6 +4237,9 @@ pub struct WorkspaceHost {
     views: HashMap<String, Entity<WorkspaceView>>,
     active: Option<String>,
     focus_handle: FocusHandle,
+    /// Moves tabs opened in the window's own pane into the selected
+    /// workspace, so they switch with it.
+    _window_items: Subscription,
 }
 
 impl WorkspaceHost {
@@ -4101,6 +4253,7 @@ impl WorkspaceHost {
     ) {
         let panes = workspace.panes().to_vec();
         let mut existing = None;
+        let mut created = None;
         for pane in panes {
             let found = pane.read(cx).items().enumerate().find_map(|(index, item)| {
                 item.downcast::<WorkspaceHost>().map(|host| (index, host))
@@ -4119,12 +4272,19 @@ impl WorkspaceHost {
                 host
             }
             None => {
+                let workspace_entity = cx.entity();
                 let host = cx.new(|cx| WorkspaceHost {
                     views: HashMap::new(),
                     active: None,
                     focus_handle: cx.focus_handle(),
+                    _window_items: cx.subscribe_in(
+                        &workspace_entity,
+                        window,
+                        Self::handle_window_event,
+                    ),
                 });
                 workspace.add_item_to_active_pane(Box::new(host.clone()), None, true, window, cx);
+                created = Some(host.clone());
                 host
             }
         };
@@ -4135,6 +4295,67 @@ impl WorkspaceHost {
         host.update(cx, |host, cx| {
             host.set_active(summary, workspace_handle, project, database_id, window, cx);
         });
+        if let Some(host) = created {
+            Self::sweep_window_items(workspace, &host, window, cx);
+        }
+    }
+
+    /// Tabs left in the window's pane from before a workspace was selected,
+    /// such as ones restored from the last session, belong to no workspace:
+    /// they close, except ones with unsaved changes, which join this one.
+    fn sweep_window_items(
+        workspace: &Workspace,
+        host: &Entity<WorkspaceHost>,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let Some(view) = host.read(cx).active_view().cloned() else {
+            return;
+        };
+        for pane in workspace.panes().to_vec() {
+            let items: Vec<Box<dyn ItemHandle>> = pane
+                .read(cx)
+                .items()
+                .filter(|item| item.downcast::<WorkspaceHost>().is_none())
+                .map(|item| item.boxed_clone())
+                .collect();
+            for item in items {
+                let dirty = item.is_dirty(cx);
+                pane.update(cx, |pane, cx| {
+                    pane.remove_item(item.item_id(), false, false, window, cx);
+                });
+                if dirty {
+                    view.update(cx, |view, cx| view.adopt_item(item, window, cx));
+                }
+            }
+        }
+    }
+
+    fn handle_window_event(
+        &mut self,
+        workspace: &Entity<Workspace>,
+        event: &workspace::Event,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let workspace::Event::ItemAdded { item } = event else {
+            return;
+        };
+        if item.downcast::<WorkspaceHost>().is_some() {
+            return;
+        }
+        let Some(view) = self.active_view().cloned() else {
+            return;
+        };
+        let item = item.boxed_clone();
+        for pane in workspace.read(cx).panes().to_vec() {
+            pane.update(cx, |pane, cx| {
+                if pane.index_for_item(item.as_ref()).is_some() {
+                    pane.remove_item(item.item_id(), false, false, window, cx);
+                }
+            });
+        }
+        view.update(cx, |view, cx| view.adopt_item(item, window, cx));
     }
 
     fn set_active(
@@ -4216,6 +4437,7 @@ impl WorkspaceHost {
                     center: PaneGroup::new(pane.clone()),
                     active_pane: pane,
                     terminal_pane: None,
+                    file_item: None,
                     connection_store: None,
                     composer,
                     composer_height: px(110.),
@@ -4701,6 +4923,17 @@ impl Render for WorkspaceHost {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn file_slot_closes_same_path_and_clean_file_but_keeps_dirty_file() {
+        let (a, b) = (EntityId::from(1u64), EntityId::from(2u64));
+        assert_eq!(files_to_close(Some(b), Some((a, false))), vec![b, a]);
+        assert_eq!(files_to_close(Some(a), Some((a, true))), vec![a]);
+        assert_eq!(files_to_close(Some(b), Some((a, true))), vec![b]);
+        assert_eq!(files_to_close(None, Some((a, false))), vec![a]);
+        assert_eq!(files_to_close(None, Some((a, true))), Vec::<EntityId>::new());
+        assert_eq!(files_to_close(None, None), Vec::<EntityId>::new());
+    }
 
     #[test]
     fn a_chat_title_names_the_workspace_unless_it_is_a_placeholder() {

@@ -522,6 +522,9 @@ pub fn initialize_workspace(app_state: Arc<AppState>, cx: &mut App) {
         let workspace_handle = cx.entity();
         let center_pane = workspace.active_pane().clone();
         initialize_pane(workspace, &center_pane, window, cx);
+        if !cx.has_global::<mnemonic_panels::SessionPaneToolbar>() {
+            cx.set_global(mnemonic_panels::SessionPaneToolbar(Arc::new(initialize_pane_toolbar)));
+        }
 
         cx.subscribe_in(&workspace_handle, window, {
             move |workspace, _, event, window, cx| match event {
@@ -1503,8 +1506,7 @@ fn initialize_pane(
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) {
-    let workspace_handle = cx.weak_entity();
-    pane.update(cx, |pane, cx| {
+    pane.update(cx, |pane, _| {
         // Without this the window's pane, which sits above a workspace's own
         // panes, takes every session tab dropped inside the workspace.
         pane.set_can_drop_predicate(Some(Arc::new(
@@ -1512,6 +1514,20 @@ fn initialize_pane(
                 !mnemonic_panels::is_session_tab(dragged)
             },
         )));
+    });
+    initialize_pane_toolbar(workspace, pane, window, cx);
+}
+
+/// Adds the editor toolbar (search, breadcrumbs and the rest). Also used for
+/// a workspace's own panes, where files open as tabs.
+fn initialize_pane_toolbar(
+    workspace: &Workspace,
+    pane: &Entity<Pane>,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    let workspace_handle = cx.weak_entity();
+    pane.update(cx, |pane, cx| {
         pane.toolbar().update(cx, |toolbar, cx| {
             let multibuffer_hint = cx.new(|_| MultibufferHint::new());
             toolbar.add_item(multibuffer_hint, window, cx);
