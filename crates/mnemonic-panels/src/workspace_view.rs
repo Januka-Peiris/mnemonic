@@ -4901,14 +4901,23 @@ impl WorkspaceHost {
             return;
         };
         let item = item.boxed_clone();
-        for pane in workspace.read(cx).panes().to_vec() {
-            pane.update(cx, |pane, cx| {
-                if pane.index_for_item(item.as_ref()).is_some() {
-                    pane.remove_item(item.item_id(), false, false, window, cx);
-                }
-            });
-        }
-        view.update(cx, |view, cx| view.adopt_item(item, window, cx));
+        let workspace = workspace.clone();
+        // Removing the item makes the outer pane show this host again, and
+        // its toolbar reads the host, which panics while it is being updated.
+        window.defer(cx, move |window, cx| {
+            let mut found = false;
+            for pane in workspace.read(cx).panes().to_vec() {
+                pane.update(cx, |pane, cx| {
+                    if pane.index_for_item(item.as_ref()).is_some() {
+                        found = true;
+                        pane.remove_item(item.item_id(), false, false, window, cx);
+                    }
+                });
+            }
+            if found {
+                view.update(cx, |view, cx| view.adopt_item(item, window, cx));
+            }
+        });
     }
 
     fn set_active(
