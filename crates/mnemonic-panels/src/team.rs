@@ -21,8 +21,8 @@ use mnemonic_core::models::{ChatSessionRecord, WorkspaceSummary};
 use mnemonic_core::repositories::{chat_session_repository, settings_repository};
 use mnemonic_core::services::team_share_server::{DiffSource, TeamServerConfig, TeamShareServer};
 use mnemonic_core::services::team_share_service::{
-    DEFAULT_TEAM_PORT, TailscaleWhois, TeamAgentState, TeamChat, TeamClient, TeamClientError,
-    TeamEntry, TeamShareHub, TeamToolStatus, TeamWorkspace, tailscale_self,
+    DEFAULT_TEAM_PORT, TailscaleSelf, TailscaleWhois, TeamAgentState, TeamChat, TeamClient,
+    TeamClientError, TeamEntry, TeamShareHub, TeamToolStatus, TeamWorkspace, tailscale_self,
 };
 use mnemonic_core::services::{git_review_service, workspace_service};
 use settings::{RegisterSetting, Settings, SettingsStore};
@@ -81,6 +81,9 @@ const PUBLISH_INTERVAL: Duration = Duration::from_secs(2);
 /// How long to wait before trying to start sharing again, as when Tailscale
 /// wasn't connected yet.
 const RETRY_SHARING_AFTER: Duration = Duration::from_secs(30);
+/// How often a running share checks Tailscale is still on the address and
+/// account it started with, as after switching Tailscale accounts.
+const CHECK_TAILSCALE_EVERY: Duration = Duration::from_secs(15);
 const POLL_ONLINE_PEER: Duration = Duration::from_secs(5);
 const POLL_OFFLINE_PEER: Duration = Duration::from_secs(15);
 /// Diff counts are only recomputed while a teammate has looked recently.
@@ -128,6 +131,9 @@ pub(crate) struct TeamShare {
     pub sharing: SharingStatus,
     start_task: Option<Task<()>>,
     publish_task: Option<Task<()>>,
+    /// Restarts sharing when this machine's Tailscale address or account
+    /// changes, since the server stays bound to the address it started on.
+    tailscale_watch: Option<Task<()>>,
     chat_watches: HashMap<String, ChatWatch>,
     pub peers: Vec<PeerState>,
     pub collapsed_peers: HashSet<String>,
@@ -167,6 +173,7 @@ pub fn init(cx: &mut App) {
             sharing: SharingStatus::Off,
             start_task: None,
             publish_task: None,
+            tailscale_watch: None,
             chat_watches: HashMap::new(),
             peers: Vec::new(),
             collapsed_peers: HashSet::new(),
@@ -344,12 +351,14 @@ impl TeamShare {
                         return true;
                     }
                     let started = match attempt {
-                        Ok(server) => {
+                        Ok((server, started_as)) => {
                             this.sharing = SharingStatus::On {
                                 address: server.address(),
                             };
                             this.server = Some(server);
                             this.start_publishing(cx);
+                            this.tailscale_watch =
+                                Some(Self::watch_tailscale(key.clone(), started_as, cx));
                             true
                         }
                         Err(err) => {
@@ -370,9 +379,42 @@ impl TeamShare {
         }));
     }
 
+    fn watch_tailscale(
+        key: ServerKey,
+        started_as: TailscaleSelf,
+        cx: &mut Context<Self>,
+    ) -> Task<()> {
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(CHECK_TAILSCALE_EVERY).await;
+                let now = cx.background_spawn(async move { tailscale_self() }).await;
+                let moved = match &now {
+                    Ok(now) => now.ip != started_as.ip || now.login != started_as.login,
+                    Err(_) => true,
+                };
+                if !moved {
+                    continue;
+                }
+                this.update(cx, |this, cx| {
+                    if this.server_key.as_ref() == Some(&key) {
+                        log::info!(
+                            "Tailscale changed since sharing started on {}; restarting sharing",
+                            started_as.ip
+                        );
+                        this.start_sharing(key.clone(), cx);
+                        cx.notify();
+                    }
+                })
+                .ok();
+                break;
+            }
+        })
+    }
+
     fn stop_sharing(&mut self) {
         self.start_task = None;
         self.publish_task = None;
+        self.tailscale_watch = None;
         self.server = None;
         self.server_key = None;
         self.chat_watches.clear();
@@ -653,7 +695,10 @@ impl TeamShare {
     }
 }
 
-fn start_server(key: ServerKey, hub: TeamShareHub) -> Result<TeamShareServer, String> {
+fn start_server(
+    key: ServerKey,
+    hub: TeamShareHub,
+) -> Result<(TeamShareServer, TailscaleSelf), String> {
     let me = tailscale_self()?;
     let display_name = [&key.display_name, &me.display_name, &me.login]
         .into_iter()
@@ -682,6 +727,7 @@ fn start_server(key: ServerKey, hub: TeamShareHub) -> Result<TeamShareServer, St
         Arc::new(TailscaleWhois::default()),
         diff_source,
     )
+    .map(|server| (server, me))
 }
 
 fn load_shared_records(
