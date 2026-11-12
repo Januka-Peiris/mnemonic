@@ -1255,6 +1255,14 @@ fn register_actions(
         )
         .register_action(
             |workspace: &mut Workspace,
+             _: &mnemonic_panels::ToggleWorkspaceToolsFocus,
+             window: &mut Window,
+             cx: &mut Context<Workspace>| {
+                mnemonic_panels::toggle_tools_panel(workspace, window, cx);
+            },
+        )
+        .register_action(
+            |workspace: &mut Workspace,
              _: &mnemonic_panels::ToggleCommandApprovalFocus,
              window: &mut Window,
              cx: &mut Context<Workspace>| {

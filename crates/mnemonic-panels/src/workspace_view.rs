@@ -1192,7 +1192,7 @@ impl WorkspaceView {
             match terminal {
                 Ok(terminal) => {
                     this.update_in(cx, |this, window, cx| {
-                        this.push_tool_terminal(ToolKind::Shell, &title, terminal, window, cx);
+                        this.push_tool_terminal(ToolKind::Shell, true, &title, terminal, window, cx);
                     })
                     .ok();
                 }
@@ -1549,11 +1549,9 @@ impl WorkspaceView {
                 .is_dirty(cx);
             Some((file_id, dirty))
         });
-        let first_pane = self.center.first_pane();
-        first_pane.update(cx, |pane, cx| {
-            pane.add_item(item, true, true, Some(0), window, cx);
-        });
-        self.file_item = Some(item_id);
+        // Closed before the new item goes in: a pane drops a new item for a
+        // file it already shows at the same index, which would leave neither.
+        // The new item keeps the buffer alive meanwhile.
         for close_id in files_to_close(same_path_item, current_file) {
             if let Some(pane) = self.pane_for_item(close_id, cx) {
                 pane.update(cx, |pane, cx| {
@@ -1561,6 +1559,11 @@ impl WorkspaceView {
                 });
             }
         }
+        let first_pane = self.center.first_pane();
+        first_pane.update(cx, |pane, cx| {
+            pane.add_item(item, true, true, Some(0), window, cx);
+        });
+        self.file_item = Some(item_id);
         cx.notify();
     }
 
@@ -1654,6 +1657,7 @@ impl WorkspaceView {
     fn push_tool_terminal(
         &mut self,
         kind: ToolKind,
+        reveal: bool,
         title: &str,
         terminal: Entity<Terminal>,
         window: &mut Window,
@@ -1693,7 +1697,9 @@ impl WorkspaceView {
                 ToolsTab::Shell(self.shells.len() - 1)
             }
         };
-        self.reveal_tools_panel(window, cx);
+        if reveal {
+            self.reveal_tools_panel(window, cx);
+        }
         cx.notify();
     }
 
@@ -1789,6 +1795,7 @@ impl WorkspaceView {
                         this.update_in(cx, |this, window, cx| {
                             this.push_tool_terminal(
                                 ToolKind::Setup,
+                                true,
                                 &plan.title,
                                 terminal,
                                 window,
@@ -2227,6 +2234,7 @@ impl WorkspaceView {
                         this.update_in(cx, |this, window, cx| {
                             this.push_tool_terminal(
                                 ToolKind::Run,
+                                true,
                                 &plan.title,
                                 terminal,
                                 window,
@@ -2352,6 +2360,7 @@ impl WorkspaceView {
                 this.update_in(cx, |this, window, cx| {
                     this.push_tool_terminal(
                         ToolKind::Run,
+                        false,
                         &plan.title,
                         terminal.clone(),
                         window,
@@ -4838,17 +4847,18 @@ impl WorkspaceHost {
         host.update(cx, |host, cx| {
             host.set_active(summary, workspace_handle, project, database_id, window, cx);
         });
-        if let Some(host) = created {
-            Self::sweep_window_items(workspace, &host, window, cx);
-        }
+        let created = created.is_some();
+        Self::sweep_window_items(workspace, &host, created, window, cx);
     }
 
-    /// Tabs left in the window's pane from before a workspace was selected,
-    /// such as ones restored from the last session, belong to no workspace:
-    /// they close, except ones with unsaved changes, which join this one.
+    /// Moves tabs left in the window's pane while no workspace was selected
+    /// into the one just selected. When the host is first created those are
+    /// restored from the last session and belong to no workspace, so they
+    /// close instead, except ones with unsaved changes.
     fn sweep_window_items(
         workspace: &Workspace,
         host: &Entity<WorkspaceHost>,
+        close_clean: bool,
         window: &mut Window,
         cx: &mut App,
     ) {
@@ -4867,7 +4877,7 @@ impl WorkspaceHost {
                 pane.update(cx, |pane, cx| {
                     pane.remove_item(item.item_id(), false, false, window, cx);
                 });
-                if dirty {
+                if dirty || !close_clean {
                     view.update(cx, |view, cx| view.adopt_item(item, window, cx));
                 }
             }
@@ -5440,6 +5450,13 @@ impl Item for WorkspaceHost {
 
     fn hides_tab_bar_when_alone(&self) -> bool {
         true
+    }
+
+    fn inner_panes(&self, cx: &App) -> Vec<Entity<Pane>> {
+        self.views
+            .values()
+            .flat_map(|view| view.read(cx).center.panes().into_iter().cloned())
+            .collect()
     }
 
     fn to_item_events(event: &Self::Event, f: &mut dyn FnMut(ItemEvent)) {

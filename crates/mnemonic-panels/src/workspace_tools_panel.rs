@@ -66,13 +66,35 @@ pub fn show_tools_panel(
         let detail_showing = dock
             .active_panel()
             .is_some_and(|panel| panel.to_any().downcast::<WorkspaceDetailPanel>().is_ok());
-        if !stacked && (open || (dock.is_open() && detail_showing)) {
+        if !stacked && open && !detail_showing {
+            // It only stacks under the right panel, so that comes back first.
+            if let Some(detail_index) = dock.panel_index_for_type::<WorkspaceDetailPanel>() {
+                dock.activate_panel(detail_index, window, cx);
+            }
+        }
+        let detail_showing = detail_showing || open;
+        if !stacked && detail_showing && (open || dock.is_open()) {
             dock.activate_panel(index, window, cx);
         }
         if open && !dock.is_open() {
             dock.set_open(true, window, cx);
         }
     });
+}
+
+/// The dock button: hides the panel when it's stacked under the right
+/// panel, and shows it there otherwise.
+pub fn toggle_tools_panel(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace>) {
+    let stacked = workspace
+        .right_dock()
+        .read(cx)
+        .stacked_panel()
+        .is_some_and(|panel| panel.to_any().downcast::<WorkspaceToolsPanel>().is_ok());
+    if stacked {
+        workspace.right_dock().update(cx, |dock, cx| dock.close_stacked_panel(window, cx));
+    } else {
+        show_tools_panel(workspace, true, window, cx);
+    }
 }
 
 impl Focusable for WorkspaceToolsPanel {

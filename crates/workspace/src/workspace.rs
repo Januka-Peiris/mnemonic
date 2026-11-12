@@ -3512,12 +3512,29 @@ impl Workspace {
                 })
             })
             .collect::<Vec<_>>();
+        // Items in panes drawn inside another item aren't restored with the
+        // window's layout, so they're never kept by hot exit: they're always
+        // offered for saving.
+        let inner_dirty_items = self
+            .panes
+            .iter()
+            .flat_map(|pane| pane.read(cx).items())
+            .flat_map(|item| item.inner_panes(cx))
+            .flat_map(|pane| {
+                pane.read(cx)
+                    .items()
+                    .filter(|item| item.is_dirty(cx))
+                    .map(|item| (pane.downgrade(), item.boxed_clone()))
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
 
         let project = self.project.clone();
         cx.spawn_in(window, async move |workspace, cx| {
-            let dirty_items = if save_intent == SaveIntent::Close && !dirty_items.is_empty() {
+            let has_dirty_items = !dirty_items.is_empty() || !inner_dirty_items.is_empty();
+            let dirty_items = if save_intent == SaveIntent::Close && has_dirty_items {
                 let mut serialize_tasks = Vec::new();
-                let mut remaining_dirty_items = Vec::new();
+                let mut remaining_dirty_items = inner_dirty_items;
                 if allow_hot_exit_serialization {
                     workspace.update_in(cx, |workspace, window, cx| {
                         for (pane, item) in dirty_items {
@@ -3538,7 +3555,7 @@ impl Workspace {
                         }
                     }
                 } else {
-                    remaining_dirty_items = dirty_items;
+                    remaining_dirty_items.extend(dirty_items);
                 }
 
                 if !remaining_dirty_items.is_empty() {
@@ -3570,7 +3587,7 @@ impl Workspace {
 
                 remaining_dirty_items
             } else {
-                dirty_items
+                dirty_items.into_iter().chain(inner_dirty_items).collect()
             };
 
             for (pane, item) in dirty_items {

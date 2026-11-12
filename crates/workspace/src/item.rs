@@ -375,6 +375,12 @@ pub trait Item: Focusable + EventEmitter<Self::Event> + Render + Sized {
         false
     }
 
+    /// Panes this item draws inside itself. Their items count when the
+    /// workspace saves everything or asks about unsaved changes on close.
+    fn inner_panes(&self, _: &App) -> Vec<Entity<Pane>> {
+        Vec::new()
+    }
+
     fn pixel_position_of_cursor(&self, _: &App) -> Option<Point<Pixels>> {
         None
     }
@@ -573,6 +579,7 @@ pub trait ItemHandle: 'static + Send {
     fn breadcrumb_prefix(&self, window: &mut Window, cx: &mut App) -> Option<gpui::AnyElement>;
     fn show_toolbar(&self, cx: &App) -> bool;
     fn hides_tab_bar_when_alone(&self, cx: &App) -> bool;
+    fn inner_panes(&self, cx: &App) -> Vec<Entity<Pane>>;
     fn pixel_position_of_cursor(&self, cx: &App) -> Option<Point<Pixels>>;
     fn downgrade_item(&self) -> Box<dyn WeakItemHandle>;
     fn workspace_settings<'a>(&self, cx: &'a App) -> &'a WorkspaceSettings;
@@ -1140,6 +1147,10 @@ impl<T: Item> ItemHandle for Entity<T> {
 
     fn hides_tab_bar_when_alone(&self, cx: &App) -> bool {
         self.read(cx).hides_tab_bar_when_alone()
+    }
+
+    fn inner_panes(&self, cx: &App) -> Vec<Entity<Pane>> {
+        self.read(cx).inner_panes(cx)
     }
 
     fn pixel_position_of_cursor(&self, cx: &App) -> Option<Point<Pixels>> {
