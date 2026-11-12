@@ -142,7 +142,7 @@ impl WorkspacePanel {
             panel
         });
 
-        crate::team::register_window(workspace.weak_handle(), cx);
+        crate::workspace_view::register_window(workspace.weak_handle(), cx);
         if let Some(team) = crate::team::team_share(cx) {
             panel.update(cx, |_, cx| {
                 cx.observe(&team, |_, _, cx| cx.notify()).detach();
@@ -514,8 +514,11 @@ impl WorkspacePanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if WorkspaceHost::show_in_window_already_hosting(&self.workspace, &ws_id, cx) {
+            return;
+        }
         self.selected_workspace_id = Some(ws_id.clone());
-        cx.set_global(crate::ActiveWorkspace(Some(ws_id.clone())));
+        crate::ActiveWorkspace::set(self.workspace.entity_id(), Some(ws_id.clone()), cx);
         self.refresh_selected_changed_files(cx);
         cx.notify();
 
@@ -741,7 +744,7 @@ impl WorkspacePanel {
                         mnemonic_bridge::clear_pr_state(&ws_id);
                         if this.selected_workspace_id.as_deref() == Some(ws_id.as_str()) {
                             this.selected_workspace_id = None;
-                            cx.set_global(crate::ActiveWorkspace(None));
+                            crate::ActiveWorkspace::set(this.workspace.entity_id(), None, cx);
                         }
                         if let Some(workspace) = this.workspace.upgrade() {
                             workspace.update(cx, |workspace, cx| {
@@ -1808,6 +1811,8 @@ impl WorkspacePanel {
             .as_deref()
             .and_then(|state| mnemonic_bridge::pr_state_color(state, cx));
         let merged_color = pr_color.filter(|_| pr_state.as_deref() == Some("merged"));
+        let shared = crate::team::is_workspace_shared(&ws.id, cx);
+        let shared_indicator = crate::team::render_shared_indicator(&ws.id, cx);
         let row = h_flex()
             .id(SharedString::from(ws.id.clone()))
             .group(row_group.clone())
@@ -1883,6 +1888,7 @@ impl WorkspacePanel {
                         .single_line(),
                 ),
             )
+            .when_some(shared_indicator, |el, indicator| el.child(indicator))
             .when_some(linked_tooltip, |el, tooltip| {
                 el.child(
                     div()
@@ -1954,6 +1960,20 @@ impl WorkspacePanel {
                     menu.entry("Copy Branch Name", None, move |_, cx| {
                         cx.write_to_clipboard(ClipboardItem::new_string(branch.clone()));
                     })
+                    .entry(
+                        if shared {
+                            "Stop Sharing with Team"
+                        } else {
+                            "Share with Team"
+                        },
+                        None,
+                        {
+                            let workspace_id = workspace_id.clone();
+                            move |_, cx| {
+                                crate::team::set_workspace_shared(&workspace_id, !shared, cx);
+                            }
+                        },
+                    )
                     .when(!link_candidates.is_empty(), |menu| {
                         menu.submenu("Link Workspace", {
                             let this = this.clone();

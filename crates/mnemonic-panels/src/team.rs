@@ -1,5 +1,6 @@
 //! Sharing workspaces with teammates over Tailscale, and following theirs.
-//! This side runs the share server while sharing is on, keeps what it
+//! Workspaces are shared one at a time. This side runs the share server
+//! while any workspace is shared, keeps what it
 //! serves up to date, and polls each teammate listed as a peer.
 
 use std::collections::{HashMap, HashSet};
@@ -17,24 +18,24 @@ use gpui::{
 };
 use mnemonic_bridge::AgentAttention;
 use mnemonic_core::models::{ChatSessionRecord, WorkspaceSummary};
-use mnemonic_core::repositories::chat_session_repository;
+use mnemonic_core::repositories::{chat_session_repository, settings_repository};
 use mnemonic_core::services::team_share_server::{DiffSource, TeamServerConfig, TeamShareServer};
 use mnemonic_core::services::team_share_service::{
-    DEFAULT_TEAM_PORT, TailscaleWhois, TeamAgentState, TeamChat, TeamClient, TeamClientError,
-    TeamEntry, TeamShareHub, TeamToolStatus, TeamWorkspace, tailscale_self,
+    DEFAULT_TEAM_PORT, TailscaleSelf, TailscaleWhois, TeamAgentState, TeamChat, TeamClient,
+    TeamClientError, TeamEntry, TeamShareHub, TeamToolStatus, TeamWorkspace, tailscale_self,
 };
 use mnemonic_core::services::{git_review_service, workspace_service};
 use settings::{RegisterSetting, Settings, SettingsStore};
 use ui::{CommonAnimationExt as _, Tooltip, prelude::*};
 use workspace::Workspace;
 
+use crate::team_settings::TeamSettingsView;
 use crate::team_view::TeamWorkspaceView;
-use crate::workspace_view::{LiveWorkspaceAgents, WorkspaceHost, chat_agent_label};
+use crate::workspace_view::{LiveWorkspaceAgents, WorkspaceHost, chat_agent_label, open_windows};
 
 /// The `team` section of the settings file.
 #[derive(Clone, Debug, PartialEq, RegisterSetting)]
 pub struct TeamSettings {
-    pub share: bool,
     pub port: u16,
     pub display_name: String,
     pub allow: Vec<String>,
@@ -51,7 +52,6 @@ impl Settings for TeamSettings {
     fn from_settings(content: &settings::SettingsContent) -> Self {
         let team = content.team.clone().unwrap_or_default();
         Self {
-            share: team.share.unwrap_or(false),
             port: team.port.unwrap_or(DEFAULT_TEAM_PORT),
             display_name: team.display_name.unwrap_or_default().trim().to_string(),
             allow: team.allow.unwrap_or_default(),
@@ -81,6 +81,9 @@ const PUBLISH_INTERVAL: Duration = Duration::from_secs(2);
 /// How long to wait before trying to start sharing again, as when Tailscale
 /// wasn't connected yet.
 const RETRY_SHARING_AFTER: Duration = Duration::from_secs(30);
+/// How often a running share checks Tailscale is still on the address and
+/// account it started with, as after switching Tailscale accounts.
+const CHECK_TAILSCALE_EVERY: Duration = Duration::from_secs(15);
 const POLL_ONLINE_PEER: Duration = Duration::from_secs(5);
 const POLL_OFFLINE_PEER: Duration = Duration::from_secs(15);
 /// Diff counts are only recomputed while a teammate has looked recently.
@@ -128,17 +131,39 @@ pub(crate) struct TeamShare {
     pub sharing: SharingStatus,
     start_task: Option<Task<()>>,
     publish_task: Option<Task<()>>,
-    windows: Vec<WeakEntity<Workspace>>,
+    /// Restarts sharing when this machine's Tailscale address or account
+    /// changes, since the server stays bound to the address it started on.
+    tailscale_watch: Option<Task<()>>,
     chat_watches: HashMap<String, ChatWatch>,
     pub peers: Vec<PeerState>,
     pub collapsed_peers: HashSet<String>,
+    /// Workspaces the user chose to share, saved in the core's settings
+    /// table so the choice survives restarts.
+    shared_workspaces: HashSet<String>,
 }
+
+/// The core settings key holding the ids of shared workspaces, as JSON.
+const SHARED_WORKSPACES_KEY: &str = "team_shared_workspaces";
 
 struct GlobalTeamShare(Entity<TeamShare>);
 
 impl Global for GlobalTeamShare {}
 
+gpui::actions!(
+    team,
+    [
+        /// Opens the Team window: share your workspaces and pick teammates to follow.
+        OpenTeamSettings
+    ]
+);
+
 pub fn init(cx: &mut App) {
+    cx.observe_new(|workspace: &mut Workspace, _, _| {
+        workspace.register_action(|workspace, _: &OpenTeamSettings, window, cx| {
+            TeamSettingsView::open(workspace, window, cx);
+        });
+    })
+    .detach();
     let team = cx.new(|cx| {
         let mut team = TeamShare {
             applied: None,
@@ -148,10 +173,11 @@ pub fn init(cx: &mut App) {
             sharing: SharingStatus::Off,
             start_task: None,
             publish_task: None,
-            windows: Vec::new(),
+            tailscale_watch: None,
             chat_watches: HashMap::new(),
             peers: Vec::new(),
             collapsed_peers: HashSet::new(),
+            shared_workspaces: load_shared_workspace_ids(),
         };
         team.apply_settings(cx);
         team
@@ -168,13 +194,65 @@ pub(crate) fn team_share(cx: &App) -> Option<Entity<TeamShare>> {
         .map(|global| global.0.clone())
 }
 
-/// Lets the share include the workspaces open in this window.
-pub(crate) fn register_window(workspace: WeakEntity<Workspace>, cx: &mut App) {
+pub(crate) fn is_workspace_shared(workspace_id: &str, cx: &App) -> bool {
+    team_share(cx).is_some_and(|team| team.read(cx).shared_workspaces.contains(workspace_id))
+}
+
+/// The icon on a shared workspace's sidebar row, coloured by whether
+/// sharing is actually running. None when the workspace isn't shared.
+pub(crate) fn render_shared_indicator(workspace_id: &str, cx: &App) -> Option<AnyElement> {
+    let team = team_share(cx)?;
+    let team = team.read(cx);
+    if !team.shared_workspaces.contains(workspace_id) {
+        return None;
+    }
+    let (color, tooltip) = match &team.sharing {
+        SharingStatus::On { .. } => (Color::Accent, "Shared with your team".to_string()),
+        SharingStatus::Starting | SharingStatus::Off => {
+            (Color::Muted, "Shared with your team (starting)".to_string())
+        }
+        SharingStatus::Failed(err) => (
+            Color::Error,
+            format!("Shared with your team, but sharing isn't running: {err}"),
+        ),
+    };
+    Some(
+        div()
+            .id(SharedString::from(format!("shared-{workspace_id}")))
+            .child(
+                Icon::new(IconName::UserGroup)
+                    .size(IconSize::XSmall)
+                    .color(color),
+            )
+            .tooltip(Tooltip::text(tooltip))
+            .into_any_element(),
+    )
+}
+
+pub(crate) fn set_workspace_shared(workspace_id: &str, shared: bool, cx: &mut App) {
     if let Some(team) = team_share(cx) {
-        team.update(cx, |team, _| {
-            team.windows.retain(|window| window.upgrade().is_some());
-            team.windows.push(workspace);
+        team.update(cx, |team, cx| {
+            team.set_workspace_shared(workspace_id, shared, cx)
         });
+    }
+}
+
+fn load_shared_workspace_ids() -> HashSet<String> {
+    let Some(state) = mnemonic_bridge::mnemonic_state_cloned() else {
+        return HashSet::new();
+    };
+    match settings_repository::get_value(&state.db, SHARED_WORKSPACES_KEY) {
+        Ok(Some(json)) => serde_json::from_str::<Vec<String>>(&json)
+            .map(|ids| ids.into_iter().collect())
+            .unwrap_or_else(|err| {
+                log::error!("Couldn't read the shared workspaces: {err}");
+                HashSet::new()
+            }),
+        Ok(None) => HashSet::new(),
+        Err(err) => {
+            log::error!("Couldn't read the shared workspaces: {err}");
+            HashSet::new()
+        }
     }
 }
 
@@ -190,22 +268,67 @@ impl TeamShare {
             .is_none_or(|applied| applied.peers != settings.peers || applied.port != settings.port);
         self.applied = Some(settings.clone());
 
-        if settings.share {
-            let key = ServerKey {
-                port: settings.port,
-                display_name: settings.display_name.clone(),
-                allow: settings.allow.clone(),
-            };
-            if self.server_key.as_ref() != Some(&key) {
-                self.start_sharing(key, cx);
-            }
-        } else {
-            self.stop_sharing();
-        }
+        self.update_sharing(cx);
         if peers_changed {
             self.connect_peers(&settings, cx);
         }
         cx.notify();
+    }
+
+    fn set_workspace_shared(&mut self, workspace_id: &str, shared: bool, cx: &mut Context<Self>) {
+        let changed = if shared {
+            self.shared_workspaces.insert(workspace_id.to_string())
+        } else {
+            self.shared_workspaces.remove(workspace_id)
+        };
+        if !changed {
+            return;
+        }
+        let mut ids: Vec<String> = self.shared_workspaces.iter().cloned().collect();
+        ids.sort();
+        cx.background_spawn(async move {
+            let Some(state) = mnemonic_bridge::mnemonic_state_cloned() else {
+                return;
+            };
+            let saved = serde_json::to_string(&ids)
+                .map_err(|err| err.to_string())
+                .and_then(|json| {
+                    settings_repository::set_value(&state.db, SHARED_WORKSPACES_KEY, &json)
+                });
+            if let Err(err) = saved {
+                log::error!("Couldn't save the shared workspaces: {err}");
+            }
+        })
+        .detach();
+        self.update_sharing(cx);
+        // Publishes straight away rather than on the next tick, so an
+        // unshared workspace disappears for teammates at once.
+        if self.server.is_some() {
+            self.start_publishing(cx);
+        }
+        cx.notify();
+    }
+
+    /// Runs the share server exactly while some workspace is shared,
+    /// restarting it when the settings it was started with change.
+    fn update_sharing(&mut self, cx: &mut Context<Self>) {
+        let Some(settings) = self.applied.clone() else {
+            return;
+        };
+        if self.shared_workspaces.is_empty() {
+            if self.server_key.is_some() {
+                self.stop_sharing();
+            }
+            return;
+        }
+        let key = ServerKey {
+            port: settings.port,
+            display_name: settings.display_name.clone(),
+            allow: settings.allow.clone(),
+        };
+        if self.server_key.as_ref() != Some(&key) {
+            self.start_sharing(key, cx);
+        }
     }
 
     fn start_sharing(&mut self, key: ServerKey, cx: &mut Context<Self>) {
@@ -228,12 +351,14 @@ impl TeamShare {
                         return true;
                     }
                     let started = match attempt {
-                        Ok(server) => {
+                        Ok((server, started_as)) => {
                             this.sharing = SharingStatus::On {
                                 address: server.address(),
                             };
                             this.server = Some(server);
                             this.start_publishing(cx);
+                            this.tailscale_watch =
+                                Some(Self::watch_tailscale(key.clone(), started_as, cx));
                             true
                         }
                         Err(err) => {
@@ -254,9 +379,42 @@ impl TeamShare {
         }));
     }
 
+    fn watch_tailscale(
+        key: ServerKey,
+        started_as: TailscaleSelf,
+        cx: &mut Context<Self>,
+    ) -> Task<()> {
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(CHECK_TAILSCALE_EVERY).await;
+                let now = cx.background_spawn(async move { tailscale_self() }).await;
+                let moved = match &now {
+                    Ok(now) => now.ip != started_as.ip || now.login != started_as.login,
+                    Err(_) => true,
+                };
+                if !moved {
+                    continue;
+                }
+                this.update(cx, |this, cx| {
+                    if this.server_key.as_ref() == Some(&key) {
+                        log::info!(
+                            "Tailscale changed since sharing started on {}; restarting sharing",
+                            started_as.ip
+                        );
+                        this.start_sharing(key.clone(), cx);
+                        cx.notify();
+                    }
+                })
+                .ok();
+                break;
+            }
+        })
+    }
+
     fn stop_sharing(&mut self) {
         self.start_task = None;
         self.publish_task = None;
+        self.tailscale_watch = None;
         self.server = None;
         self.server_key = None;
         self.chat_watches.clear();
@@ -271,11 +429,15 @@ impl TeamShare {
         self.publish_task = Some(cx.spawn(async move |this, cx| {
             let mut counts_refreshed_at: Option<Instant> = None;
             loop {
+                let Ok(shared_ids) = this.read_with(cx, |this, _| this.shared_workspaces.clone())
+                else {
+                    break;
+                };
                 if let Some(state) = mnemonic_bridge::mnemonic_state_cloned() {
                     let records = cx
                         .background_spawn({
                             let state = state.clone();
-                            async move { load_shared_records(&state) }
+                            async move { load_shared_records(&state, &shared_ids) }
                         })
                         .await;
                     let hub = match records {
@@ -322,18 +484,17 @@ impl TeamShare {
 
     fn publish(
         &mut self,
-        records: Vec<(WorkspaceSummary, Vec<ChatSessionRecord>)>,
+        mut records: Vec<(WorkspaceSummary, Vec<ChatSessionRecord>)>,
         cx: &mut Context<Self>,
     ) {
         if self.server.is_none() {
             return;
         }
-        self.windows.retain(|window| window.upgrade().is_some());
+        // The list was loaded off the main thread; a workspace unshared
+        // meanwhile must not slip through.
+        records.retain(|(summary, _)| self.shared_workspaces.contains(&summary.id));
         let mut live: HashMap<String, LiveWorkspaceAgents> = HashMap::new();
-        for window in &self.windows {
-            let Some(workspace) = window.upgrade() else {
-                continue;
-            };
+        for workspace in open_windows(cx) {
             for agents in WorkspaceHost::live_agents(workspace.read(cx), cx) {
                 live.entry(agents.workspace_id.clone()).or_insert(agents);
             }
@@ -534,7 +695,10 @@ impl TeamShare {
     }
 }
 
-fn start_server(key: ServerKey, hub: TeamShareHub) -> Result<TeamShareServer, String> {
+fn start_server(
+    key: ServerKey,
+    hub: TeamShareHub,
+) -> Result<(TeamShareServer, TailscaleSelf), String> {
     let me = tailscale_self()?;
     let display_name = [&key.display_name, &me.display_name, &me.login]
         .into_iter()
@@ -563,13 +727,16 @@ fn start_server(key: ServerKey, hub: TeamShareHub) -> Result<TeamShareServer, St
         Arc::new(TailscaleWhois::default()),
         diff_source,
     )
+    .map(|server| (server, me))
 }
 
 fn load_shared_records(
     state: &mnemonic_core::state::AppState,
+    shared_ids: &HashSet<String>,
 ) -> Result<Vec<(WorkspaceSummary, Vec<ChatSessionRecord>)>, String> {
     workspace_service::list_workspaces(state)?
         .into_iter()
+        .filter(|summary| shared_ids.contains(&summary.id))
         .map(|summary| {
             let chats = chat_session_repository::list_for_workspace(&state.db, &summary.id)?;
             Ok((summary, chats))
@@ -741,17 +908,26 @@ pub(crate) fn one_line_preview(text: &str) -> String {
     preview
 }
 
-/// The sidebar's Team section: each teammate and their workspaces. None
-/// when there's nothing to show.
+/// The sidebar's Team section: each teammate and their workspaces, with a
+/// way into the Team window.
 pub(crate) fn render_team_section(
     workspace: WeakEntity<Workspace>,
     cx: &App,
 ) -> Option<AnyElement> {
     let team = team_share(cx)?;
     let team_state = team.read(cx);
-    if team_state.peers.is_empty() && matches!(team_state.sharing, SharingStatus::Off) {
-        return None;
-    }
+    let nothing_set_up =
+        team_state.peers.is_empty() && matches!(team_state.sharing, SharingStatus::Off);
+    let open_team_window = {
+        let workspace = workspace.clone();
+        move |_: &gpui::ClickEvent, window: &mut gpui::Window, cx: &mut App| {
+            workspace
+                .update(cx, |workspace, cx| {
+                    TeamSettingsView::open(workspace, window, cx)
+                })
+                .ok();
+        }
+    };
     let colors = cx.theme().colors();
     let (sharing_icon, sharing_color, sharing_tooltip) = match &team_state.sharing {
         SharingStatus::Off => (
@@ -790,17 +966,51 @@ pub(crate) fn render_team_section(
                         .color(Color::Muted),
                 ),
             )
+            .when(!nothing_set_up, |row| {
+                row.child(
+                    div()
+                        .id("team-sharing-status")
+                        .child(
+                            Icon::new(sharing_icon)
+                                .size(IconSize::XSmall)
+                                .color(sharing_color),
+                        )
+                        .tooltip(Tooltip::text(sharing_tooltip)),
+                )
+            })
             .child(
-                div()
-                    .id("team-sharing-status")
-                    .child(
-                        Icon::new(sharing_icon)
-                            .size(IconSize::XSmall)
-                            .color(sharing_color),
-                    )
-                    .tooltip(Tooltip::text(sharing_tooltip)),
+                IconButton::new("team-open-settings", IconName::Settings)
+                    .icon_size(IconSize::XSmall)
+                    .icon_color(Color::Muted)
+                    .tooltip(Tooltip::text("Sharing and teammates"))
+                    .on_click(open_team_window.clone()),
             ),
     );
+    if nothing_set_up {
+        section = section.child(
+            h_flex()
+                .id("team-set-up")
+                .px_2()
+                .h(px(24.))
+                .gap_1p5()
+                .items_center()
+                .w_full()
+                .cursor_pointer()
+                .rounded_md()
+                .hover(|style| style.bg(colors.ghost_element_hover))
+                .on_click(open_team_window)
+                .child(
+                    Icon::new(IconName::UserGroup)
+                        .size(IconSize::XSmall)
+                        .color(Color::Muted),
+                )
+                .child(
+                    Label::new("Share with your team")
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
+                ),
+        );
+    }
 
     for peer in &team_state.peers {
         let host = peer.peer.host.clone();

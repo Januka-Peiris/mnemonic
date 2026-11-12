@@ -1467,10 +1467,7 @@ fn add_session_to_active_mnemonic_workspace(
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) -> bool {
-    let Some(workspace_id) = cx
-        .try_global::<mnemonic_bridge::ActiveWorkspace>()
-        .and_then(|active| active.0.clone())
-    else {
+    let Some(workspace_id) = mnemonic_bridge::ActiveWorkspace::get(cx.entity_id(), cx) else {
         return false;
     };
     mnemonic_panels::WorkspaceHost::add_session_for_workspace(

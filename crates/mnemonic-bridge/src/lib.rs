@@ -1,7 +1,7 @@
 use std::sync::{mpsc, Arc};
 
 use futures::StreamExt;
-use gpui::{actions, App, AppContext as _, Entity, EventEmitter, Global, Hsla};
+use gpui::{actions, App, AppContext as _, Entity, EntityId, EventEmitter, Global, Hsla};
 use theme::ActiveTheme as _;
 use mnemonic_core::state::{AppEventEmitter, AppState};
 
@@ -15,11 +15,34 @@ actions!(
     ]
 );
 
-/// The workspace currently selected in the left panel. Set by the workspace
-/// panel; observed by panels and the title bar.
-pub struct ActiveWorkspace(pub Option<String>);
+/// The workspace selected in each window's left panel, keyed by the entity
+/// id of that window's `Workspace`, so two windows can show different
+/// workspaces. Set by the workspace panel; observed by panels and the title
+/// bar, which each read their own window's entry.
+#[derive(Clone, Default)]
+pub struct ActiveWorkspace(std::collections::HashMap<EntityId, String>);
 
 impl Global for ActiveWorkspace {}
+
+impl ActiveWorkspace {
+    /// The workspace selected in the window whose `Workspace` has this id.
+    pub fn get(window_workspace: EntityId, cx: &App) -> Option<String> {
+        cx.try_global::<Self>()?.0.get(&window_workspace).cloned()
+    }
+
+    pub fn set(window_workspace: EntityId, workspace_id: Option<String>, cx: &mut App) {
+        let mut active = cx.try_global::<Self>().cloned().unwrap_or_default();
+        let changed = match workspace_id {
+            Some(workspace_id) => {
+                active.0.insert(window_workspace, workspace_id.clone()) != Some(workspace_id)
+            }
+            None => active.0.remove(&window_workspace).is_some(),
+        };
+        if changed {
+            cx.set_global(active);
+        }
+    }
+}
 
 /// Last terminal output time per workspace's agent, written by workspace
 /// views and read by the left panel for its attention indicators. A plain

@@ -432,10 +432,8 @@ impl Render for TitleBar {
 impl TitleBar {
     /// The selected Mnemonic workspace's PR, coloured by its GitHub state.
     fn render_pr_state(&self, cx: &App) -> Option<AnyElement> {
-        let workspace_id = cx
-            .try_global::<mnemonic_bridge::ActiveWorkspace>()?
-            .0
-            .clone()?;
+        let workspace_id =
+            mnemonic_bridge::ActiveWorkspace::get(self.workspace.entity_id(), cx)?;
         let state = mnemonic_bridge::pr_state(&workspace_id)?;
         let color = mnemonic_bridge::pr_state_color(&state, cx)?;
         let label = mnemonic_bridge::pr_state_label(&state);

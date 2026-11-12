@@ -1,6 +1,7 @@
 mod command_approval_panel;
 mod coordinator_panel;
 mod team;
+mod team_settings;
 mod team_view;
 mod workspace_detail_panel;
 mod workspace_panel;

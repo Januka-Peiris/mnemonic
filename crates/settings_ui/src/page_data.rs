@@ -8472,26 +8472,12 @@ fn workspaces_page() -> SettingsPage {
         ]
     }
 
-    fn team_section() -> [SettingsPageItem; 3] {
+    fn team_section() -> [SettingsPageItem; 2] {
         [
             SettingsPageItem::SectionHeader("Team"),
             SettingsPageItem::SettingItem(SettingItem {
-                title: "Share My Workspaces",
-                description: "Let teammates on your allow list (team.allow in settings.json) follow your workspaces and agent chats, read-only, over Tailscale. Chats can include anything your agents printed.",
-                field: Box::new(SettingField {
-                    organization_override: None,
-                    json_path: Some("team.share"),
-                    pick: |settings_content| settings_content.team.as_ref()?.share.as_ref(),
-                    write: |settings_content, value, _| {
-                        settings_content.team.get_or_insert_default().share = value;
-                    },
-                }),
-                metadata: None,
-                files: USER,
-            }),
-            SettingsPageItem::SettingItem(SettingItem {
                 title: "Display Name",
-                description: "The name teammates see for you. When empty, your Tailscale name is used.",
+                description: "The name teammates see for you. When empty, your Tailscale name is used. Choose what to share and whom to follow in the Team tab (the gear in the sidebar's Team section).",
                 field: Box::new(SettingField {
                     organization_override: None,
                     json_path: Some("team.display_name"),

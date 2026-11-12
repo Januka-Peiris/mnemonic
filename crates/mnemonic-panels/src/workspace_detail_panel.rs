@@ -395,9 +395,7 @@ impl WorkspaceDetailPanel {
     }
 
     fn refresh(&mut self, cx: &App) {
-        let selected_id = cx
-            .try_global::<ActiveWorkspace>()
-            .and_then(|active| active.0.clone());
+        let selected_id = ActiveWorkspace::get(self.workspace.entity_id(), cx);
         let Some(selected_id) = selected_id else {
             self.summary = None;
             return;
