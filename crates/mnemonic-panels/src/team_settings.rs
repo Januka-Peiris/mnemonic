@@ -1,4 +1,4 @@
-//! The Team tab: share workspaces one at a time and pick, from the machines
+//! The Team window: share workspaces one at a time and pick, from the machines
 //! on your tailnet, whom to follow and who may follow you. Following and
 //! allowing are written straight to the settings file; which workspaces are
 //! shared is kept in the core's settings table.
@@ -7,19 +7,21 @@ use std::sync::Arc;
 
 use fs::Fs;
 use gpui::{
-    App, AppContext as _, ClipboardItem, Context, EventEmitter, FocusHandle, Focusable,
-    IntoElement, Render, SharedString, Subscription, Task, Window, px,
+    App, AppContext as _, Bounds, ClipboardItem, Context, Entity, FocusHandle, Focusable,
+    IntoElement, Render, SharedString, Stateful, Subscription, Task, TitlebarOptions, Window,
+    WindowBounds, WindowOptions, px, size,
 };
+use language::LanguageRegistry;
 use mnemonic_core::services::team_share_service::{TailnetDevice, tailnet_devices};
 use mnemonic_core::services::workspace_service;
 use settings::{Settings as _, SettingsStore, TeamPeerContent, update_settings_file};
 use ui::{Checkbox, Headline, HeadlineSize, Switch, ToggleState, Tooltip, prelude::*};
-use workspace::Workspace;
-use workspace::item::{Item, ItemEvent};
+use util::ResultExt as _;
 
 use crate::team::{
     SharingStatus, TeamPeer, TeamSettings, is_workspace_shared, set_workspace_shared, team_share,
 };
+use crate::team_view::TeamWorkspaceView;
 
 enum Devices {
     Loading,
@@ -44,22 +46,6 @@ pub(crate) struct TeamSettingsView {
 }
 
 impl TeamSettingsView {
-    /// Shows the Team tab, reusing it if it's already open.
-    pub(crate) fn open(
-        workspace: &mut Workspace,
-        window: &mut Window,
-        cx: &mut Context<Workspace>,
-    ) {
-        let existing = workspace.items_of_type::<Self>(cx).next();
-        if let Some(existing) = existing {
-            workspace.activate_item(&existing, true, true, window, cx);
-            return;
-        }
-        let fs = workspace.app_state().fs.clone();
-        let view = cx.new(|cx| Self::new(fs, cx));
-        workspace.add_item_to_active_pane(Box::new(view), None, true, window, cx);
-    }
-
     fn new(fs: Arc<dyn Fs>, cx: &mut Context<Self>) -> Self {
         let mut subscriptions = vec![cx.observe_global::<SettingsStore>(|_, cx| cx.notify())];
         if let Some(team) = team_share(cx) {
@@ -602,24 +588,6 @@ impl Focusable for TeamSettingsView {
     }
 }
 
-impl EventEmitter<ItemEvent> for TeamSettingsView {}
-
-impl Item for TeamSettingsView {
-    type Event = ItemEvent;
-
-    fn tab_content_text(&self, _detail: usize, _cx: &App) -> SharedString {
-        "Team".into()
-    }
-
-    fn tab_icon(&self, _window: &Window, _cx: &App) -> Option<Icon> {
-        Some(Icon::new(IconName::UserGroup))
-    }
-
-    fn to_item_events(event: &Self::Event, f: &mut dyn FnMut(ItemEvent)) {
-        f(*event)
-    }
-}
-
 impl Render for TeamSettingsView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let settings = TeamSettings::get_global(cx).clone();
@@ -670,6 +638,225 @@ impl Render for TeamSettingsView {
                     .child(self.render_workspaces(cx))
                     .child(self.render_devices(&settings, cx)),
             )
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) enum TeamWindowTab {
+    Settings,
+    Teammate { host: String, workspace_id: String },
+}
+
+/// The Team window: the Team settings, then one tab per teammate workspace
+/// being followed. It lives outside every workspace window so none of this
+/// sits among a workspace's own tabs.
+pub(crate) struct TeamWindow {
+    settings: Entity<TeamSettingsView>,
+    teammates: Vec<Entity<TeamWorkspaceView>>,
+    /// `None` shows the settings; otherwise the index into `teammates`.
+    active_teammate: Option<usize>,
+    languages: Arc<LanguageRegistry>,
+    _subscriptions: Vec<Subscription>,
+}
+
+/// Opens the Team window on `tab`, or brings the open one forward.
+pub(crate) fn open_team_window(
+    tab: TeamWindowTab,
+    fs: Arc<dyn Fs>,
+    languages: Arc<LanguageRegistry>,
+    cx: &mut App,
+) {
+    let existing = cx
+        .windows()
+        .into_iter()
+        .find_map(|window| window.downcast::<TeamWindow>());
+    if let Some(existing) = existing {
+        existing
+            .update(cx, |team_window, window, cx| {
+                window.activate_window();
+                team_window.show(tab, cx);
+            })
+            .log_err();
+        return;
+    }
+    // Deferred so the calling window's update finishes before a new window
+    // opens.
+    cx.defer(move |cx| {
+        let bounds = Bounds::centered(None, size(px(900.), px(700.)), cx);
+        cx.open_window(
+            WindowOptions {
+                titlebar: Some(TitlebarOptions {
+                    title: Some("Mnemonic - Team".into()),
+                    ..Default::default()
+                }),
+                focus: true,
+                show: true,
+                window_bounds: Some(WindowBounds::Windowed(bounds)),
+                window_min_size: Some(size(px(700.), px(400.))),
+                window_background: cx.theme().window_background_appearance(),
+                ..Default::default()
+            },
+            |_window, cx| {
+                cx.new(|cx| {
+                    let settings = cx.new(|cx| TeamSettingsView::new(fs, cx));
+                    let mut team_window = TeamWindow {
+                        settings,
+                        teammates: Vec::new(),
+                        active_teammate: None,
+                        languages,
+                        _subscriptions: Vec::new(),
+                    };
+                    team_window.show(tab, cx);
+                    team_window
+                })
+            },
+        )
+        .log_err();
+    });
+}
+
+impl TeamWindow {
+    fn show(&mut self, tab: TeamWindowTab, cx: &mut Context<Self>) {
+        match tab {
+            TeamWindowTab::Settings => self.active_teammate = None,
+            TeamWindowTab::Teammate { host, workspace_id } => {
+                let existing = self
+                    .teammates
+                    .iter()
+                    .position(|view| view.read(cx).matches(&host, &workspace_id));
+                match existing {
+                    Some(index) => self.active_teammate = Some(index),
+                    None => {
+                        let Some(team) = team_share(cx) else {
+                            return;
+                        };
+                        let languages = self.languages.clone();
+                        let view = cx.new(|cx| {
+                            TeamWorkspaceView::new(team, host, workspace_id, languages, cx)
+                        });
+                        self._subscriptions
+                            .push(cx.observe(&view, |_, _, cx| cx.notify()));
+                        self.teammates.push(view);
+                        self.active_teammate = Some(self.teammates.len() - 1);
+                    }
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    fn close_teammate(&mut self, index: usize, cx: &mut Context<Self>) {
+        if index >= self.teammates.len() {
+            return;
+        }
+        self.teammates.remove(index);
+        self.active_teammate = match self.active_teammate {
+            Some(active) if active == index => None,
+            Some(active) if active > index => Some(active - 1),
+            other => other,
+        };
+        cx.notify();
+    }
+
+    fn render_tab(
+        &self,
+        id: impl Into<ElementId>,
+        label: SharedString,
+        tooltip: Option<SharedString>,
+        selected: bool,
+        cx: &Context<Self>,
+    ) -> Stateful<Div> {
+        let colors = cx.theme().colors();
+        h_flex()
+            .id(id.into())
+            .h_full()
+            .px_3()
+            .gap_1p5()
+            .items_center()
+            .cursor_pointer()
+            .border_b_1()
+            .border_color(if selected {
+                colors.text_accent
+            } else {
+                gpui::transparent_black()
+            })
+            .when_some(tooltip, |tab, tooltip| tab.tooltip(Tooltip::text(tooltip)))
+            .child(
+                Icon::new(IconName::UserGroup)
+                    .size(IconSize::Small)
+                    .color(if selected {
+                        Color::Default
+                    } else {
+                        Color::Muted
+                    }),
+            )
+            .child(Label::new(label).size(LabelSize::Small).color(if selected {
+                Color::Default
+            } else {
+                Color::Muted
+            }))
+    }
+}
+
+impl Render for TeamWindow {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let ui_font = theme_settings::setup_ui_font(window, cx);
+        let mut tabs = h_flex()
+            .h(px(32.))
+            .flex_none()
+            .w_full()
+            .border_b_1()
+            .border_color(cx.theme().colors().border)
+            .bg(cx.theme().colors().tab_bar_background)
+            .child(
+                self.render_tab(
+                    "team-window-settings",
+                    "Team".into(),
+                    None,
+                    self.active_teammate.is_none(),
+                    cx,
+                )
+                .on_click(cx.listener(|this, _, _, cx| this.show(TeamWindowTab::Settings, cx))),
+            );
+        for (index, view) in self.teammates.iter().enumerate() {
+            let view = view.read(cx);
+            tabs = tabs.child(
+                self.render_tab(
+                    ("team-window-teammate", index),
+                    view.title(cx),
+                    view.tooltip(cx),
+                    self.active_teammate == Some(index),
+                    cx,
+                )
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.active_teammate = Some(index);
+                    cx.notify();
+                }))
+                .child(
+                    IconButton::new(("team-window-close", index), IconName::Close)
+                        .icon_size(IconSize::XSmall)
+                        .tooltip(Tooltip::text("Close"))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.close_teammate(index, cx);
+                        })),
+                ),
+            );
+        }
+        let body = match self
+            .active_teammate
+            .and_then(|index| self.teammates.get(index))
+        {
+            Some(view) => view.clone().into_any_element(),
+            None => self.settings.clone().into_any_element(),
+        };
+        v_flex()
+            .size_full()
+            .font(ui_font)
+            .text_color(cx.theme().colors().text)
+            .bg(cx.theme().colors().panel_background)
+            .child(tabs)
+            .child(div().flex_1().min_h_0().child(body))
     }
 }
 

@@ -522,6 +522,9 @@ pub fn initialize_workspace(app_state: Arc<AppState>, cx: &mut App) {
         let workspace_handle = cx.entity();
         let center_pane = workspace.active_pane().clone();
         initialize_pane(workspace, &center_pane, window, cx);
+        if !cx.has_global::<mnemonic_panels::SessionPaneToolbar>() {
+            cx.set_global(mnemonic_panels::SessionPaneToolbar(Arc::new(initialize_pane_toolbar)));
+        }
 
         cx.subscribe_in(&workspace_handle, window, {
             move |workspace, _, event, window, cx| match event {
@@ -752,6 +755,8 @@ fn initialize_panels(window: &mut Window, cx: &mut Context<Workspace>) -> Task<a
             mnemonic_panels::CoordinatorPanel::load(workspace_handle.clone(), cx.clone());
         let mnemonic_detail_panel =
             mnemonic_panels::WorkspaceDetailPanel::load(workspace_handle.clone(), cx.clone());
+        let mnemonic_tools_panel =
+            mnemonic_panels::WorkspaceToolsPanel::load(workspace_handle.clone(), cx.clone());
 
         async fn add_panel_when_ready(
             panel_task: impl Future<Output = anyhow::Result<Entity<impl workspace::Panel>>> + 'static,
@@ -776,8 +781,14 @@ fn initialize_panels(window: &mut Window, cx: &mut Context<Workspace>) -> Task<a
             add_panel_when_ready(mnemonic_command_panel, workspace_handle.clone(), cx.clone()),
             add_panel_when_ready(mnemonic_coordinator_panel, workspace_handle.clone(), cx.clone()),
             add_panel_when_ready(mnemonic_detail_panel, workspace_handle.clone(), cx.clone()),
-            initialize_agent_panel(workspace_handle, cx.clone()).map(|r| r.log_err()),
+            add_panel_when_ready(mnemonic_tools_panel, workspace_handle.clone(), cx.clone()),
+            initialize_agent_panel(workspace_handle.clone(), cx.clone()).map(|r| r.log_err()),
         );
+        workspace_handle
+            .update_in(cx, |workspace, window, cx| {
+                mnemonic_panels::show_tools_panel(workspace, false, window, cx);
+            })
+            .log_err();
 
         anyhow::Ok(())
     })
@@ -1244,6 +1255,14 @@ fn register_actions(
         )
         .register_action(
             |workspace: &mut Workspace,
+             _: &mnemonic_panels::ToggleWorkspaceToolsFocus,
+             window: &mut Window,
+             cx: &mut Context<Workspace>| {
+                mnemonic_panels::toggle_tools_panel(workspace, window, cx);
+            },
+        )
+        .register_action(
+            |workspace: &mut Workspace,
              _: &mnemonic_panels::ToggleCommandApprovalFocus,
              window: &mut Window,
              cx: &mut Context<Workspace>| {
@@ -1503,8 +1522,7 @@ fn initialize_pane(
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) {
-    let workspace_handle = cx.weak_entity();
-    pane.update(cx, |pane, cx| {
+    pane.update(cx, |pane, _| {
         // Without this the window's pane, which sits above a workspace's own
         // panes, takes every session tab dropped inside the workspace.
         pane.set_can_drop_predicate(Some(Arc::new(
@@ -1512,6 +1530,20 @@ fn initialize_pane(
                 !mnemonic_panels::is_session_tab(dragged)
             },
         )));
+    });
+    initialize_pane_toolbar(workspace, pane, window, cx);
+}
+
+/// Adds the editor toolbar (search, breadcrumbs and the rest). Also used for
+/// a workspace's own panes, where files open as tabs.
+fn initialize_pane_toolbar(
+    workspace: &Workspace,
+    pane: &Entity<Pane>,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    let workspace_handle = cx.weak_entity();
+    pane.update(cx, |pane, cx| {
         pane.toolbar().update(cx, |toolbar, cx| {
             let multibuffer_hint = cx.new(|_| MultibufferHint::new());
             toolbar.add_item(multibuffer_hint, window, cx);

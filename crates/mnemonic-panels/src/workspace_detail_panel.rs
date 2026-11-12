@@ -1371,6 +1371,10 @@ impl WorkspaceDetailPanel {
                 ))
             })
             .child(div().flex_grow(1.0))
+            .children(self.workspace.upgrade().and_then(|workspace| {
+                let view = WorkspaceHost::view_in(workspace.read(cx), &ws.id, cx)?;
+                Some(view.read(cx).render_auto_fix_controls(view.downgrade()))
+            }))
             .child(
                 Button::new("start-review", "Review")
                     .label_size(LabelSize::Small)

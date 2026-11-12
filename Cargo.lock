@@ -11395,6 +11395,7 @@ dependencies = [
  "task",
  "terminal",
  "terminal_view",
+ "theme_settings",
  "ui",
  "util",
  "uuid",
