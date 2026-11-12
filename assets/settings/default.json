@@ -1757,8 +1757,10 @@
     // "codex" - Review with Codex (default)
     // "claude" - Review with Claude
     "review_agent": "codex",
-    // Whether creating a pull request also starts watching its CI and has
-    // the agent fix failing checks until they pass.
+    // Whether creating a pull request also starts watching its CI and
+    // Greptile's review comments, and has the agent fix failing checks and
+    // deal with the comments until the PR is green and clear. It doesn't
+    // merge the PR.
     "keep_ci_green": false,
     // How pull requests are merged from the workspace panel:
     // "squash" (default), "merge" or "rebase".

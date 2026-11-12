@@ -3,6 +3,7 @@ pub mod agent_context_service;
 pub mod agent_memory_service;
 pub mod agent_profile_service;
 pub mod app_runtime_service;
+pub mod chat_transcript_service;
 pub mod checkpoint_service;
 pub mod command_safety_service;
 pub mod coordination_artifact_service;

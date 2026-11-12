@@ -234,6 +234,7 @@ pub fn rename_unpublished_workspace(
     workspace_id: &str,
     expected_name: &str,
     new_name: &str,
+    branch_slug: &str,
 ) -> Result<Option<WorkspaceSummary>, String> {
     let summary = workspace_repository::get(&state.db, workspace_id)?;
     if summary.name != expected_name
@@ -263,23 +264,23 @@ pub fn rename_unpublished_workspace(
         .rsplit_once('/')
         .map(|(prefix, _)| format!("{prefix}/"))
         .unwrap_or_default();
-    let candidates = std::iter::once(new_name.to_string())
-        .chain((2..100).map(|suffix| format!("{new_name}-{suffix}")));
-    let mut chosen_name = None;
+    let candidates = std::iter::once(branch_slug.to_string())
+        .chain((2..100).map(|suffix| format!("{branch_slug}-{suffix}")));
+    let mut chosen_slug = None;
     for candidate in candidates {
         if !git_worktree_service::branch_name_taken(root, &format!("{prefix}{candidate}"))? {
-            chosen_name = Some(candidate);
+            chosen_slug = Some(candidate);
             break;
         }
     }
-    let Some(name) = chosen_name else {
+    let Some(slug) = chosen_slug else {
         return Ok(None);
     };
-    let new_branch = format!("{prefix}{name}");
+    let new_branch = format!("{prefix}{slug}");
 
     git_worktree_service::rename_branch(root, &old_branch, &new_branch)?;
     if let Err(err) =
-        workspace_repository::update_name_and_branch(&state.db, workspace_id, &name, &new_branch)
+        workspace_repository::update_name_and_branch(&state.db, workspace_id, new_name, &new_branch)
     {
         if let Err(revert_err) = git_worktree_service::rename_branch(root, &new_branch, &old_branch)
         {
@@ -316,9 +317,30 @@ pub fn rename_workspace(
     workspace_id: &str,
     new_name: &str,
 ) -> Result<WorkspaceSummary, String> {
-    let name = new_name
-        .trim()
-        .chars()
+    let name = new_name.split_whitespace().collect::<Vec<_>>().join(" ");
+    if name.is_empty() {
+        return Err("A workspace name can't be empty".to_string());
+    }
+    let summary = workspace_repository::get(&state.db, workspace_id)?;
+    if name == summary.name {
+        return Ok(summary);
+    }
+    let slug = branch_slug(&name);
+    if !slug.is_empty() {
+        if let Some(renamed) =
+            rename_unpublished_workspace(state, workspace_id, &summary.name, &name, &slug)?
+        {
+            return Ok(renamed);
+        }
+    }
+    workspace_repository::update_name_and_branch(&state.db, workspace_id, &name, &summary.branch)?;
+    workspace_repository::get(&state.db, workspace_id)
+}
+
+/// A workspace name as a branch's last segment: lowercase letters and
+/// digits joined by dashes, as in "Fix the login page" to "fix-the-login-page".
+pub fn branch_slug(name: &str) -> String {
+    name.chars()
         .map(|character| {
             if character.is_ascii_alphanumeric() {
                 character.to_ascii_lowercase()
@@ -330,20 +352,7 @@ pub fn rename_workspace(
         .split('-')
         .filter(|part| !part.is_empty())
         .collect::<Vec<_>>()
-        .join("-");
-    if name.is_empty() {
-        return Err("A workspace name needs at least one letter or number".to_string());
-    }
-    let summary = workspace_repository::get(&state.db, workspace_id)?;
-    if name == summary.name {
-        return Ok(summary);
-    }
-    if let Some(renamed) = rename_unpublished_workspace(state, workspace_id, &summary.name, &name)?
-    {
-        return Ok(renamed);
-    }
-    workspace_repository::update_name_and_branch(&state.db, workspace_id, &name, &summary.branch)?;
-    workspace_repository::get(&state.db, workspace_id)
+        .join("-")
 }
 
 /// Settings key holding the pairs of workspaces that are linked together.
