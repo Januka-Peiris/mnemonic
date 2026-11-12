@@ -752,6 +752,9 @@ pub struct WorkspaceView {
     auto_fix_attempts: u32,
     last_auto_fix_at: Option<Instant>,
     auto_fix_state: SharedString,
+    /// The auto-fix state the right panel last drew, so it redraws only
+    /// when that changes.
+    auto_fix_shown: (bool, SharedString),
     /// Set after one all-clear poll; a second in a row ends the loop. A
     /// review that starts a moment after the checks finish is caught by it.
     auto_fix_confirming: bool,
@@ -2743,6 +2746,52 @@ impl WorkspaceView {
 
     /// Redraws the surfaces that show the workspace name: the host tab and
     /// the side panels, which reload from the database when rendered.
+    fn notify_detail_panel(&self, cx: &mut Context<Self>) {
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+        if let Some(panel) = workspace.read(cx).panel::<WorkspaceDetailPanel>(cx) {
+            panel.update(cx, |_, cx| cx.notify());
+        }
+    }
+
+    /// The Keep CI green toggle and its state, shown in the right panel's
+    /// header for the selected workspace.
+    pub(crate) fn render_auto_fix_controls(&self, this: WeakEntity<Self>) -> AnyElement {
+        h_flex()
+            .gap_0p5()
+            .items_center()
+            .when(!self.auto_fix_state.is_empty(), |el| {
+                el.child(
+                    Label::new(self.auto_fix_state.clone())
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted),
+                )
+            })
+            .child(
+                IconButton::new("auto-fix-toggle", IconName::CheckDouble)
+                    .icon_size(IconSize::Small)
+                    .icon_color(if self.auto_fix_enabled {
+                        Color::Accent
+                    } else {
+                        Color::Muted
+                    })
+                    .tooltip(Tooltip::text(if self.auto_fix_enabled {
+                        "Keeping this PR green and clear: watching its checks and \
+                         Greptile's review comments, and having the agent fix both. \
+                         It doesn't merge the PR. Click to stop"
+                    } else {
+                        "Keep CI green: watch this PR's checks and Greptile's review \
+                         comments, and have the agent fix and push until the checks \
+                         pass and the comments are dealt with. It doesn't merge the PR"
+                    }))
+                    .on_click(move |_, _, cx| {
+                        this.update(cx, |this, cx| this.toggle_auto_fix(cx)).log_err();
+                    }),
+            )
+            .into_any_element()
+    }
+
     fn refresh_workspace_chrome(&self, cx: &mut Context<Self>) {
         let Some(workspace) = self.workspace.upgrade() else {
             return;
@@ -4359,6 +4408,11 @@ impl WorkspaceHost {
                         for pane in view.center.panes() {
                             pane.update(cx, |_, cx| cx.notify());
                         }
+                        let auto_fix = (view.auto_fix_enabled, view.auto_fix_state.clone());
+                        if auto_fix != view.auto_fix_shown {
+                            view.auto_fix_shown = auto_fix;
+                            view.notify_detail_panel(cx);
+                        }
                     }),
                     diagnostic_summary: DiagnosticSummary::default(),
                     _diagnostics_updated: cx.subscribe(
@@ -4406,6 +4460,7 @@ impl WorkspaceHost {
                     auto_fix_attempts: 0,
                     last_auto_fix_at: None,
                     auto_fix_state: SharedString::default(),
+                    auto_fix_shown: (false, SharedString::default()),
                     auto_fix_confirming: false,
                     auto_fix_task: None,
                     auto_naming: AutoNaming::Waiting,
@@ -4690,7 +4745,11 @@ impl WorkspaceHost {
         true
     }
 
-    fn view_in(workspace: &Workspace, workspace_id: &str, cx: &App) -> Option<Entity<WorkspaceView>> {
+    pub(crate) fn view_in(
+        workspace: &Workspace,
+        workspace_id: &str,
+        cx: &App,
+    ) -> Option<Entity<WorkspaceView>> {
         workspace.panes().iter().find_map(|pane| {
             pane.read(cx)
                 .items()
