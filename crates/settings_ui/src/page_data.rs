@@ -8381,7 +8381,7 @@ fn workspaces_page() -> SettingsPage {
             }),
             SettingsPageItem::SettingItem(SettingItem {
                 title: "Keep CI Green",
-                description: "Whether creating a pull request also starts watching its CI and has the agent fix failing checks until they pass.",
+                description: "Whether creating a pull request also starts watching its CI and Greptile's review comments, and has the agent fix failing checks and deal with the comments until the PR is green and clear. It doesn't merge the PR.",
                 field: Box::new(SettingField {
                     organization_override: None,
                     json_path: Some("workspaces.keep_ci_green"),

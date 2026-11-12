@@ -20,6 +20,8 @@ use gpui::{
 use mnemonic_bridge::AgentAttention;
 use mnemonic_core::models::{ChatSessionRecord, WorkspaceSummary};
 use mnemonic_core::repositories::{chat_session_repository, workspace_repository};
+use mnemonic_core::services::chat_transcript_service::{self, LinkedChat};
+use mnemonic_core::services::pr_draft_service::OpenReviewComment;
 use mnemonic_core::services::workspace_script_service::RunCommandPlan;
 use mnemonic_core::services::{
     checkpoint_service, terminal_service, workspace_script_service, workspace_service,
@@ -715,10 +717,15 @@ pub struct WorkspaceView {
     auto_fix_attempts: u32,
     last_auto_fix_at: Option<Instant>,
     auto_fix_state: SharedString,
+    /// Set after one all-clear poll; a second in a row ends the loop. A
+    /// review that starts a moment after the checks finish is caught by it.
+    auto_fix_confirming: bool,
     auto_fix_task: Option<gpui::Task<()>>,
-    /// Set once the placeholder name has been considered for renaming, so
-    /// later messages never rename the branch again.
-    branch_rename_started: bool,
+    /// How far automatic naming has got for this workspace.
+    auto_naming: AutoNaming,
+    /// Names the workspace from its first message if the agent hasn't sent
+    /// a chat title by then.
+    auto_naming_fallback: Option<gpui::Task<()>>,
     run_command_count: usize,
     run_tooltip: SharedString,
     run_starting: bool,
@@ -2089,12 +2096,16 @@ impl WorkspaceView {
                 }),
                 cx.subscribe(&thread, move |this, thread, event, cx| {
                     if releases_pending(event) {
+                        this.save_chat_transcript(view_id, &thread, cx);
                         this.flush_pending(view_id, cx);
                         cx.notify();
                     }
                     if matches!(event, acp_thread::AcpThreadEvent::NewEntry) {
                         this.checkpoint_new_user_message(&thread, cx);
                         this.name_workspace_from_thread(view_id, &thread, cx);
+                    }
+                    if matches!(event, acp_thread::AcpThreadEvent::TitleUpdated) {
+                        this.name_workspace_from_title(view_id, &thread, cx);
                     }
                     this.raise_thread_attention(view_id, &thread, event, cx);
                 }),
@@ -2138,6 +2149,225 @@ impl WorkspaceView {
                 self.flush_pending(view_id, cx);
             }
         }
+    }
+
+    /// A chat's transcript as it stands, with what's needed to save it.
+    fn chat_transcript(
+        &self,
+        view_id: EntityId,
+        thread: &Entity<acp_thread::AcpThread>,
+        cx: &App,
+    ) -> Option<(String, String, String)> {
+        let session = self.sessions.get(self.chat_index(view_id)?)?;
+        let chat = session.chat()?;
+        let thread = thread.read(cx);
+        if thread.entries().is_empty() {
+            return None;
+        }
+        Some((
+            chat.record_id.clone(),
+            session.title.to_string(),
+            thread.to_markdown(cx),
+        ))
+    }
+
+    /// Saves the chat as a file when a turn ends, off the main thread, so
+    /// a linked workspace can open it or give it to its agent.
+    fn save_chat_transcript(
+        &self,
+        view_id: EntityId,
+        thread: &Entity<acp_thread::AcpThread>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((chat_id, title, markdown)) = self.chat_transcript(view_id, thread, cx) else {
+            return;
+        };
+        let workspace_id = self.workspace_id.clone();
+        let workspace_name = self.workspace_name.to_string();
+        cx.background_spawn(async move {
+            let Some(state) = mnemonic_bridge::mnemonic_state_cloned() else {
+                return;
+            };
+            if let Err(err) = chat_transcript_service::save_transcript(
+                &state,
+                &workspace_id,
+                &chat_id,
+                &title,
+                &workspace_name,
+                &markdown,
+            ) {
+                log::error!("Failed to save the chat transcript: {err}");
+            }
+        })
+        .detach();
+    }
+
+    /// Saves every open chat right now, so a linked workspace about to list
+    /// them sees turns that are still running.
+    fn save_chat_transcripts_now(&self, cx: &App) {
+        let state = mnemonic_bridge::mnemonic_state(cx);
+        for chat in self.sessions.iter().filter_map(WorkspaceSession::chat) {
+            let Some(thread) = chat.view.read(cx).root_thread(cx) else {
+                continue;
+            };
+            let Some((chat_id, title, markdown)) =
+                self.chat_transcript(chat.view.entity_id(), &thread, cx)
+            else {
+                continue;
+            };
+            if let Err(err) = chat_transcript_service::save_transcript(
+                &state,
+                &self.workspace_id,
+                &chat_id,
+                &title,
+                &self.workspace_name,
+                &markdown,
+            ) {
+                log::error!("Failed to save the chat transcript: {err}");
+            }
+        }
+    }
+
+    /// The chats of the workspaces linked to this one, freshly saved where
+    /// their workspace is open in some window.
+    fn linked_chats(&self, cx: &App) -> Vec<LinkedChat> {
+        let state = mnemonic_bridge::mnemonic_state(cx);
+        match workspace_service::linked_workspaces(&state, &self.workspace_id) {
+            Ok(linked) => {
+                for workspace in open_windows(cx) {
+                    for summary in &linked {
+                        let view = WorkspaceHost::view_in(workspace.read(cx), &summary.id, cx);
+                        if let Some(view) = view {
+                            view.read(cx).save_chat_transcripts_now(cx);
+                        }
+                    }
+                }
+            }
+            Err(err) => log::error!("Failed to read linked workspaces: {err}"),
+        }
+        chat_transcript_service::linked_chats(&state, &self.workspace_id).unwrap_or_else(|err| {
+            log::error!("Failed to list linked chats: {err}");
+            Vec::new()
+        })
+    }
+
+    /// Adds a file to the message being written in the active session: a
+    /// mention in a chat, or its path typed into an agent's terminal.
+    fn attach_file_to_active_session(
+        &mut self,
+        path: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(session) = self.sessions.get(self.active_session) else {
+            return;
+        };
+        if let Some(terminal) = session.terminal().cloned() {
+            terminal.update(cx, |terminal, cx| {
+                terminal.add_paths_to_terminal(&[path], window, cx);
+            });
+            return;
+        }
+        let (Some(chat), Some(project)) = (
+            session.chat().map(|chat| chat.view.clone()),
+            self.project.upgrade(),
+        ) else {
+            return;
+        };
+        let project_path = Workspace::project_path_for_path(project, &path, false, cx);
+        window
+            .spawn(cx, async move |cx| {
+                let Some((worktree, project_path)) = project_path.await.log_err() else {
+                    return;
+                };
+                chat.update_in(cx, |chat, window, cx| {
+                    chat.insert_dragged_files(vec![project_path], vec![worktree], window, cx);
+                })
+                .log_err();
+            })
+            .detach();
+    }
+
+    /// Opens a saved chat as text in a tab, where any part of it can be
+    /// selected and copied.
+    fn open_transcript(&self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+        workspace.update(cx, |workspace, cx| {
+            workspace
+                .open_abs_path(path, workspace::OpenOptions::default(), window, cx)
+                .detach_and_log_err(cx);
+        });
+    }
+
+    /// A menu of the linked workspaces' chats: open one to read it, or add
+    /// it to the message being written so the agent reads it.
+    fn render_linked_chats_menu(&self, this: WeakEntity<Self>) -> Option<AnyElement> {
+        if !mnemonic_bridge::has_linked_workspaces(&self.workspace_id) {
+            return None;
+        }
+        Some(
+            PopoverMenu::new("workspace-linked-chats-menu")
+                .anchor(Anchor::TopRight)
+                .trigger(
+                    IconButton::new("workspace-linked-chats", IconName::Link)
+                        .icon_size(IconSize::Small)
+                        .icon_color(Color::Muted)
+                        .tooltip(Tooltip::text("Chats from linked workspaces")),
+                )
+                .menu(move |window, cx| {
+                    let chats = this
+                        .read_with(cx, |this, cx| this.linked_chats(cx))
+                        .unwrap_or_default();
+                    let this = this.clone();
+                    Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
+                        if chats.is_empty() {
+                            return menu.label("The linked workspaces have no chats yet");
+                        }
+                        let mut current_workspace = None;
+                        for chat in chats {
+                            if current_workspace.as_ref() != Some(&chat.workspace_id) {
+                                current_workspace = Some(chat.workspace_id.clone());
+                                menu = menu.header(chat.workspace_name.clone());
+                            }
+                            let Some(transcript) = chat.transcript else {
+                                menu = menu.label(format!(
+                                    "{}: open this chat in its workspace once to make it available",
+                                    chat.title
+                                ));
+                                continue;
+                            };
+                            menu = menu
+                                .entry(format!("Open \"{}\"", chat.title), None, {
+                                    let this = this.clone();
+                                    let transcript = transcript.clone();
+                                    move |window, cx| {
+                                        this.update(cx, |this, cx| {
+                                            this.open_transcript(transcript.clone(), window, cx);
+                                        })
+                                        .log_err();
+                                    }
+                                })
+                                .entry(format!("Add \"{}\" to My Message", chat.title), None, {
+                                    let this = this.clone();
+                                    move |window, cx| {
+                                        this.update(cx, |this, cx| {
+                                            this.attach_file_to_active_session(
+                                                transcript.clone(),
+                                                window,
+                                                cx,
+                                            );
+                                        })
+                                        .log_err();
+                                    }
+                                });
+                        }
+                        menu
+                    }))
+                })
+                .into_any_element(),
+        )
     }
 
     /// Checkpoints the worktree when a chat turn starts, whether the message
@@ -2210,24 +2440,42 @@ impl WorkspaceView {
     /// message the user typed into a work chat. Instructions the app sent are
     /// skipped, and only messages sent live count (the thread is generating),
     /// so replaying a resumed conversation never renames.
+    /// Whether automatic naming may rename the workspace now. A name taken
+    /// from the first message may still be upgraded to the chat's title.
+    fn can_auto_name(&self, upgrading_to_title: bool) -> bool {
+        match &self.auto_naming {
+            AutoNaming::Waiting => is_generated_workspace_name(&self.workspace_name),
+            AutoNaming::FromMessage(name) => upgrading_to_title && *name == self.workspace_name,
+            AutoNaming::Renaming | AutoNaming::Finished => false,
+        }
+    }
+
+    /// The chat this view id belongs to, unless it is a review chat, whose
+    /// title describes the review rather than the work.
+    fn naming_chat(&self, view_id: EntityId) -> Option<&ChatSession> {
+        self.chat_index(view_id)
+            .and_then(|index| self.sessions.get(index))
+            .and_then(WorkspaceSession::chat)
+            .filter(|chat| !chat.is_review)
+    }
+
+    /// When the first message goes out, names the workspace from the
+    /// agent's chat title if it already has one, and otherwise arranges for
+    /// the message itself to name it if no title arrives in time.
     fn name_workspace_from_thread(
         &mut self,
         view_id: EntityId,
         thread: &Entity<acp_thread::AcpThread>,
         cx: &mut Context<Self>,
     ) {
-        if self.branch_rename_started || !is_generated_workspace_name(&self.workspace_name) {
+        if !self.can_auto_name(false) || self.auto_naming_fallback.is_some() {
             return;
         }
-        let Some(chat) = self
-            .chat_index(view_id)
-            .and_then(|index| self.sessions.get(index))
-            .and_then(WorkspaceSession::chat)
-            .filter(|chat| !chat.is_review)
-        else {
+        let Some(chat) = self.naming_chat(view_id) else {
             return;
         };
-        let slug = {
+        let agent_label = chat.agent.label();
+        let (slug, title) = {
             let thread = thread.read(cx);
             if thread.status() != acp_thread::ThreadStatus::Generating {
                 return;
@@ -2243,23 +2491,78 @@ impl WorkspaceView {
                 }
                 branch_slug_from_message(&text).map(|slug| (index, slug))
             });
-            match first_meaningful {
+            let slug = match first_meaningful {
                 Some((index, slug)) if index + 1 == entries.len() => slug,
                 _ => return,
-            }
+            };
+            (slug, agent_chat_title(thread, agent_label))
         };
-        self.rename_placeholder_workspace(slug, cx);
-    }
-
-    /// Renames the workspace and its branch to `<prefix>/<slug>` off the main
-    /// thread. The core service refuses when the branch was pushed or a PR
-    /// exists; failures are logged and never affect the message being sent.
-    fn rename_placeholder_workspace(&mut self, slug: String, cx: &mut Context<Self>) {
-        if self.branch_rename_started || !is_generated_workspace_name(&self.workspace_name) {
+        if let Some(title) = title {
+            self.name_workspace_after_title(title, cx);
             return;
         }
-        self.branch_rename_started = true;
+        self.auto_naming_fallback = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(WAIT_FOR_CHAT_TITLE).await;
+            this.update(cx, |this, cx| {
+                this.auto_naming_fallback = None;
+                this.rename_placeholder_workspace(name_from_slug(&slug), slug, false, cx);
+            })
+            .ok();
+        }));
+    }
+
+    /// Names the workspace after the agent's title for the chat, which
+    /// summarises the task far better than the first words of a message.
+    fn name_workspace_from_title(
+        &mut self,
+        view_id: EntityId,
+        thread: &Entity<acp_thread::AcpThread>,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.can_auto_name(true) {
+            return;
+        }
+        let Some(chat) = self.naming_chat(view_id) else {
+            return;
+        };
+        let thread = thread.read(cx);
+        let has_user_message = thread
+            .entries()
+            .iter()
+            .any(|entry| matches!(entry, acp_thread::AgentThreadEntry::UserMessage(_)));
+        if !has_user_message {
+            return;
+        }
+        if let Some(title) = agent_chat_title(thread, chat.agent.label()) {
+            self.name_workspace_after_title(title, cx);
+        }
+    }
+
+    fn name_workspace_after_title(&mut self, title: String, cx: &mut Context<Self>) {
+        let Some(slug) = branch_slug_from_message(&title) else {
+            return;
+        };
+        self.auto_naming_fallback = None;
+        self.rename_placeholder_workspace(title, slug, true, cx);
+    }
+
+    /// Renames the workspace to `name` and its branch to `<prefix>/<slug>`
+    /// off the main thread. The core service refuses when the branch was
+    /// pushed or a PR exists; failures are logged and never affect the
+    /// message being sent.
+    fn rename_placeholder_workspace(
+        &mut self,
+        name: String,
+        slug: String,
+        from_title: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.can_auto_name(from_title) {
+            return;
+        }
+        self.auto_naming = AutoNaming::Renaming;
         if mnemonic_bridge::pr_state(&self.workspace_id).is_some() {
+            self.auto_naming = AutoNaming::Finished;
             return;
         }
         let workspace_id = self.workspace_id.clone();
@@ -2274,21 +2577,31 @@ impl WorkspaceView {
                         &state,
                         &workspace_id,
                         &expected_name,
+                        &name,
                         &slug,
                     )
                 })
                 .await;
-            let summary = match result {
-                Ok(Some(summary)) => summary,
-                Ok(None) => return,
-                Err(err) => {
-                    log::error!("Failed to rename workspace branch: {err}");
-                    return;
-                }
-            };
-            log::info!("Renamed workspace to {} ({})", summary.name, summary.branch);
             this.update(cx, |this, cx| {
+                let summary = match result {
+                    Ok(Some(summary)) => summary,
+                    Ok(None) => {
+                        this.auto_naming = AutoNaming::Finished;
+                        return;
+                    }
+                    Err(err) => {
+                        log::error!("Failed to rename workspace branch: {err}");
+                        this.auto_naming = AutoNaming::Finished;
+                        return;
+                    }
+                };
+                log::info!("Renamed workspace to {} ({})", summary.name, summary.branch);
                 this.workspace_name = SharedString::from(summary.name);
+                this.auto_naming = if from_title {
+                    AutoNaming::Finished
+                } else {
+                    AutoNaming::FromMessage(this.workspace_name.clone())
+                };
                 this.refresh_workspace_chrome(cx);
                 cx.notify();
             })
@@ -2781,8 +3094,10 @@ impl WorkspaceView {
             }
         };
         if source == MessageSource::User {
+            // An agent in a terminal sends no chat title, so its first
+            // message names the workspace straight away.
             if let Some(slug) = branch_slug_from_message(&text) {
-                self.rename_placeholder_workspace(slug, cx);
+                self.rename_placeholder_workspace(name_from_slug(&slug), slug, false, cx);
             }
         }
         let Some(agent_view) = self.sessions.get(index).and_then(WorkspaceSession::terminal)
@@ -2811,9 +3126,10 @@ impl WorkspaceView {
         }
     }
 
-    /// Toggles the poll → fix → push loop: GitHub checks are polled, and
-    /// while they're failing the agent is periodically instructed to
-    /// investigate, fix, and push, until checks go green or attempts run out.
+    /// Toggles the poll → fix → push loop: the PR's checks and the review
+    /// bot's comments are polled, and while checks fail or comments are
+    /// open the agent is periodically instructed to fix and push, until the
+    /// PR is green and clear or attempts run out.
     fn toggle_auto_fix(&mut self, cx: &mut Context<Self>) {
         if self.auto_fix_enabled {
             self.auto_fix_enabled = false;
@@ -2826,7 +3142,8 @@ impl WorkspaceView {
         self.auto_fix_enabled = true;
         self.auto_fix_attempts = 0;
         self.last_auto_fix_at = None;
-        self.auto_fix_state = SharedString::from("watching CI");
+        self.auto_fix_confirming = false;
+        self.auto_fix_state = SharedString::from("watching CI and reviews");
         let workspace_id = self.workspace_id.clone();
         self.auto_fix_task = Some(cx.spawn(async move |this, cx| {
             loop {
@@ -2834,20 +3151,36 @@ impl WorkspaceView {
                 let Some(state) = mnemonic_bridge::mnemonic_state_cloned() else {
                     continue;
                 };
-                let status = {
+                let polled = {
                     let workspace_id = workspace_id.clone();
                     cx.background_spawn(async move {
-                        mnemonic_core::services::pr_draft_service::get_workspace_pr_status(
-                            &state,
-                            &workspace_id,
-                        )
+                        use mnemonic_core::services::pr_draft_service;
+                        let status =
+                            pr_draft_service::get_workspace_pr_status(&state, &workspace_id)?;
+                        // None when the comments couldn't be read, so a
+                        // failed lookup is never mistaken for "no comments".
+                        let review_comments = match status.url.as_deref() {
+                            Some(url) if status.found => {
+                                match pr_draft_service::get_open_review_comments(url) {
+                                    Ok(comments) => Some(comments),
+                                    Err(err) => {
+                                        log::warn!("Couldn't read review comments: {err}");
+                                        None
+                                    }
+                                }
+                            }
+                            _ => Some(Vec::new()),
+                        };
+                        Ok::<_, String>((status, review_comments))
                     })
                     .await
                 };
-                let Ok(status) = status else {
+                let Ok((status, review_comments)) = polled else {
                     continue;
                 };
-                match this.update(cx, |this, cx| this.handle_auto_fix_status(&status, cx)) {
+                match this.update(cx, |this, cx| {
+                    this.handle_auto_fix_status(&status, review_comments.as_deref(), cx)
+                }) {
                     Ok(true) => {}
                     Ok(false) | Err(_) => break,
                 }
@@ -2861,6 +3194,7 @@ impl WorkspaceView {
     fn handle_auto_fix_status(
         &mut self,
         status: &mnemonic_core::models::WorkspacePrStatus,
+        review_comments: Option<&[OpenReviewComment]>,
         cx: &mut Context<Self>,
     ) -> bool {
         if !self.auto_fix_enabled {
@@ -2893,14 +3227,26 @@ impl WorkspaceView {
             .iter()
             .any(|check| !check.status.eq_ignore_ascii_case("completed"));
 
-        if !failing.is_empty() || conflicts {
+        // Review comments wait for the checks to settle, so a review that
+        // is still being written isn't acted on half-read. Failing CI is
+        // acted on at once and takes any open comments along.
+        let open_comments = review_comments.unwrap_or_default();
+        let comments_ready = !any_pending && !open_comments.is_empty();
+
+        if !failing.is_empty() || conflicts || comments_ready {
+            self.auto_fix_confirming = false;
+            let what = match (!failing.is_empty() || conflicts, !open_comments.is_empty()) {
+                (true, true) => "CI failing and review comments open",
+                (true, false) => "CI failing",
+                (false, _) => "review comments open",
+            };
             if self.auto_fix_attempts >= AUTO_FIX_MAX_ATTEMPTS {
                 self.auto_fix_enabled = false;
                 self.auto_fix_state =
                     SharedString::from(format!("gave up after {AUTO_FIX_MAX_ATTEMPTS} attempts"));
                 self.show_workspace_toast(
                     format!(
-                        "{}: CI still failing after {AUTO_FIX_MAX_ATTEMPTS} fix attempts, needs you",
+                        "{}: {what} after {AUTO_FIX_MAX_ATTEMPTS} fix attempts, needs you",
                         self.workspace_name
                     ),
                     cx,
@@ -2929,14 +3275,25 @@ impl WorkspaceView {
             if !failing.is_empty() {
                 problems.push(format!("these CI checks failed: {}", failing.join(", ")));
             }
-            let prompt = format!(
-                "CI status on this PR needs fixing (attempt {}/{}): {}. \
-                 Use `gh pr checks` and `gh run view --log-failed` to inspect the failures \
-                 (and resolve any merge conflicts by merging the base branch), fix the \
-                 problems, commit, and push.",
-                self.auto_fix_attempts,
-                AUTO_FIX_MAX_ATTEMPTS,
-                problems.join("; "),
+            let mut prompt = format!(
+                "This PR isn't green and clear yet (attempt {}/{}).",
+                self.auto_fix_attempts, AUTO_FIX_MAX_ATTEMPTS,
+            );
+            if !problems.is_empty() {
+                prompt.push_str(&format!(
+                    " CI: {}. Use `gh pr checks` and `gh run view --log-failed` to inspect \
+                     the failures, and resolve any merge conflicts by merging the base branch.",
+                    problems.join("; "),
+                ));
+            }
+            if !open_comments.is_empty() {
+                prompt.push_str(&review_comments_instruction(open_comments));
+            }
+            // Clear is the goal. Whether the agent merges afterwards is the
+            // user's own choice, so this neither asks for it nor forbids it.
+            prompt.push_str(
+                " Fix the problems, commit, and push. The aim here is a PR that is green \
+                 and clear; that on its own isn't a request to merge it.",
             );
             self.dispatch_to_agent(prompt, cx);
             self.auto_fix_state = SharedString::from(format!(
@@ -2945,7 +3302,7 @@ impl WorkspaceView {
             ));
             self.show_workspace_toast(
                 format!(
-                    "{}: CI failing, agent fixing ({}/{})",
+                    "{}: {what}, agent fixing ({}/{})",
                     self.workspace_name, self.auto_fix_attempts, AUTO_FIX_MAX_ATTEMPTS
                 ),
                 cx,
@@ -2955,15 +3312,32 @@ impl WorkspaceView {
         }
 
         if any_pending || status.checks.is_empty() {
+            self.auto_fix_confirming = false;
             self.auto_fix_state = SharedString::from("CI running…");
             cx.notify();
             return true;
         }
+        if review_comments.is_none() {
+            self.auto_fix_confirming = false;
+            self.auto_fix_state = SharedString::from("CI green, checking reviews");
+            cx.notify();
+            return true;
+        }
+        if !self.auto_fix_confirming {
+            self.auto_fix_confirming = true;
+            self.auto_fix_state = SharedString::from("CI green, confirming reviews are clear");
+            cx.notify();
+            return true;
+        }
 
-        // Everything completed and nothing failed: done.
+        // Checks completed with none failing and no review comment is
+        // open, twice in a row: done.
         self.auto_fix_enabled = false;
-        self.auto_fix_state = SharedString::from("CI green ✓");
-        self.show_workspace_toast(format!("{}: CI green ✓", self.workspace_name), cx);
+        self.auto_fix_state = SharedString::from("CI green, reviews clear ✓");
+        self.show_workspace_toast(
+            format!("{}: CI green, reviews clear ✓", self.workspace_name),
+            cx,
+        );
         cx.notify();
         false
     }
@@ -3362,6 +3736,7 @@ impl WorkspaceView {
             .items_center()
             .when(is_first_pane, |el| {
                 el.children(self.render_diagnostics_button())
+                    .children(self.render_linked_chats_menu(this.clone()))
                     .child(self.render_run_controls(&this))
                     .when(!self.auto_fix_state.is_empty(), |el| {
                         el.child(
@@ -3379,11 +3754,13 @@ impl WorkspaceView {
                                 Color::Muted
                             })
                             .tooltip(Tooltip::text(if self.auto_fix_enabled {
-                                "Keeping CI green: watching this PR's checks and having the \
-                                 agent fix failures. Click to stop"
+                                "Keeping this PR green and clear: watching its checks and \
+                                 Greptile's review comments, and having the agent fix both. \
+                                 It doesn't merge the PR. Click to stop"
                             } else {
-                                "Keep CI green: watch this PR's checks and have the agent fix \
-                                 and push until they pass"
+                                "Keep CI green: watch this PR's checks and Greptile's review \
+                                 comments, and have the agent fix and push until the checks \
+                                 pass and the comments are dealt with. It doesn't merge the PR"
                             }))
                             .on_click({
                             let this = this.clone();
@@ -3552,6 +3929,136 @@ pub(crate) fn open_windows(cx: &App) -> Vec<Entity<Workspace>> {
     cx.try_global::<OpenWindows>()
         .map(|windows| windows.0.iter().filter_map(WeakEntity::upgrade).collect())
         .unwrap_or_default()
+}
+
+/// How much of each review comment goes into the fix instruction; the agent
+/// reads the full thread itself.
+const REVIEW_COMMENT_PREVIEW_CHARS: usize = 300;
+
+/// The part of the auto-fix instruction that lists the open review comments
+/// and says what dealing with one means.
+fn review_comments_instruction(comments: &[OpenReviewComment]) -> String {
+    let mut instruction = format!(
+        " Review: {} left {} that {} been dealt with:",
+        comments
+            .first()
+            .map_or("the reviewer", |comment| comment.author.as_str()),
+        match comments.len() {
+            1 => "1 comment".to_string(),
+            count => format!("{count} comments"),
+        },
+        if comments.len() == 1 { "hasn't" } else { "haven't" },
+    );
+    for comment in comments {
+        let location = match comment.line {
+            Some(line) => format!("{}:{line}", comment.path),
+            None => comment.path.clone(),
+        };
+        instruction.push_str(&format!(
+            "\n- {location}: {}",
+            review_comment_preview(&comment.body)
+        ));
+    }
+    instruction.push_str(
+        "\nRead the full threads with `gh`. For each comment, fix it, or if it doesn't \
+         apply, reply on its thread saying why. Reply to and resolve every thread you \
+         deal with.",
+    );
+    instruction
+}
+
+/// A review comment as one plain line: HTML badges dropped, whitespace
+/// collapsed, and cut to a preview's length.
+fn review_comment_preview(body: &str) -> String {
+    let mut text = String::new();
+    let mut in_tag = false;
+    for character in body.chars() {
+        match character {
+            '<' => in_tag = true,
+            '>' if in_tag => in_tag = false,
+            _ if !in_tag => text.push(character),
+            _ => {}
+        }
+    }
+    let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if text.chars().count() <= REVIEW_COMMENT_PREVIEW_CHARS {
+        text
+    } else {
+        let mut preview: String = text.chars().take(REVIEW_COMMENT_PREVIEW_CHARS).collect();
+        preview.push('…');
+        preview
+    }
+}
+
+/// How long to wait for the agent's chat title before naming a workspace
+/// from its first message instead.
+const WAIT_FOR_CHAT_TITLE: Duration = Duration::from_secs(60);
+/// Longer chat titles are cut at a word, so the sidebar row stays readable.
+const MAX_WORKSPACE_TITLE_CHARS: usize = 60;
+
+/// Automatic naming of a workspace that still has its placeholder name.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum AutoNaming {
+    /// Waiting for the agent's chat title (or the fallback).
+    Waiting,
+    Renaming,
+    /// Named from the first message; the chat's title may still replace it.
+    FromMessage(SharedString),
+    Finished,
+}
+
+/// The agent's own title for a chat, tidied for use as a workspace name.
+/// None while there's only a provisional title, or when the title is a
+/// placeholder like the agent's name.
+fn agent_chat_title(thread: &acp_thread::AcpThread, agent_label: &str) -> Option<String> {
+    if thread.has_provisional_title() {
+        return None;
+    }
+    clean_chat_title(&thread.title()?, agent_label)
+}
+
+fn clean_chat_title(title: &str, agent_label: &str) -> Option<String> {
+    let title = title.split_whitespace().collect::<Vec<_>>().join(" ");
+    let title = title
+        .trim_matches(|character: char| matches!(character, '"' | '\'' | '.' | ':'))
+        .trim()
+        .to_string();
+    let is_placeholder = title.is_empty()
+        || title.eq_ignore_ascii_case(agent_label)
+        || ["new thread", "new chat", "untitled", "new session"]
+            .iter()
+            .any(|placeholder| title.eq_ignore_ascii_case(placeholder));
+    if is_placeholder {
+        return None;
+    }
+    if title.chars().count() <= MAX_WORKSPACE_TITLE_CHARS {
+        return Some(title);
+    }
+    let mut cut = String::new();
+    for word in title.split(' ') {
+        if cut.chars().count() + word.chars().count() + 1 > MAX_WORKSPACE_TITLE_CHARS {
+            break;
+        }
+        if !cut.is_empty() {
+            cut.push(' ');
+        }
+        cut.push_str(word);
+    }
+    Some(if cut.is_empty() {
+        title.chars().take(MAX_WORKSPACE_TITLE_CHARS).collect()
+    } else {
+        cut
+    })
+}
+
+/// A readable name from a branch slug, as in "fix-login-page" to "Fix login page".
+fn name_from_slug(slug: &str) -> String {
+    let words = slug.replace('-', " ");
+    let mut characters = words.chars();
+    match characters.next() {
+        Some(first) => first.to_uppercase().chain(characters).collect(),
+        None => words,
+    }
 }
 
 /// The display name of a chat's agent, from the id stored with the chat.
@@ -3724,8 +4231,10 @@ impl WorkspaceHost {
                     auto_fix_attempts: 0,
                     last_auto_fix_at: None,
                     auto_fix_state: SharedString::default(),
+                    auto_fix_confirming: false,
                     auto_fix_task: None,
-                    branch_rename_started: false,
+                    auto_naming: AutoNaming::Waiting,
+                    auto_naming_fallback: None,
                     run_command_count: 0,
                     run_tooltip: SharedString::from("Reading .mnemonic/config.json…"),
                     run_starting: false,
@@ -3821,7 +4330,8 @@ impl WorkspaceHost {
                     if let Some(view) = host.views.get(workspace_id) {
                         view.update(cx, |view, cx| {
                             view.workspace_name = SharedString::from(name.to_string());
-                            view.branch_rename_started = true;
+                            view.auto_naming = AutoNaming::Finished;
+                            view.auto_naming_fallback = None;
                             cx.notify();
                         });
                     }
@@ -4191,6 +4701,24 @@ impl Render for WorkspaceHost {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_chat_title_names_the_workspace_unless_it_is_a_placeholder() {
+        assert_eq!(
+            clean_chat_title("  Unused panes and features in Zed ", "Claude").as_deref(),
+            Some("Unused panes and features in Zed")
+        );
+        assert_eq!(clean_chat_title("Claude", "Claude"), None);
+        assert_eq!(clean_chat_title("New Thread", "Codex"), None);
+        let long = "Record where the work started so reviewers can follow every capture back to its source";
+        let cut = clean_chat_title(long, "Claude").expect("a real title");
+        assert_eq!(cut, "Record where the work started so reviewers can follow every");
+        assert_eq!(
+            branch_slug_from_message("Unused panes and features in Zed").as_deref(),
+            Some("unused-panes-features-zed")
+        );
+        assert_eq!(name_from_slug("fix-login-page"), "Fix login page");
+    }
 
     fn chat(agent: ChatAgent, is_review: bool) -> SessionSummary {
         SessionSummary::Chat {

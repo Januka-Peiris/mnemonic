@@ -264,7 +264,15 @@ impl WorkspacePanel {
             Err(e) => log::error!("Failed to list repositories: {e}"),
         }
         match workspace_service::list_workspace_links(&state) {
-            Ok(links) => self.workspace_links = links,
+            Ok(links) => {
+                mnemonic_bridge::set_linked_workspaces(
+                    links
+                        .iter()
+                        .flat_map(|(first, second)| [first.clone(), second.clone()])
+                        .collect(),
+                );
+                self.workspace_links = links;
+            }
             Err(e) => log::error!("Failed to list workspace links: {e}"),
         }
         // Load persisted ordering.

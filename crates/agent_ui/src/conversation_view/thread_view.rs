@@ -5846,6 +5846,12 @@ impl ThreadView {
                     .child(
                         div()
                             .relative()
+                            // Your messages sit on the right and the agent's
+                            // on the left, so the two are told apart at a
+                            // glance when scrolling back.
+                            .when(!is_indented, |this| {
+                                this.ml_auto().w(relative(USER_MESSAGE_WIDTH))
+                            })
                             .child(
                                 div()
                                     .py_3()
@@ -6245,11 +6251,19 @@ impl ThreadView {
             return Empty.into_any_element();
         }
 
+        let copy_last_reply = Self::last_agent_reply(thread.read(cx).entries(), cx).map(|reply| {
+            CopyButton::new("copy-last-reply", reply)
+                .icon_size(IconSize::Small)
+                .tooltip_label("Copy Last Reply")
+        });
+
         let open_as_markdown = IconButton::new("open-as-markdown", IconName::FileMarkdown)
             .shape(ui::IconButtonShape::Square)
             .icon_size(IconSize::Small)
             .icon_color(Color::Ignored)
-            .tooltip(Tooltip::text("Open Thread as Markdown"))
+            .tooltip(Tooltip::text(
+                "Open Chat as Text, to Select and Copy Any Part",
+            ))
             .on_click(cx.listener(move |this, _, window, cx| {
                 if let Some(workspace) = this.workspace.upgrade() {
                     this.open_thread_as_markdown(workspace, window, cx)
@@ -6426,6 +6440,7 @@ impl ThreadView {
         }
 
         container
+            .children(copy_last_reply)
             .child(open_as_markdown)
             .child(scroll_to_recent_user_prompt)
             .child(scroll_to_top)
@@ -7066,6 +7081,32 @@ impl ThreadView {
                 })
             })
             .into_any_element()
+    }
+
+    /// The agent's final message of the latest turn, without its thinking
+    /// or the narration between tool calls.
+    fn last_agent_reply(entries: &[AgentThreadEntry], cx: &App) -> Option<String> {
+        entries
+            .iter()
+            .rev()
+            .take_while(|entry| !matches!(entry, AgentThreadEntry::UserMessage(_)))
+            .find_map(|entry| {
+                let AgentThreadEntry::AssistantMessage(message) = entry else {
+                    return None;
+                };
+                let text = message
+                    .chunks
+                    .iter()
+                    .filter_map(|chunk| match chunk {
+                        AssistantMessageChunk::Message { block } => {
+                            Some(block.to_markdown(cx)).filter(|text| !text.trim().is_empty())
+                        }
+                        AssistantMessageChunk::Thought { .. } => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n\n");
+                (!text.is_empty()).then_some(text)
+            })
     }
 
     fn get_agent_message_content(

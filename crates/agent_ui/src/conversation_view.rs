@@ -102,6 +102,9 @@ use crate::{
 };
 
 const STOPWATCH_THRESHOLD: Duration = Duration::from_secs(30);
+/// How much of the chat's width a message of yours takes, so it reads as
+/// sitting on the right.
+const USER_MESSAGE_WIDTH: f32 = 0.85;
 const TOKEN_THRESHOLD: u64 = 250;
 
 pub(crate) const DRAFT_PROMPT_PERSIST_DEBOUNCE: Duration = Duration::from_millis(250);

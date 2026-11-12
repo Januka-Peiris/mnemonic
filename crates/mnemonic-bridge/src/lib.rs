@@ -120,6 +120,28 @@ pub fn clear_agent_attention(workspace_id: &str) {
     }
 }
 
+/// Ids of the workspaces that are linked to at least one other, written by
+/// the sidebar when it reloads the links and read by workspace views to
+/// decide whether to offer the linked chats.
+static LINKED_WORKSPACES: std::sync::Mutex<Option<std::collections::HashSet<String>>> =
+    std::sync::Mutex::new(None);
+
+pub fn set_linked_workspaces(workspace_ids: std::collections::HashSet<String>) {
+    let mut guard = LINKED_WORKSPACES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    *guard = Some(workspace_ids);
+}
+
+pub fn has_linked_workspaces(workspace_id: &str) -> bool {
+    let guard = LINKED_WORKSPACES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    guard
+        .as_ref()
+        .is_some_and(|linked| linked.contains(workspace_id))
+}
+
 /// Last observed PR state per workspace ("open", "ready", "conflicts",
 /// "failed", "merged", "closed") and PR number, written by whichever
 /// component polls GitHub and read wherever the PR's state is shown.

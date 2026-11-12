@@ -974,8 +974,10 @@ pub struct WorkspacesSettingsContent {
     ///
     /// Default: "codex"
     pub review_agent: Option<ReviewAgent>,
-    /// Whether creating a pull request also starts watching its CI and has
-    /// the agent fix failing checks until they pass.
+    /// Whether creating a pull request also starts watching its CI and
+    /// Greptile's review comments, and has the agent fix failing checks and
+    /// deal with the comments until the PR is green and clear. It doesn't
+    /// merge the PR.
     ///
     /// Default: false
     pub keep_ci_green: Option<bool>,

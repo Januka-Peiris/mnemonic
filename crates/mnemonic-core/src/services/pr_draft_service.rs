@@ -760,3 +760,165 @@ fn timestamp() -> String {
         .map(|duration| duration.as_secs().to_string())
         .unwrap_or_else(|_| "0".to_string())
 }
+
+/// A review comment from a review bot that nobody has dealt with yet.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenReviewComment {
+    pub author: String,
+    pub path: String,
+    pub line: Option<i64>,
+    pub body: String,
+}
+
+/// Logins of the review bots whose comments the auto-fix loop clears.
+const REVIEW_BOT_LOGIN_PREFIXES: &[&str] = &["greptile"];
+
+const REVIEW_THREADS_QUERY: &str = "query($owner: String!, $name: String!, $number: Int!) { \
+    repository(owner: $owner, name: $name) { pullRequest(number: $number) { \
+    reviewThreads(first: 100) { nodes { isResolved isOutdated path line \
+    comments(first: 50) { nodes { author { login } body } } } } } } }";
+
+/// The review bot's comments on a PR that still need dealing with. A thread
+/// counts as dealt with once it is resolved, the code under it has changed,
+/// or someone has replied to the bot, so the loop always ends.
+pub fn get_open_review_comments(pr_url: &str) -> Result<Vec<OpenReviewComment>, String> {
+    let (owner, name, number) = parse_pr_url(pr_url)
+        .ok_or_else(|| format!("Couldn't read the repository from {pr_url}"))?;
+    let output = std::process::Command::new(gh_binary())
+        .args([
+            "api",
+            "graphql",
+            "-f",
+            &format!("query={REVIEW_THREADS_QUERY}"),
+            "-F",
+            &format!("owner={owner}"),
+            "-F",
+            &format!("name={name}"),
+            "-F",
+            &format!("number={number}"),
+        ])
+        .output()
+        .map_err(|err| format!("Failed to run gh: {err}"))?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+    }
+    let value = serde_json::from_slice::<Value>(&output.stdout)
+        .map_err(|err| format!("Failed to parse the PR's review threads: {err}"))?;
+    Ok(parse_open_review_comments(&value))
+}
+
+/// `(owner, repository, number)` from a PR's web address.
+fn parse_pr_url(url: &str) -> Option<(String, String, i64)> {
+    let mut parts = url
+        .trim()
+        .trim_end_matches('/')
+        .split("://")
+        .nth(1)?
+        .split('/')
+        .skip(1);
+    let owner = parts.next()?.to_string();
+    let name = parts.next()?.to_string();
+    if parts.next()? != "pull" {
+        return None;
+    }
+    let number = parts.next()?.parse().ok()?;
+    Some((owner, name, number))
+}
+
+fn is_review_bot(login: &str) -> bool {
+    let login = login.to_ascii_lowercase();
+    REVIEW_BOT_LOGIN_PREFIXES
+        .iter()
+        .any(|prefix| login.starts_with(prefix))
+}
+
+fn parse_open_review_comments(value: &Value) -> Vec<OpenReviewComment> {
+    let threads = value
+        .pointer("/data/repository/pullRequest/reviewThreads/nodes")
+        .and_then(Value::as_array);
+    let mut open = Vec::new();
+    for thread in threads.into_iter().flatten() {
+        let flag = |name: &str| thread.get(name).and_then(Value::as_bool).unwrap_or(false);
+        if flag("isResolved") || flag("isOutdated") {
+            continue;
+        }
+        let comments = thread
+            .pointer("/comments/nodes")
+            .and_then(Value::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        let login = |comment: &Value| {
+            comment
+                .pointer("/author/login")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string()
+        };
+        let (Some(first), Some(last)) = (comments.first(), comments.last()) else {
+            continue;
+        };
+        let author = login(first);
+        if !is_review_bot(&author) || !is_review_bot(&login(last)) {
+            continue;
+        }
+        open.push(OpenReviewComment {
+            author,
+            path: thread
+                .get("path")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            line: thread.get("line").and_then(Value::as_i64),
+            body: first
+                .get("body")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+        });
+    }
+    open
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_bot_threads_nobody_has_dealt_with_stay_open() {
+        let thread = |resolved: bool, outdated: bool, authors: &[&str]| {
+            serde_json::json!({
+                "isResolved": resolved,
+                "isOutdated": outdated,
+                "path": "src/app.ts",
+                "line": 12,
+                "comments": { "nodes": authors.iter().map(|author| serde_json::json!({
+                    "author": { "login": author },
+                    "body": format!("comment by {author}"),
+                })).collect::<Vec<_>>() },
+            })
+        };
+        let value = serde_json::json!({ "data": { "repository": { "pullRequest": {
+            "reviewThreads": { "nodes": [
+                thread(false, false, &["greptile-apps"]),
+                thread(true, false, &["greptile-apps"]),
+                thread(false, true, &["greptile-apps"]),
+                thread(false, false, &["greptile-apps", "Januka-Peiris"]),
+                thread(false, false, &["a-teammate"]),
+            ] }
+        } } } });
+
+        assert_eq!(
+            parse_open_review_comments(&value),
+            vec![OpenReviewComment {
+                author: "greptile-apps".to_string(),
+                path: "src/app.ts".to_string(),
+                line: Some(12),
+                body: "comment by greptile-apps".to_string(),
+            }]
+        );
+        assert_eq!(
+            parse_pr_url("https://github.com/axe-payments/sidekick-analytics/pull/622"),
+            Some(("axe-payments".to_string(), "sidekick-analytics".to_string(), 622))
+        );
+    }
+}
