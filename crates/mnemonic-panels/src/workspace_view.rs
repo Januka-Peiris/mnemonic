@@ -43,7 +43,7 @@ use workspace::item::{Item, ItemEvent, ItemHandle};
 use workspace::notifications::{DetachAndPromptErr as _, NotificationId};
 use workspace::{
     ActivatePaneDown, ActivatePaneLeft, ActivatePaneRight, ActivatePaneUp, DraggedTab, Pane,
-    Member, PaneAxis, PaneGroup, PaneRenderContext, SaveIntent, SplitDirection, SplitMode, Toast,
+    Member, PaneAxis, PaneGroup, PaneRenderContext, SaveIntent, SplitDirection, Toast,
     Workspace,
     WorkspaceId, pane,
 };
@@ -1156,6 +1156,7 @@ impl WorkspaceView {
             pane.display_nav_history_buttons(None);
             pane.set_should_display_tab_bar(|_, _| true);
             pane.set_can_toggle_zoom(false, cx);
+            pane.set_split_in_tab_menu(true);
             pane.set_can_split(Some(Arc::new({
                 let this = this.clone();
                 move |pane, dragged, _window, cx| {
@@ -1168,16 +1169,13 @@ impl WorkspaceView {
             })));
             pane.set_render_tab_bar_buttons(cx, {
                 let this = this.clone();
-                move |pane, _window, cx| {
+                move |_pane, _window, cx| {
                     let Some(view) = this.upgrade() else {
                         return (None, None);
                     };
-                    let controls = view.read(cx).render_pane_controls(
-                        this.clone(),
-                        cx.entity(),
-                        pane.items_len() > 1,
-                        cx,
-                    );
+                    let controls =
+                        view.read(cx)
+                            .render_pane_controls(this.clone(), cx.entity(), cx);
                     (None, Some(controls))
                 }
             });
@@ -3858,7 +3856,6 @@ impl WorkspaceView {
         &self,
         this: WeakEntity<Self>,
         pane: Entity<Pane>,
-        can_split: bool,
         cx: &App,
     ) -> AnyElement {
         let is_first_pane = self.center.first_pane() == pane;
@@ -3870,78 +3867,35 @@ impl WorkspaceView {
             .when(is_first_pane, |el| {
                 el.children(self.render_diagnostics_button())
                     .children(self.render_linked_chats_menu(this.clone()))
-                    .child(self.render_run_controls(&this))
-                    .when(!self.auto_fix_state.is_empty(), |el| {
-                        el.child(
-                            Label::new(self.auto_fix_state.clone())
-                                .size(LabelSize::XSmall)
-                                .color(Color::Muted),
-                        )
-                    })
-                    .child(
-                        IconButton::new("auto-fix-toggle", IconName::CheckDouble)
-                            .icon_size(IconSize::Small)
-                            .icon_color(if self.auto_fix_enabled {
-                                Color::Accent
-                            } else {
-                                Color::Muted
-                            })
-                            .tooltip(Tooltip::text(if self.auto_fix_enabled {
-                                "Keeping this PR green and clear: watching its checks and \
-                                 Greptile's review comments, and having the agent fix both. \
-                                 It doesn't merge the PR. Click to stop"
-                            } else {
-                                "Keep CI green: watch this PR's checks and Greptile's review \
-                                 comments, and have the agent fix and push until the checks \
-                                 pass and the comments are dealt with. It doesn't merge the PR"
-                            }))
-                            .on_click({
-                            let this = this.clone();
-                            move |_, _, cx| {
-                                this.update(cx, |this, cx| this.toggle_auto_fix(cx))
-                                    .log_err();
-                            }
-                        }),
-                    )
                     .children(self.render_status_chip(cx))
             })
-            .when(can_split, |el| {
-                let pane = pane.clone();
-                el.child(
-                    PopoverMenu::new("workspace-split-menu")
-                        .anchor(Anchor::TopRight)
-                        .trigger(
-                            IconButton::new("workspace-split", IconName::Split)
-                                .icon_size(IconSize::Small)
-                                .tooltip(Tooltip::text("Move this tab into a split")),
-                        )
-                        .menu(move |window, cx| {
-                            let pane = pane.clone();
-                            Some(ContextMenu::build(window, cx, move |menu, _, _| {
-                                [
-                                    ("Split Right", SplitDirection::Right),
-                                    ("Split Down", SplitDirection::Down),
-                                ]
-                                .into_iter()
-                                .fold(menu, |menu, (label, direction)| {
-                                    let pane = pane.clone();
-                                    menu.entry(label, None, move |window, cx| {
-                                        pane.update(cx, |pane, cx| {
-                                            pane.split(direction, SplitMode::MovePane, window, cx);
-                                        });
-                                    })
-                                })
-                            }))
-                        }),
-                )
-            })
+            .child(
+                IconButton::new("workspace-new-chat", IconName::Plus)
+                    .icon_size(IconSize::Small)
+                    .tooltip(Tooltip::text("New chat"))
+                    .on_click({
+                        let this = this.clone();
+                        let pane = pane.clone();
+                        move |_, window, cx| {
+                            this.update(cx, |this, cx| {
+                                this.active_pane = pane.clone();
+                                this.add_session(
+                                    NewSession::from(AgentSessionKind::ClaudeChat),
+                                    window,
+                                    cx,
+                                );
+                            })
+                            .log_err();
+                        }
+                    }),
+            )
             .child(
                 PopoverMenu::new("workspace-add-session-menu")
                     .anchor(Anchor::TopRight)
                     .trigger(
-                        IconButton::new("workspace-add-session", IconName::Plus)
-                            .icon_size(IconSize::Small)
-                            .tooltip(Tooltip::text("New session in this workspace")),
+                        IconButton::new("workspace-add-session", IconName::ChevronDown)
+                            .icon_size(IconSize::XSmall)
+                            .tooltip(Tooltip::text("New session with another agent")),
                     )
                     .menu(move |window, cx| {
                         let this = this.clone();
@@ -3951,14 +3905,13 @@ impl WorkspaceView {
                             let chats = agents.into_iter().map(|agent| {
                                 (format!("{} chat", agent.label()), NewSession::Chat(agent))
                             });
-                            let terminals = [
+                            let clis = [
                                 ("Claude CLI", NewSession::ClaudeCli),
                                 ("Codex CLI", NewSession::CodexCli),
-                                ("Terminal", NewSession::Shell),
                             ]
                             .into_iter()
                             .map(|(label, kind)| (label.to_string(), kind));
-                            chats.chain(terminals).fold(menu, |menu, (label, kind)| {
+                            chats.chain(clis).fold(menu, |menu, (label, kind)| {
                                 let this = this.clone();
                                 let pane = pane.clone();
                                 menu.entry(label, None, move |window, cx| {

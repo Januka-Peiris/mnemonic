@@ -416,6 +416,7 @@ pub struct Pane {
     can_split_predicate:
         Option<Arc<dyn Fn(&mut Self, &dyn Any, &mut Window, &mut Context<Self>) -> bool>>,
     can_toggle_zoom: bool,
+    split_in_tab_menu: bool,
     should_display_tab_bar: Rc<dyn Fn(&Window, &mut Context<Pane>) -> bool>,
     should_display_welcome_page: bool,
     render_tab_bar_buttons: Rc<
@@ -601,6 +602,7 @@ impl Pane {
             can_drop_predicate,
             can_split_predicate: None,
             can_toggle_zoom: true,
+            split_in_tab_menu: false,
             should_display_tab_bar: Rc::new(|_, cx| TabBarSettings::get_global(cx).show),
             should_display_welcome_page: false,
             render_tab_bar_buttons: Rc::new(default_render_tab_bar_buttons),
@@ -841,6 +843,12 @@ impl Pane {
         can_drop_predicate: Option<Arc<dyn Fn(&dyn Any, &mut Window, &mut App) -> bool + 'static>>,
     ) {
         self.can_drop_predicate = can_drop_predicate;
+    }
+
+    /// Offers Split Right and Split Down on a tab's right-click menu, for
+    /// panes with no split button of their own.
+    pub fn set_split_in_tab_menu(&mut self, enabled: bool) {
+        self.split_in_tab_menu = enabled;
     }
 
     pub fn set_can_split(
@@ -3219,6 +3227,27 @@ impl Pane {
                                         .detach_and_log_err(cx)
                                 }),
                             );
+
+                        let (split_in_tab_menu, item_count) = {
+                            let pane = pane.read(cx);
+                            (pane.split_in_tab_menu, pane.items.len())
+                        };
+                        if split_in_tab_menu && item_count > 1 {
+                            menu = menu.separator();
+                            for (label, direction) in [
+                                ("Split Right", SplitDirection::Right),
+                                ("Split Down", SplitDirection::Down),
+                            ] {
+                                menu = menu.entry(
+                                    label,
+                                    None,
+                                    window.handler_for(&pane, move |pane, window, cx| {
+                                        pane.activate_item(ix, true, true, window, cx);
+                                        pane.split(direction, SplitMode::MovePane, window, cx);
+                                    }),
+                                );
+                            }
+                        }
 
                         let pin_tab_entries = |menu: ContextMenu| {
                             menu.separator().map(|this| {
