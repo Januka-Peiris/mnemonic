@@ -17,6 +17,7 @@ use crate::state::AppState;
 
 const CONFIG_RELATIVE_PATH: &str = ".mnemonic/config.json";
 pub const PROJECT_RUN_SCRIPT_KEY: &str = "run_script";
+pub const PROJECT_SETUP_SCRIPT_KEY: &str = "setup_script";
 
 pub fn get_workspace_mnemonic_config(
     state: &AppState,
@@ -34,16 +35,20 @@ pub fn get_workspace_mnemonic_config(
 /// `run` commands from `.mnemonic/config.json`, the same way the project's
 /// base branch replaces the app-wide default.
 fn project_run_script(state: &AppState, workspace_id: &str) -> Result<Option<String>, String> {
+    project_script(state, workspace_id, PROJECT_RUN_SCRIPT_KEY)
+}
+
+fn project_script(
+    state: &AppState,
+    workspace_id: &str,
+    key: &str,
+) -> Result<Option<String>, String> {
     let Some(repository_id) = workspace_repository::get_detail(&state.db, workspace_id)?
         .and_then(|workspace| workspace.summary.repository_id)
     else {
         return Ok(None);
     };
-    let script = repository_settings_repository::get_value(
-        &state.db,
-        &repository_id,
-        PROJECT_RUN_SCRIPT_KEY,
-    )?;
+    let script = repository_settings_repository::get_value(&state.db, &repository_id, key)?;
     Ok(script
         .map(|script| script.trim().to_string())
         .filter(|script| !script.is_empty()))
@@ -316,6 +321,65 @@ pub fn prepare_workspace_run_commands(
             hook_service::HookPhase::Pre,
             &run_hook_context(workspace_id, action_kind, plan),
         )?;
+    }
+    Ok((root, plans))
+}
+
+/// The commands a new workspace runs to set itself up: `setup` from
+/// `.mnemonic/config.json`, then the project's setup script, titled the
+/// way the core titles them when it runs them at creation.
+fn setup_commands(
+    state: &AppState,
+    workspace_id: &str,
+) -> Result<(PathBuf, Vec<(String, String)>), String> {
+    let root = workspace_root_path(state, workspace_id)?;
+    let config = load_config_from_root(&root);
+    let mut commands: Vec<(String, String)> = config
+        .setup
+        .iter()
+        .enumerate()
+        .map(|(index, command)| (setup_title(index, command), command.clone()))
+        .collect();
+    if let Some(script) = project_script(state, workspace_id, PROJECT_SETUP_SCRIPT_KEY)? {
+        commands.push(("Repo setup".to_string(), script));
+    }
+    Ok((root, commands))
+}
+
+pub fn workspace_has_setup_commands(state: &AppState, workspace_id: &str) -> Result<bool, String> {
+    Ok(!setup_commands(state, workspace_id)?.1.is_empty())
+}
+
+/// Prepares the workspace's setup commands for a host that runs them in its
+/// own terminals, with the same risky-command gate as the run commands.
+pub fn prepare_workspace_setup_commands(
+    state: &AppState,
+    workspace_id: &str,
+) -> Result<(PathBuf, Vec<RunCommandPlan>), String> {
+    let (root, commands) = setup_commands(state, workspace_id)?;
+    let risky_allowed = risky_workspace_scripts_enabled(state);
+    let plans = commands
+        .into_iter()
+        .enumerate()
+        .map(|(index, (title, command))| {
+            if !risky_allowed && command_safety_service::is_risky_command(&command) {
+                return Err(blocked_command_message(&title));
+            }
+            Ok(RunCommandPlan {
+                index,
+                title,
+                command,
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    for plan in &plans {
+        insert_script_activity(
+            state,
+            workspace_id,
+            "Workspace setup started",
+            "info",
+            &format!("{} · {}", plan.title, plan.command),
+        );
     }
     Ok((root, plans))
 }

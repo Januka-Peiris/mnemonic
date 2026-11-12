@@ -1135,7 +1135,7 @@ impl WorkspacePanel {
         cx.notify();
     }
 
-    fn open_project_settings(
+    pub(crate) fn open_project_settings(
         &mut self,
         project_name: String,
         window: &mut Window,

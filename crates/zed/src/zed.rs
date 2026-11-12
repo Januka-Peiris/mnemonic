@@ -755,6 +755,8 @@ fn initialize_panels(window: &mut Window, cx: &mut Context<Workspace>) -> Task<a
             mnemonic_panels::CoordinatorPanel::load(workspace_handle.clone(), cx.clone());
         let mnemonic_detail_panel =
             mnemonic_panels::WorkspaceDetailPanel::load(workspace_handle.clone(), cx.clone());
+        let mnemonic_tools_panel =
+            mnemonic_panels::WorkspaceToolsPanel::load(workspace_handle.clone(), cx.clone());
 
         async fn add_panel_when_ready(
             panel_task: impl Future<Output = anyhow::Result<Entity<impl workspace::Panel>>> + 'static,
@@ -779,8 +781,14 @@ fn initialize_panels(window: &mut Window, cx: &mut Context<Workspace>) -> Task<a
             add_panel_when_ready(mnemonic_command_panel, workspace_handle.clone(), cx.clone()),
             add_panel_when_ready(mnemonic_coordinator_panel, workspace_handle.clone(), cx.clone()),
             add_panel_when_ready(mnemonic_detail_panel, workspace_handle.clone(), cx.clone()),
-            initialize_agent_panel(workspace_handle, cx.clone()).map(|r| r.log_err()),
+            add_panel_when_ready(mnemonic_tools_panel, workspace_handle.clone(), cx.clone()),
+            initialize_agent_panel(workspace_handle.clone(), cx.clone()).map(|r| r.log_err()),
         );
+        workspace_handle
+            .update_in(cx, |workspace, window, cx| {
+                mnemonic_panels::show_tools_panel(workspace, false, window, cx);
+            })
+            .log_err();
 
         anyhow::Ok(())
     })

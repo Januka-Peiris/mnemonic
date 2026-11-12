@@ -5,6 +5,7 @@ mod team_settings;
 mod team_view;
 mod workspace_detail_panel;
 mod workspace_panel;
+mod workspace_tools_panel;
 mod workspace_view;
 mod workspaces_settings;
 
@@ -16,6 +17,7 @@ pub use workspace_detail_panel::ToggleFocus as ToggleWorkspaceDetailFocus;
 pub use workspace_detail_panel::WorkspaceDetailPanel;
 pub use workspace_panel::ToggleFocus as ToggleWorkspacePanelFocus;
 pub use workspace_panel::WorkspacePanel;
+pub use workspace_tools_panel::{WorkspaceToolsPanel, show_tools_panel};
 pub use workspace_panel::{SelectNextWorkspace, SelectPreviousWorkspace};
 pub use workspace_view::{SessionPaneToolbar, WorkspaceHost, WorkspaceView, is_session_tab};
 pub use team::TeamSettings;

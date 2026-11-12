@@ -13,9 +13,9 @@ use agent_ui::{
 use editor::Editor;
 use futures::future::Either;
 use gpui::{
-    Action as _, Anchor, AnyWindowHandle, App, AppContext as _, Axis, Context, DragMoveEvent, Empty,
+    Action as _, Anchor, AnyWindowHandle, App, AppContext as _, Context, DragMoveEvent, Empty,
     Entity, EntityId, EventEmitter, ExternalPaths, FocusHandle, Focusable, IntoElement, Pixels,
-    Render, SharedString, Subscription, WeakEntity, Window, WindowHandle, actions, px,
+    Render, SharedString, Stateful, Subscription, WeakEntity, Window, WindowHandle, actions, px,
 };
 use mnemonic_bridge::AgentAttention;
 use mnemonic_core::models::{ChatSessionRecord, WorkspaceSummary};
@@ -43,7 +43,7 @@ use workspace::item::{Item, ItemEvent, ItemHandle};
 use workspace::notifications::{DetachAndPromptErr as _, NotificationId};
 use workspace::{
     ActivatePaneDown, ActivatePaneLeft, ActivatePaneRight, ActivatePaneUp, DraggedTab, Pane,
-    Member, PaneAxis, PaneGroup, PaneRenderContext, SaveIntent, SplitDirection, Toast,
+    PaneGroup, PaneRenderContext, SaveIntent, SplitDirection, Toast,
     Workspace,
     WorkspaceId, pane,
 };
@@ -240,9 +240,42 @@ pub(crate) struct TerminalSession {
     provider: Option<AgentProvider>,
     /// The persistent tmux session backing this terminal, if any.
     session_name: Option<String>,
-    /// Started by Run from the workspace's `.mnemonic/config.json`.
-    run_command: bool,
     _subscription: Subscription,
+}
+
+/// A terminal in the Setup / Run / Terminal panel: a shell, or a setup or
+/// run command's output.
+pub(crate) struct ToolTerminal {
+    title: SharedString,
+    view: Entity<TerminalView>,
+    _subscription: Subscription,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ToolsTab {
+    Setup,
+    Run,
+    Shell(usize),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ToolKind {
+    Setup,
+    Run,
+    Shell,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SetupState {
+    Unknown,
+    Missing,
+    Configured,
+}
+
+/// What a setup command the core ran at creation printed.
+struct SetupOutput {
+    title: SharedString,
+    text: SharedString,
 }
 
 pub(crate) enum SessionKind {
@@ -446,9 +479,9 @@ impl Render for SessionItem {
 /// Set by the app, which owns the toolbar items, so files opened in a
 /// workspace's own panes get the same toolbar as the window's.
 #[derive(Clone)]
-pub struct SessionPaneToolbar(
-    pub Arc<dyn Fn(&Workspace, &Entity<Pane>, &mut Window, &mut Context<Workspace>)>,
-);
+pub struct SessionPaneToolbar(pub Arc<PaneToolbarInit>);
+
+pub type PaneToolbarInit = dyn Fn(&Workspace, &Entity<Pane>, &mut Window, &mut Context<Workspace>);
 
 impl gpui::Global for SessionPaneToolbar {}
 
@@ -537,6 +570,119 @@ fn is_session_tab_of(
             }),
         }
     })
+}
+
+const SETUP_POLL_INTERVAL: Duration = Duration::from_secs(2);
+
+fn read_setup_outputs(
+    state: &mnemonic_core::state::AppState,
+    workspace_id: &str,
+) -> Result<Vec<SetupOutput>, String> {
+    let sessions = terminal_service::list_workspace_terminal_sessions(state, workspace_id)?;
+    let mut outputs = Vec::new();
+    for session in sessions
+        .into_iter()
+        .filter(|session| is_setup_session_title(&session.title))
+    {
+        let response = terminal_service::get_workspace_terminal_output_for_session(
+            state,
+            workspace_id,
+            &session.id,
+            None,
+        )?;
+        let raw: String = response.chunks.iter().map(|chunk| chunk.data.as_str()).collect();
+        outputs.push(SetupOutput {
+            title: SharedString::from(session.title),
+            text: SharedString::from(strip_terminal_codes(&raw)),
+        });
+    }
+    Ok(outputs)
+}
+
+fn tools_tab_button(
+    id: impl Into<ElementId>,
+    label: SharedString,
+    selected: bool,
+    cx: &App,
+) -> Stateful<Div> {
+    h_flex()
+        .id(id.into())
+        .h(px(22.))
+        .px_2()
+        .gap_1()
+        .items_center()
+        .rounded_md()
+        .cursor_pointer()
+        .when(selected, |tab| tab.bg(cx.theme().colors().ghost_element_selected))
+        .hover(|style| style.bg(cx.theme().colors().ghost_element_hover))
+        .child(
+            Label::new(label)
+                .size(LabelSize::Small)
+                .color(if selected { Color::Default } else { Color::Muted }),
+        )
+}
+
+/// Terminals one above the other, titled when there's more than one.
+fn render_terminal_stack(terminals: &[ToolTerminal]) -> AnyElement {
+    let titled = terminals.len() > 1;
+    v_flex()
+        .size_full()
+        .children(terminals.iter().map(|tool| {
+            v_flex()
+                .flex_1()
+                .min_h_0()
+                .when(titled, |el| {
+                    el.child(
+                        div()
+                            .px_2()
+                            .py_0p5()
+                            .child(Label::new(tool.title.clone()).size(LabelSize::XSmall).color(Color::Muted)),
+                    )
+                })
+                .child(div().flex_1().min_h_0().child(tool.view.clone()))
+        }))
+        .into_any_element()
+}
+
+/// Setup sessions the core ran headless when the workspace was created:
+/// `.mnemonic/config.json` setup commands and the project's setup script.
+fn is_setup_session_title(title: &str) -> bool {
+    title == "Repo setup" || title.starts_with("Setup ")
+}
+
+/// Plain text from saved terminal output: colour and cursor codes, window
+/// titles and carriage returns removed.
+fn strip_terminal_codes(output: &str) -> String {
+    let mut text = String::with_capacity(output.len());
+    let mut chars = output.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\u{1b}' => match chars.next() {
+                Some('[') => {
+                    for code in chars.by_ref() {
+                        if ('@'..='~').contains(&code) {
+                            break;
+                        }
+                    }
+                }
+                Some(']') => {
+                    while let Some(code) = chars.next() {
+                        if code == '\u{7}' {
+                            break;
+                        }
+                        if code == '\u{1b}' && chars.peek() == Some(&'\\') {
+                            chars.next();
+                            break;
+                        }
+                    }
+                }
+                _ => {}
+            },
+            '\r' => {}
+            _ => text.push(ch),
+        }
+    }
+    text
 }
 
 /// The tabs to close when a newly opened file takes a workspace's file slot.
@@ -733,8 +879,16 @@ pub struct WorkspaceView {
     active_session: usize,
     center: PaneGroup,
     active_pane: Entity<Pane>,
-    /// The strip along the bottom that shells and Run output open in.
-    terminal_pane: Option<Entity<Pane>>,
+    /// Shells in the Setup / Run / Terminal panel.
+    shells: Vec<ToolTerminal>,
+    run_terminals: Vec<ToolTerminal>,
+    setup_terminals: Vec<ToolTerminal>,
+    tools_tab: ToolsTab,
+    setup_state: SetupState,
+    setup_outputs: Vec<SetupOutput>,
+    setup_poll: Option<gpui::Task<()>>,
+    /// The workspace's project, for opening its settings.
+    project_name: String,
     /// The tab files open in, replaced by each file opened after it.
     file_item: Option<EntityId>,
     connection_store: Option<Entity<AgentConnectionStore>>,
@@ -991,7 +1145,6 @@ impl WorkspaceView {
                             &title,
                             Some(session_for_close),
                             Some(provider),
-                            false,
                             terminal,
                             window,
                             cx,
@@ -1023,7 +1176,10 @@ impl WorkspaceView {
     fn add_shell_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let cwd = self.worktree_path.clone();
         let project = self.project.clone();
-        let title = format!("shell {}", self.terminal_titles().count());
+        let title = match self.shells.len() {
+            0 => "Terminal".to_string(),
+            count => format!("Terminal {}", count + 1),
+        };
 
         cx.spawn_in(window, async move |this, cx| {
             let terminal = match project
@@ -1036,7 +1192,7 @@ impl WorkspaceView {
             match terminal {
                 Ok(terminal) => {
                     this.update_in(cx, |this, window, cx| {
-                        this.push_terminal(&title, None, None, false, terminal, window, cx);
+                        this.push_tool_terminal(ToolKind::Shell, &title, terminal, window, cx);
                     })
                     .ok();
                 }
@@ -1080,24 +1236,6 @@ impl WorkspaceView {
                 }
             }
         }
-    }
-
-    /// Closes a session's tab from code. Tabs the user closes arrive through
-    /// `handle_pane_event` instead.
-    fn remove_session(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
-        if index >= self.sessions.len() {
-            return;
-        }
-        let session = self.sessions.remove(index);
-        let item_id = session.item.entity_id();
-        if let Some(pane) = self.pane_for_item(item_id, cx) {
-            pane.update(cx, |pane, cx| {
-                pane.remove_item(item_id, false, true, window, cx);
-            });
-        }
-        self.dispose_session(session, cx);
-        self.sync_active_session(cx);
-        cx.notify();
     }
 
     fn session_index(&self, item_id: EntityId) -> Option<usize> {
@@ -1468,7 +1606,6 @@ impl WorkspaceView {
         title: &str,
         session_name: Option<String>,
         provider: Option<AgentProvider>,
-        run_command: bool,
         terminal: Entity<Terminal>,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -1507,53 +1644,454 @@ impl WorkspaceView {
                 view,
                 provider,
                 session_name,
-                run_command,
                 _subscription: subscription,
             }),
         });
-        if provider.is_some() {
-            self.show_new_session(item, window, cx);
-            return;
-        }
-        let Some(pane) = self.ensure_terminal_pane(window, cx) else {
-            self.show_new_session(item, window, cx);
-            return;
-        };
-        self.active_session = self.sessions.len().saturating_sub(1);
-        pane.update(cx, |pane, cx| {
-            pane.add_item(Box::new(item), true, true, None, window, cx);
+        self.show_new_session(item, window, cx);
+    }
+
+    /// Adds a terminal to the Setup / Run / Terminal panel and shows it.
+    fn push_tool_terminal(
+        &mut self,
+        kind: ToolKind,
+        title: &str,
+        terminal: Entity<Terminal>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let subscription = cx.subscribe(&terminal, |_, _, event, cx| {
+            if matches!(event, terminal::Event::Wakeup) {
+                cx.notify();
+            }
         });
-        self.active_pane = pane;
+        let view = cx.new(|cx| {
+            TerminalView::new(
+                terminal,
+                self.workspace.clone(),
+                self.database_id,
+                self.project.clone(),
+                window,
+                cx,
+            )
+        });
+        let tool = ToolTerminal {
+            title: SharedString::from(title.to_string()),
+            view,
+            _subscription: subscription,
+        };
+        self.tools_tab = match kind {
+            ToolKind::Setup => {
+                self.setup_terminals.push(tool);
+                ToolsTab::Setup
+            }
+            ToolKind::Run => {
+                self.run_terminals.push(tool);
+                ToolsTab::Run
+            }
+            ToolKind::Shell => {
+                self.shells.push(tool);
+                ToolsTab::Shell(self.shells.len() - 1)
+            }
+        };
+        self.reveal_tools_panel(window, cx);
         cx.notify();
     }
 
-    /// The pane along the bottom of the workspace for shells and Run output,
-    /// created under all the other panes the first time one opens, so a
-    /// terminal doesn't take the place of the chat.
-    fn ensure_terminal_pane(
-        &mut self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Option<Entity<Pane>> {
-        let existing = self
-            .terminal_pane
-            .clone()
-            .filter(|pane| self.center.panes().contains(&pane));
-        if existing.is_some() {
-            return existing;
+    fn reveal_tools_panel(&self, window: &mut Window, cx: &mut Context<Self>) {
+        let workspace = self.workspace.clone();
+        // Deferred because terminals are often added while the workspace is
+        // being updated.
+        window.defer(cx, move |window, cx| {
+            workspace
+                .update(cx, |workspace, cx| {
+                    crate::workspace_tools_panel::show_tools_panel(workspace, true, window, cx);
+                })
+                .log_err();
+        });
+    }
+
+    fn close_shell(&mut self, index: usize, cx: &mut Context<Self>) {
+        if index >= self.shells.len() {
+            return;
         }
-        let pane = self.add_pane(window, cx)?;
-        let above = self.center.root.clone();
-        // Flexes are relative to an even split, so these give the chats
-        // about 70% of the height and the terminal 30%.
-        self.center.root = Member::Axis(PaneAxis::load(
-            Axis::Vertical,
-            vec![above, Member::Pane(pane.clone())],
-            Some(vec![1.4, 0.6]),
-        ));
-        self.center.mark_positions(cx);
-        self.terminal_pane = Some(pane.clone());
-        Some(pane)
+        self.shells.remove(index);
+        self.tools_tab = match self.tools_tab {
+            ToolsTab::Shell(active) if active == index => match index.checked_sub(1) {
+                Some(previous) => ToolsTab::Shell(previous),
+                None if self.shells.is_empty() => ToolsTab::Run,
+                None => ToolsTab::Shell(0),
+            },
+            ToolsTab::Shell(active) if active > index => ToolsTab::Shell(active - 1),
+            other => other,
+        };
+        cx.notify();
+    }
+
+    /// Runs the workspace's setup commands again in the Setup tab, replacing
+    /// the last run's terminals.
+    fn run_setup_commands(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        for tool in self.setup_terminals.drain(..) {
+            let terminal = tool.view.read(cx).terminal().clone();
+            terminal.update(cx, |terminal, _| terminal.kill_active_task());
+        }
+        self.tools_tab = ToolsTab::Setup;
+        cx.notify();
+        let state = mnemonic_bridge::mnemonic_state(cx);
+        let workspace_id = self.workspace_id.clone();
+        let project = self.project.clone();
+        cx.spawn_in(window, async move |this, cx| {
+            let prepared = cx
+                .background_spawn(async move {
+                    workspace_script_service::prepare_workspace_setup_commands(
+                        &state,
+                        &workspace_id,
+                    )
+                })
+                .await;
+            let (root, plans) = match prepared {
+                Ok(prepared) => prepared,
+                Err(err) => {
+                    this.update(cx, |this, cx| {
+                        this.show_workspace_toast(
+                            format!("{}: couldn't run setup: {err}", this.workspace_name),
+                            cx,
+                        );
+                    })
+                    .log_err();
+                    return;
+                }
+            };
+            for plan in &plans {
+                let (command, args) = ShellBuilder::new(&Shell::System, cfg!(windows))
+                    .build(Some(plan.command.clone()), &[]);
+                let spawn_task = SpawnInTerminal {
+                    id: TaskId(format!("mnemonic-setup-{}", plan.index)),
+                    full_label: plan.title.clone(),
+                    label: plan.title.clone(),
+                    command: Some(command),
+                    args,
+                    command_label: plan.command.clone(),
+                    cwd: Some(root.clone()),
+                    shell: Shell::System,
+                    reveal: RevealStrategy::Always,
+                    use_new_terminal: true,
+                    allow_concurrent_runs: true,
+                    ..Default::default()
+                };
+                let terminal = match project
+                    .update(cx, |project, cx| project.create_terminal_task(spawn_task, cx))
+                {
+                    Ok(task) => task.await,
+                    Err(err) => Err(err),
+                };
+                match terminal {
+                    Ok(terminal) => {
+                        this.update_in(cx, |this, window, cx| {
+                            this.push_tool_terminal(
+                                ToolKind::Setup,
+                                &plan.title,
+                                terminal,
+                                window,
+                                cx,
+                            );
+                        })
+                        .log_err();
+                    }
+                    Err(err) => {
+                        this.update(cx, |this, cx| {
+                            this.show_workspace_toast(
+                                format!("{}: couldn't start {}: {err}", this.workspace_name, plan.title),
+                                cx,
+                            );
+                        })
+                        .log_err();
+                        return;
+                    }
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// Asks a new chat to write the workspace's setup commands.
+    fn ask_agent_for_setup(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.add_session(NewSession::from(AgentSessionKind::ClaudeChat), window, cx);
+        self.dispatch_to_agent(
+            "Add this project's setup commands (installing dependencies, copying env files \
+             and similar) to the \"setup\" array in .mnemonic/config.json, creating the file \
+             if it doesn't exist."
+                .to_string(),
+            cx,
+        );
+    }
+
+    fn open_project_settings(&self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+        let Some(panel) = workspace.read(cx).panel::<WorkspacePanel>(cx) else {
+            return;
+        };
+        let project_name = self.project_name.clone();
+        panel.update(cx, |panel, cx| {
+            panel.open_project_settings(project_name, window, cx);
+        });
+    }
+
+    /// While the Setup tab of the selected workspace is showing, reads what
+    /// the setup commands run at creation printed, every couple of seconds.
+    fn ensure_setup_poll(&mut self, cx: &mut Context<Self>) {
+        if self.setup_poll.is_some() {
+            return;
+        }
+        self.setup_poll = Some(cx.spawn(async move |this, cx| {
+            loop {
+                let request = this
+                    .update(cx, |this, cx| {
+                        (this.tools_tab == ToolsTab::Setup
+                            && this.setup_terminals.is_empty()
+                            && this.is_on_screen(cx))
+                        .then(|| (mnemonic_bridge::mnemonic_state(cx), this.workspace_id.clone()))
+                    })
+                    .ok()
+                    .flatten();
+                let Some((state, workspace_id)) = request else {
+                    this.update(cx, |this, _| this.setup_poll = None).log_err();
+                    return;
+                };
+                let outputs = cx
+                    .background_spawn(async move { read_setup_outputs(&state, &workspace_id) })
+                    .await;
+                let keep_going = this
+                    .update(cx, |this, cx| {
+                        match outputs {
+                            Ok(outputs) => this.setup_outputs = outputs,
+                            Err(err) => log::warn!("Couldn't read setup output: {err}"),
+                        }
+                        cx.notify();
+                    })
+                    .is_ok();
+                if !keep_going {
+                    return;
+                }
+                cx.background_executor().timer(SETUP_POLL_INTERVAL).await;
+            }
+        }));
+    }
+
+    pub(crate) fn render_tools(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        if self.tools_tab == ToolsTab::Setup && self.setup_terminals.is_empty() {
+            self.ensure_setup_poll(cx);
+        }
+        if let ToolsTab::Shell(index) = self.tools_tab {
+            if index >= self.shells.len() {
+                self.tools_tab = ToolsTab::Run;
+            }
+        }
+        let this = cx.weak_entity();
+        let mut strip = h_flex()
+            .h(px(30.))
+            .flex_none()
+            .w_full()
+            .px_1()
+            .gap_0p5()
+            .items_center()
+            .border_b_1()
+            .border_color(cx.theme().colors().border)
+            .child(
+                tools_tab_button("tools-tab-setup", "Setup".into(), self.tools_tab == ToolsTab::Setup, cx)
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.tools_tab = ToolsTab::Setup;
+                        cx.notify();
+                    })),
+            )
+            .child(
+                tools_tab_button("tools-tab-run", "Run".into(), self.tools_tab == ToolsTab::Run, cx)
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.tools_tab = ToolsTab::Run;
+                        cx.notify();
+                    })),
+            );
+        for (index, shell) in self.shells.iter().enumerate() {
+            strip = strip.child(
+                tools_tab_button(
+                    ("tools-tab-shell", index),
+                    shell.title.clone(),
+                    self.tools_tab == ToolsTab::Shell(index),
+                    cx,
+                )
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.tools_tab = ToolsTab::Shell(index);
+                    cx.notify();
+                }))
+                .child(
+                    IconButton::new(("tools-close-shell", index), IconName::Close)
+                        .icon_size(IconSize::XSmall)
+                        .tooltip(Tooltip::text("Close this terminal"))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.close_shell(index, cx);
+                        })),
+                ),
+            );
+        }
+        strip = strip
+            .child(
+                IconButton::new("tools-new-shell", IconName::Plus)
+                    .icon_size(IconSize::Small)
+                    .tooltip(Tooltip::text("New terminal"))
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.add_shell_terminal(window, cx);
+                    })),
+            )
+            .child(div().flex_grow(1.0))
+            .child(self.render_run_controls(&this))
+            .child(
+                IconButton::new("tools-hide", IconName::ChevronDown)
+                    .icon_size(IconSize::Small)
+                    .tooltip(Tooltip::text("Hide this panel"))
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        let Some(workspace) = this.workspace.upgrade() else {
+                            return;
+                        };
+                        workspace.update(cx, |workspace, cx| {
+                            workspace.right_dock().update(cx, |dock, cx| {
+                                dock.close_stacked_panel(window, cx);
+                            });
+                        });
+                    })),
+            );
+
+        let body = match self.tools_tab {
+            ToolsTab::Setup => self.render_setup_tab(cx),
+            ToolsTab::Run if self.run_terminals.is_empty() => v_flex()
+                .size_full()
+                .items_center()
+                .justify_center()
+                .gap_1()
+                .child(Label::new("Nothing running").color(Color::Muted))
+                .child(
+                    Label::new(self.run_tooltip.clone())
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
+                )
+                .into_any_element(),
+            ToolsTab::Run => render_terminal_stack(&self.run_terminals),
+            ToolsTab::Shell(index) => match self.shells.get(index) {
+                Some(shell) => div().size_full().child(shell.view.clone()).into_any_element(),
+                None => Empty.into_any_element(),
+            },
+        };
+        v_flex()
+            .size_full()
+            .child(strip)
+            .child(div().flex_1().min_h_0().child(body))
+            .into_any_element()
+    }
+
+    fn render_setup_tab(&self, cx: &mut Context<Self>) -> AnyElement {
+        let run_setup = Button::new("tools-run-setup", "Run setup")
+            .style(ButtonStyle::Subtle)
+            .label_size(LabelSize::XSmall)
+            .start_icon(
+                Icon::new(IconName::PlayFilled)
+                    .size(IconSize::XSmall)
+                    .color(Color::Muted),
+            )
+            .on_click(cx.listener(|this, _, window, cx| this.run_setup_commands(window, cx)));
+        if !self.setup_terminals.is_empty() {
+            return v_flex()
+                .size_full()
+                .child(h_flex().px_2().py_1().justify_end().child(run_setup))
+                .child(div().flex_1().min_h_0().child(render_terminal_stack(&self.setup_terminals)))
+                .into_any_element();
+        }
+        if !self.setup_outputs.is_empty() {
+            return v_flex()
+                .size_full()
+                .child(h_flex().px_2().py_1().justify_end().child(run_setup))
+                .child(
+                    div()
+                        .id("tools-setup-output")
+                        .flex_1()
+                        .min_h_0()
+                        .overflow_y_scroll()
+                        .px_3()
+                        .pb_2()
+                        .children(self.setup_outputs.iter().map(|output| {
+                            v_flex()
+                                .gap_1()
+                                .pb_2()
+                                .child(Label::new(output.title.clone()).size(LabelSize::Small))
+                                .child(
+                                    div()
+                                        .font_buffer(cx)
+                                        .text_xs()
+                                        .text_color(cx.theme().colors().text_muted)
+                                        .child(output.text.clone()),
+                                )
+                        })),
+                )
+                .into_any_element();
+        }
+        match self.setup_state {
+            SetupState::Missing => v_flex()
+                .size_full()
+                .items_center()
+                .justify_center()
+                .p_4()
+                .child(
+                    v_flex()
+                        .w_full()
+                        .max_w(rems(22.))
+                        .p_4()
+                        .gap_2()
+                        .items_center()
+                        .rounded_md()
+                        .border_1()
+                        .border_color(cx.theme().colors().border)
+                        .bg(cx.theme().colors().surface_background)
+                        .child(Label::new("Add setup script"))
+                        .child(
+                            h_flex()
+                                .gap_1()
+                                .child(
+                                    Button::new("tools-setup-ask-agent", "Ask agent")
+                                        .style(ButtonStyle::Filled)
+                                        .label_size(LabelSize::Small)
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.ask_agent_for_setup(window, cx);
+                                        })),
+                                )
+                                .child(
+                                    Button::new("tools-setup-add-manually", "Add manually")
+                                        .style(ButtonStyle::Subtle)
+                                        .label_size(LabelSize::Small)
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.open_project_settings(window, cx);
+                                        })),
+                                ),
+                        )
+                        .child(
+                            Label::new(
+                                "Run commands when a workspace is created to install \
+                                 dependencies or set up the environment",
+                            )
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                        ),
+                )
+                .into_any_element(),
+            SetupState::Configured => v_flex()
+                .size_full()
+                .items_center()
+                .justify_center()
+                .gap_1()
+                .child(Label::new("Setup hasn't run in this workspace yet").color(Color::Muted))
+                .child(run_setup)
+                .into_any_element(),
+            SetupState::Unknown => Empty.into_any_element(),
+        }
     }
 
     /// Reads the workspace's run commands off the UI thread, so the Run
@@ -1565,10 +2103,24 @@ impl WorkspaceView {
         cx.spawn(async move |this, cx| {
             let config = cx
                 .background_spawn(async move {
-                    workspace_script_service::get_workspace_mnemonic_config(&state, &workspace_id)
+                    let has_setup =
+                        workspace_script_service::workspace_has_setup_commands(&state, &workspace_id);
+                    (
+                        workspace_script_service::get_workspace_mnemonic_config(&state, &workspace_id),
+                        has_setup,
+                    )
                 })
                 .await;
+            let (config, has_setup) = config;
             this.update(cx, |this, cx| {
+                this.setup_state = match has_setup {
+                    Ok(true) => SetupState::Configured,
+                    Ok(false) => SetupState::Missing,
+                    Err(err) => {
+                        log::warn!("Failed to read workspace setup commands: {err}");
+                        SetupState::Unknown
+                    }
+                };
                 match config {
                     Ok(config) => {
                         this.run_command_count = config.run.len();
@@ -1595,9 +2147,7 @@ impl WorkspaceView {
     }
 
     fn has_run_terminals(&self) -> bool {
-        self.sessions.iter().any(|session| {
-            matches!(&session.kind, SessionKind::Terminal(terminal) if terminal.run_command)
-        })
+        !self.run_terminals.is_empty()
     }
 
     /// Starts each configured run command in its own terminal tab, rooted in
@@ -1675,7 +2225,13 @@ impl WorkspaceView {
                 match terminal {
                     Ok(terminal) => {
                         this.update_in(cx, |this, window, cx| {
-                            this.push_terminal(&plan.title, None, None, true, terminal, window, cx);
+                            this.push_tool_terminal(
+                                ToolKind::Run,
+                                &plan.title,
+                                terminal,
+                                window,
+                                cx,
+                            );
                         })
                         .ok();
                     }
@@ -1721,29 +2277,16 @@ impl WorkspaceView {
     /// terminal alone only signals its shell, which can leave a dev server
     /// running.
     pub(crate) fn kill_run_terminals(&self, cx: &mut Context<Self>) {
-        for session in &self.sessions {
-            if let SessionKind::Terminal(terminal) = &session.kind {
-                if terminal.run_command {
-                    let terminal = terminal.view.read(cx).terminal().clone();
-                    terminal.update(cx, |terminal, _| terminal.kill_active_task());
-                }
-            }
+        for tool in &self.run_terminals {
+            let terminal = tool.view.read(cx).terminal().clone();
+            terminal.update(cx, |terminal, _| terminal.kill_active_task());
         }
     }
 
-    fn stop_run_commands(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn stop_run_commands(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
         self.kill_run_terminals(cx);
-        let mut index = self.sessions.len();
-        while index > 0 {
-            index -= 1;
-            let is_run = matches!(
-                self.sessions.get(index).map(|session| &session.kind),
-                Some(SessionKind::Terminal(terminal)) if terminal.run_command
-            );
-            if is_run {
-                self.remove_session(index, window, cx);
-            }
-        }
+        self.run_terminals.clear();
+        cx.notify();
     }
 
     fn restart_run_commands(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1807,11 +2350,9 @@ impl WorkspaceView {
                     }
                 };
                 this.update_in(cx, |this, window, cx| {
-                    this.push_terminal(
+                    this.push_tool_terminal(
+                        ToolKind::Run,
                         &plan.title,
-                        None,
-                        None,
-                        false,
                         terminal.clone(),
                         window,
                         cx,
@@ -4443,7 +4984,14 @@ impl WorkspaceHost {
                     active_session: 0,
                     center: PaneGroup::new(pane.clone()),
                     active_pane: pane,
-                    terminal_pane: None,
+                    shells: Vec::new(),
+                    run_terminals: Vec::new(),
+                    setup_terminals: Vec::new(),
+                    tools_tab: ToolsTab::Setup,
+                    setup_state: SetupState::Unknown,
+                    setup_outputs: Vec::new(),
+                    setup_poll: None,
+                    project_name: summary.repo.clone(),
                     file_item: None,
                     connection_store: None,
                     composer,
@@ -4935,6 +5483,21 @@ impl Render for WorkspaceHost {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn saved_setup_output_drops_terminal_escape_codes() {
+        assert_eq!(
+            strip_terminal_codes("\u{1b}[32mok\u{1b}[0m done\r\n\u{1b}]0;title\u{7}next"),
+            "ok done\nnext"
+        );
+    }
+
+    #[test]
+    fn setup_tab_shows_repo_and_config_setup_sessions_only() {
+        assert!(is_setup_session_title("Repo setup"));
+        assert!(is_setup_session_title("Setup 1 · pnpm install"));
+        assert!(!is_setup_session_title("Run 1 · pnpm dev"));
+    }
 
     #[test]
     fn file_slot_closes_same_path_and_clean_file_but_keeps_dirty_file() {
