@@ -8,16 +8,24 @@ use std::path::PathBuf;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
+use agent_client_protocol::schema as acp;
 use serde::{Deserialize, Serialize};
 
 /// Bumped whenever a change to the wire types would break an older peer.
-pub const TEAM_PROTOCOL_VERSION: u32 = 1;
+pub const TEAM_PROTOCOL_VERSION: u32 = 2;
+/// Chats travel as the ACP crate's own types, so peers on different crate
+/// versions are treated as speaking different protocols.
+pub const TEAM_ACP_CRATE_VERSION: &str = "0.14.0";
 pub const DEFAULT_TEAM_PORT: u16 = 47231;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct TeamHello {
     pub name: String,
     pub protocol: u32,
+    /// Defaulted so a peer from before protocol 2 is reported as a
+    /// different version rather than as an unreadable answer.
+    #[serde(default)]
+    pub acp_crate: String,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -71,44 +79,13 @@ pub struct TeamWorkspaceList {
     pub workspaces: Vec<TeamWorkspace>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum TeamToolStatus {
-    Pending,
-    WaitingForApproval,
-    Running,
-    Done,
-    Failed,
-    Rejected,
-    Canceled,
-}
-
-/// One entry of a chat transcript. Deliberately independent of ACP's types
-/// so an ACP upgrade on one machine doesn't break the wire format.
+/// One entry of a chat transcript.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum TeamEntry {
-    User {
-        markdown: String,
-    },
-    Assistant {
-        markdown: String,
-        /// The model's thinking before or between its reply.
-        #[serde(default)]
-        thinking: Option<String>,
-    },
-    ToolCall {
-        title: String,
-        tool_kind: String,
-        status: TeamToolStatus,
-        #[serde(default)]
-        description: Option<String>,
-        #[serde(default)]
-        output_preview: Option<String>,
-    },
-    Plan {
-        markdown: String,
-    },
+    /// Applied in order to the end of a thread, these rebuild one entry.
+    Updates { updates: Vec<acp::SessionUpdate> },
+    CompletedPlan { entries: Vec<acp::PlanEntry> },
     Compaction {
         #[serde(default)]
         summary: Option<String>,
@@ -133,6 +110,9 @@ pub struct TeamChatUpdate {
     pub reset: bool,
     pub len: usize,
     pub changes: Vec<TeamEntryChange>,
+    /// The chat's current plan, sent with every update.
+    #[serde(default)]
+    pub plan: Vec<acp::PlanEntry>,
 }
 
 /// Where to reach a teammate: a Tailscale machine name or address, with an
@@ -162,6 +142,8 @@ struct ChatFeed {
     /// invalidates every viewer's cursor.
     generation: u64,
     entries: Vec<(TeamEntry, u64)>,
+    plan: Vec<acp::PlanEntry>,
+    plan_changed_at: u64,
 }
 
 struct HubState {
@@ -296,6 +278,24 @@ impl TeamShareHub {
         true
     }
 
+    /// Sets a chat's current plan. Returns false when the chat isn't known,
+    /// in which case the caller should replace the whole chat.
+    pub fn set_chat_plan(&self, chat_id: &str, entries: Vec<acp::PlanEntry>) -> bool {
+        let mut state = self.lock();
+        let next_version = state.version + 1;
+        let Some(feed) = state.chats.get_mut(chat_id) else {
+            return false;
+        };
+        if feed.plan == entries {
+            return true;
+        }
+        feed.plan = entries;
+        feed.plan_changed_at = next_version;
+        state.version = next_version;
+        self.inner.changed.notify_all();
+        true
+    }
+
     pub fn remove_chat(&self, chat_id: &str) {
         if self.lock().chats.remove(chat_id).is_some() {
             self.inner.changed.notify_all();
@@ -314,7 +314,7 @@ impl TeamShareHub {
     /// What changed since `cursor`, or None when the chat isn't loaded.
     pub fn chat_update(&self, chat_id: &str, cursor: Option<&str>) -> Option<TeamChatUpdate> {
         let state = self.lock();
-        Self::update_locked(&state, chat_id, cursor)
+        Self::update_locked(&state, chat_id, cursor).map(|(update, _)| update)
     }
 
     /// Like `chat_update`, but waits up to `timeout` for something to change.
@@ -329,8 +329,8 @@ impl TeamShareHub {
         let mut state = self.lock();
         let mut waited = false;
         loop {
-            let update = Self::update_locked(&state, chat_id, cursor)?;
-            if update.reset || !update.changes.is_empty() {
+            let (update, changed) = Self::update_locked(&state, chat_id, cursor)?;
+            if changed {
                 if waited {
                     drop(state);
                     std::thread::sleep(COALESCE_CHANGES);
@@ -352,11 +352,12 @@ impl TeamShareHub {
         }
     }
 
+    /// The update since `cursor`, and whether anything in it changed.
     fn update_locked(
         state: &HubState,
         chat_id: &str,
         cursor: Option<&str>,
-    ) -> Option<TeamChatUpdate> {
+    ) -> Option<(TeamChatUpdate, bool)> {
         let feed = state.chats.get(chat_id)?;
         let parsed = cursor.and_then(parse_cursor);
         let since = match parsed {
@@ -369,7 +370,7 @@ impl TeamShareHub {
             }
             _ => None,
         };
-        let changes = feed
+        let changes: Vec<TeamEntryChange> = feed
             .entries
             .iter()
             .enumerate()
@@ -379,12 +380,16 @@ impl TeamShareHub {
                 entry: entry.clone(),
             })
             .collect();
-        Some(TeamChatUpdate {
+        let changed = !changes.is_empty()
+            || since.is_none_or(|since| feed.plan_changed_at > since);
+        let update = TeamChatUpdate {
             cursor: format!("{}.{}.{}", state.epoch, feed.generation, state.version),
             reset: since.is_none(),
             len: feed.entries.len(),
             changes,
-        })
+            plan: feed.plan.clone(),
+        };
+        Some((update, changed))
     }
 }
 
@@ -757,11 +762,7 @@ impl TeamClient {
         let hello: TeamHello = self
             .get_json("/v1/hello", REQUEST_TIMEOUT)?
             .ok_or_else(|| TeamClientError::Other("Not a Mnemonic".to_string()))?;
-        if hello.protocol != TEAM_PROTOCOL_VERSION {
-            return Err(TeamClientError::Incompatible {
-                protocol: hello.protocol,
-            });
-        }
+        check_hello(&hello)?;
         Ok(hello)
     }
 
@@ -805,6 +806,15 @@ impl TeamClient {
     }
 }
 
+fn check_hello(hello: &TeamHello) -> Result<(), TeamClientError> {
+    if hello.protocol != TEAM_PROTOCOL_VERSION || hello.acp_crate != TEAM_ACP_CRATE_VERSION {
+        return Err(TeamClientError::Incompatible {
+            protocol: hello.protocol,
+        });
+    }
+    Ok(())
+}
+
 /// Ids are generated by Mnemonic, so anything that would need escaping is a
 /// bug rather than something to encode.
 fn path_segment(id: &str) -> Result<&str, TeamClientError> {
@@ -827,8 +837,10 @@ mod tests {
     use super::*;
 
     fn user(text: &str) -> TeamEntry {
-        TeamEntry::User {
-            markdown: text.to_string(),
+        TeamEntry::Updates {
+            updates: vec![acp::SessionUpdate::UserMessageChunk(acp::ContentChunk::new(
+                text.into(),
+            ))],
         }
     }
 
@@ -863,6 +875,32 @@ mod tests {
         assert!(!hub.set_chat_entry("chat", 5, user("gap")));
         hub.remove_chat("chat");
         assert!(hub.chat_update("chat", Some(&third.cursor)).is_none());
+    }
+
+    #[test]
+    fn acp_crate_version_matches_the_dependency_pin() {
+        let workspace_manifest = include_str!("../../../../Cargo.toml");
+        let pin = format!("agent-client-protocol = {{ version = \"={TEAM_ACP_CRATE_VERSION}\"");
+        assert!(
+            workspace_manifest.contains(&pin),
+            "The workspace no longer pins `{pin}`; update TEAM_ACP_CRATE_VERSION to match"
+        );
+    }
+
+    #[test]
+    fn hello_rejects_a_different_acp_version() {
+        let hello = |acp_crate: &str| TeamHello {
+            name: "Alice".to_string(),
+            protocol: TEAM_PROTOCOL_VERSION,
+            acp_crate: acp_crate.to_string(),
+        };
+        assert_eq!(
+            check_hello(&hello("0.13.0")),
+            Err(TeamClientError::Incompatible {
+                protocol: TEAM_PROTOCOL_VERSION
+            })
+        );
+        assert_eq!(check_hello(&hello(TEAM_ACP_CRATE_VERSION)), Ok(()));
     }
 
     #[test]

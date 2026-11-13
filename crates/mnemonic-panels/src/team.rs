@@ -9,9 +9,11 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use acp_thread::{
-    AcpThread, AcpThreadEvent, AgentThreadEntry, AssistantMessageChunk, ToolCall, ToolCallContent,
-    ToolCallStatus,
+    AcpThread, AcpThreadEvent, AgentThreadEntry, AssistantMessageChunk, PlanEntry,
+    SANDBOX_AUTHORIZATION_META_KEY, SUBAGENT_SESSION_INFO_META_KEY, TOOL_NAME_META_KEY, ToolCall,
+    ToolCallContent, ToolCallStatus,
 };
+use agent_client_protocol::schema as acp;
 use gpui::{
     AnyElement, App, AppContext as _, Context, Entity, EntityId, Global, IntoElement, SharedString,
     Subscription, Task, WeakEntity, px,
@@ -22,11 +24,13 @@ use mnemonic_core::repositories::{chat_session_repository, settings_repository};
 use mnemonic_core::services::team_share_server::{DiffSource, TeamServerConfig, TeamShareServer};
 use mnemonic_core::services::team_share_service::{
     DEFAULT_TEAM_PORT, TailscaleSelf, TailscaleWhois, TeamAgentState, TeamChat, TeamClient,
-    TeamClientError, TeamEntry, TeamShareHub, TeamToolStatus, TeamWorkspace, tailscale_self,
+    TeamClientError, TeamEntry, TeamShareHub, TeamWorkspace, tailscale_self,
 };
 use mnemonic_core::services::{git_review_service, workspace_service};
 use settings::{RegisterSetting, Settings, SettingsStore};
 use ui::{CommonAnimationExt as _, Tooltip, prelude::*};
+use util::ResultExt as _;
+use util::markdown::MarkdownCodeBlock;
 use workspace::Workspace;
 
 use crate::team_settings::{TeamWindowTab, open_team_window};
@@ -571,8 +575,7 @@ impl TeamShare {
             if watched && self.hub.has_chat(&chat_id) {
                 continue;
             }
-            self.hub
-                .replace_chat(&chat_id, thread_entries(thread.read(cx), cx));
+            self.replace_chat(&chat_id, thread.read(cx), cx);
             let subscription = cx.subscribe(&thread, {
                 let chat_id = chat_id.clone();
                 move |this, thread, event, cx| {
@@ -622,9 +625,17 @@ impl TeamShare {
             }
             _ => true,
         };
+        // A plan update raises no thread event of its own, so the plan is
+        // re-checked on every event. An unchanged plan wakes nobody.
+        let published = published && self.hub.set_chat_plan(chat_id, thread_plan(thread, cx));
         if !published {
-            self.hub.replace_chat(chat_id, thread_entries(thread, cx));
+            self.replace_chat(chat_id, thread, cx);
         }
+    }
+
+    fn replace_chat(&self, chat_id: &str, thread: &AcpThread, cx: &App) {
+        self.hub.replace_chat(chat_id, thread_entries(thread, cx));
+        self.hub.set_chat_plan(chat_id, thread_plan(thread, cx));
     }
 
     fn connect_peers(&mut self, settings: &TeamSettings, cx: &mut Context<Self>) {
@@ -794,69 +805,60 @@ fn thread_entries(thread: &AcpThread, cx: &App) -> Vec<TeamEntry> {
         .collect()
 }
 
-fn push_paragraph(text: &mut String, paragraph: &str) {
-    if paragraph.trim().is_empty() {
-        return;
-    }
-    if !text.is_empty() {
-        text.push_str("\n\n");
-    }
-    text.push_str(paragraph);
+fn thread_plan(thread: &AcpThread, cx: &App) -> Vec<acp::PlanEntry> {
+    thread
+        .plan()
+        .entries
+        .iter()
+        .map(|entry| acp_plan_entry(entry, cx))
+        .collect()
 }
 
-fn team_entry(entry: &AgentThreadEntry, cx: &App) -> TeamEntry {
+fn acp_plan_entry(entry: &PlanEntry, cx: &App) -> acp::PlanEntry {
+    acp::PlanEntry::new(
+        entry.content.read(cx).source().to_string(),
+        entry.priority.clone(),
+        entry.status.clone(),
+    )
+}
+
+pub(crate) fn team_entry(entry: &AgentThreadEntry, cx: &App) -> TeamEntry {
     match entry {
-        AgentThreadEntry::UserMessage(message) => TeamEntry::User {
-            markdown: message.content.to_markdown(cx).to_string(),
+        AgentThreadEntry::UserMessage(message) => TeamEntry::Updates {
+            updates: message
+                .chunks
+                .iter()
+                .map(|chunk| {
+                    acp::SessionUpdate::UserMessageChunk(acp::ContentChunk::new(chunk.clone()))
+                })
+                .collect(),
         },
-        AgentThreadEntry::AssistantMessage(message) => {
-            let mut markdown = String::new();
-            let mut thinking = String::new();
-            for chunk in &message.chunks {
-                match chunk {
+        AgentThreadEntry::AssistantMessage(message) => TeamEntry::Updates {
+            updates: message
+                .chunks
+                .iter()
+                .map(|chunk| match chunk {
                     AssistantMessageChunk::Message { block } => {
-                        push_paragraph(&mut markdown, block.to_markdown(cx))
+                        acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new(
+                            block.to_markdown(cx).into(),
+                        ))
                     }
                     AssistantMessageChunk::Thought { block } => {
-                        push_paragraph(&mut thinking, block.to_markdown(cx))
+                        acp::SessionUpdate::AgentThoughtChunk(acp::ContentChunk::new(
+                            block.to_markdown(cx).into(),
+                        ))
                     }
-                }
-            }
-            TeamEntry::Assistant {
-                markdown,
-                thinking: (!thinking.is_empty()).then_some(thinking),
-            }
-        }
-        AgentThreadEntry::ToolCall(tool_call) => {
-            let status = match &tool_call.status {
-                ToolCallStatus::Pending => TeamToolStatus::Pending,
-                ToolCallStatus::WaitingForConfirmation { .. } => TeamToolStatus::WaitingForApproval,
-                ToolCallStatus::InProgress => TeamToolStatus::Running,
-                ToolCallStatus::Completed => TeamToolStatus::Done,
-                ToolCallStatus::Failed => TeamToolStatus::Failed,
-                ToolCallStatus::Rejected => TeamToolStatus::Rejected,
-                ToolCallStatus::Canceled => TeamToolStatus::Canceled,
-            };
-            let output_preview = (status == TeamToolStatus::Failed)
-                .then(|| tool_call_error_preview(tool_call, cx))
-                .flatten();
-            TeamEntry::ToolCall {
-                title: tool_call.label.read(cx).source().to_string(),
-                tool_kind: serde_json::to_value(tool_call.kind)
-                    .ok()
-                    .and_then(|kind| kind.as_str().map(str::to_string))
-                    .unwrap_or_default(),
-                status,
-                description: tool_call_description(tool_call),
-                output_preview,
-            }
-        }
-        AgentThreadEntry::CompletedPlan(entries) => TeamEntry::Plan {
-            markdown: entries
+                })
+                .collect(),
+        },
+        AgentThreadEntry::ToolCall(tool_call) => TeamEntry::Updates {
+            updates: vec![acp::SessionUpdate::ToolCall(acp_tool_call(tool_call, cx))],
+        },
+        AgentThreadEntry::CompletedPlan(entries) => TeamEntry::CompletedPlan {
+            entries: entries
                 .iter()
-                .map(|entry| format!("- {}", entry.content.read(cx).source()))
-                .collect::<Vec<_>>()
-                .join("\n"),
+                .map(|entry| acp_plan_entry(entry, cx))
+                .collect(),
         },
         AgentThreadEntry::ContextCompaction(compaction) => TeamEntry::Compaction {
             summary: compaction
@@ -867,31 +869,83 @@ fn team_entry(entry: &AgentThreadEntry, cx: &App) -> TeamEntry {
     }
 }
 
-/// What the agent said a tool call is for, from the `description` it gave
-/// with the call.
-fn tool_call_description(tool_call: &ToolCall) -> Option<String> {
-    let description = tool_call
-        .raw_input
-        .as_ref()?
-        .get("description")?
-        .as_str()?
-        .trim();
-    (!description.is_empty()).then(|| description.to_string())
-}
-
-/// The start of a failed tool call's output, which usually says why.
-fn tool_call_error_preview(tool_call: &ToolCall, cx: &App) -> Option<String> {
-    let text = tool_call
+fn acp_tool_call(tool_call: &ToolCall, cx: &App) -> acp::ToolCall {
+    let status = match &tool_call.status {
+        ToolCallStatus::Pending | ToolCallStatus::WaitingForConfirmation { .. } => {
+            acp::ToolCallStatus::Pending
+        }
+        ToolCallStatus::InProgress => acp::ToolCallStatus::InProgress,
+        ToolCallStatus::Completed => acp::ToolCallStatus::Completed,
+        ToolCallStatus::Failed | ToolCallStatus::Rejected | ToolCallStatus::Canceled => {
+            acp::ToolCallStatus::Failed
+        }
+    };
+    let content = tool_call
         .content
         .iter()
-        .filter_map(|content| match content {
-            ToolCallContent::ContentBlock(block) => Some(block.to_markdown(cx)),
-            ToolCallContent::Diff(_) | ToolCallContent::Terminal(_) => None,
+        .map(|content| match content {
+            ToolCallContent::ContentBlock(block) => {
+                acp::ToolCallContent::Content(acp::Content::new(block.to_markdown(cx)))
+            }
+            ToolCallContent::Diff(diff) => {
+                let diff = diff.read(cx);
+                let old_text = diff.base_text();
+                acp::ToolCallContent::Diff(
+                    acp::Diff::new(
+                        diff.file_path(cx).unwrap_or_default(),
+                        diff.buffer().read(cx).text(),
+                    )
+                    // A new file's diff has an empty base, which ACP marks
+                    // as no old text.
+                    .old_text((!old_text.is_empty()).then(|| old_text.to_string())),
+                )
+            }
+            ToolCallContent::Terminal(terminal) => {
+                let output = terminal.read(cx).inner().read(cx).get_content();
+                acp::ToolCallContent::Content(acp::Content::new(
+                    MarkdownCodeBlock {
+                        tag: "",
+                        text: &output,
+                    }
+                    .to_string(),
+                ))
+            }
         })
-        .collect::<Vec<_>>()
-        .join("\n");
-    let preview = one_line_preview(&text);
-    (!preview.is_empty()).then_some(preview)
+        .collect();
+    acp::ToolCall::new(
+        tool_call.id.clone(),
+        tool_call.label.read(cx).source().to_string(),
+    )
+    .kind(tool_call.kind)
+    .status(status)
+    .content(content)
+    .locations(tool_call.locations.clone())
+    .raw_input(tool_call.raw_input.clone())
+    .raw_output(tool_call.raw_output.clone())
+    .meta(tool_call_meta(tool_call))
+}
+
+/// `ToolCall` keeps only the meta keys it reads, so those are rebuilt.
+fn tool_call_meta(tool_call: &ToolCall) -> Option<acp::Meta> {
+    let mut meta = acp::Meta::new();
+    if let Some(tool_name) = &tool_call.tool_name {
+        meta.insert(TOOL_NAME_META_KEY.into(), tool_name.to_string().into());
+    }
+    if let Some(value) = tool_call
+        .subagent_session_info
+        .as_ref()
+        .and_then(|info| serde_json::to_value(info).log_err())
+    {
+        meta.insert(SUBAGENT_SESSION_INFO_META_KEY.into(), value);
+    }
+    if let Some(value) = tool_call
+        .sandbox_authorization_details
+        .as_ref()
+        .and_then(|details| serde_json::to_value(details).log_err())
+    {
+        meta.insert(SANDBOX_AUTHORIZATION_META_KEY.into(), value);
+    }
+    (!meta.is_empty()).then_some(meta)
 }
 
 /// Collapses text onto one line for a preview, dropping code fences and
@@ -1219,4 +1273,90 @@ pub(crate) fn render_agent_state(id: &str, state: TeamAgentState, cx: &App) -> A
         .tooltip(Tooltip::text(tooltip))
         .child(indicator)
         .into_any_element()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use acp_thread::{AgentConnection as _, StubAgentConnection};
+    use gpui::TestAppContext;
+    use project::{FakeFs, Project};
+    use settings::SettingsStore;
+    use std::rc::Rc;
+    use util::path_list::PathList;
+
+    async fn new_thread(cx: &mut TestAppContext) -> Entity<AcpThread> {
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let connection = Rc::new(StubAgentConnection::new());
+        cx.update(|cx| connection.new_session(project, PathList::default(), cx))
+            .await
+            .expect("the stub connection starts a session")
+    }
+
+    #[gpui::test]
+    async fn team_entries_rebuild_the_same_thread(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let settings_store = SettingsStore::test(cx);
+            cx.set_global(settings_store);
+        });
+        let shared = new_thread(cx).await;
+        let tool_call_id = acp::ToolCallId::new("edit-login");
+        let session_updates = vec![
+            acp::SessionUpdate::UserMessageChunk(acp::ContentChunk::new(
+                "Fix the login page".into(),
+            )),
+            acp::SessionUpdate::UserMessageChunk(acp::ContentChunk::new(" please".into())),
+            acp::SessionUpdate::AgentThoughtChunk(acp::ContentChunk::new("Looking at".into())),
+            acp::SessionUpdate::AgentThoughtChunk(acp::ContentChunk::new(" the form".into())),
+            acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new("I'll fix".into())),
+            acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new(" the form.".into())),
+            acp::SessionUpdate::ToolCall(
+                acp::ToolCall::new(tool_call_id.clone(), "Edit login.rs")
+                    .kind(acp::ToolKind::Edit)
+                    .status(acp::ToolCallStatus::InProgress)
+                    .raw_input(serde_json::json!({ "path": "/project/login.rs" })),
+            ),
+            acp::SessionUpdate::ToolCallUpdate(acp::ToolCallUpdate::new(
+                tool_call_id,
+                acp::ToolCallUpdateFields::new()
+                    .status(acp::ToolCallStatus::Completed)
+                    .content(vec![
+                        acp::ToolCallContent::Diff(
+                            acp::Diff::new("/project/login.rs", "let valid = true;\n")
+                                .old_text("let valid = false;\n".to_string()),
+                        ),
+                        acp::ToolCallContent::Content(acp::Content::new("Saved login.rs")),
+                    ]),
+            )),
+        ];
+        shared.update(cx, |thread, cx| {
+            session_updates
+                .into_iter()
+                .try_for_each(|update| thread.handle_session_update(update, cx))
+        })
+        .expect("the shared thread takes every update");
+        cx.executor().advance_clock(Duration::from_secs(1));
+        cx.run_until_parked();
+
+        let team_entries = shared.read_with(cx, |thread, cx| thread_entries(thread, cx));
+        let mirror = new_thread(cx).await;
+        mirror.update(cx, |thread, cx| {
+            team_entries
+                .into_iter()
+                .flat_map(|entry| match entry {
+                    TeamEntry::Updates { updates } => updates,
+                    _ => Vec::new(),
+                })
+                .try_for_each(|update| thread.handle_session_update(update, cx))
+        })
+        .expect("the mirror takes every update");
+        cx.executor().advance_clock(Duration::from_secs(1));
+        cx.run_until_parked();
+
+        let shared_markdown = shared.read_with(cx, |thread, cx| thread.to_markdown(cx));
+        let mirror_markdown = mirror.read_with(cx, |thread, cx| thread.to_markdown(cx));
+        assert!(shared_markdown.contains("let valid = true;"));
+        assert_eq!(mirror_markdown, shared_markdown);
+    }
 }

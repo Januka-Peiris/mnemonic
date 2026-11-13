@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use agent_client_protocol::schema as acp;
 use editor::Editor;
 use futures::StreamExt as _;
 use gpui::{
@@ -14,8 +15,7 @@ use gpui::{
 use language::{Buffer, LanguageRegistry};
 use markdown::{Markdown, MarkdownElement, MarkdownFont, MarkdownStyle};
 use mnemonic_core::services::team_share_service::{
-    MAX_CHAT_WAIT, TeamChatUpdate, TeamClient, TeamClientError, TeamEntry, TeamToolStatus,
-    TeamWorkspace,
+    MAX_CHAT_WAIT, TeamChatUpdate, TeamClient, TeamClientError, TeamEntry, TeamWorkspace,
 };
 use ui::{Tooltip, prelude::*};
 use util::ResultExt as _;
@@ -55,9 +55,6 @@ enum TranscriptEntry {
     },
     Tool {
         title: String,
-        status: TeamToolStatus,
-        description: Option<String>,
-        output_preview: Option<String>,
     },
     Plan(Entity<Markdown>),
     Compaction,
@@ -70,27 +67,29 @@ impl TranscriptEntry {
             cx.new(|cx| Markdown::new(text.into(), Some(languages.clone()), None, cx))
         };
         match entry {
-            TeamEntry::User { markdown: text } => Self::User(markdown(text, cx)),
-            TeamEntry::Assistant {
-                markdown: text,
-                thinking,
-            } => Self::Assistant {
-                markdown: markdown(text, cx),
-                thinking,
+            TeamEntry::Updates { updates } => match updates.first() {
+                Some(acp::SessionUpdate::ToolCall(tool_call)) => Self::Tool {
+                    title: tool_call.title.clone(),
+                },
+                Some(acp::SessionUpdate::UserMessageChunk(_)) => {
+                    Self::User(markdown(updates_text(&updates).0, cx))
+                }
+                _ => {
+                    let (text, thinking) = updates_text(&updates);
+                    Self::Assistant {
+                        markdown: markdown(text, cx),
+                        thinking,
+                    }
+                }
             },
-            TeamEntry::ToolCall {
-                title,
-                status,
-                description,
-                output_preview,
-                ..
-            } => Self::Tool {
-                title,
-                status,
-                description,
-                output_preview,
-            },
-            TeamEntry::Plan { markdown: text } => Self::Plan(markdown(text, cx)),
+            TeamEntry::CompletedPlan { entries } => Self::Plan(markdown(
+                entries
+                    .iter()
+                    .map(|entry| format!("- {}", entry.content))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+                cx,
+            )),
             TeamEntry::Compaction { .. } => Self::Compaction,
             TeamEntry::Unknown => Self::Unknown,
         }
@@ -100,31 +99,45 @@ impl TranscriptEntry {
     /// markdown. Returns false when the entry has to be rebuilt.
     fn update(&mut self, entry: &TeamEntry, cx: &mut App) -> bool {
         match (self, entry) {
-            (Self::User(markdown), TeamEntry::User { markdown: text }) => {
-                markdown.update(cx, |markdown, cx| markdown.reset(text.clone().into(), cx));
-                true
-            }
             (
                 Self::Assistant {
                     markdown,
                     thinking: current_thinking,
                 },
-                TeamEntry::Assistant {
-                    markdown: text,
-                    thinking,
-                },
-            ) => {
-                markdown.update(cx, |markdown, cx| markdown.reset(text.clone().into(), cx));
-                current_thinking.clone_from(thinking);
-                true
-            }
-            (Self::Plan(markdown), TeamEntry::Plan { markdown: text }) => {
-                markdown.update(cx, |markdown, cx| markdown.reset(text.clone().into(), cx));
+                TeamEntry::Updates { updates },
+            ) if !matches!(
+                updates.first(),
+                Some(
+                    acp::SessionUpdate::ToolCall(_) | acp::SessionUpdate::UserMessageChunk(_)
+                )
+            ) =>
+            {
+                let (text, thinking) = updates_text(updates);
+                markdown.update(cx, |markdown, cx| markdown.reset(text.into(), cx));
+                *current_thinking = thinking;
                 true
             }
             _ => false,
         }
     }
+}
+
+/// The text of an entry's message chunks, and of its thought chunks.
+fn updates_text(updates: &[acp::SessionUpdate]) -> (String, Option<String>) {
+    let mut text = String::new();
+    let mut thinking = String::new();
+    for update in updates {
+        let (target, chunk) = match update {
+            acp::SessionUpdate::UserMessageChunk(chunk)
+            | acp::SessionUpdate::AgentMessageChunk(chunk) => (&mut text, chunk),
+            acp::SessionUpdate::AgentThoughtChunk(chunk) => (&mut thinking, chunk),
+            _ => continue,
+        };
+        if let acp::ContentBlock::Text(content) = &chunk.content {
+            target.push_str(&content.text);
+        }
+    }
+    (text, (!thinking.is_empty()).then_some(thinking))
 }
 
 /// Stops the polling thread once the chat stops being followed.
@@ -669,42 +682,8 @@ impl TeamWorkspaceView {
                     column.child(MarkdownElement::new(markdown.clone(), markdown_style()))
                 })
                 .into_any_element(),
-            TranscriptEntry::Tool {
-                title,
-                status,
-                description,
-                output_preview,
-            } => {
-                let (icon, color) = match status {
-                    TeamToolStatus::Pending => (IconName::Circle, Color::Muted),
-                    TeamToolStatus::WaitingForApproval => (IconName::Info, Color::Accent),
-                    TeamToolStatus::Running => (IconName::ArrowCircle, Color::Muted),
-                    TeamToolStatus::Done => (IconName::Check, Color::Muted),
-                    TeamToolStatus::Failed => (IconName::XCircle, Color::Error),
-                    TeamToolStatus::Rejected | TeamToolStatus::Canceled => {
-                        (IconName::Close, Color::Muted)
-                    }
-                };
-                let (label, chip) = match description {
-                    Some(description) => (description.clone(), Some(title.clone())),
-                    None => (title.clone(), None),
-                };
-                let label = if *status == TeamToolStatus::WaitingForApproval {
-                    format!("Waiting for permission: {label}")
-                } else {
-                    label
-                };
-                v_flex()
-                    .child(render_activity_row(icon, color, label, chip, cx))
-                    .when_some(output_preview.clone(), |column, preview| {
-                        column.child(render_activity_row(
-                            IconName::XCircle,
-                            Color::Error,
-                            "Error".to_string(),
-                            Some(preview),
-                            cx,
-                        ))
-                    })
+            TranscriptEntry::Tool { title } => {
+                render_activity_row(IconName::Check, Color::Muted, title.clone(), None, cx)
                     .into_any_element()
             }
             TranscriptEntry::Plan(markdown) => v_flex()
