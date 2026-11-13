@@ -1218,6 +1218,9 @@ fn register_actions(
              action: &zed_actions::mnemonic::NewAgentSession,
              window: &mut Window,
              cx: &mut Context<Workspace>| {
+                if show_teammate_workspace_is_read_only(workspace, cx) {
+                    return;
+                }
                 if !add_session_to_active_mnemonic_workspace(workspace, action.kind, window, cx) {
                     struct NoActiveMnemonicWorkspace;
                     workspace.show_toast(
@@ -1235,6 +1238,9 @@ fn register_actions(
              _: &zed_actions::mnemonic::NewDefaultAgentSession,
              window: &mut Window,
              cx: &mut Context<Workspace>| {
+                if show_teammate_workspace_is_read_only(workspace, cx) {
+                    return;
+                }
                 if !add_session_to_active_mnemonic_workspace(
                     workspace,
                     zed_actions::mnemonic::AgentSessionKind::DefaultChat,
@@ -1478,6 +1484,27 @@ fn register_actions(
         workspace.show_error(DebugError, cx);
         workspace.show_error(SecondDebugError, cx);
     });
+}
+
+/// When a teammate's shared workspace is selected, says it can't take a new
+/// session and returns true.
+fn show_teammate_workspace_is_read_only(
+    workspace: &mut Workspace,
+    cx: &mut Context<Workspace>,
+) -> bool {
+    let teammate_selected = mnemonic_bridge::ActiveWorkspace::get(cx.entity_id(), cx)
+        .is_some_and(|workspace_id| mnemonic_bridge::is_teammate_workspace(&workspace_id));
+    if teammate_selected {
+        struct TeammateWorkspaceReadOnly;
+        workspace.show_toast(
+            Toast::new(
+                NotificationId::unique::<TeammateWorkspaceReadOnly>(),
+                "Teammate workspaces are read-only",
+            ),
+            cx,
+        );
+    }
+    teammate_selected
 }
 
 fn add_session_to_active_mnemonic_workspace(

@@ -26,7 +26,10 @@ use crate::team_connection::TeamAgentServer;
 /// What the window's selected workspace id holds while a teammate's
 /// workspace is selected. It never matches a local workspace's id.
 pub(crate) fn teammate_workspace_key(host: &str, workspace_id: &str) -> String {
-    format!("team:{host}:{workspace_id}")
+    format!(
+        "{}{host}:{workspace_id}",
+        mnemonic_bridge::TEAMMATE_WORKSPACE_PREFIX
+    )
 }
 
 /// One of the teammate's chats as a tab.
@@ -325,6 +328,18 @@ impl TeammateWorkspaceView {
             }
         }
 
+        mnemonic_bridge::TeammateWorkspaceTitles::set(
+            &teammate_workspace_key(&self.host, &self.workspace_id),
+            mnemonic_bridge::TeammateWorkspaceTitle {
+                peer: peer_name.to_string(),
+                project: live.project.clone(),
+                name: live.name.clone(),
+                branch: live.branch.clone(),
+                pr_state: live.pr_state.clone(),
+                pr_number: live.pr_number,
+            },
+            cx,
+        );
         self.last_known = Some(live);
         cx.notify();
     }
@@ -418,14 +433,18 @@ impl TeammateWorkspaceView {
         let team = team_share(cx)?;
         let team = team.read(cx);
         match team.peer(&self.host) {
-            Some(peer) if matches!(peer.status, PeerStatus::Online) => {
-                let listed = peer
-                    .workspaces
-                    .iter()
-                    .any(|workspace| workspace.id == self.workspace_id);
-                (!listed).then(|| format!("{peer_name} stopped sharing this workspace"))
-            }
-            _ => Some(format!("{peer_name} is offline")),
+            Some(peer) => match peer.status {
+                PeerStatus::Online => {
+                    let listed = peer
+                        .workspaces
+                        .iter()
+                        .any(|workspace| workspace.id == self.workspace_id);
+                    (!listed).then(|| format!("{peer_name} stopped sharing this workspace"))
+                }
+                PeerStatus::Connecting => Some(format!("Connecting to {peer_name}")),
+                PeerStatus::Failed(_) => Some(format!("{peer_name} is offline")),
+            },
+            None => Some(format!("{peer_name} is offline")),
         }
     }
 
@@ -453,49 +472,45 @@ impl TeammateWorkspaceView {
                     .size(LabelSize::Small)
                     .color(Color::Muted),
             )
-            .child(Label::new("/").size(LabelSize::Small).color(Color::Muted))
-            .child(
-                Label::new(
-                    shared
-                        .map(|shared| shared.name.clone())
-                        .unwrap_or_else(|| "Not shared any more".to_string()),
-                )
-                .size(LabelSize::Small)
-                .single_line(),
-            )
             .when_some(shared, |row, shared| {
-                row.child(
-                    Label::new(shared.branch.clone())
-                        .size(LabelSize::XSmall)
-                        .color(Color::Muted)
-                        .buffer_font(cx)
-                        .single_line()
-                        .truncate(),
-                )
-                .when_some(shared.pr_state.as_deref(), |row, state| {
-                    let label = match shared.pr_number {
-                        Some(number) => {
-                            format!("#{number} {}", mnemonic_bridge::pr_state_label(state))
-                        }
-                        None => mnemonic_bridge::pr_state_label(state).to_string(),
-                    };
-                    let color = mnemonic_bridge::pr_state_color(state, cx)
-                        .map(Color::Custom)
-                        .unwrap_or(Color::Muted);
-                    row.child(Label::new(label).size(LabelSize::XSmall).color(color))
-                })
-                .when(shared.additions > 0 || shared.deletions > 0, |row| {
-                    row.child(
-                        Label::new(format!("+{}", shared.additions))
-                            .size(LabelSize::XSmall)
-                            .color(Color::Created),
+                row.child(Label::new("/").size(LabelSize::Small).color(Color::Muted))
+                    .child(
+                        Label::new(shared.name.clone())
+                            .size(LabelSize::Small)
+                            .single_line(),
                     )
                     .child(
-                        Label::new(format!("-{}", shared.deletions))
+                        Label::new(shared.branch.clone())
                             .size(LabelSize::XSmall)
-                            .color(Color::Deleted),
+                            .color(Color::Muted)
+                            .buffer_font(cx)
+                            .single_line()
+                            .truncate(),
                     )
-                })
+                    .when_some(shared.pr_state.as_deref(), |row, state| {
+                        let label = match shared.pr_number {
+                            Some(number) => {
+                                format!("#{number} {}", mnemonic_bridge::pr_state_label(state))
+                            }
+                            None => mnemonic_bridge::pr_state_label(state).to_string(),
+                        };
+                        let color = mnemonic_bridge::pr_state_color(state, cx)
+                            .map(Color::Custom)
+                            .unwrap_or(Color::Muted);
+                        row.child(Label::new(label).size(LabelSize::XSmall).color(color))
+                    })
+                    .when(shared.additions > 0 || shared.deletions > 0, |row| {
+                        row.child(
+                            Label::new(format!("+{}", shared.additions))
+                                .size(LabelSize::XSmall)
+                                .color(Color::Created),
+                        )
+                        .child(
+                            Label::new(format!("-{}", shared.deletions))
+                                .size(LabelSize::XSmall)
+                                .color(Color::Deleted),
+                        )
+                    })
             })
     }
 }

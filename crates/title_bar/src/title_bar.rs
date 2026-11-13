@@ -302,6 +302,14 @@ impl Render for TitleBar {
                         )
                         .children(self.render_restricted_mode(cx))
                         .when(render_project_items, |title_bar| {
+                            // A teammate's workspace isn't the window's
+                            // project, which still points at the last local
+                            // workspace, so its own name and branch show.
+                            if let Some(teammate) = self.teammate_workspace_title(cx) {
+                                return title_bar.child(
+                                    self.render_teammate_workspace(teammate, &title_bar_settings),
+                                );
+                            }
                             title_bar
                                 .when(title_bar_settings.show_project_items, |title_bar| {
                                     title_bar
@@ -430,14 +438,92 @@ impl Render for TitleBar {
 }
 
 impl TitleBar {
+    /// The selected workspace's title when it is a teammate's shared one.
+    fn teammate_workspace_title(
+        &self,
+        cx: &App,
+    ) -> Option<mnemonic_bridge::TeammateWorkspaceTitle> {
+        let workspace_id = mnemonic_bridge::ActiveWorkspace::get(self.workspace.entity_id(), cx)?;
+        if !mnemonic_bridge::is_teammate_workspace(&workspace_id) {
+            return None;
+        }
+        mnemonic_bridge::TeammateWorkspaceTitles::get(&workspace_id, cx)
+    }
+
+    /// A teammate's workspace in the place of the project name, worktree and
+    /// branch, with the same look. Nothing opens from it: the pickers act on
+    /// this machine's project.
+    fn render_teammate_workspace(
+        &self,
+        teammate: mnemonic_bridge::TeammateWorkspaceTitle,
+        settings: &TitleBarSettings,
+    ) -> impl IntoElement {
+        let tooltip = format!("{}'s workspace. Read-only.", teammate.peer);
+        h_flex()
+            .gap_px()
+            .when(settings.show_project_items, |this| {
+                this.child(
+                    Button::new("teammate_project_name", teammate.project.clone())
+                        .label_size(LabelSize::Small)
+                        .start_icon(
+                            Icon::new(IconName::UserGroup)
+                                .size(IconSize::XSmall)
+                                .color(Color::Muted),
+                        )
+                        .tooltip(Tooltip::text(tooltip.clone())),
+                )
+                .child(
+                    Button::new("teammate_workspace_name", teammate.name.clone())
+                        .label_size(LabelSize::Small)
+                        .color(Color::Muted)
+                        .start_icon(
+                            Icon::new(IconName::GitWorktree)
+                                .size(IconSize::XSmall)
+                                .color(Color::Muted),
+                        )
+                        .tooltip(Tooltip::text(tooltip.clone())),
+                )
+            })
+            .when(settings.show_branch_name, |this| {
+                this.when(settings.show_project_items, |this| {
+                    this.child(
+                        Label::new("/")
+                            .size(LabelSize::Small)
+                            .color(Color::Muted)
+                            .alpha(0.25),
+                    )
+                })
+                .child(
+                    Button::new(
+                        "teammate_branch_name",
+                        util::truncate_and_trailoff(&teammate.branch, MAX_BRANCH_NAME_LENGTH),
+                    )
+                    .label_size(LabelSize::Small)
+                    .color(Color::Muted)
+                    .start_icon(
+                        Icon::new(IconName::GitBranch)
+                            .size(IconSize::XSmall)
+                            .color(Color::Muted),
+                    )
+                    .tooltip(Tooltip::text(tooltip)),
+                )
+            })
+    }
+
     /// The selected Mnemonic workspace's PR, coloured by its GitHub state.
     fn render_pr_state(&self, cx: &App) -> Option<AnyElement> {
         let workspace_id =
             mnemonic_bridge::ActiveWorkspace::get(self.workspace.entity_id(), cx)?;
-        let state = mnemonic_bridge::pr_state(&workspace_id)?;
+        let (state, number) = match self.teammate_workspace_title(cx) {
+            Some(teammate) => (teammate.pr_state?, teammate.pr_number),
+            None => (
+                mnemonic_bridge::pr_state(&workspace_id)?,
+                mnemonic_bridge::pr_number(&workspace_id),
+            ),
+        };
         let color = mnemonic_bridge::pr_state_color(&state, cx)?;
         let label = mnemonic_bridge::pr_state_label(&state);
-        let text = match mnemonic_bridge::pr_number(&workspace_id) {
+        let text = match number {
             Some(number) => format!("#{number} {label}"),
             None => label.to_string(),
         };
@@ -478,6 +564,8 @@ impl TitleBar {
         let client = workspace.app_state().client.clone();
         let active_call = ActiveCall::try_global(cx);
         cx.observe_global::<mnemonic_bridge::ActiveWorkspace>(|_, cx| cx.notify())
+            .detach();
+        cx.observe_global::<mnemonic_bridge::TeammateWorkspaceTitles>(|_, cx| cx.notify())
             .detach();
 
         let platform_style = PlatformStyle::platform();
