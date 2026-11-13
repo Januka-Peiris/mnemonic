@@ -1781,6 +1781,44 @@ impl AgentConnection for AcpConnection {
         )
     }
 
+    fn supports_fork_session(&self) -> bool {
+        self.agent_capabilities.session_capabilities.fork.is_some()
+    }
+
+    fn fork_session(
+        self: Rc<Self>,
+        session_id: acp::SessionId,
+        work_dirs: PathList,
+        cx: &mut App,
+    ) -> Task<Result<acp::SessionId>> {
+        if !self.supports_fork_session() {
+            return Task::ready(Err(anyhow!(LoadError::Other(
+                "Forking sessions is not supported by this agent.".into()
+            ))));
+        }
+        let directories = match self.session_directories_from_work_dirs(&work_dirs) {
+            Ok(directories) => directories,
+            Err(error) => return Task::ready(Err(error)),
+        };
+        let mcp_servers = self
+            .sessions
+            .borrow()
+            .get(&session_id)
+            .and_then(|session| session.thread.upgrade())
+            .map(|thread| mcp_servers_for_project(thread.read(cx).project(), cx))
+            .unwrap_or_default();
+        let request = acp::ForkSessionRequest::new(session_id, directories.cwd)
+            .additional_directories(directories.additional_directories)
+            .mcp_servers(mcp_servers);
+        let connection = self.connection.clone();
+        cx.foreground_executor().spawn(async move {
+            let response = into_foreground_future(connection.send_request(request))
+                .await
+                .map_err(map_acp_error)?;
+            Ok(response.session_id)
+        })
+    }
+
     fn supports_close_session(&self) -> bool {
         self.agent_capabilities.session_capabilities.close.is_some()
     }
@@ -2407,6 +2445,14 @@ pub mod test_support {
                 agent_client_protocol::on_receive_request!(),
             )
             .on_receive_request(
+                async move |req: acp::ForkSessionRequest, responder, _cx| {
+                    responder.respond(acp::ForkSessionResponse::new(acp::SessionId::new(
+                        format!("{}-fork", req.session_id),
+                    )))
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_request(
                 {
                     let close_session_count = close_session_count.clone();
                     async move |_req: acp::CloseSessionRequest, responder, _cx| {
@@ -2911,6 +2957,64 @@ mod tests {
                 additional_directories: vec![std::path::PathBuf::from("/workspace-a")],
             }
         );
+    }
+
+    #[gpui::test]
+    async fn fork_session_returns_the_agents_new_session_id(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            let store = settings::SettingsStore::test(cx);
+            cx.set_global(store);
+        });
+
+        let fs = fs::FakeFs::new(cx.executor());
+        fs.insert_tree("/", serde_json::json!({ "a": {} })).await;
+        let project = project::Project::test(fs, [std::path::Path::new("/a")], cx).await;
+        let mut harness = test_support::connect_fake_acp_connection(project, cx).await;
+        Rc::get_mut(&mut harness.connection)
+            .expect("test harness should own the only ACP connection handle")
+            .agent_capabilities
+            .session_capabilities
+            .fork = Some(acp::SessionForkCapabilities::new());
+
+        assert!(harness.connection.supports_fork_session());
+        let connection = harness.connection.clone();
+        let forked = cx
+            .update(|cx| {
+                connection.fork_session(
+                    acp::SessionId::new("original"),
+                    PathList::new(&[std::path::PathBuf::from("/a")]),
+                    cx,
+                )
+            })
+            .await
+            .expect("fork_session should succeed");
+        assert_eq!(forked, acp::SessionId::new("original-fork"));
+    }
+
+    #[gpui::test]
+    async fn fork_session_is_rejected_without_the_capability(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            let store = settings::SettingsStore::test(cx);
+            cx.set_global(store);
+        });
+
+        let fs = fs::FakeFs::new(cx.executor());
+        fs.insert_tree("/", serde_json::json!({ "a": {} })).await;
+        let project = project::Project::test(fs, [std::path::Path::new("/a")], cx).await;
+        let harness = test_support::connect_fake_acp_connection(project, cx).await;
+
+        assert!(!harness.connection.supports_fork_session());
+        let connection = harness.connection.clone();
+        let result = cx
+            .update(|cx| {
+                connection.fork_session(
+                    acp::SessionId::new("original"),
+                    PathList::new(&[std::path::PathBuf::from("/a")]),
+                    cx,
+                )
+            })
+            .await;
+        assert!(result.is_err(), "fork_session should fail without the capability");
     }
 
     async fn connect_session_delete_test_agent(
