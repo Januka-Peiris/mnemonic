@@ -1,11 +1,12 @@
 use gpui::{App, Global};
 use mnemonic_core::repositories::settings_repository;
-use settings::{MergeMethod, RegisterSetting, ReviewAgent, Settings, SettingsStore};
+use settings::{DefaultAgent, MergeMethod, RegisterSetting, ReviewAgent, Settings, SettingsStore};
 
 /// The `workspaces` section of the settings file.
 #[derive(Clone, Debug, PartialEq, RegisterSetting)]
 pub struct WorkspacesSettings {
     pub review_agent: ReviewAgent,
+    pub default_agent: DefaultAgent,
     pub keep_ci_green: bool,
     pub merge_method: MergeMethod,
     pub branch_prefix: String,
@@ -20,6 +21,7 @@ impl Settings for WorkspacesSettings {
         let workspaces = content.workspaces.clone().unwrap_or_default();
         Self {
             review_agent: workspaces.review_agent.unwrap_or_default(),
+            default_agent: workspaces.default_agent.unwrap_or_default(),
             keep_ci_green: workspaces.keep_ci_green.unwrap_or(false),
             merge_method: workspaces.merge_method.unwrap_or_default(),
             branch_prefix: workspaces.branch_prefix.unwrap_or_default(),

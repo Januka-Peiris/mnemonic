@@ -8275,6 +8275,31 @@ fn ai_page() -> SettingsPage {
 }
 
 fn workspaces_page() -> SettingsPage {
+    fn agents_section() -> [SettingsPageItem; 2] {
+        [
+            SettingsPageItem::SectionHeader("Agents"),
+            SettingsPageItem::SettingItem(SettingItem {
+                title: "Default Agent",
+                description: "The agent a new workspace's first chat and the new chat button use. Other agents can still be picked for a single chat.",
+                field: Box::new(SettingField {
+                    organization_override: None,
+                    json_path: Some("workspaces.default_agent"),
+                    pick: |settings_content| {
+                        settings_content.workspaces.as_ref()?.default_agent.as_ref()
+                    },
+                    write: |settings_content, value, _| {
+                        settings_content
+                            .workspaces
+                            .get_or_insert_default()
+                            .default_agent = value;
+                    },
+                }),
+                metadata: None,
+                files: USER,
+            }),
+        ]
+    }
+
     fn projects_section() -> [SettingsPageItem; 2] {
         [
             SettingsPageItem::SectionHeader("Projects"),
@@ -8497,6 +8522,7 @@ fn workspaces_page() -> SettingsPage {
     SettingsPage {
         title: "Workspaces",
         items: concat_sections![
+            agents_section(),
             projects_section(),
             branches_section(),
             pull_requests_section(),

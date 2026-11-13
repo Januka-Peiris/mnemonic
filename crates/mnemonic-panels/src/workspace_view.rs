@@ -28,7 +28,7 @@ use mnemonic_core::services::{
 };
 use project::agent_server_store::AllAgentServersSettings;
 use project::{AgentId, DiagnosticSummary, Project};
-use settings::{NotifyWhenAgentWaiting, ReviewAgent, Settings as _};
+use settings::{DefaultAgent, NotifyWhenAgentWaiting, ReviewAgent, Settings as _};
 use task::{RevealStrategy, Shell, SpawnInTerminal, TaskId};
 use terminal::Terminal;
 use terminal_view::TerminalView;
@@ -168,7 +168,18 @@ impl ChatAgent {
         Self::Cursor,
     ];
 
-    fn agent_id(self) -> &'static str {
+    /// The agent from the Default Agent setting.
+    pub(crate) fn default_agent(cx: &App) -> Self {
+        match WorkspacesSettings::get_global(cx).default_agent {
+            DefaultAgent::Claude => Self::Claude,
+            DefaultAgent::Codex => Self::Codex,
+            DefaultAgent::Gemini => Self::Gemini,
+            DefaultAgent::OpenCode => Self::OpenCode,
+            DefaultAgent::Cursor => Self::Cursor,
+        }
+    }
+
+    pub(crate) fn agent_id(self) -> &'static str {
         match self {
             Self::Claude => "claude-acp",
             Self::Codex => "codex-acp",
@@ -178,7 +189,7 @@ impl ChatAgent {
         }
     }
 
-    fn label(self) -> &'static str {
+    pub(crate) fn label(self) -> &'static str {
         match self {
             Self::Claude => "Claude",
             Self::Codex => "Codex",
@@ -841,6 +852,8 @@ pub(crate) fn pick_dispatch_target(
 
 #[derive(Clone, Copy)]
 enum NewSession {
+    /// A chat with the agent from the Default Agent setting.
+    DefaultChat,
     Chat(ChatAgent),
     ClaudeCli,
     CodexCli,
@@ -850,6 +863,7 @@ enum NewSession {
 impl From<AgentSessionKind> for NewSession {
     fn from(kind: AgentSessionKind) -> Self {
         match kind {
+            AgentSessionKind::DefaultChat => Self::DefaultChat,
             AgentSessionKind::ClaudeChat => Self::Chat(ChatAgent::Claude),
             AgentSessionKind::CodexChat => Self::Chat(ChatAgent::Codex),
             AgentSessionKind::ClaudeCli => Self::ClaudeCli,
@@ -952,6 +966,7 @@ impl WorkspaceView {
 
     fn add_session(&mut self, kind: NewSession, window: &mut Window, cx: &mut Context<Self>) {
         match kind {
+            NewSession::DefaultChat => self.add_chat(ChatAgent::default_agent(cx), window, cx),
             NewSession::Chat(agent) => self.add_chat(agent, window, cx),
             NewSession::ClaudeCli => self.add_claude_terminal(window, cx),
             NewSession::CodexCli => self.add_codex_terminal(window, cx),
@@ -1826,7 +1841,7 @@ impl WorkspaceView {
 
     /// Asks a new chat to write the workspace's setup commands.
     fn ask_agent_for_setup(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.add_session(NewSession::from(AgentSessionKind::ClaudeChat), window, cx);
+        self.add_session(NewSession::DefaultChat, window, cx);
         self.dispatch_to_agent(
             "Add this project's setup commands (installing dependencies, copying env files \
              and similar) to the \"setup\" array in .mnemonic/config.json, creating the file \
@@ -4553,11 +4568,7 @@ impl WorkspaceView {
                         move |_, window, cx| {
                             this.update(cx, |this, cx| {
                                 this.active_pane = pane.clone();
-                                this.add_session(
-                                    NewSession::from(AgentSessionKind::ClaudeChat),
-                                    window,
-                                    cx,
-                                );
+                                this.add_session(NewSession::DefaultChat, window, cx);
                             })
                             .log_err();
                         }
