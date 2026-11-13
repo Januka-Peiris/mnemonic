@@ -15,7 +15,7 @@ use action_log::ActionLog;
 use agent_client_protocol::schema as acp;
 use agent_servers::{AgentServer, AgentServerDelegate};
 use anyhow::{Result, anyhow};
-use gpui::{App, AppContext as _, Context, Entity, SharedString, Task, WeakEntity};
+use gpui::{App, AppContext, Context, Entity, SharedString, Task, WeakEntity};
 use markdown::Markdown;
 use mnemonic_core::services::team_share_service::{
     MAX_CHAT_WAIT, TeamChatUpdate, TeamClient, TeamEntry,
@@ -201,10 +201,7 @@ fn poll_chat(
             match result {
                 Ok(Some(update)) => {
                     cursor = Some(update.cursor.clone());
-                    if thread
-                        .update(cx, |thread, cx| mirror.apply(thread, update, cx))
-                        .is_err()
-                    {
+                    if apply_chat_update(&mut mirror, &thread, update, cx).is_err() {
                         return;
                     }
                 }
@@ -225,43 +222,59 @@ fn poll_chat(
     })
 }
 
-/// Applies a teammate's chat updates to a thread, one sharer entry at a time.
+/// Applies each change in its own `thread.update`: the thread's `NewEntry`
+/// events are delivered only once an update ends, and their handlers take the
+/// last entry as the new one, so two pushes in one update break the chat view.
+fn apply_chat_update<C: AppContext>(
+    mirror: &mut ChatMirror,
+    thread: &WeakEntity<AcpThread>,
+    update: TeamChatUpdate,
+    cx: &mut C,
+) -> Result<()> {
+    for operation in mirror.apply(update) {
+        thread.update(cx, |thread, cx| operation.apply(thread, cx))?;
+    }
+    Ok(())
+}
+
+/// Turns a teammate's chat updates into changes to a thread, one sharer entry
+/// at a time.
 #[derive(Default)]
 pub(crate) struct ChatMirror {
     applied: Vec<TeamEntry>,
 }
 
 impl ChatMirror {
-    pub(crate) fn apply(
-        &mut self,
-        thread: &mut AcpThread,
-        update: TeamChatUpdate,
-        cx: &mut Context<AcpThread>,
-    ) {
+    pub(crate) fn apply(&mut self, update: TeamChatUpdate) -> Vec<MirrorOperation> {
+        let mut operations = Vec::new();
         if update.reset {
-            thread.truncate_entries(0, cx);
+            operations.push(MirrorOperation::Truncate(0));
             self.applied.clear();
         }
         for change in update.changes {
-            self.apply_change(thread, change.index, change.entry, cx);
+            self.apply_change(
+                change.index,
+                without_locations(change.entry),
+                &mut operations,
+            );
         }
         if update.len < self.applied.len() {
-            thread.truncate_entries(self.thread_index(update.len), cx);
+            operations.push(MirrorOperation::Truncate(self.thread_index(update.len)));
             self.applied.truncate(update.len);
         }
-        thread.update_plan(acp::Plan::new(update.plan), cx);
+        operations.push(MirrorOperation::UpdatePlan(update.plan));
+        operations
     }
 
     fn apply_change(
         &mut self,
-        thread: &mut AcpThread,
         index: usize,
         entry: TeamEntry,
-        cx: &mut Context<AcpThread>,
+        operations: &mut Vec<MirrorOperation>,
     ) {
         let Some(previous) = self.applied.get(index) else {
             if index == self.applied.len() {
-                append_entry(thread, index, &entry, cx);
+                append_entry(index, &entry, operations);
                 self.applied.push(entry);
             } else {
                 log::warn!(
@@ -275,7 +288,7 @@ impl ChatMirror {
             return;
         }
         if let Some(tool_call) = same_tool_call(previous, &entry) {
-            thread.upsert_tool_call(tool_call.clone(), cx).log_err();
+            operations.push(MirrorOperation::UpsertToolCall(tool_call.clone()));
             self.applied[index] = entry;
             return;
         }
@@ -285,16 +298,14 @@ impl ChatMirror {
             None
         };
         if let Some(suffix) = suffix {
-            for update in suffix {
-                extend_last_entry(thread, update, cx);
-            }
+            operations.extend(suffix.into_iter().map(MirrorOperation::ExtendLastEntry));
             self.applied[index] = entry;
             return;
         }
-        thread.truncate_entries(self.thread_index(index), cx);
+        operations.push(MirrorOperation::Truncate(self.thread_index(index)));
         let later = self.applied.split_off(index).into_iter().skip(1);
         for (offset, entry) in std::iter::once(entry).chain(later).enumerate() {
-            append_entry(thread, index + offset, &entry, cx);
+            append_entry(index + offset, &entry, operations);
             self.applied.push(entry);
         }
     }
@@ -310,6 +321,84 @@ impl ChatMirror {
     }
 }
 
+/// One change to a mirrored thread, adding at most one entry to it.
+pub(crate) enum MirrorOperation {
+    Truncate(usize),
+    /// Starts a new entry with a message chunk.
+    NewMessage(acp::SessionUpdate),
+    ExtendLastEntry(acp::SessionUpdate),
+    UpsertToolCall(acp::ToolCall),
+    CompletedPlan(Vec<acp::PlanEntry>),
+    Compaction {
+        index: usize,
+        summary: Option<String>,
+    },
+    UpdatePlan(Vec<acp::PlanEntry>),
+}
+
+impl MirrorOperation {
+    fn apply(self, thread: &mut AcpThread, cx: &mut Context<AcpThread>) {
+        match self {
+            MirrorOperation::Truncate(len) => thread.truncate_entries(len, cx),
+            // `handle_session_update` would merge a message into an adjacent
+            // one of the same kind, but the sharer's entries stay separate.
+            MirrorOperation::NewMessage(update) => match update {
+                acp::SessionUpdate::UserMessageChunk(chunk) => {
+                    thread.push_new_user_message(chunk.content, cx)
+                }
+                acp::SessionUpdate::AgentMessageChunk(chunk) => {
+                    thread.push_new_assistant_message(chunk.content, false, cx)
+                }
+                acp::SessionUpdate::AgentThoughtChunk(chunk) => {
+                    thread.push_new_assistant_message(chunk.content, true, cx)
+                }
+                update => extend_last_entry(thread, update, cx),
+            },
+            MirrorOperation::ExtendLastEntry(update) => extend_last_entry(thread, update, cx),
+            MirrorOperation::UpsertToolCall(tool_call) => {
+                thread.upsert_tool_call(tool_call, cx).log_err();
+            }
+            MirrorOperation::CompletedPlan(entries) => {
+                thread.update_plan(acp::Plan::new(entries), cx);
+                thread.snapshot_completed_plan(cx);
+            }
+            MirrorOperation::Compaction { index, summary } => {
+                let languages = thread.project().read(cx).languages().clone();
+                let summary = summary.map(|summary| {
+                    cx.new(|cx| Markdown::new(summary.into(), Some(languages), None, cx))
+                });
+                thread.push_context_compaction(
+                    ContextCompaction {
+                        id: ContextCompactionId(format!("team-{index}").into()),
+                        status: ContextCompactionStatus::Completed,
+                        summary,
+                    },
+                    cx,
+                );
+            }
+            MirrorOperation::UpdatePlan(entries) => thread.update_plan(acp::Plan::new(entries), cx),
+        }
+    }
+}
+
+/// A tool call's locations are paths on the teammate's machine. Resolving
+/// them would open buffers and add worktrees in the local project.
+fn without_locations(entry: TeamEntry) -> TeamEntry {
+    let TeamEntry::Updates { mut updates } = entry else {
+        return entry;
+    };
+    for update in &mut updates {
+        match update {
+            acp::SessionUpdate::ToolCall(tool_call) => tool_call.locations.clear(),
+            acp::SessionUpdate::ToolCallUpdate(tool_call_update) => {
+                tool_call_update.fields.locations = None
+            }
+            _ => {}
+        }
+    }
+    TeamEntry::Updates { updates }
+}
+
 fn adds_thread_entry(entry: &TeamEntry) -> bool {
     match entry {
         TeamEntry::Updates { updates } => !updates.is_empty(),
@@ -319,53 +408,28 @@ fn adds_thread_entry(entry: &TeamEntry) -> bool {
     }
 }
 
-/// Adds a sharer entry to the end of the thread as an entry of its own.
-fn append_entry(
-    thread: &mut AcpThread,
-    index: usize,
-    entry: &TeamEntry,
-    cx: &mut Context<AcpThread>,
-) {
+/// The operations that add a sharer entry to the end of the thread as an
+/// entry of its own.
+fn append_entry(index: usize, entry: &TeamEntry, operations: &mut Vec<MirrorOperation>) {
     match entry {
         TeamEntry::Updates { updates } => {
             let mut updates = updates.iter().cloned();
-            // `handle_session_update` would merge a message into an adjacent
-            // one of the same kind, but the sharer's entries stay separate.
-            match updates.next() {
-                Some(acp::SessionUpdate::UserMessageChunk(chunk)) => {
-                    thread.push_new_user_message(chunk.content, cx)
-                }
-                Some(acp::SessionUpdate::AgentMessageChunk(chunk)) => {
-                    thread.push_new_assistant_message(chunk.content, false, cx)
-                }
-                Some(acp::SessionUpdate::AgentThoughtChunk(chunk)) => {
-                    thread.push_new_assistant_message(chunk.content, true, cx)
-                }
-                Some(update) => extend_last_entry(thread, update, cx),
-                None => {}
+            if let Some(first) = updates.next() {
+                operations.push(if message_chunk(&first).is_some() {
+                    MirrorOperation::NewMessage(first)
+                } else {
+                    MirrorOperation::ExtendLastEntry(first)
+                });
             }
-            for update in updates {
-                extend_last_entry(thread, update, cx);
-            }
+            operations.extend(updates.map(MirrorOperation::ExtendLastEntry));
         }
         TeamEntry::CompletedPlan { entries } => {
-            thread.update_plan(acp::Plan::new(entries.clone()), cx);
-            thread.snapshot_completed_plan(cx);
+            operations.push(MirrorOperation::CompletedPlan(entries.clone()));
         }
-        TeamEntry::Compaction { summary } => {
-            let languages = thread.project().read(cx).languages().clone();
-            let summary = summary.clone().map(|summary| {
-                cx.new(|cx| Markdown::new(summary.into(), Some(languages), None, cx))
-            });
-            thread.push_context_compaction(
-                ContextCompaction {
-                    id: ContextCompactionId(format!("team-{index}").into()),
-                    status: ContextCompactionStatus::Completed,
-                    summary,
-                },
-                cx,
-            );
-        }
+        TeamEntry::Compaction { summary } => operations.push(MirrorOperation::Compaction {
+            index,
+            summary: summary.clone(),
+        }),
         TeamEntry::Unknown => {}
     }
 }
@@ -538,7 +602,8 @@ mod tests {
         update: TeamChatUpdate,
         cx: &mut TestAppContext,
     ) {
-        thread.update(cx, |thread, cx| mirror.apply(thread, update, cx));
+        apply_chat_update(mirror, &thread.downgrade(), update, cx)
+            .expect("the thread is still open");
         cx.executor().advance_clock(Duration::from_secs(1));
         cx.run_until_parked();
     }
@@ -654,6 +719,70 @@ mod tests {
         thread.read_with(cx, |thread, cx| {
             assert_eq!(thread.entries().len(), 1);
             assert!(thread.entries()[0].to_markdown(cx).contains("Only question"));
+        });
+    }
+
+    #[gpui::test]
+    async fn each_new_entry_is_announced_after_only_that_entry_is_added(cx: &mut TestAppContext) {
+        let thread = new_thread(cx).await;
+        let lengths_at_new_entry = Rc::new(RefCell::new(Vec::new()));
+        let _subscription = cx.update(|cx| {
+            let lengths_at_new_entry = lengths_at_new_entry.clone();
+            cx.subscribe(&thread, move |thread, event, cx| {
+                if let acp_thread::AcpThreadEvent::NewEntry = event {
+                    lengths_at_new_entry
+                        .borrow_mut()
+                        .push(thread.read(cx).entries().len());
+                }
+            })
+        });
+        let mut mirror = ChatMirror::default();
+        // Called outside an app update, as `poll_chat` does from its task,
+        // so each thread update delivers its events when it ends.
+        apply_chat_update(
+            &mut mirror,
+            &thread.downgrade(),
+            update(
+                true,
+                3,
+                vec![
+                    (0, user("First question")),
+                    (1, assistant("First answer")),
+                    (2, user("Second question")),
+                ],
+            ),
+            cx,
+        )
+        .expect("the thread is still open");
+        cx.run_until_parked();
+
+        assert_eq!(*lengths_at_new_entry.borrow(), vec![1, 2, 3]);
+    }
+
+    #[gpui::test]
+    async fn teammate_tool_call_locations_are_not_opened_here(cx: &mut TestAppContext) {
+        let thread = new_thread(cx).await;
+        let mut mirror = ChatMirror::default();
+        let read_secret = TeamEntry::Updates {
+            updates: vec![acp::SessionUpdate::ToolCall(
+                acp::ToolCall::new(acp::ToolCallId::new("read-secret"), "Read secret.rs")
+                    .kind(acp::ToolKind::Read)
+                    .locations(vec![acp::ToolCallLocation::new("/teammate/secret.rs")]),
+            )],
+        };
+        apply(
+            &mut mirror,
+            &thread,
+            update(true, 1, vec![(0, read_secret)]),
+            cx,
+        );
+
+        thread.read_with(cx, |thread, cx| {
+            match thread.entries() {
+                [AgentThreadEntry::ToolCall(call)] => assert!(call.locations.is_empty()),
+                other => panic!("expected one tool call, got {other:?}"),
+            }
+            assert!(thread.project().read(cx).agent_location().is_none());
         });
     }
 

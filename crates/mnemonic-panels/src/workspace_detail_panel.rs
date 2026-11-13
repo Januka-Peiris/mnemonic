@@ -258,7 +258,9 @@ pub struct WorkspaceDetailPanel {
     /// Shows a merged workspace's file list instead of the merged summary.
     show_merged_changes: bool,
     /// The teammate's workspace whose changes are listed while one is selected.
-    teammate: Option<Entity<TeammateWorkspaceView>>,
+    /// Held weakly so the panel never keeps it, and its chats' polls of the
+    /// teammate, alive after the window's host drops it.
+    teammate: Option<WeakEntity<TeammateWorkspaceView>>,
     teammate_subscription: Option<Subscription>,
 }
 
@@ -271,6 +273,7 @@ impl WorkspaceDetailPanel {
         let workspace_handle = workspace.weak_handle();
         let panel = cx.new(|cx| {
             cx.observe_global::<ActiveWorkspace>(|this: &mut Self, cx| {
+                this.sync_teammate_view(cx);
                 let previous = this.summary.as_ref().map(|summary| summary.id.clone());
                 this.refresh(cx);
                 let current = this.summary.as_ref().map(|summary| summary.id.clone());
@@ -3260,10 +3263,7 @@ impl WorkspaceDetailPanel {
 
     /// Follows the teammate view while a teammate's workspace is selected, so
     /// the list updates when its files do.
-    fn sync_teammate_view(
-        &mut self,
-        cx: &mut Context<Self>,
-    ) -> Option<Entity<TeammateWorkspaceView>> {
+    fn sync_teammate_view(&mut self, cx: &mut Context<Self>) {
         let selected = ActiveWorkspace::get(self.workspace.entity_id(), cx)
             .is_some_and(|id| mnemonic_bridge::is_teammate_workspace(&id));
         let view = if selected {
@@ -3278,9 +3278,8 @@ impl WorkspaceDetailPanel {
             self.teammate_subscription = view
                 .as_ref()
                 .map(|view| cx.observe(view, |_, _, cx| cx.notify()));
-            self.teammate = view.clone();
+            self.teammate = view.map(|view| view.downgrade());
         }
-        view
     }
 
     fn render_empty(&self) -> impl IntoElement {
@@ -3381,7 +3380,7 @@ impl Panel for WorkspaceDetailPanel {
 
 impl Render for WorkspaceDetailPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let teammate = self.sync_teammate_view(cx);
+        let teammate = self.teammate.as_ref().and_then(|view| view.upgrade());
         if teammate.is_none() {
             self.maybe_refresh_change_annotations(cx);
         }

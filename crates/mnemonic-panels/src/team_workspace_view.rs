@@ -17,7 +17,7 @@ use gpui::{
 };
 use language::Buffer;
 use mnemonic_core::services::team_share_service::{
-    split_unified_diff, TeamChat, TeamClient, TeamFileDiff, TeamWorkspace,
+    split_unified_diff, TeamChat, TeamClient, TeamClientError, TeamFileDiff, TeamWorkspace,
 };
 use project::Project;
 use ui::prelude::*;
@@ -44,7 +44,8 @@ pub(crate) struct TeammateChatItem {
     peer_name: SharedString,
     /// None until the chat is open on the teammate's machine.
     view: Option<Entity<ConversationView>>,
-    /// The chat is no longer in the teammate's list.
+    /// The chat is no longer in the teammate's list, or was closed there
+    /// after its content was shown here.
     closed: bool,
     focus_handle: FocusHandle,
 }
@@ -160,6 +161,9 @@ pub(crate) struct TeammateWorkspaceView {
     /// The teammate address the chat views follow; they are rebuilt when it
     /// changes, since their connection keeps the address it started with.
     client_url: Option<String>,
+    /// The teammate was online and listing this workspace at the last sync,
+    /// so the diff reloads when they come back.
+    available: bool,
     /// The workspace as last listed, kept while the teammate is unreachable.
     last_known: Option<TeamWorkspace>,
     files: Vec<TeamFileDiff>,
@@ -196,6 +200,7 @@ impl TeammateWorkspaceView {
             dismissed: HashSet::new(),
             connection_store: None,
             client_url: None,
+            available: false,
             last_known: None,
             files: Vec::new(),
             diff_state: TeammateDiffState::Loading,
@@ -425,12 +430,13 @@ impl TeammateWorkspaceView {
         let Some(team) = team_share(cx) else {
             return;
         };
-        let (peer_name, client, live) = {
+        let (peer_name, online, client, live) = {
             let team = team.read(cx);
             let peer = team.peer(&self.host);
             (
                 peer.map(|peer| peer.peer.name.clone())
                     .unwrap_or_else(|| self.host.clone()),
+                peer.is_some_and(|peer| matches!(peer.status, PeerStatus::Online)),
                 peer.and_then(|peer| peer.client.clone()),
                 peer.and_then(|peer| {
                     peer.workspaces
@@ -441,12 +447,18 @@ impl TeammateWorkspaceView {
             )
         };
 
+        let available = online && live.is_some();
+        let came_back = available && !self.available;
+        self.available = available;
         let client_url = client.as_ref().map(|client| client.base_url().to_string());
-        if client_url.is_some() && client_url != self.client_url {
+        let address_changed = client_url.is_some() && client_url != self.client_url;
+        if address_changed {
             if self.client_url.is_some() {
                 self.restart_chat_views(cx);
             }
             self.client_url = client_url;
+        }
+        if address_changed || came_back {
             self.reload_diff(window, cx);
         }
 
@@ -457,13 +469,18 @@ impl TeammateWorkspaceView {
 
         let peer_name = SharedString::from(peer_name);
         for item in &self.chats {
-            let listed = live
+            let open = live
                 .chats
                 .iter()
-                .any(|chat| chat.id == item.read(cx).chat_id);
+                .find(|chat| chat.id == item.read(cx).chat_id)
+                .map(|chat| chat.open);
             item.update(cx, |item, cx| {
-                if item.closed == listed || item.peer_name != peer_name {
-                    item.closed = !listed;
+                let closed = match open {
+                    Some(open) => !open && item.view.is_some(),
+                    None => true,
+                };
+                if item.closed != closed || item.peer_name != peer_name {
+                    item.closed = closed;
                     item.peer_name = peer_name.clone();
                     cx.emit(ItemEvent::UpdateTab);
                     cx.notify();
@@ -627,7 +644,7 @@ impl TeammateWorkspaceView {
         let team = team_share(cx)?;
         let team = team.read(cx);
         match team.peer(&self.host) {
-            Some(peer) => match peer.status {
+            Some(peer) => match &peer.status {
                 PeerStatus::Online => {
                     let listed = peer
                         .workspaces
@@ -636,7 +653,18 @@ impl TeammateWorkspaceView {
                     (!listed).then(|| format!("{peer_name} stopped sharing this workspace"))
                 }
                 PeerStatus::Connecting => Some(format!("Connecting to {peer_name}")),
-                PeerStatus::Failed(_) => Some(format!("{peer_name} is offline")),
+                PeerStatus::Failed(TeamClientError::Unreachable(_)) => {
+                    Some(format!("{peer_name} is offline"))
+                }
+                PeerStatus::Failed(TeamClientError::Forbidden) => {
+                    Some(format!("{peer_name} hasn't added you to their allow list"))
+                }
+                PeerStatus::Failed(TeamClientError::Incompatible { .. }) => {
+                    Some(format!("{peer_name} is on a different Mnemonic version"))
+                }
+                PeerStatus::Failed(TeamClientError::Other(message)) => {
+                    Some(format!("Can't reach {peer_name}: {message}"))
+                }
             },
             None => Some(format!("{peer_name} is offline")),
         }
