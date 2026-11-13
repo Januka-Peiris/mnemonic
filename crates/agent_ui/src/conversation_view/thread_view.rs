@@ -646,7 +646,7 @@ pub struct ThreadView {
 }
 impl Focusable for ThreadView {
     fn focus_handle(&self, cx: &App) -> FocusHandle {
-        if self.parent_session_id.is_some() {
+        if self.parent_session_id.is_some() || self.read_only_notice(cx).is_some() {
             self.focus_handle.clone()
         } else {
             self.active_editor(cx).focus_handle(cx)
@@ -4141,6 +4141,12 @@ impl ThreadView {
         )
     }
 
+    fn read_only_notice(&self, cx: &App) -> Option<SharedString> {
+        self.server_view
+            .upgrade()
+            .and_then(|server_view| server_view.read(cx).read_only())
+    }
+
     pub(crate) fn render_message_editor(
         &mut self,
         window: &mut Window,
@@ -4148,6 +4154,14 @@ impl ThreadView {
     ) -> AnyElement {
         if self.is_subagent() {
             return div().into_any_element();
+        }
+
+        if let Some(notice) = self.read_only_notice(cx) {
+            return div()
+                .w_full()
+                .p_2()
+                .child(Label::new(notice).color(Color::Muted))
+                .into_any_element();
         }
 
         let focus_handle = self.message_editor.focus_handle(cx);
