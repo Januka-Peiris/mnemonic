@@ -883,39 +883,41 @@ fn acp_tool_call(tool_call: &ToolCall, cx: &App) -> acp::ToolCall {
     let content = tool_call
         .content
         .iter()
-        .map(|content| match content {
-            ToolCallContent::ContentBlock(block) => {
-                acp::ToolCallContent::Content(acp::Content::new(block.to_markdown(cx)))
-            }
+        .filter_map(|content| match content {
+            ToolCallContent::ContentBlock(block) => Some(acp::ToolCallContent::Content(
+                acp::Content::new(block.to_markdown(cx)),
+            )),
             ToolCallContent::Diff(diff) => {
                 let diff = diff.read(cx);
                 let old_text = diff.base_text();
-                acp::ToolCallContent::Diff(
-                    acp::Diff::new(
-                        diff.file_path(cx).unwrap_or_default(),
-                        diff.buffer().read(cx).text(),
-                    )
-                    // A new file's diff has an empty base, which ACP marks
-                    // as no old text.
-                    .old_text((!old_text.is_empty()).then(|| old_text.to_string())),
-                )
+                Some(acp::ToolCallContent::Diff(
+                    acp::Diff::new(diff.file_path(cx)?, diff.buffer().read(cx).text())
+                        // A new file's diff has an empty base, which ACP
+                        // marks as no old text.
+                        .old_text((!old_text.is_empty()).then(|| old_text.to_string())),
+                ))
             }
             ToolCallContent::Terminal(terminal) => {
                 let output = terminal.read(cx).inner().read(cx).get_content();
-                acp::ToolCallContent::Content(acp::Content::new(
+                Some(acp::ToolCallContent::Content(acp::Content::new(
                     MarkdownCodeBlock {
                         tag: "",
                         text: &output,
                     }
                     .to_string(),
-                ))
+                )))
             }
         })
         .collect();
-    acp::ToolCall::new(
-        tool_call.id.clone(),
-        tool_call.label.read(cx).source().to_string(),
-    )
+    let label = tool_call.label.read(cx).source();
+    // The thread escapes an edit's title into its label, and the viewer's
+    // thread escapes what it receives, so the original title is sent.
+    let title = if tool_call.kind == acp::ToolKind::Edit {
+        unescape_markdown(label)
+    } else {
+        label.to_string()
+    };
+    acp::ToolCall::new(tool_call.id.clone(), title)
     .kind(tool_call.kind)
     .status(status)
     .content(content)
@@ -923,6 +925,37 @@ fn acp_tool_call(tool_call: &ToolCall, cx: &App) -> acp::ToolCall {
     .raw_input(tool_call.raw_input.clone())
     .raw_output(tool_call.raw_output.clone())
     .meta(tool_call_meta(tool_call))
+}
+
+/// Reverses `util::markdown::MarkdownEscaped`, which puts a backslash before
+/// every punctuation character it escapes (backslashes included) and writes
+/// `<` and `>` as entities. Its `&` is always escaped, so a bare `&` can only
+/// start one of those two entities.
+fn unescape_markdown(escaped: &str) -> String {
+    let mut text = String::with_capacity(escaped.len());
+    let mut rest = escaped;
+    while let Some(character) = rest.chars().next() {
+        if let Some(entity_rest) = rest.strip_prefix("&lt;") {
+            text.push('<');
+            rest = entity_rest;
+            continue;
+        }
+        if let Some(entity_rest) = rest.strip_prefix("&gt;") {
+            text.push('>');
+            rest = entity_rest;
+            continue;
+        }
+        rest = &rest[character.len_utf8()..];
+        if character == '\\' {
+            if let Some(escaped_character) = rest.chars().next() {
+                text.push(escaped_character);
+                rest = &rest[escaped_character.len_utf8()..];
+                continue;
+            }
+        }
+        text.push(character);
+    }
+    text
 }
 
 /// `ToolCall` keeps only the meta keys it reads, so those are rebuilt.
@@ -1084,8 +1117,8 @@ pub(crate) fn render_team_section(
             PeerStatus::Failed(TeamClientError::Unreachable(detail)) => Some(format!(
                 "Couldn't reach {host}. Their Mac may be asleep, or sharing is off. ({detail})"
             )),
-            PeerStatus::Failed(TeamClientError::Incompatible { protocol }) => Some(format!(
-                "{host} speaks team protocol {protocol}; update both Mnemonics to the same version."
+            PeerStatus::Failed(TeamClientError::Incompatible { .. }) => Some(format!(
+                "{host} runs a different Mnemonic version; update both Mnemonics to the same version."
             )),
             _ => None,
         };
@@ -1312,7 +1345,7 @@ mod tests {
             acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new("I'll fix".into())),
             acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new(" the form.".into())),
             acp::SessionUpdate::ToolCall(
-                acp::ToolCall::new(tool_call_id.clone(), "Edit login.rs")
+                acp::ToolCall::new(tool_call_id.clone(), "Edit team_share.rs")
                     .kind(acp::ToolKind::Edit)
                     .status(acp::ToolCallStatus::InProgress)
                     .raw_input(serde_json::json!({ "path": "/project/login.rs" })),

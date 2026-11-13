@@ -878,6 +878,39 @@ mod tests {
     }
 
     #[test]
+    fn set_chat_plan_bumps_only_on_change() {
+        let hub = TeamShareHub::new();
+        hub.replace_chat("chat", vec![user("one")]);
+        let first = hub.chat_update("chat", None).expect("chat is open");
+        let plan = vec![acp::PlanEntry::new(
+            "Fix the form",
+            acp::PlanEntryPriority::High,
+            acp::PlanEntryStatus::InProgress,
+        )];
+        assert!(hub.set_chat_plan("chat", plan.clone()));
+
+        let waited_from = Instant::now();
+        let second = hub
+            .wait_chat_update("chat", Some(&first.cursor), Duration::from_secs(10))
+            .expect("chat is open");
+        assert!(
+            waited_from.elapsed() < Duration::from_secs(5),
+            "a plan-only change should end the long-poll at once"
+        );
+        assert!(!second.reset);
+        assert!(second.changes.is_empty());
+        assert_eq!(second.plan, plan);
+        assert_ne!(second.cursor, first.cursor);
+
+        assert!(hub.set_chat_plan("chat", plan));
+        let third = hub
+            .chat_update("chat", Some(&second.cursor))
+            .expect("chat is open");
+        assert_eq!(third.cursor, second.cursor);
+        assert!(!hub.set_chat_plan("closed", Vec::new()));
+    }
+
+    #[test]
     fn acp_crate_version_matches_the_dependency_pin() {
         let workspace_manifest = include_str!("../../../../Cargo.toml");
         let pin = format!("agent-client-protocol = {{ version = \"={TEAM_ACP_CRATE_VERSION}\"");
