@@ -5500,6 +5500,19 @@ impl WorkspaceHost {
         })
     }
 
+    /// The teammate's workspace shown in this window, if one is selected.
+    pub(crate) fn teammate_view_in(
+        workspace: &Workspace,
+        cx: &App,
+    ) -> Option<Entity<TeammateWorkspaceView>> {
+        workspace.panes().iter().find_map(|pane| {
+            pane.read(cx)
+                .items()
+                .find_map(|item| item.downcast::<WorkspaceHost>())
+                .and_then(|host| host.read(cx).active_teammate().cloned())
+        })
+    }
+
     fn hosts(workspace: &Workspace, workspace_id: &str, cx: &App) -> bool {
         Self::view_in(workspace, workspace_id, cx).is_some()
     }

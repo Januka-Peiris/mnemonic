@@ -10,13 +10,18 @@ use std::sync::Arc;
 use agent_client_protocol::schema as acp;
 use agent_servers::AgentServer;
 use agent_ui::{Agent, AgentConnectionStore, AgentThreadSource, ConversationView};
+use editor::Editor;
 use gpui::{
     Action as _, App, AppContext as _, Context, Entity, EventEmitter, FocusHandle, Focusable,
-    IntoElement, NoAction, Render, SharedString, Subscription, WeakEntity, Window,
+    IntoElement, NoAction, Render, SharedString, Subscription, Task, WeakEntity, Window,
 };
-use mnemonic_core::services::team_share_service::{TeamChat, TeamClient, TeamWorkspace};
+use language::Buffer;
+use mnemonic_core::services::team_share_service::{
+    split_unified_diff, TeamChat, TeamClient, TeamFileDiff, TeamWorkspace,
+};
 use project::Project;
 use ui::prelude::*;
+use util::ResultExt as _;
 use workspace::item::{Item, ItemEvent};
 use workspace::{DraggedTab, Pane, Workspace, pane};
 
@@ -98,6 +103,49 @@ impl Render for TeammateChatItem {
     }
 }
 
+/// One changed file's diff as a read-only tab.
+struct TeammateDiffItem {
+    title: SharedString,
+    editor: Entity<Editor>,
+}
+
+impl EventEmitter<ItemEvent> for TeammateDiffItem {}
+
+impl Focusable for TeammateDiffItem {
+    fn focus_handle(&self, cx: &App) -> FocusHandle {
+        self.editor.focus_handle(cx)
+    }
+}
+
+impl Item for TeammateDiffItem {
+    type Event = ItemEvent;
+
+    fn tab_content_text(&self, _detail: usize, _cx: &App) -> SharedString {
+        self.title.clone()
+    }
+
+    fn tab_icon(&self, _window: &Window, _cx: &App) -> Option<Icon> {
+        Some(Icon::new(IconName::Diff))
+    }
+
+    fn to_item_events(event: &Self::Event, f: &mut dyn FnMut(ItemEvent)) {
+        f(*event)
+    }
+}
+
+impl Render for TeammateDiffItem {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div().size_full().child(self.editor.clone())
+    }
+}
+
+#[derive(Clone, PartialEq)]
+pub(crate) enum TeammateDiffState {
+    Loading,
+    Loaded,
+    Failed(SharedString),
+}
+
 pub(crate) struct TeammateWorkspaceView {
     host: String,
     workspace_id: String,
@@ -114,6 +162,11 @@ pub(crate) struct TeammateWorkspaceView {
     client_url: Option<String>,
     /// The workspace as last listed, kept while the teammate is unreachable.
     last_known: Option<TeamWorkspace>,
+    files: Vec<TeamFileDiff>,
+    diff_state: TeammateDiffState,
+    /// Replacing it cancels a load still in flight.
+    diff_task: Option<Task<()>>,
+    diff_items: Vec<(String, Entity<TeammateDiffItem>)>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -144,9 +197,14 @@ impl TeammateWorkspaceView {
             connection_store: None,
             client_url: None,
             last_known: None,
+            files: Vec::new(),
+            diff_state: TeammateDiffState::Loading,
+            diff_task: None,
+            diff_items: Vec::new(),
             _subscriptions: subscriptions,
         };
         view.sync_chats(window, cx);
+        view.reload_diff(window, cx);
         let first_open = view
             .chats
             .iter()
@@ -196,6 +254,114 @@ impl TeammateWorkspaceView {
             pane.set_render_tab_bar_buttons(cx, |_, _, _| (None, None));
             pane
         })
+    }
+
+    pub(crate) fn files(&self) -> &[TeamFileDiff] {
+        &self.files
+    }
+
+    pub(crate) fn diff_state(&self) -> &TeammateDiffState {
+        &self.diff_state
+    }
+
+    pub(crate) fn reload_diff(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let client = team_share(cx).and_then(|team| {
+            team.read(cx)
+                .peer(&self.host)
+                .and_then(|peer| peer.client.clone())
+        });
+        let Some(client) = client else {
+            self.diff_state = TeammateDiffState::Failed("Can't reach this teammate".into());
+            self.diff_task = None;
+            cx.notify();
+            return;
+        };
+        self.diff_state = TeammateDiffState::Loading;
+        let workspace_id = self.workspace_id.clone();
+        self.diff_task = Some(cx.spawn_in(window, async move |this, cx| {
+            let diff = cx
+                .background_spawn(async move { client.diff(&workspace_id) })
+                .await;
+            this.update(cx, |this, cx| {
+                match diff {
+                    Ok(Some(text)) => {
+                        this.files = split_unified_diff(&text);
+                        this.diff_state = TeammateDiffState::Loaded;
+                    }
+                    Ok(None) => {
+                        this.files.clear();
+                        this.diff_state = TeammateDiffState::Failed(
+                            "This workspace is no longer shared".into(),
+                        );
+                    }
+                    Err(err) => {
+                        this.diff_state = TeammateDiffState::Failed(err.to_string().into());
+                    }
+                }
+                cx.notify();
+            })
+            .log_err();
+        }));
+        cx.notify();
+    }
+
+    /// Opens the file's diff as a read-only tab, or focuses the one already
+    /// open.
+    pub(crate) fn open_file_diff(
+        &mut self,
+        path: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some((_, item)) = self.diff_items.iter().find(|(open, _)| open == path) {
+            let item = item.clone();
+            self.pane.update(cx, |pane, cx| {
+                if let Some(index) = pane.index_for_item(&item) {
+                    pane.activate_item(index, true, true, window, cx);
+                }
+            });
+            return;
+        }
+        let Some(file) = self.files.iter().find(|file| file.path == path) else {
+            return;
+        };
+        let text = file.diff.clone();
+        let title = SharedString::from(
+            path.rsplit('/')
+                .next()
+                .filter(|name| !name.is_empty())
+                .unwrap_or(path)
+                .to_string(),
+        );
+        let languages = self.project.read(cx).languages().clone();
+        let path = path.to_string();
+        cx.spawn_in(window, async move |this, cx| {
+            let language = languages.language_for_name("Diff").await.log_err();
+            this.update_in(cx, |this, window, cx| {
+                // Another click may have opened the tab while the language loaded.
+                if this.diff_items.iter().any(|(open, _)| *open == path) {
+                    return;
+                }
+                let buffer = cx.new(|cx| {
+                    let mut buffer = Buffer::local(text, cx);
+                    buffer.set_language(language, cx);
+                    buffer
+                });
+                let editor = cx.new(|cx| {
+                    let mut editor = Editor::for_buffer(buffer, None, window, cx);
+                    editor.set_read_only(true);
+                    editor
+                });
+                let item = cx.new(|_| TeammateDiffItem { title, editor });
+                this.pane.update(cx, |pane, cx| {
+                    pane.add_item(Box::new(item.clone()), true, true, None, window, cx);
+                });
+                this.diff_items.push((path, item));
+                cx.notify();
+            })
+            .log_err();
+        })
+        .detach();
     }
 
     fn peer_name(&self, cx: &App) -> String {
@@ -417,6 +583,7 @@ impl TeammateWorkspaceView {
             return;
         };
         let item_id = item.item_id();
+        self.diff_items.retain(|(_, diff)| diff.entity_id() != item_id);
         if let Some(index) = self
             .chats
             .iter()
@@ -525,7 +692,10 @@ impl Render for TeammateWorkspaceView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let peer_name = self.peer_name(cx);
         let banner = self.banner(&peer_name, cx);
-        let body = if self.chats.is_empty() && self.dismissed.is_empty() {
+        let body = if self.chats.is_empty()
+            && self.dismissed.is_empty()
+            && self.diff_items.is_empty()
+        {
             v_flex()
                 .size_full()
                 .items_center()

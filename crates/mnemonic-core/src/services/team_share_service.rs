@@ -832,9 +832,97 @@ pub fn is_plain_id(id: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
+/// One file's section of a teammate's unified diff.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TeamFileDiff {
+    pub path: String,
+    pub additions: u32,
+    pub deletions: u32,
+    pub diff: String,
+}
+
+/// Splits a unified diff into one item per `diff --git` section.
+pub fn split_unified_diff(diff: &str) -> Vec<TeamFileDiff> {
+    let mut files: Vec<TeamFileDiff> = Vec::new();
+    let mut in_hunk = false;
+    let mut old_path: Option<String> = None;
+    let mut new_path: Option<String> = None;
+    let mut finished_paths: Vec<(Option<String>, Option<String>)> = Vec::new();
+
+    for line in diff.split_inclusive('\n') {
+        let text = line.trim_end_matches(['\n', '\r']);
+        if let Some(header) = text.strip_prefix("diff --git ") {
+            if !files.is_empty() {
+                finished_paths.push((old_path.take(), new_path.take()));
+            }
+            in_hunk = false;
+            old_path = None;
+            new_path = None;
+            let fallback = header
+                .rsplit_once(" b/")
+                .map(|(_, path)| path.to_string())
+                .unwrap_or_else(|| header.to_string());
+            files.push(TeamFileDiff {
+                path: fallback,
+                additions: 0,
+                deletions: 0,
+                diff: String::new(),
+            });
+        }
+        let Some(file) = files.last_mut() else {
+            continue;
+        };
+        file.diff.push_str(line);
+        if text.starts_with("@@") {
+            in_hunk = true;
+        } else if !in_hunk {
+            if let Some(path) = text.strip_prefix("--- ") {
+                old_path = path.strip_prefix("a/").map(str::to_string);
+            } else if let Some(path) = text.strip_prefix("+++ ") {
+                new_path = path.strip_prefix("b/").map(str::to_string);
+            }
+        } else if text.starts_with('+') {
+            file.additions += 1;
+        } else if text.starts_with('-') {
+            file.deletions += 1;
+        }
+    }
+    if !files.is_empty() {
+        finished_paths.push((old_path, new_path));
+    }
+    for (file, (old_path, new_path)) in files.iter_mut().zip(finished_paths) {
+        if let Some(path) = new_path.or(old_path) {
+            file.path = path;
+        }
+    }
+    files
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn split_unified_diff_lists_each_file_with_counts() {
+        let diff = "diff --git a/src/lib.rs b/src/lib.rs\nindex 1..2 100644\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1,2 +1,2 @@\n keep\n-old\n+new\n+more\ndiff --git a/notes.md b/notes.md\nnew file mode 100644\n--- /dev/null\n+++ b/notes.md\n@@ -0,0 +1 @@\n+hello\n";
+        let files = split_unified_diff(diff);
+        assert_eq!(files.len(), 2);
+        assert_eq!(files[0].path, "src/lib.rs");
+        assert_eq!((files[0].additions, files[0].deletions), (2, 1));
+        assert!(files[0].diff.starts_with("diff --git a/src/lib.rs"));
+        assert!(!files[0].diff.contains("notes.md"));
+        assert_eq!(files[1].path, "notes.md");
+        assert_eq!((files[1].additions, files[1].deletions), (1, 0));
+    }
+
+    #[test]
+    fn split_unified_diff_names_deleted_files() {
+        let diff = "diff --git a/gone.txt b/gone.txt\ndeleted file mode 100644\n--- a/gone.txt\n+++ /dev/null\n@@ -1,2 +0,0 @@\n-a\n-b\n";
+        let files = split_unified_diff(diff);
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path, "gone.txt");
+        assert_eq!((files[0].additions, files[0].deletions), (0, 2));
+    }
 
     fn user(text: &str) -> TeamEntry {
         TeamEntry::Updates {
