@@ -204,7 +204,9 @@ impl TeammateWorkspaceView {
             _subscriptions: subscriptions,
         };
         view.sync_chats(window, cx);
-        view.reload_diff(window, cx);
+        if view.diff_task.is_none() {
+            view.reload_diff(window, cx);
+        }
         let first_open = view
             .chats
             .iter()
@@ -282,11 +284,12 @@ impl TeammateWorkspaceView {
             let diff = cx
                 .background_spawn(async move { client.diff(&workspace_id) })
                 .await;
-            this.update(cx, |this, cx| {
+            this.update_in(cx, |this, window, cx| {
                 match diff {
                     Ok(Some(text)) => {
                         this.files = split_unified_diff(&text);
                         this.diff_state = TeammateDiffState::Loaded;
+                        this.refresh_open_diffs(window, cx);
                     }
                     Ok(None) => {
                         this.files.clear();
@@ -303,6 +306,29 @@ impl TeammateWorkspaceView {
             .log_err();
         }));
         cx.notify();
+    }
+
+    /// Brings open diff tabs up to date with the reloaded diff and closes
+    /// those whose file is no longer changed.
+    fn refresh_open_diffs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        for (path, item) in self.diff_items.clone() {
+            match self.files.iter().find(|file| file.path == path) {
+                Some(file) => {
+                    let buffer = item.read(cx).editor.read(cx).buffer().read(cx).as_singleton();
+                    if let Some(buffer) = buffer {
+                        if buffer.read(cx).text() != file.diff {
+                            let text = file.diff.clone();
+                            buffer.update(cx, |buffer, cx| buffer.set_text(text, cx));
+                        }
+                    }
+                }
+                None => {
+                    self.pane.update(cx, |pane, cx| {
+                        pane.remove_item(item.entity_id(), false, false, window, cx);
+                    });
+                }
+            }
+        }
     }
 
     /// Opens the file's diff as a read-only tab, or focuses the one already
@@ -421,6 +447,7 @@ impl TeammateWorkspaceView {
                 self.restart_chat_views(cx);
             }
             self.client_url = client_url;
+            self.reload_diff(window, cx);
         }
 
         let Some(live) = live else {
