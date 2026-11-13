@@ -49,6 +49,7 @@ use workspace::{
 };
 use zed_actions::mnemonic::AgentSessionKind;
 
+use crate::team_workspace_view::{TeammateChatItem, TeammateWorkspaceView, teammate_workspace_key};
 use crate::workspace_detail_panel::WorkspaceDetailPanel;
 use crate::workspaces_settings::WorkspacesSettings;
 use crate::workspace_panel::{
@@ -496,12 +497,14 @@ pub type PaneToolbarInit = dyn Fn(&Workspace, &Entity<Pane>, &mut Window, &mut C
 
 impl gpui::Global for SessionPaneToolbar {}
 
-/// Whether a drag carries a workspace session's tab. The window's own panes
-/// refuse these, so a session can only be dropped inside its workspace.
+/// Whether a drag carries a workspace session's tab, or a teammate's chat
+/// tab. The window's own panes refuse these, so a session can only be
+/// dropped inside its workspace.
 pub fn is_session_tab(dragged: &dyn Any) -> bool {
-    dragged
-        .downcast_ref::<DraggedTab>()
-        .is_some_and(|tab| tab.item.downcast::<SessionItem>().is_some())
+    dragged.downcast_ref::<DraggedTab>().is_some_and(|tab| {
+        tab.item.downcast::<SessionItem>().is_some()
+            || tab.item.downcast::<TeammateChatItem>().is_some()
+    })
 }
 
 /// Types files dropped on a workspace into the terminal under the cursor,
@@ -4867,13 +4870,24 @@ pub(crate) struct LiveChat {
     pub thread: Option<Entity<acp_thread::AcpThread>>,
 }
 
+/// What the host shows: one of your workspaces, by id, or a teammate's, by
+/// `teammate_workspace_key`.
+enum ActiveView {
+    Local(String),
+    Teammate(String),
+}
+
 /// The single center item that hosts workspace views. The left panel is the
 /// switcher: selecting a workspace swaps which view this item shows, instead
 /// of stacking one tab per workspace. Views are cached, so switching back is
 /// instant and terminals keep running.
 pub struct WorkspaceHost {
     views: HashMap<String, Entity<WorkspaceView>>,
-    active: Option<String>,
+    /// The teammate's workspace being shown. Unlike your own it isn't kept
+    /// once another workspace is selected, so a teammate's machine is only
+    /// asked for the chats someone is looking at.
+    teammate: Option<Entity<TeammateWorkspaceView>>,
+    active: Option<ActiveView>,
     focus_handle: FocusHandle,
     /// Moves tabs opened in the window's own pane into the selected
     /// workspace, so they switch with it.
@@ -4889,9 +4903,49 @@ impl WorkspaceHost {
         window: &mut Window,
         cx: &mut Context<Workspace>,
     ) {
+        let (host, created) = Self::show_host(workspace, window, cx);
+        let workspace_handle = workspace.weak_handle();
+        let project = workspace.project().clone();
+        let database_id = workspace.database_id();
+        host.update(cx, |host, cx| {
+            host.set_active(summary, workspace_handle, project, database_id, window, cx);
+        });
+        Self::sweep_window_items(workspace, &host, created, window, cx);
+    }
+
+    /// Ensures the host item exists in a pane, activates it, and switches it
+    /// to a teammate's shared workspace.
+    pub(crate) fn activate_teammate(
+        workspace: &mut Workspace,
+        host: String,
+        workspace_id: String,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
+    ) {
+        let (host_item, _) = Self::show_host(workspace, window, cx);
+        let workspace_handle = workspace.weak_handle();
+        let project = workspace.project().clone();
+        host_item.update(cx, |host_item, cx| {
+            host_item.set_active_teammate(
+                host,
+                workspace_id,
+                workspace_handle,
+                project,
+                window,
+                cx,
+            );
+        });
+    }
+
+    /// Finds the host item and activates its tab, creating it when the
+    /// window has none. Returns whether it was created.
+    fn show_host(
+        workspace: &mut Workspace,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
+    ) -> (Entity<WorkspaceHost>, bool) {
         let panes = workspace.panes().to_vec();
         let mut existing = None;
-        let mut created = None;
         for pane in panes {
             let found = pane.read(cx).items().enumerate().find_map(|(index, item)| {
                 item.downcast::<WorkspaceHost>().map(|host| (index, host))
@@ -4902,17 +4956,18 @@ impl WorkspaceHost {
             }
         }
 
-        let host = match existing {
+        match existing {
             Some((pane, index, host)) => {
                 pane.update(cx, |pane, cx| {
                     pane.activate_item(index, true, true, window, cx);
                 });
-                host
+                (host, false)
             }
             None => {
                 let workspace_entity = cx.entity();
                 let host = cx.new(|cx| WorkspaceHost {
                     views: HashMap::new(),
+                    teammate: None,
                     active: None,
                     focus_handle: cx.focus_handle(),
                     _window_items: cx.subscribe_in(
@@ -4922,19 +4977,9 @@ impl WorkspaceHost {
                     ),
                 });
                 workspace.add_item_to_active_pane(Box::new(host.clone()), None, true, window, cx);
-                created = Some(host.clone());
-                host
+                (host, true)
             }
-        };
-
-        let workspace_handle = workspace.weak_handle();
-        let project = workspace.project().clone();
-        let database_id = workspace.database_id();
-        host.update(cx, |host, cx| {
-            host.set_active(summary, workspace_handle, project, database_id, window, cx);
-        });
-        let created = created.is_some();
-        Self::sweep_window_items(workspace, &host, created, window, cx);
+        }
     }
 
     /// Moves tabs left in the window's pane while no workspace was selected
@@ -5147,7 +5192,8 @@ impl WorkspaceHost {
             self.views.insert(summary.id.clone(), view);
         }
 
-        self.active = Some(summary.id.clone());
+        self.active = Some(ActiveView::Local(summary.id.clone()));
+        self.teammate = None;
         if let Some(view) = self.views.get(&summary.id) {
             view.update(cx, |view, cx| {
                 view.load_run_config(cx);
@@ -5160,8 +5206,51 @@ impl WorkspaceHost {
         cx.notify();
     }
 
+    fn set_active_teammate(
+        &mut self,
+        host: String,
+        workspace_id: String,
+        workspace: WeakEntity<Workspace>,
+        project: Entity<Project>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let key = teammate_workspace_key(&host, &workspace_id);
+        let current = match &self.active {
+            Some(ActiveView::Teammate(active_key)) if *active_key == key => self.teammate.clone(),
+            Some(ActiveView::Teammate(_) | ActiveView::Local(_)) | None => None,
+        };
+        let view = match current {
+            Some(view) => {
+                view.update(cx, |view, cx| view.reopen_closed_chats(window, cx));
+                view
+            }
+            None => cx.new(|cx| {
+                TeammateWorkspaceView::new(host, workspace_id, workspace, project, window, cx)
+            }),
+        };
+        self.teammate = Some(view.clone());
+        self.active = Some(ActiveView::Teammate(key));
+        let focus_handle = view.focus_handle(cx);
+        window.focus(&focus_handle, cx);
+        cx.emit(ItemEvent::UpdateTab);
+        cx.notify();
+    }
+
+    /// The selected workspace's view when it is one of your own. None while a
+    /// teammate's workspace is shown, so nothing is moved into it.
     fn active_view(&self) -> Option<&Entity<WorkspaceView>> {
-        self.active.as_ref().and_then(|id| self.views.get(id))
+        match &self.active {
+            Some(ActiveView::Local(id)) => self.views.get(id),
+            Some(ActiveView::Teammate(_)) | None => None,
+        }
+    }
+
+    fn active_teammate(&self) -> Option<&Entity<TeammateWorkspaceView>> {
+        match &self.active {
+            Some(ActiveView::Teammate(_)) => self.teammate.as_ref(),
+            Some(ActiveView::Local(_)) | None => None,
+        }
     }
 
     /// Drops the cached view for an archived workspace, clearing the host's
@@ -5181,7 +5270,7 @@ impl WorkspaceHost {
                     if let Some(view) = host.views.remove(workspace_id) {
                         view.update(cx, |view, cx| view.close_all_chats(cx));
                     }
-                    if host.active.as_deref() == Some(workspace_id) {
+                    if matches!(&host.active, Some(ActiveView::Local(id)) if id == workspace_id) {
                         host.active = None;
                         cx.emit(ItemEvent::UpdateTab);
                     }
@@ -5522,9 +5611,13 @@ impl WorkspaceHost {
 
 impl Focusable for WorkspaceHost {
     fn focus_handle(&self, cx: &App) -> FocusHandle {
-        self.active_view()
-            .map(|view| view.focus_handle(cx))
-            .unwrap_or_else(|| self.focus_handle.clone())
+        if let Some(view) = self.active_view() {
+            return view.focus_handle(cx);
+        }
+        if let Some(view) = self.active_teammate() {
+            return view.focus_handle(cx);
+        }
+        self.focus_handle.clone()
     }
 }
 
@@ -5534,9 +5627,13 @@ impl Item for WorkspaceHost {
     type Event = ItemEvent;
 
     fn tab_content_text(&self, _detail: usize, cx: &App) -> SharedString {
-        self.active_view()
-            .map(|view| view.read(cx).workspace_name.clone())
-            .unwrap_or_else(|| SharedString::from("Workspace"))
+        if let Some(view) = self.active_view() {
+            return view.read(cx).workspace_name.clone();
+        }
+        if let Some(view) = self.active_teammate() {
+            return view.read(cx).title(cx);
+        }
+        SharedString::from("Workspace")
     }
 
     fn tab_icon(&self, _window: &Window, _cx: &App) -> Option<Icon> {
@@ -5579,9 +5676,10 @@ impl Render for WorkspaceHost {
         div()
             .size_full()
             .bg(cx.theme().colors().editor_background)
-            .map(|el| match self.active_view().cloned() {
-                Some(view) => el.child(view),
-                None => el.child(
+            .map(|el| match (self.active_view().cloned(), self.active_teammate().cloned()) {
+                (Some(view), _) => el.child(view),
+                (None, Some(view)) => el.child(view),
+                (None, None) => el.child(
                     v_flex().size_full().items_center().justify_center().child(
                         Label::new("Select a workspace")
                             .size(LabelSize::Small)

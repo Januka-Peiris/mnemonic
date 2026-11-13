@@ -3,7 +3,7 @@ mod coordinator_panel;
 mod team;
 mod team_connection;
 mod team_settings;
-mod team_view;
+mod team_workspace_view;
 mod workspace_detail_panel;
 mod workspace_panel;
 mod workspace_tools_panel;

@@ -33,7 +33,9 @@ use util::ResultExt as _;
 use util::markdown::MarkdownCodeBlock;
 use workspace::Workspace;
 
-use crate::team_settings::{TeamWindowTab, open_team_window};
+use crate::team_settings::open_team_window;
+use crate::team_workspace_view::teammate_workspace_key;
+use crate::workspace_panel::WorkspacePanel;
 use crate::workspace_view::{LiveWorkspaceAgents, WorkspaceHost, chat_agent_label, open_windows};
 
 /// The `team` section of the settings file.
@@ -160,16 +162,14 @@ gpui::actions!(
     ]
 );
 
-fn open_team_window_from(workspace: &Workspace, tab: TeamWindowTab, cx: &mut App) {
-    let fs = workspace.app_state().fs.clone();
-    let languages = workspace.project().read(cx).languages().clone();
-    open_team_window(tab, fs, languages, cx);
+fn open_team_window_from(workspace: &Workspace, cx: &mut App) {
+    open_team_window(workspace.app_state().fs.clone(), cx);
 }
 
 pub fn init(cx: &mut App) {
     cx.observe_new(|workspace: &mut Workspace, _, _| {
         workspace.register_action(|workspace, _: &OpenTeamSettings, _window, cx| {
-            open_team_window_from(workspace, TeamWindowTab::Settings, cx);
+            open_team_window_from(workspace, cx);
         });
     })
     .detach();
@@ -981,27 +981,9 @@ fn tool_call_meta(tool_call: &ToolCall) -> Option<acp::Meta> {
     (!meta.is_empty()).then_some(meta)
 }
 
-/// Collapses text onto one line for a preview, dropping code fences and
-/// blank lines.
-pub(crate) fn one_line_preview(text: &str) -> String {
-    let mut preview = String::new();
-    for line in text.lines().map(str::trim) {
-        if line.is_empty() || line.starts_with("```") {
-            continue;
-        }
-        if !preview.is_empty() {
-            preview.push(' ');
-        }
-        preview.push_str(line);
-        if preview.len() > 300 {
-            break;
-        }
-    }
-    preview
-}
-
 /// The sidebar's Team section: each teammate and their workspaces, with a
-/// way into the Team window.
+/// way into the Team window. Selecting a teammate's workspace opens it in
+/// this window, the way your own workspaces open.
 pub(crate) fn render_team_section(
     workspace: WeakEntity<Workspace>,
     cx: &App,
@@ -1014,9 +996,7 @@ pub(crate) fn render_team_section(
         let workspace = workspace.clone();
         move |_: &gpui::ClickEvent, _window: &mut gpui::Window, cx: &mut App| {
             workspace
-                .update(cx, |workspace, cx| {
-                    open_team_window_from(workspace, TeamWindowTab::Settings, cx)
-                })
+                .update(cx, |workspace, cx| open_team_window_from(workspace, cx))
                 .ok();
         }
     };
@@ -1215,6 +1195,8 @@ fn render_peer_workspace_row(
     };
     let host = host.to_string();
     let workspace_id = shared.id.clone();
+    let is_selected = mnemonic_bridge::ActiveWorkspace::get(workspace.entity_id(), cx)
+        .is_some_and(|selected| selected == teammate_workspace_key(&host, &workspace_id));
     h_flex()
         .id(SharedString::from(format!("team-{host}-{}", shared.id)))
         .pl(px(28.))
@@ -1225,18 +1207,19 @@ fn render_peer_workspace_row(
         .w_full()
         .cursor_pointer()
         .rounded_md()
+        .when(is_selected, |row| row.bg(colors.ghost_element_selected))
         .hover(|style| style.bg(colors.ghost_element_hover))
         .tooltip(Tooltip::text(tooltip))
-        .on_click(move |_, _window, cx| {
-            let tab = TeamWindowTab::Teammate {
-                host: host.clone(),
-                workspace_id: workspace_id.clone(),
+        .on_click(move |_, window, cx| {
+            let Some(workspace) = workspace.upgrade() else {
+                return;
             };
-            workspace
-                .update(cx, |workspace, cx| {
-                    open_team_window_from(workspace, tab, cx)
-                })
-                .ok();
+            let Some(panel) = workspace.read(cx).panel::<WorkspacePanel>(cx) else {
+                return;
+            };
+            panel.update(cx, |panel, cx| {
+                panel.select_teammate(host.clone(), workspace_id.clone(), window, cx);
+            });
         })
         .child(render_agent_state(&shared.id, shared.agent_state, cx))
         .child(
