@@ -695,6 +695,17 @@ impl Dock {
             .or(self.active_panel_index)
     }
 
+    /// The panel whose stored size sets this dock's width or height while it
+    /// is open.
+    pub fn sizing_panel(&self) -> Option<&Arc<dyn PanelHandle>> {
+        if !self.is_open {
+            return None;
+        }
+        self.sizing_panel_index()
+            .and_then(|index| self.panel_entries.get(index))
+            .map(|entry| &entry.panel)
+    }
+
     pub fn set_panel_zoomed(
         &mut self,
         panel: &AnyView,

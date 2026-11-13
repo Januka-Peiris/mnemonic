@@ -2419,7 +2419,7 @@ impl Workspace {
     }
 
     fn dock_size(&self, dock: &Dock, window: &Window, cx: &App) -> Option<Pixels> {
-        let panel = dock.active_panel()?;
+        let panel = dock.sizing_panel()?;
         let size_state = dock
             .stored_panel_size_state(panel.as_ref())
             .unwrap_or_default();
@@ -2503,7 +2503,7 @@ impl Workspace {
         };
 
         let opposite_dock = self.dock_at_position(opposite_position).read(cx);
-        let panel = opposite_dock.visible_panel()?;
+        let panel = opposite_dock.sizing_panel()?;
         let mut size_state = opposite_dock
             .stored_panel_size_state(panel.as_ref())
             .unwrap_or_default();
@@ -8011,7 +8011,7 @@ impl Workspace {
         // included in the element tree so its focus handle remains mounted — without
         // this, toggle_panel_focus cannot focus the panel when the dock is closed.
         let dock = dock.read(cx);
-        if let Some(panel) = dock.visible_panel() {
+        if let Some(panel) = dock.sizing_panel() {
             let size_state = dock.stored_panel_size_state(panel.as_ref());
             let min_size = panel.min_size(window, cx);
             if position.axis() == Axis::Horizontal {
@@ -13023,6 +13023,43 @@ mod tests {
             assert!(!pane.focus_handle(cx).is_focused(window));
             assert!(workspace.right_dock().read(cx).is_open());
             assert!(workspace.zoomed.is_none());
+        });
+    }
+
+    #[gpui::test]
+    async fn test_resizing_dock_with_lower_stacked_panel_active(cx: &mut gpui::TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+
+        let project = Project::test(fs, [], cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project, window, cx));
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.bounds.size.width = px(1200.);
+            let upper = cx.new(|cx| TestPanel::new(DockPosition::Right, 100, cx));
+            let lower = cx.new(|cx| {
+                let mut panel = TestPanel::new(DockPosition::Right, 200, cx);
+                panel.stacks = true;
+                panel
+            });
+            workspace.add_panel(upper, window, cx);
+            workspace.add_panel(lower, window, cx);
+            // Activating the lower panel last leaves it as the active one.
+            workspace.right_dock().update(cx, |dock, cx| {
+                dock.activate_panel(0, window, cx);
+                dock.set_open(true, window, cx);
+                dock.activate_panel(1, window, cx);
+            });
+
+            workspace.resize_right_dock(px(420.), window, cx);
+
+            let right_dock = workspace.right_dock().read(cx);
+            assert_eq!(
+                workspace.dock_size(right_dock, window, cx),
+                Some(px(420.)),
+                "Dragging the dock edge should resize it while the lower panel is active"
+            );
         });
     }
 
