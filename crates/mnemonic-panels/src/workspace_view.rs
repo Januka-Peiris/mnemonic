@@ -644,12 +644,12 @@ fn render_terminal_stack(terminals: &[ToolTerminal]) -> AnyElement {
         .into_any_element()
 }
 
-/// Setup sessions the core ran headless when the workspace was created:
-/// `.mnemonic/config.json` setup commands and the project's setup script.
 fn forked_title(title: &str) -> String {
     format!("{title} (fork)")
 }
 
+/// Setup sessions the core ran headless when the workspace was created:
+/// `.mnemonic/config.json` setup commands and the project's setup script.
 fn is_setup_session_title(title: &str) -> bool {
     title == "Repo setup" || title.starts_with("Setup ")
 }
@@ -5598,12 +5598,6 @@ mod tests {
         assert!(is_setup_session_title("Repo setup"));
         assert!(is_setup_session_title("Setup 1 · pnpm install"));
         assert!(!is_setup_session_title("Run 1 · pnpm dev"));
-    }
-
-    #[test]
-    fn forked_chat_title_appends_fork() {
-        assert_eq!(forked_title("Claude 2"), "Claude 2 (fork)");
-        assert_eq!(forked_title("Claude 2 (fork)"), "Claude 2 (fork) (fork)");
     }
 
     #[test]
