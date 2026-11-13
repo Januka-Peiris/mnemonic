@@ -541,6 +541,8 @@ fn affects_thread_metadata(event: &AcpThreadEvent) -> bool {
 
 pub enum AcpServerViewEvent {
     ActiveThreadChanged,
+    /// The Fork button was clicked; the embedder opens the fork.
+    ForkRequested,
 }
 
 impl EventEmitter<AcpServerViewEvent> for ConversationView {}
@@ -562,6 +564,7 @@ pub struct ConversationView {
     /// Set by hosts outside the agent panel that raise their own
     /// notifications; this view's pop-ups would open the agent panel instead.
     notifications_suppressed: bool,
+    fork_enabled: bool,
     auth_task: Option<Task<()>>,
     loading_status: Option<SharedString>,
     /// When settings change, use this to see if the theme has changed (which
@@ -626,6 +629,16 @@ impl ConversationView {
 
     pub fn suppress_notifications(&mut self) {
         self.notifications_suppressed = true;
+    }
+
+    /// Shows a Fork button after the last reply. Only embedders that handle
+    /// `AcpServerViewEvent::ForkRequested` turn it on.
+    pub fn enable_fork(&mut self) {
+        self.fork_enabled = true;
+    }
+
+    pub fn fork_enabled(&self) -> bool {
+        self.fork_enabled
     }
 
     pub fn has_load_error(&self) -> bool {
@@ -845,6 +858,7 @@ impl ConversationView {
             notifications: Vec::new(),
             notification_subscriptions: HashMap::default(),
             notifications_suppressed: false,
+            fork_enabled: false,
             auth_task: None,
             loading_status: None,
             last_theme_id: Some(cx.theme().id.clone()),

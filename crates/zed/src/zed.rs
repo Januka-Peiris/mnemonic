@@ -1237,7 +1237,7 @@ fn register_actions(
              cx: &mut Context<Workspace>| {
                 if !add_session_to_active_mnemonic_workspace(
                     workspace,
-                    zed_actions::mnemonic::AgentSessionKind::ClaudeChat,
+                    zed_actions::mnemonic::AgentSessionKind::DefaultChat,
                     window,
                     cx,
                 ) {

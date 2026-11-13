@@ -933,6 +933,7 @@ impl WorkspacePanel {
             .cloned();
 
         let existing_names: Vec<String> = self.workspaces.iter().map(|ws| ws.name.clone()).collect();
+        let first_agent = crate::workspace_view::ChatAgent::default_agent(cx);
 
         cx.spawn_in(window, async move |this, cx| {
             let Some(repo) = repo else {
@@ -1009,14 +1010,14 @@ impl WorkspacePanel {
                 Ok(detail) => {
                     log::info!("Created workspace: {}", detail.summary.id);
                     // New workspaces are chat-first: the saved chat session
-                    // makes the workspace view open a Claude chat instead of
-                    // the claude CLI.
+                    // makes the workspace view open a chat with the default
+                    // agent instead of the claude CLI.
                     if let Some(state) = mnemonic_bridge::mnemonic_state_cloned() {
                         let record = ChatSessionRecord {
                             id: uuid::Uuid::new_v4().to_string(),
                             workspace_id: detail.summary.id.clone(),
-                            agent: "claude-acp".to_string(),
-                            title: "Claude".to_string(),
+                            agent: first_agent.agent_id().to_string(),
+                            title: first_agent.label().to_string(),
                             acp_session_id: None,
                             is_review: false,
                             is_primary: true,

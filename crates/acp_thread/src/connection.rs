@@ -153,6 +153,23 @@ pub trait AgentConnection {
         )))
     }
 
+    /// Whether this agent supports forking a session into a new one.
+    fn supports_fork_session(&self) -> bool {
+        false
+    }
+
+    /// Asks the agent to copy an existing session, history included, into a
+    /// new session and returns its ID. The new session is opened separately
+    /// with `load_session` or `resume_session`.
+    fn fork_session(
+        self: Rc<Self>,
+        _session_id: acp::SessionId,
+        _work_dirs: PathList,
+        _cx: &mut App,
+    ) -> Task<Result<acp::SessionId>> {
+        Task::ready(Err(anyhow::Error::msg("Forking sessions is not supported")))
+    }
+
     /// Whether this agent supports showing session history.
     fn supports_session_history(&self) -> bool {
         self.supports_load_session() || self.supports_resume_session()

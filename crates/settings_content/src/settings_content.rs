@@ -974,6 +974,11 @@ pub struct WorkspacesSettingsContent {
     ///
     /// Default: "codex"
     pub review_agent: Option<ReviewAgent>,
+    /// The agent a new workspace's first chat and the new chat button use.
+    /// Other agents can still be picked for a single chat.
+    ///
+    /// Default: "claude"
+    pub default_agent: Option<DefaultAgent>,
     /// Whether creating a pull request also starts watching its CI and
     /// Greptile's review comments, and has the agent fix failing checks and
     /// deal with the comments until the PR is green and clear. It doesn't
@@ -1041,6 +1046,30 @@ pub struct TeamPeerContent {
     /// The teammate's Tailscale machine name or address, optionally with a
     /// port, as in "alice-mbp" or "alice-mbp:47231".
     pub host: Option<String>,
+}
+
+#[derive(
+    Copy,
+    Clone,
+    Default,
+    Debug,
+    Serialize,
+    Deserialize,
+    JsonSchema,
+    MergeFrom,
+    PartialEq,
+    strum::VariantArray,
+    strum::VariantNames,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum DefaultAgent {
+    #[default]
+    Claude,
+    Codex,
+    Gemini,
+    #[serde(rename = "opencode")]
+    OpenCode,
+    Cursor,
 }
 
 #[derive(

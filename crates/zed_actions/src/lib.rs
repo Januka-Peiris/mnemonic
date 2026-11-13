@@ -910,6 +910,8 @@ pub mod mnemonic {
     #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, JsonSchema)]
     #[serde(rename_all = "snake_case")]
     pub enum AgentSessionKind {
+        /// A chat with the agent chosen in the `workspaces.default_agent` setting.
+        DefaultChat,
         ClaudeChat,
         CodexChat,
         ClaudeCli,

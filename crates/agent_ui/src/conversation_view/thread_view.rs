@@ -6353,6 +6353,26 @@ impl ThreadView {
                 .tooltip_label("Copy Last Reply")
         });
 
+        let fork_chat = self
+            .server_view
+            .upgrade()
+            .filter(|server_view| {
+                server_view.read(cx).fork_enabled()
+                    && thread.read(cx).connection().supports_fork_session()
+            })
+            .map(|server_view| {
+                IconButton::new("fork-chat", IconName::GitBranch)
+                    .shape(ui::IconButtonShape::Square)
+                    .icon_size(IconSize::Small)
+                    .icon_color(Color::Ignored)
+                    .tooltip(Tooltip::text("Fork Chat to a New Tab"))
+                    .on_click(move |_, _, cx| {
+                        server_view.update(cx, |_, cx| {
+                            cx.emit(crate::conversation_view::AcpServerViewEvent::ForkRequested)
+                        });
+                    })
+            });
+
         let open_as_markdown = IconButton::new("open-as-markdown", IconName::FileMarkdown)
             .shape(ui::IconButtonShape::Square)
             .icon_size(IconSize::Small)
@@ -6537,6 +6557,7 @@ impl ThreadView {
 
         container
             .children(copy_last_reply)
+            .children(fork_chat)
             .child(open_as_markdown)
             .child(scroll_to_recent_user_prompt)
             .child(scroll_to_top)

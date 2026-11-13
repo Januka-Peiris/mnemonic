@@ -1823,6 +1823,24 @@ mod tests {
     }
 
     #[gpui::test]
+    fn test_workspaces_default_agent_reads_from_settings_file(cx: &mut App) {
+        let mut store = SettingsStore::new(cx, &default_settings());
+        let default_agent = |store: &SettingsStore| {
+            store
+                .merged_settings()
+                .workspaces
+                .as_ref()
+                .and_then(|workspaces| workspaces.default_agent)
+        };
+        assert_eq!(default_agent(&store), Some(settings_content::DefaultAgent::Claude));
+
+        store
+            .set_user_settings(r#"{ "workspaces": { "default_agent": "opencode" } }"#, cx)
+            .unwrap();
+        assert_eq!(default_agent(&store), Some(settings_content::DefaultAgent::OpenCode));
+    }
+
+    #[gpui::test]
     fn test_settings_store_basic(cx: &mut App) {
         let mut store = SettingsStore::new(cx, &default_settings());
         store.register_setting::<AutoUpdateSetting>();
