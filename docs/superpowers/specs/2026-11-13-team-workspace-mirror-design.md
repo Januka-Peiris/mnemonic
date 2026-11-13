@@ -16,7 +16,7 @@ Project 1 is built so that project 2 is mostly sending the viewer's actions back
 
 - Clicking a teammate's shared workspace in the sidebar's Team section opens it in the main window, in the same place your own workspaces open, and selects it in the sidebar the way your own do.
 - Each of the teammate's chats in that workspace is a tab in the workspace's tab row, drawn with the same chat view as your own chats (`ConversationView`/`ThreadView`): messages, thinking, plans, and tool calls with their diffs and terminal output. Chats update live while their agent works.
-- Subagents a chat starts are mirrored too, so their tool calls open the same way they do in your own chats.
+- Subagent work shows the same way it does in your own chats. Claude's adapter (claude-agent-acp 0.107) sends subagent work inline in the chat's own session, so mirroring each chat's session covers it.
 - A chat that is not open on the teammate's machine still gets a tab, showing that it appears once they open it (as today).
 - The right panel shows the teammate's changed files, built from the diff their Mac already sends, with the same look as your own Changes list. Clicking a file opens that file's diff, read-only.
 - The workspace's name, branch and PR state show where your own workspace shows them.
@@ -59,7 +59,7 @@ Jay picked A: it is the only one that grows into project 2 without redrawing the
 - Teammate workspaces open in the main window from the sidebar. The Team window keeps the Team settings and stops hosting teammate tabs (Claude's call: one place to open a teammate's workspace).
 - The changed-file list comes from the existing whole-workspace diff, split per file on the viewer's side.
 - The wire format may use the ACP crate's own types (the old format avoided them so an ACP upgrade on one side couldn't break it). To keep a mismatch from failing silently, `/v1/hello` also carries the `agent-client-protocol` crate version, and a viewer treats a different version like a different team protocol: "update both Mnemonics to the same version". Both Macs are expected to run the same build. (Claude's call.)
-- Subagents are mirrored, so a chat on the wire is a root session plus the sessions its subagents start, and the teammate connection supports loading a subagent session like `ConversationView::load_subagent_session` does for your own chats. (Claude's call: an empty subagent box would look broken.)
+- Separate subagent sessions (`subagent_session_info` meta) come only from Zed's built-in agent, which Mnemonic chats do not use, so they are not mirrored. (Claude's call, after checking the adapter.)
 - The chat's "files changed" summary is left out (see Non-goals). (Claude's call.)
 
 ## Left to the builder
