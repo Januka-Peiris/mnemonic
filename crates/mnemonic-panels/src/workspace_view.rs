@@ -7,8 +7,8 @@ use std::time::{Duration, Instant};
 use agent_client_protocol::schema as acp;
 use agent_settings::AgentSettings;
 use agent_ui::{
-    Agent, AgentConnectionStore, AgentNotification, AgentNotificationEvent, AgentThreadSource,
-    ConversationView,
+    AcpServerViewEvent, Agent, AgentConnectionStore, AgentNotification, AgentNotificationEvent,
+    AgentThreadSource, ConversationView,
 };
 use editor::Editor;
 use futures::future::Either;
@@ -646,6 +646,10 @@ fn render_terminal_stack(terminals: &[ToolTerminal]) -> AnyElement {
 
 /// Setup sessions the core ran headless when the workspace was created:
 /// `.mnemonic/config.json` setup commands and the project's setup script.
+fn forked_title(title: &str) -> String {
+    format!("{title} (fork)")
+}
+
 fn is_setup_session_title(title: &str) -> bool {
     title == "Repo setup" || title.starts_with("Setup ")
 }
@@ -2591,6 +2595,67 @@ impl WorkspaceView {
         self.open_chat(record, None, window, cx);
     }
 
+    /// Copies a chat's agent session, history included, into a new chat tab
+    /// in this workspace. The original chat is left as it was.
+    fn fork_chat(&mut self, view_id: EntityId, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(chat) = self
+            .sessions
+            .iter()
+            .filter_map(WorkspaceSession::chat)
+            .find(|chat| chat.view.entity_id() == view_id)
+        else {
+            return;
+        };
+        let Some(thread) = chat.view.read(cx).root_thread(cx) else {
+            return;
+        };
+        let Some(work_dirs) = self.chat_work_dirs(cx) else {
+            return;
+        };
+        let state = mnemonic_bridge::mnemonic_state(cx);
+        let original = match chat_session_repository::list_for_workspace(&state.db, &self.workspace_id)
+        {
+            Ok(records) => records.into_iter().find(|record| record.id == chat.record_id),
+            Err(err) => {
+                log::error!("Failed to list chat sessions: {err}");
+                None
+            }
+        };
+        let Some(original) = original else {
+            return;
+        };
+        let session_id = thread.read(cx).session_id().clone();
+        let connection = thread.read(cx).connection().clone();
+        let fork = connection.fork_session(session_id, work_dirs, cx);
+        cx.spawn_in(window, async move |this, cx| {
+            let forked = fork.await;
+            this.update_in(cx, |this, window, cx| match forked {
+                Ok(forked_session_id) => {
+                    let record = ChatSessionRecord {
+                        id: uuid::Uuid::new_v4().to_string(),
+                        workspace_id: this.workspace_id.clone(),
+                        agent: original.agent.clone(),
+                        title: forked_title(&original.title),
+                        acp_session_id: Some(forked_session_id.to_string()),
+                        is_review: false,
+                        is_primary: false,
+                        position: this.next_chat_position(cx),
+                    };
+                    let state = mnemonic_bridge::mnemonic_state(cx);
+                    if let Err(err) = chat_session_repository::insert(&state.db, &record) {
+                        log::error!("Failed to save forked chat session: {err}");
+                    }
+                    this.open_chat(record, None, window, cx);
+                }
+                Err(err) => {
+                    log::error!("Failed to fork chat: {err:#}");
+                    this.show_workspace_toast(format!("Couldn't fork the chat: {err}"), cx);
+                }
+            })
+        })
+        .detach_and_log_err(cx);
+    }
+
     fn next_chat_position(&self, cx: &App) -> i64 {
         let state = mnemonic_bridge::mnemonic_state(cx);
         match chat_session_repository::list_for_workspace(&state.db, &self.workspace_id) {
@@ -2625,6 +2690,17 @@ impl WorkspaceView {
         }
     }
 
+    /// The workspace's own folder comes first, which makes it the session's
+    /// working directory; linked workspaces follow as extra folders the
+    /// agent may read and edit.
+    fn chat_work_dirs(&self, cx: &App) -> Option<PathList> {
+        self.worktree_path.as_ref().map(|path| {
+            let mut paths = vec![path.clone()];
+            paths.extend(self.linked_workspace_paths(cx));
+            PathList::new(&paths)
+        })
+    }
+
     fn build_chat(
         &mut self,
         record: &ChatSessionRecord,
@@ -2648,14 +2724,7 @@ impl WorkspaceView {
         let fs = project.read(cx).fs().clone();
         let server = agent.server(fs, agent::ThreadStore::global(cx));
         let resume_session_id = record.acp_session_id.clone().map(acp::SessionId::new);
-        // The workspace's own folder comes first, which makes it the session's
-        // working directory; linked workspaces follow as extra folders the
-        // agent may read and edit.
-        let work_dirs = self.worktree_path.as_ref().map(|path| {
-            let mut paths = vec![path.clone()];
-            paths.extend(self.linked_workspace_paths(cx));
-            PathList::new(&paths)
-        });
+        let work_dirs = self.chat_work_dirs(cx);
         let title = SharedString::from(record.title.clone());
         let workspace = self.workspace.clone();
         let app_messages = initial_prompt.iter().cloned().collect();
@@ -2678,12 +2747,18 @@ impl WorkspaceView {
                 cx,
             );
             view.suppress_notifications();
+            view.enable_fork();
             view
         });
 
         let view_id = view.entity_id();
         let observation = cx.observe(&view, move |this, _view, cx| {
             this.handle_chat_changed(view_id, cx);
+        });
+        let fork_requests = cx.subscribe_in(&view, window, move |this, _view, event, window, cx| {
+            if let AcpServerViewEvent::ForkRequested = event {
+                this.fork_chat(view_id, window, cx);
+            }
         });
 
         Some(ChatSession {
@@ -2703,7 +2778,7 @@ impl WorkspaceView {
             app_messages,
             awaiting_model: record.is_review && record.acp_session_id.is_none(),
             thread_subscriptions: Vec::new(),
-            _subscriptions: vec![observation],
+            _subscriptions: vec![observation, fork_requests],
         })
     }
 
@@ -5523,6 +5598,12 @@ mod tests {
         assert!(is_setup_session_title("Repo setup"));
         assert!(is_setup_session_title("Setup 1 · pnpm install"));
         assert!(!is_setup_session_title("Run 1 · pnpm dev"));
+    }
+
+    #[test]
+    fn forked_chat_title_appends_fork() {
+        assert_eq!(forked_title("Claude 2"), "Claude 2 (fork)");
+        assert_eq!(forked_title("Claude 2 (fork)"), "Claude 2 (fork) (fork)");
     }
 
     #[test]
