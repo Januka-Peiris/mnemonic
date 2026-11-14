@@ -163,6 +163,8 @@ pub(crate) struct TeamShare {
     saved_chats: HashMap<String, SystemTime>,
     pub peers: Vec<PeerState>,
     pub collapsed_peers: HashSet<String>,
+    /// A teammate's projects folded in the sidebar, as (host, project).
+    collapsed_peer_projects: HashSet<(String, String)>,
     /// Workspaces the user chose to share, saved in the core's settings
     /// table so the choice survives restarts.
     shared_workspaces: HashSet<String>,
@@ -208,6 +210,7 @@ pub fn init(cx: &mut App) {
             saved_chats: HashMap::new(),
             peers: Vec::new(),
             collapsed_peers: HashSet::new(),
+            collapsed_peer_projects: HashSet::new(),
             shared_workspaces: load_shared_workspace_ids(),
         };
         team.apply_settings(cx);
@@ -1272,13 +1275,74 @@ pub(crate) fn render_team_section(
         if collapsed {
             continue;
         }
+        let mut projects: Vec<(&str, Vec<&TeamWorkspace>)> = Vec::new();
         for shared in &peer.workspaces {
-            section = section.child(render_peer_workspace_row(
-                &host,
-                shared,
-                workspace.clone(),
-                cx,
-            ));
+            match projects
+                .iter_mut()
+                .find(|(project, _)| *project == shared.project)
+            {
+                Some((_, workspaces)) => workspaces.push(shared),
+                None => projects.push((&shared.project, vec![shared])),
+            }
+        }
+        for (project, workspaces) in projects {
+            let project_key = (host.clone(), project.to_string());
+            let project_collapsed = team_state.collapsed_peer_projects.contains(&project_key);
+            section = section.child(
+                h_flex()
+                    .id(SharedString::from(format!("team-{host}-project-{project}")))
+                    .pl(px(22.))
+                    .pr_2()
+                    .h(px(24.))
+                    .gap_1()
+                    .items_center()
+                    .w_full()
+                    .cursor_pointer()
+                    .hover(|style| style.bg(colors.ghost_element_hover))
+                    .on_click({
+                        let team = team.clone();
+                        move |_, _, cx| {
+                            team.update(cx, |team, cx| {
+                                if !team.collapsed_peer_projects.remove(&project_key) {
+                                    team.collapsed_peer_projects.insert(project_key.clone());
+                                }
+                                cx.notify();
+                            });
+                        }
+                    })
+                    .child(
+                        Icon::new(if project_collapsed {
+                            IconName::ChevronRight
+                        } else {
+                            IconName::ChevronDown
+                        })
+                        .size(IconSize::XSmall)
+                        .color(Color::Muted),
+                    )
+                    .child(
+                        div().overflow_hidden().child(
+                            Label::new(project.to_string())
+                                .size(LabelSize::Small)
+                                .single_line(),
+                        ),
+                    )
+                    .child(
+                        Label::new(workspaces.len().to_string())
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
+                    ),
+            );
+            if project_collapsed {
+                continue;
+            }
+            for shared in workspaces {
+                section = section.child(render_peer_workspace_row(
+                    &host,
+                    shared,
+                    workspace.clone(),
+                    cx,
+                ));
+            }
         }
     }
     Some(section.into_any_element())
@@ -1310,7 +1374,7 @@ fn render_peer_workspace_row(
         .is_some_and(|selected| selected == teammate_workspace_key(&host, &workspace_id));
     h_flex()
         .id(SharedString::from(format!("team-{host}-{}", shared.id)))
-        .pl(px(28.))
+        .pl(px(42.))
         .pr_2()
         .h(px(24.))
         .gap_1p5()
