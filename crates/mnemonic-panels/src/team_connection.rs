@@ -20,7 +20,7 @@ use anyhow::{Result, anyhow};
 use gpui::{App, AppContext, Context, Entity, SharedString, Task, WeakEntity};
 use markdown::Markdown;
 use mnemonic_core::services::team_share_service::{
-    MAX_CHAT_WAIT, TeamChatUpdate, TeamClient, TeamEntry, TeamPermissionRequest,
+    MAX_CHAT_WAIT, TeamChatUpdate, TeamClient, TeamClientError, TeamEntry, TeamPermissionRequest,
 };
 use project::{AgentId, Project};
 use ui::IconName;
@@ -37,8 +37,8 @@ const READ_ONLY: &str = "This is a teammate's chat; it is read-only";
 pub(crate) type ReportFailure = Rc<dyn Fn(SharedString, &mut App)>;
 
 /// Posts the option the viewer picked for a teammate agent's tool call, as
-/// `(tool_call_id, option_id)`.
-type AnswerPermission = Rc<dyn Fn(String, String, &mut App)>;
+/// `(tool_call_id, option_id)`, failing when the sharer is still waiting.
+type AnswerPermission = Rc<dyn Fn(String, String, &mut App) -> Task<Result<()>>>;
 
 /// A `ReportFailure` that can live in an `AgentServer`, which must be `Send`.
 pub(crate) type SendableReportFailure = Arc<dyn Fn(SharedString, &mut App) + Send + Sync>;
@@ -237,11 +237,17 @@ fn poll_chat(
                         client.answer_permission(&chat_id, &tool_call_id, &option_id)
                     })
                     .await;
-                if let Err(err) = result {
-                    cx.update(|cx| report(format!("Couldn't answer the agent: {err}").into(), cx));
+                match result {
+                    // A 409 means someone else answered first, and the next
+                    // update withdraws the request.
+                    Ok(()) | Err(TeamClientError::Refused { status: 409, .. }) => Ok(()),
+                    Err(err) => {
+                        let message = format!("Couldn't answer the agent: {err}");
+                        cx.update(|cx| report(message.clone().into(), cx));
+                        Err(anyhow!(message))
+                    }
                 }
             })
-            .detach();
         }
     });
     cx.spawn(async move |cx| {
@@ -342,7 +348,13 @@ fn request_authorization(
         // must not hear about.
         if let RequestPermissionOutcome::Selected(selected) = outcome.await {
             answered_here.borrow_mut().insert(tool_call_id.clone());
-            cx.update(|cx| answer(tool_call_id, selected.option_id.0.to_string(), cx));
+            let posted =
+                cx.update(|cx| answer(tool_call_id.clone(), selected.option_id.0.to_string(), cx));
+            // The failure is already reported; the sharer is still waiting,
+            // so the next update shows the buttons again.
+            if posted.await.is_err() {
+                answered_here.borrow_mut().remove(&tool_call_id);
+            }
         }
     })
     .detach();
@@ -771,7 +783,7 @@ mod tests {
     }
 
     fn no_answer() -> AnswerPermission {
-        Rc::new(|_, _, _| {})
+        Rc::new(|_, _, _| Task::ready(Ok(())))
     }
 
     fn apply(
@@ -802,7 +814,10 @@ mod tests {
         let answers = Answers::default();
         let answer: AnswerPermission = Rc::new({
             let answers = answers.clone();
-            move |tool_call_id, option_id, _| answers.borrow_mut().push((tool_call_id, option_id))
+            move |tool_call_id, option_id, _| {
+                answers.borrow_mut().push((tool_call_id, option_id));
+                Task::ready(Ok(()))
+            }
         });
         (answers, answer)
     }
@@ -1082,9 +1097,7 @@ mod tests {
         );
     }
 
-    #[gpui::test]
-    async fn picking_an_option_posts_the_answer_once(cx: &mut TestAppContext) {
-        let (thread, mut mirror, answers, answer) = waiting_on_run_tests(cx).await;
+    fn pick_allow(thread: &Entity<AcpThread>, cx: &mut TestAppContext) {
         thread.update(cx, |thread, cx| {
             thread.authorize_tool_call(
                 acp::ToolCallId::new("call-1"),
@@ -1096,6 +1109,12 @@ mod tests {
             )
         });
         cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    async fn picking_an_option_posts_the_answer_once(cx: &mut TestAppContext) {
+        let (thread, mut mirror, answers, answer) = waiting_on_run_tests(cx).await;
+        pick_allow(&thread, cx);
         assert_eq!(
             *answers.borrow(),
             vec![("call-1".to_string(), "allow".to_string())]
@@ -1110,6 +1129,34 @@ mod tests {
         );
         assert_eq!(waiting_options(&thread, cx), None);
         assert_eq!(answers.borrow().len(), 1);
+    }
+
+    #[gpui::test]
+    async fn a_failed_answer_asks_again(cx: &mut TestAppContext) {
+        let thread = new_thread(cx).await;
+        let mut mirror = ChatMirror::default();
+        let failing_answer: AnswerPermission =
+            Rc::new(|_, _, _| Task::ready(Err(anyhow!("The teammate couldn't be reached"))));
+        apply_answering(
+            &mut mirror,
+            &thread,
+            asking_about_run_tests(true, vec![(0, run_tests_call())]),
+            &failing_answer,
+            cx,
+        );
+        pick_allow(&thread, cx);
+
+        apply_answering(
+            &mut mirror,
+            &thread,
+            asking_about_run_tests(false, Vec::new()),
+            &failing_answer,
+            cx,
+        );
+        assert_eq!(
+            waiting_options(&thread, cx),
+            Some(vec!["allow".to_string(), "reject".to_string()])
+        );
     }
 
     #[gpui::test]
