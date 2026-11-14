@@ -593,6 +593,8 @@ mod tests {
                 .map(|(index, entry)| TeamEntryChange { index, entry })
                 .collect(),
             plan: Vec::new(),
+            generating: false,
+            permissions: Vec::new(),
         }
     }
 

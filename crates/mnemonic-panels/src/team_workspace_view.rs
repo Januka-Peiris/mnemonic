@@ -662,7 +662,12 @@ impl TeammateWorkspaceView {
                 PeerStatus::Failed(TeamClientError::Incompatible { .. }) => {
                     Some(format!("{peer_name} is on a different Mnemonic version"))
                 }
-                PeerStatus::Failed(TeamClientError::Other(message)) => {
+                PeerStatus::Failed(
+                    TeamClientError::Other(message)
+                    | TeamClientError::Refused {
+                        reason: message, ..
+                    },
+                ) => {
                     Some(format!("Can't reach {peer_name}: {message}"))
                 }
             },

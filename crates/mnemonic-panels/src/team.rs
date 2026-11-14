@@ -24,7 +24,8 @@ use mnemonic_core::models::{ChatSessionRecord, WorkspaceSummary};
 use mnemonic_core::repositories::{chat_session_repository, settings_repository};
 use mnemonic_core::services::team_share_server::{DiffSource, TeamServerConfig, TeamShareServer};
 use mnemonic_core::services::team_share_service::{
-    DEFAULT_TEAM_PORT, TailscaleSelf, TailscaleWhois, TeamAgentState, TeamChat, TeamClient,
+    DEFAULT_TEAM_PORT, TailscaleSelf, TailscaleWhois, TeamActionError, TeamAgentState, TeamChat,
+    TeamClient,
     TeamClientError, TeamEntry, TeamShareHub, TeamWorkspace, saved_chat_entries, tailscale_self,
 };
 use mnemonic_core::services::{chat_transcript_service, git_review_service, workspace_service};
@@ -567,6 +568,7 @@ impl TeamShare {
                         .unwrap_or(record.title),
                     agent: chat_agent_label(&record.agent).to_string(),
                     open: thread.is_some() || self.hub.has_chat(&record.id),
+                    live: thread.is_some(),
                 });
                 if let Some(thread) = thread {
                     open_chats.push((record.id, thread));
@@ -606,6 +608,7 @@ impl TeamShare {
                 idle_seconds: mnemonic_bridge::last_agent_activity(&summary.id)
                     .map(|at| at.elapsed().as_secs()),
                 chats,
+                step_in: false,
                 id: summary.id,
                 project: summary.repo,
                 name: summary.name,
@@ -826,6 +829,7 @@ fn start_server(
         hub,
         Arc::new(TailscaleWhois::default()),
         diff_source,
+        Arc::new(|_action| Err(TeamActionError::Failed("Not available yet".into()))),
     )
     .map(|server| (server, me))
 }
