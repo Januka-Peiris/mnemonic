@@ -364,6 +364,7 @@ dependencies = [
  "chrono",
  "client",
  "collections",
+ "db",
  "env_logger 0.11.8",
  "feature_flags",
  "fs",

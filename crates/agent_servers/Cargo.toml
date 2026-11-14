@@ -33,6 +33,7 @@ anyhow.workspace = true
 chrono.workspace = true
 client.workspace = true
 collections.workspace = true
+db.workspace = true
 env_logger = { workspace = true, optional = true }
 fs.workspace = true
 futures.workspace = true
@@ -67,6 +68,7 @@ nix.workspace = true
 
 [dev-dependencies]
 client = { workspace = true, features = ["test-support"] }
+db = { workspace = true, features = ["test-support"] }
 env_logger.workspace = true
 fs.workspace = true
 

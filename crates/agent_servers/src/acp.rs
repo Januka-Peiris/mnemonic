@@ -10,6 +10,7 @@ use agent_client_protocol::{
 use anyhow::anyhow;
 use async_channel;
 use collections::{HashMap, HashSet};
+use db::kvp::KeyValueStore;
 use feature_flags::{AcpBetaFeatureFlag, FeatureFlagAppExt as _};
 use futures::channel::mpsc;
 use futures::future::Shared;
@@ -1220,6 +1221,7 @@ impl AcpConnection {
             Ok(directories) => directories,
             Err(error) => return Task::ready(Err(error)),
         };
+        let kvp = KeyValueStore::global(cx);
 
         let shared_task = cx
             .spawn({
@@ -1274,7 +1276,13 @@ impl AcpConnection {
                         config_state(response.modes, response.config_options);
 
                     if let Some(config_opts) = config_options.as_ref() {
-                        this.apply_default_config_options(&session_id, config_opts, cx);
+                        let saved = saved_session_choices(
+                            &kvp,
+                            &this.id,
+                            &session_id,
+                            &config_opts.borrow(),
+                        );
+                        this.apply_default_config_options(&session_id, config_opts, &saved, cx);
                     }
 
                     let ref_count = this
@@ -1317,10 +1325,13 @@ impl AcpConnection {
             .spawn(async move { shared_task.await.map_err(|err| anyhow!(err)) })
     }
 
+    /// Sets each option to what the session was last set to, or else to the
+    /// settings' default.
     fn apply_default_config_options(
         &self,
         session_id: &acp::SessionId,
         config_options: &Rc<RefCell<Vec<acp::SessionConfigOption>>>,
+        saved: &HashMap<String, String>,
         cx: &mut AsyncApp,
     ) {
         let id = self.id.clone();
@@ -1329,26 +1340,27 @@ impl AcpConnection {
             config_opts_ref
                 .iter()
                 .filter_map(|config_option| {
+                    // A saved value the agent no longer offers, like a
+                    // retired model, gives way to the default.
+                    if let Some(saved_value) = saved
+                        .get(config_option.id.0.as_ref())
+                        .filter(|value| is_valid_config_value(config_option, value))
+                    {
+                        let initial_value = match &config_option.kind {
+                            acp::SessionConfigKind::Select(select) => {
+                                Some(select.current_value.clone())
+                            }
+                            _ => None,
+                        };
+                        return Some((
+                            config_option.id.clone(),
+                            saved_value.clone(),
+                            initial_value,
+                        ));
+                    }
                     let default_value = self.defaults.config_option(config_option.id.0.as_ref())?;
 
-                    let is_valid = match &config_option.kind {
-                        acp::SessionConfigKind::Select(select) => match &select.options {
-                            acp::SessionConfigSelectOptions::Ungrouped(options) => options
-                                .iter()
-                                .any(|opt| &*opt.value.0 == default_value.as_str()),
-                            acp::SessionConfigSelectOptions::Grouped(groups) => {
-                                groups.iter().any(|g| {
-                                    g.options
-                                        .iter()
-                                        .any(|opt| &*opt.value.0 == default_value.as_str())
-                                })
-                            }
-                            _ => false,
-                        },
-                        _ => false,
-                    };
-
-                    if is_valid {
+                    if is_valid_config_value(config_option, &default_value) {
                         let initial_value = match &config_option.kind {
                             acp::SessionConfigKind::Select(select) => {
                                 Some(select.current_value.clone())
@@ -1408,6 +1420,53 @@ impl AcpConnection {
                 }
             }
         }
+    }
+}
+
+/// Where the options picked in a chat (model, effort, mode) are kept, so the
+/// chat reopens with them instead of the settings' defaults.
+const SESSION_CHOICES_NAMESPACE: &str = "acp_session_config_choices";
+
+fn session_choice_key(
+    agent_id: &AgentId,
+    session_id: &acp::SessionId,
+    config_id: &acp::SessionConfigId,
+) -> String {
+    format!("{}\n{}\n{}", agent_id.0, session_id.0, config_id.0)
+}
+
+/// The options this session was last set to, by config option id.
+fn saved_session_choices(
+    kvp: &KeyValueStore,
+    agent_id: &AgentId,
+    session_id: &acp::SessionId,
+    config_options: &[acp::SessionConfigOption],
+) -> HashMap<String, String> {
+    let store = kvp.scoped(SESSION_CHOICES_NAMESPACE);
+    config_options
+        .iter()
+        .filter_map(|option| {
+            let value = store
+                .read(&session_choice_key(agent_id, session_id, &option.id))
+                .log_err()
+                .flatten()?;
+            Some((option.id.0.to_string(), value))
+        })
+        .collect()
+}
+
+fn is_valid_config_value(config_option: &acp::SessionConfigOption, value: &str) -> bool {
+    match &config_option.kind {
+        acp::SessionConfigKind::Select(select) => match &select.options {
+            acp::SessionConfigSelectOptions::Ungrouped(options) => {
+                options.iter().any(|opt| &*opt.value.0 == value)
+            }
+            acp::SessionConfigSelectOptions::Grouped(groups) => groups
+                .iter()
+                .any(|g| g.options.iter().any(|opt| &*opt.value.0 == value)),
+            _ => false,
+        },
+        _ => false,
     }
 }
 
@@ -1648,7 +1707,12 @@ impl AgentConnection for AcpConnection {
             }
 
             if let Some(config_opts) = config_options.as_ref() {
-                self.apply_default_config_options(&response.session_id, config_opts, cx);
+                self.apply_default_config_options(
+                    &response.session_id,
+                    config_opts,
+                    &HashMap::default(),
+                    cx,
+                );
             }
 
             let action_log = cx.new(|_| ActionLog::new(project.clone()));
@@ -2059,6 +2123,7 @@ impl AgentConnection for AcpConnection {
         let config_opts = session.config_options.as_ref()?;
 
         Some(Rc::new(AcpSessionConfigOptions {
+            agent_id: self.id.clone(),
             session_id: session_id.clone(),
             connection: self.connection.clone(),
             state: config_opts.config_options.clone(),
@@ -3220,6 +3285,73 @@ mod tests {
         };
     }
 
+    fn fake_model_option(current: &str) -> acp::SessionConfigOption {
+        acp::SessionConfigOption::select(
+            "model",
+            "Model",
+            current.to_string(),
+            vec![
+                acp::SessionConfigSelectOption::new("opus", "Opus"),
+                acp::SessionConfigSelectOption::new("fable", "Fable"),
+            ],
+        )
+    }
+
+    fn current_model(connection: &AcpConnection, session_id: &acp::SessionId, cx: &App) -> String {
+        let options = connection
+            .session_config_options(session_id, cx)
+            .expect("session has config options")
+            .config_options();
+        match &options[0].kind {
+            acp::SessionConfigKind::Select(select) => select.current_value.0.to_string(),
+            _ => panic!("model is a select"),
+        }
+    }
+
+    #[gpui::test]
+    async fn test_reopened_session_keeps_the_model_picked_in_it(cx: &mut gpui::TestAppContext) {
+        let (connection, project, _, _, _, _, _keep_agent_alive) = connect_fake_agent(cx).await;
+        let session_id = acp::SessionId::new("session-that-picked-fable");
+        let work_dirs = util::path_list::PathList::new(&[std::path::Path::new("/a")]);
+        let load = |cx: &mut gpui::TestAppContext| {
+            cx.update(|cx| {
+                connection.clone().load_session(
+                    session_id.clone(),
+                    project.clone(),
+                    work_dirs.clone(),
+                    None,
+                    cx,
+                )
+            })
+        };
+
+        let _thread = load(cx).await.expect("load failed");
+        cx.update(|cx| {
+            connection
+                .session_config_options(&session_id, cx)
+                .expect("session has config options")
+                .set_config_option(
+                    acp::SessionConfigId::new("model"),
+                    acp::SessionConfigValueId::new("fable"),
+                    cx,
+                )
+        })
+        .await
+        .expect("setting the model failed");
+        cx.update(|cx| connection.clone().close_session(&session_id, cx))
+            .await
+            .expect("close failed");
+        cx.run_until_parked();
+
+        let _thread = load(cx).await.expect("reload failed");
+        cx.run_until_parked();
+
+        assert_eq!(
+            cx.update(|cx| current_model(&connection, &session_id, cx)),
+            "fable"
+        );
+    }
+
     async fn connect_fake_agent(
         cx: &mut gpui::TestAppContext,
     ) -> (
@@ -3326,8 +3458,23 @@ mod tests {
                             gate.recv().await.ok();
                         }
 
-                        responder.respond(acp::LoadSessionResponse::new())
+                        responder.respond(
+                            acp::LoadSessionResponse::new()
+                                .config_options(vec![fake_model_option("opus")]),
+                        )
                     }
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_request(
+                async move |req: acp::SetSessionConfigOptionRequest, responder, _cx| {
+                    let picked = match &req.value {
+                        acp::SessionConfigOptionValue::ValueId { value } => value.0.to_string(),
+                        _ => "opus".to_string(),
+                    };
+                    responder.respond(acp::SetSessionConfigOptionResponse::new(vec![
+                        fake_model_option(&picked),
+                    ]))
                 },
                 agent_client_protocol::on_receive_request!(),
             )
@@ -3891,6 +4038,7 @@ impl acp_thread::AgentSessionModes for AcpSessionModes {
 }
 
 struct AcpSessionConfigOptions {
+    agent_id: AgentId,
     session_id: acp::SessionId,
     connection: ConnectionTo<Agent>,
     state: Rc<RefCell<Vec<acp::SessionConfigOption>>>,
@@ -3917,12 +4065,25 @@ impl acp_thread::AgentSessionConfigOptions for AcpSessionConfigOptions {
 
         let watch_tx = self.watch_tx.clone();
         let defaults = self.defaults.clone();
+        let choice_key = session_choice_key(&self.agent_id, &session_id, &config_id);
+        let choice = value.0.to_string();
+        let kvp = KeyValueStore::global(cx);
+        let background = cx.background_executor().clone();
 
         cx.foreground_executor().spawn(async move {
             let response = into_foreground_future(connection.send_request(
                 acp::SetSessionConfigOptionRequest::new(session_id, config_id, value),
             ))
             .await?;
+
+            background
+                .spawn(async move {
+                    kvp.scoped(SESSION_CHOICES_NAMESPACE)
+                        .write(choice_key, choice)
+                        .await
+                        .log_err();
+                })
+                .detach();
 
             *state.borrow_mut() = response.config_options.clone();
             watch_tx.borrow_mut().send(()).ok();
