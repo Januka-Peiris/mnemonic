@@ -636,6 +636,11 @@ pub struct ThreadView {
     pub show_codex_windows_warning: bool,
     pub multi_root_callout_dismissed: bool,
     pub generating_indicator_in_list: bool,
+    // Kept here rather than read from the `ConversationView`: `send` and
+    // `cancel_generation` run while it is being updated, where reading it
+    // panics.
+    read_only_notice: Option<SharedString>,
+    send_handler: Option<SendHandler>,
     pub skill_loading_issues: Vec<SkillLoadingIssue>,
     /// Issues the user has explicitly dismissed. Each entry is matched against
     /// emitted issues by full equality; when an issue no longer appears in the
@@ -646,7 +651,7 @@ pub struct ThreadView {
 }
 impl Focusable for ThreadView {
     fn focus_handle(&self, cx: &App) -> FocusHandle {
-        if self.parent_session_id.is_some() || self.read_only_notice(cx).is_some() {
+        if self.parent_session_id.is_some() || self.read_only_notice().is_some() {
             self.focus_handle.clone()
         } else {
             self.active_editor(cx).focus_handle(cx)
@@ -841,6 +846,8 @@ impl ThreadView {
         code_span_resolver: AgentCodeSpanResolver,
         thread_store: Option<Entity<ThreadStore>>,
         initial_content: Option<AgentInitialContent>,
+        read_only_notice: Option<SharedString>,
+        send_handler: Option<SendHandler>,
         mut subscriptions: Vec<Subscription>,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -1087,6 +1094,8 @@ impl ThreadView {
             show_codex_windows_warning,
             multi_root_callout_dismissed: false,
             generating_indicator_in_list: false,
+            read_only_notice,
+            send_handler,
             skill_loading_issues: Vec::new(),
             dismissed_skill_loading_issues: HashSet::default(),
         };
@@ -1496,7 +1505,7 @@ impl ThreadView {
         // Before the queue-while-generating branch: a mirrored thread reports
         // generating while the agent it mirrors works, and the message is for
         // that agent.
-        if let Some(handler) = self.send_handler(cx) {
+        if let Some(handler) = self.send_handler.clone() {
             self.send_to_handler(handler, window, cx);
             return;
         }
@@ -1575,17 +1584,11 @@ impl ThreadView {
         self.send_impl(message_editor, window, cx)
     }
 
-    fn send_handler(&self, cx: &App) -> Option<Rc<dyn Fn(String, &mut Window, &mut App)>> {
-        self.server_view
-            .upgrade()
-            .and_then(|server_view| server_view.read(cx).send_handler())
-    }
-
     /// Never sends through the thread: a mirrored thread only gets entries
     /// from the chat it mirrors.
     fn send_to_handler(
         &mut self,
-        handler: Rc<dyn Fn(String, &mut Window, &mut App)>,
+        handler: SendHandler,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -1860,7 +1863,7 @@ impl ThreadView {
             return;
         }
 
-        if let Some(handler) = self.send_handler(cx) {
+        if let Some(handler) = self.send_handler.clone() {
             self.send_to_handler(handler, window, cx);
             return;
         }
@@ -2021,7 +2024,7 @@ impl ThreadView {
     pub fn cancel_generation(&mut self, cx: &mut Context<Self>) {
         // A mirrored thread that only shows its notice offers no Stop, so
         // Escape must not stop the agent it mirrors either.
-        if self.read_only_notice(cx).is_some() {
+        if self.read_only_notice().is_some() {
             return;
         }
         self.thread_retry_status.take();
@@ -4182,10 +4185,25 @@ impl ThreadView {
         )
     }
 
-    fn read_only_notice(&self, cx: &App) -> Option<SharedString> {
-        self.server_view
-            .upgrade()
-            .and_then(|server_view| server_view.read(cx).message_editor_notice())
+    pub(crate) fn set_read_only(
+        &mut self,
+        notice: Option<SharedString>,
+        send_handler: Option<SendHandler>,
+        cx: &mut Context<Self>,
+    ) {
+        self.read_only_notice = notice;
+        self.send_handler = send_handler;
+        cx.notify();
+    }
+
+    /// The notice shown in place of the message editor, if any. A view with
+    /// a send handler keeps its editor.
+    fn read_only_notice(&self) -> Option<SharedString> {
+        if self.send_handler.is_some() {
+            None
+        } else {
+            self.read_only_notice.clone()
+        }
     }
 
     pub(crate) fn render_message_editor(
@@ -4197,7 +4215,7 @@ impl ThreadView {
             return div().into_any_element();
         }
 
-        if let Some(notice) = self.read_only_notice(cx) {
+        if let Some(notice) = self.read_only_notice() {
             return div()
                 .w_full()
                 .p_2()

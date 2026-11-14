@@ -668,7 +668,7 @@ impl TeammateWorkspaceView {
                 cx,
             );
             view.suppress_notifications();
-            view.set_read_only(notice);
+            view.set_read_only(notice, cx);
             view
         })
     }

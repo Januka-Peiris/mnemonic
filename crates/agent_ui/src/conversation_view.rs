@@ -541,6 +541,10 @@ fn affects_thread_metadata(event: &AcpThreadEvent) -> bool {
     }
 }
 
+/// Takes a message sent from a read-only view's editor, in place of the
+/// thread.
+pub type SendHandler = Rc<dyn Fn(String, &mut Window, &mut App)>;
+
 pub enum AcpServerViewEvent {
     ActiveThreadChanged,
     /// The Fork button was clicked; the embedder opens the fork.
@@ -568,7 +572,7 @@ pub struct ConversationView {
     notifications_suppressed: bool,
     fork_enabled: bool,
     read_only: Option<SharedString>,
-    send_handler: Option<Rc<dyn Fn(String, &mut Window, &mut App)>>,
+    send_handler: Option<SendHandler>,
     auth_task: Option<Task<()>>,
     loading_status: Option<SharedString>,
     /// When settings change, use this to see if the theme has changed (which
@@ -647,8 +651,9 @@ impl ConversationView {
 
     /// Replaces the message editor with `notice`, for views that mirror
     /// someone else's chat.
-    pub fn set_read_only(&mut self, notice: SharedString) {
+    pub fn set_read_only(&mut self, notice: SharedString, cx: &mut Context<Self>) {
         self.read_only = Some(notice);
+        self.sync_read_only_to_thread_views(cx);
     }
 
     pub fn read_only(&self) -> Option<SharedString> {
@@ -664,21 +669,22 @@ impl ConversationView {
     ) {
         let changed = self.send_handler.is_some() != handler.is_some();
         self.send_handler = handler;
+        self.sync_read_only_to_thread_views(cx);
         if changed {
             cx.notify();
         }
     }
 
-    pub(crate) fn send_handler(&self) -> Option<Rc<dyn Fn(String, &mut Window, &mut App)>> {
-        self.send_handler.clone()
-    }
-
-    /// The notice shown in place of the message editor, if any.
-    pub(crate) fn message_editor_notice(&self) -> Option<SharedString> {
-        if self.send_handler.is_some() {
-            None
-        } else {
-            self.read_only.clone()
+    fn sync_read_only_to_thread_views(&self, cx: &mut Context<Self>) {
+        let Some(connected) = self.as_connected() else {
+            return;
+        };
+        for thread_view in connected.threads.values() {
+            let notice = self.read_only.clone();
+            let handler = self.send_handler.clone();
+            thread_view.update(cx, |thread_view, cx| {
+                thread_view.set_read_only(notice, handler, cx)
+            });
         }
     }
 
@@ -1366,6 +1372,8 @@ impl ConversationView {
                 self.code_span_resolver.clone(),
                 self.thread_store.clone(),
                 initial_content,
+                self.read_only.clone(),
+                self.send_handler.clone(),
                 subscriptions,
                 window,
                 cx,
@@ -3610,7 +3618,7 @@ pub(crate) mod tests {
             setup_conversation_view(StubAgentServer::default_response(), cx).await;
         let sent = Rc::new(std::cell::RefCell::new(Vec::new()));
         conversation_view.update(cx, |view, cx| {
-            view.set_read_only("A teammate's chat".into());
+            view.set_read_only("A teammate's chat".into(), cx);
             let sent = sent.clone();
             view.set_send_handler(
                 Some(Rc::new(
@@ -6662,6 +6670,46 @@ pub(crate) mod tests {
 
         setup.thread.read_with(cx, |thread, _cx| {
             assert_eq!(thread.status(), ThreadStatus::Idle);
+        });
+    }
+
+    #[gpui::test]
+    async fn cancel_generation_from_within_a_conversation_view_update_stops_the_turn(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+
+        let (setup, cx) = setup_generating_thread(cx).await;
+
+        setup
+            .conversation_view
+            .update(cx, |view, cx| view.cancel_generation(cx));
+        cx.run_until_parked();
+
+        setup.thread.read_with(cx, |thread, _cx| {
+            assert_eq!(thread.status(), ThreadStatus::Idle);
+        });
+    }
+
+    #[gpui::test]
+    async fn an_auto_submitted_prompt_is_sent_when_the_thread_view_is_built(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+
+        let (conversation_view, cx) = setup_conversation_view_with_initial_content(
+            StubAgentServer::default_response(),
+            AgentInitialContent::ContentBlock {
+                blocks: vec!["Hello".into()],
+                auto_submit: true,
+            },
+            cx,
+        )
+        .await;
+        cx.run_until_parked();
+
+        active_thread(&conversation_view, cx).read_with(cx, |view, cx| {
+            assert_eq!(view.thread.read(cx).entries().len(), 2);
         });
     }
 
