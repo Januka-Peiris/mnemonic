@@ -3496,6 +3496,42 @@ impl WorkspaceView {
         .detach();
     }
 
+    /// Stops a chat's agent the way its own Stop button does.
+    pub(crate) fn stop_chat(&mut self, record_id: &str, cx: &mut Context<Self>) {
+        let Some(chat) = self.chat_by_record(record_id) else {
+            return;
+        };
+        chat.view
+            .update(cx, |conversation, cx| conversation.cancel_generation(cx));
+    }
+
+    /// Queues a message for a chat, sent once its agent is idle.
+    pub(crate) fn queue_chat_message(
+        &mut self,
+        record_id: &str,
+        text: String,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(chat) = self
+            .sessions
+            .iter_mut()
+            .filter_map(WorkspaceSession::chat_mut)
+            .find(|chat| chat.record_id == record_id)
+        else {
+            return;
+        };
+        chat.pending_messages.push(text);
+        let view_id = chat.view.entity_id();
+        self.flush_pending(view_id, cx);
+    }
+
+    fn chat_by_record(&self, record_id: &str) -> Option<&ChatSession> {
+        self.sessions
+            .iter()
+            .filter_map(WorkspaceSession::chat)
+            .find(|chat| chat.record_id == record_id)
+    }
+
     /// Switches a new review chat to a Sonnet model when the agent offers
     /// one, then releases its review prompt.
     fn select_review_model(
@@ -4719,6 +4755,41 @@ pub(crate) fn open_windows(cx: &App) -> Vec<Entity<Workspace>> {
     cx.try_global::<OpenWindows>()
         .map(|windows| windows.0.iter().filter_map(WeakEntity::upgrade).collect())
         .unwrap_or_default()
+}
+
+/// A chat loaded in one of this app's windows.
+pub(crate) struct OpenChat {
+    pub window: Entity<Workspace>,
+    pub workspace_id: String,
+    pub view: Entity<WorkspaceView>,
+    pub title: SharedString,
+    /// None until the agent has connected.
+    pub thread: Option<Entity<acp_thread::AcpThread>>,
+}
+
+/// Finds a loaded chat by its record id, in whichever window holds it.
+pub(crate) fn find_open_chat(record_id: &str, cx: &App) -> Option<OpenChat> {
+    open_windows(cx).into_iter().find_map(|window| {
+        let host = window.read(cx).panes().iter().find_map(|pane| {
+            pane.read(cx)
+                .items()
+                .find_map(|item| item.downcast::<WorkspaceHost>())
+        })?;
+        host.read(cx).views.iter().find_map(|(workspace_id, view)| {
+            let session = view.read(cx).sessions.iter().find(|session| {
+                session
+                    .chat()
+                    .is_some_and(|chat| chat.record_id == record_id)
+            })?;
+            Some(OpenChat {
+                window: window.clone(),
+                workspace_id: workspace_id.clone(),
+                view: view.clone(),
+                title: session.title.clone(),
+                thread: session.chat()?.view.read(cx).root_thread(cx),
+            })
+        })
+    })
 }
 
 /// How much of each review comment goes into the fix instruction; the agent
