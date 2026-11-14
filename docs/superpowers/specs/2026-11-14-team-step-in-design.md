@@ -81,6 +81,10 @@ mine" and keeps the sharer's chat as the single place things happen.
   workspace clears it.
 - `TeamWorkspace` gains `step_in: bool`. The viewer enables its controls only
   when it is true.
+- `TeamChat` gains `live: bool`: the chat is loaded in the sharer's app right
+  now. `open` stays "readable", which since step 1 includes chats shown from a
+  saved transcript. A chat that is readable but not live keeps the step 1
+  read-only notice, so no control is offered that can only fail.
 
 ### Protocol v3
 
@@ -92,7 +96,10 @@ mine" and keeps the sharer's chat as the single place things happen.
 - `permissions: Vec<TeamPermissionRequest>`: one per tool call waiting for an
   answer, `{ tool_call_id, options: Vec<acp::PermissionOption> }`. The
   sharer's dropdown-style options are flattened to their allow and deny
-  options. Empty unless the workspace allows stepping in.
+  options. Only `AllowOnce` and `RejectOnce` options are sent: an "always"
+  answer would leave a standing rule in the owner's agent, which is a
+  setting, and that is the owner's to make. A request with no once-only
+  option is not sent. Empty unless the workspace allows stepping in.
 
 New routes, all POST with a JSON body, all behind the same Tailscale identity
 and allow-list check as the GET routes, plus: the chat must belong to a shared
@@ -116,13 +123,20 @@ longer waiting, 413 when the body is over 256 KB.
   sends the action to a foreground task owned by `TeamShare`.
 - The action carries who asked: the caller's Tailscale display name, falling
   back to the login.
-- Stop: `thread.cancel`.
+- Stop: the same path as the owner's own Stop button
+  (`ConversationView::cancel_generation`), not a bare `thread.cancel`. The
+  owner's button also marks the turn as interrupted by the user, which stops
+  the chat view from sending the owner's next queued message straight after.
+  The workspace's pending-message queue flushes as it does after a local
+  stop, so a teammate's queued message still goes out.
 - Message: pushed onto the chat's existing pending-message queue in
   `WorkspaceHost`, as `From {name} (teammate):\n\n{text}`, then flushed. The
   queue already sends when the thread goes idle.
 - Permission: the option is looked up by id in the tool call's own options
-  (so a teammate can only pick an option the agent offered), then
-  `thread.authorize_tool_call`.
+  (so a teammate can only pick an option the agent offered) and must be
+  `AllowOnce` or `RejectOnce`, else 403. Then `thread.authorize_tool_call`.
+- Whether a chat is loaded (the 404) is decided on the foreground thread from
+  the live chats, not from the hub, which also keeps feeds for closed chats.
 - Each stop and each permission answer shows a notification on the sharer's
   Mac: "{name} stopped the agent in {chat}", "{name} allowed {tool} in
   {chat}". A message needs none; it is in the chat with its label.
@@ -135,7 +149,9 @@ longer waiting, 413 when the body is over 256 KB.
   set and no local turn calls the connection's `cancel`.
 - `TeamConnection::cancel` posts stop.
 - The chat view's read-only mode gains a variant where the editor stays and
-  sending calls a handler instead of `thread.send`. The teammate view uses it
+  sending calls a handler instead of `thread.send`. The handler runs before
+  the chat view's own "queue locally while generating" branch, or the
+  remote-generating flag would trap the message in the viewer's queue. The teammate view uses it
   when `step_in` is true and posts the message. The message appears through
   the mirror once the sharer's chat has it. If the answer says queued, the
   viewer shows "Queued until {name}'s agent finishes".
@@ -143,7 +159,8 @@ longer waiting, 413 when the body is over 256 KB.
   authorization with those options, so the usual buttons appear. Picking one
   posts the answer. When a request leaves `permissions` without a local
   answer (answered on the sharer's Mac or by another teammate) the mirror
-  clears the waiting state without posting.
+  clears the waiting state without posting. `AcpThread` needs a new method
+  for that: a status update alone keeps a tool call waiting.
 - A failed action shows an error notification with the server's reason.
 - With `step_in` false everything stays as in step 1.
 
@@ -165,7 +182,7 @@ Each test names the production behaviour that breaks it.
   off, and when the caller is not on the allow list.
 - Sharer: a teammate's message is queued while the agent is busy and sent
   once it is idle, with the sender's label; a permission answer naming an
-  option the agent never offered is refused.
+  option the agent never offered, or an "always" option, is refused.
 - Viewer: a mirrored chat reports generating while the sharer's does;
   permission buttons appear for a waiting request and clear without posting
   when it is answered elsewhere.
