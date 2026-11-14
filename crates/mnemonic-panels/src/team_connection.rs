@@ -273,12 +273,18 @@ fn poll_chat(
                     // A chat closed and reopened restarts its feed, which an
                     // old cursor could be mistaken for.
                     cursor = None;
+                    if show_teammate_unreachable(&thread, cx).is_err() {
+                        return;
+                    }
                     cx.background_executor().timer(RETRY_CHAT_AFTER).await;
                 }
                 Err(err) => {
                     log::debug!("Couldn't follow teammate chat {chat_id}: {err}");
                     // The chat may have been closed and reopened meanwhile.
                     cursor = None;
+                    if show_teammate_unreachable(&thread, cx).is_err() {
+                        return;
+                    }
                     cx.background_executor().timer(RETRY_CHAT_AFTER).await;
                 }
             }
@@ -316,6 +322,37 @@ fn apply_chat_update<C: AppContext>(
         let answer = answer.clone();
         thread.update(cx, |thread, cx| {
             request_authorization(thread, request, answered_here, answer, cx)
+        })?;
+    }
+    Ok(())
+}
+
+/// Shows a chat the teammate closed, or a teammate who can't be reached, as
+/// idle with nothing waiting, so no Stop or permission button is offered
+/// that can only fail. The next update from the teammate shows the chat
+/// again as it is.
+fn show_teammate_unreachable<C: AppContext>(
+    thread: &WeakEntity<AcpThread>,
+    cx: &mut C,
+) -> Result<()> {
+    thread.update(cx, |thread, cx| thread.set_remote_generating(false, cx))?;
+    let waiting: Vec<acp::ToolCallId> = thread.read_with(cx, |thread, _| {
+        thread
+            .entries()
+            .iter()
+            .filter_map(|entry| match entry {
+                AgentThreadEntry::ToolCall(ToolCall {
+                    id,
+                    status: ToolCallStatus::WaitingForConfirmation { .. },
+                    ..
+                }) => Some(id.clone()),
+                _ => None,
+            })
+            .collect()
+    })?;
+    for tool_call_id in waiting {
+        thread.update(cx, |thread, cx| {
+            thread.clear_tool_call_authorization(&tool_call_id, cx)
         })?;
     }
     Ok(())
@@ -1187,6 +1224,35 @@ mod tests {
             waiting_options(&thread, cx),
             Some(vec!["allow".to_string(), "reject".to_string()])
         );
+        assert!(answers.borrow().is_empty());
+    }
+
+    #[gpui::test]
+    async fn an_unreachable_teammate_leaves_the_chat_idle_with_nothing_to_answer(
+        cx: &mut TestAppContext,
+    ) {
+        let thread = new_thread(cx).await;
+        let mut mirror = ChatMirror::default();
+        let (answers, answer) = recording_answer();
+        let working_and_asking = TeamChatUpdate {
+            generating: true,
+            ..asking_about_run_tests(true, vec![(0, run_tests_call())])
+        };
+        apply_answering(&mut mirror, &thread, working_and_asking, &answer, cx);
+        assert_eq!(
+            thread.read_with(cx, |thread, _| thread.status()),
+            ThreadStatus::Generating
+        );
+        assert!(waiting_options(&thread, cx).is_some());
+
+        show_teammate_unreachable(&thread.downgrade(), cx).expect("the thread is still open");
+        cx.run_until_parked();
+
+        assert_eq!(
+            thread.read_with(cx, |thread, _| thread.status()),
+            ThreadStatus::Idle
+        );
+        assert_eq!(waiting_options(&thread, cx), None);
         assert!(answers.borrow().is_empty());
     }
 

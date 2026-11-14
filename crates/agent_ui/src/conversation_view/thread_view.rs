@@ -1188,7 +1188,7 @@ impl ThreadView {
         match event {
             MessageEditorEvent::Send => self.send(window, cx),
             MessageEditorEvent::SendImmediately => self.interrupt_and_send(window, cx),
-            MessageEditorEvent::Cancel => self.cancel_generation(cx),
+            MessageEditorEvent::Cancel => self.cancel_generation_on_escape(cx),
             MessageEditorEvent::Focus => {
                 self.cancel_editing(&Default::default(), window, cx);
             }
@@ -2033,6 +2033,15 @@ impl ThreadView {
         self._cancel_task = Some(self.thread.update(cx, |thread, cx| thread.cancel(cx)));
         self.sync_generating_indicator(cx);
         cx.notify();
+    }
+
+    /// In a teammate's chat Escape would stop their agent, not this one, so
+    /// there only the Stop button does.
+    fn cancel_generation_on_escape(&mut self, cx: &mut Context<Self>) {
+        if self.send_handler.is_some() {
+            return;
+        }
+        self.cancel_generation(cx);
     }
 
     pub fn retry_generation(&mut self, cx: &mut Context<Self>) {
@@ -11365,7 +11374,7 @@ impl Render for ThreadView {
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(|this, _: &menu::Cancel, _, cx| {
                 if this.parent_session_id.is_none() {
-                    this.cancel_generation(cx);
+                    this.cancel_generation_on_escape(cx);
                 }
             }))
             .on_action(cx.listener(|this, _: &workspace::GoBack, window, cx| {

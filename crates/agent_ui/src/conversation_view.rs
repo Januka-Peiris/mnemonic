@@ -675,6 +675,23 @@ impl ConversationView {
         }
     }
 
+    /// Puts back a message the send handler couldn't deliver, unless
+    /// something new was typed meanwhile.
+    pub fn restore_unsent_message(
+        &mut self,
+        text: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(thread_view) = self.root_thread_view() else {
+            return;
+        };
+        let message_editor = thread_view.read(cx).message_editor.clone();
+        if message_editor.read(cx).is_empty(cx) {
+            message_editor.update(cx, |editor, cx| editor.insert_text(text, window, cx));
+        }
+    }
+
     fn sync_read_only_to_thread_views(&self, cx: &mut Context<Self>) {
         let Some(connected) = self.as_connected() else {
             return;
