@@ -17,6 +17,9 @@ pub const TEAM_PROTOCOL_VERSION: u32 = 3;
 /// versions are treated as speaking different protocols.
 pub const TEAM_ACP_CRATE_VERSION: &str = "0.14.0";
 pub const DEFAULT_TEAM_PORT: u16 = 47231;
+/// Sent on every action, so a web page can't post one without a CORS
+/// preflight the share server never answers.
+pub const TEAM_REQUEST_HEADER: &str = "X-Mnemonic-Team";
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct TeamHello {
@@ -145,7 +148,9 @@ pub struct TeamCaller {
 #[derive(Clone, Debug, PartialEq)]
 pub struct TeamAction {
     pub chat_id: String,
+    /// The caller's display name, which they choose themselves.
     pub from: String,
+    pub login: String,
     pub kind: TeamActionKind,
 }
 
@@ -750,13 +755,16 @@ impl CallerIdentity for TailscaleWhois {
         let caller = whois
             .user_profile
             .filter(|user| !user.login_name.is_empty())
-            .map(|user| TeamCaller {
-                name: if user.display_name.is_empty() {
-                    user.login_name.clone()
-                } else {
-                    user.display_name
-                },
-                login: user.login_name,
+            .map(|user| {
+                let name = single_line(&user.display_name);
+                TeamCaller {
+                    name: if name.is_empty() {
+                        user.login_name.clone()
+                    } else {
+                        name
+                    },
+                    login: user.login_name,
+                }
             });
         self.cache
             .lock()
@@ -764,6 +772,20 @@ impl CallerIdentity for TailscaleWhois {
             .insert(address, (caller.clone(), Instant::now()));
         Ok(caller)
     }
+}
+
+/// A display name is chosen by its owner and ends up in chat labels and
+/// notifications, so it must not be able to fake extra lines there.
+fn single_line(name: &str) -> String {
+    name.split_whitespace()
+        .map(|word| {
+            word.chars()
+                .filter(|character| !character.is_control())
+                .collect::<String>()
+        })
+        .filter(|word| !word.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -883,6 +905,7 @@ impl TeamClient {
             .http
             .post(format!("{}{path}", self.base_url))
             .timeout(REQUEST_TIMEOUT)
+            .header(TEAM_REQUEST_HEADER, TEAM_PROTOCOL_VERSION.to_string())
             .json(&body)
             .send()
             .map_err(|err| {
@@ -896,15 +919,14 @@ impl TeamClient {
         if (200..300).contains(&status) {
             return Ok(response);
         }
-        let reason = response.text().unwrap_or_default().trim().to_string();
-        Err(TeamClientError::Refused {
-            status,
-            reason: if reason.is_empty() {
-                format!("Request failed ({status})")
-            } else {
-                reason
-            },
-        })
+        let reason = match response.text() {
+            Ok(text) if !text.trim().is_empty() => text.trim().to_string(),
+            Ok(_) => format!("Request failed ({status})"),
+            Err(err) => {
+                format!("Request failed ({status}), and its reason couldn't be read: {err}")
+            }
+        };
+        Err(TeamClientError::Refused { status, reason })
     }
 
     /// Stops the chat's agent.

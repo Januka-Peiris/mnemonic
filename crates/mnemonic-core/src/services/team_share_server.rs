@@ -3,7 +3,7 @@
 //! action handler and only for chats the sharer has opened to step-in.
 
 use std::io::Read as _;
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread::JoinHandle;
@@ -13,8 +13,8 @@ use tiny_http::{Header, Method, Request, Response, Server};
 
 use crate::services::team_share_service::{
     ActionHandler, CallerIdentity, MAX_CHAT_WAIT, TEAM_ACP_CRATE_VERSION, TEAM_PROTOCOL_VERSION,
-    TeamAction, TeamActionError, TeamActionKind, TeamHello, TeamShareHub, TeamWorkspaceList,
-    is_plain_id,
+    TEAM_REQUEST_HEADER, TeamAction, TeamActionError, TeamActionKind, TeamCaller, TeamHello,
+    TeamShareHub, TeamWorkspaceList, is_plain_id,
 };
 
 /// Produces a workspace's diff. Behind a closure so tests don't need a
@@ -149,6 +149,10 @@ fn accept_requests(server: &Server, shared: &Arc<Shared>) {
 }
 
 fn handle(mut request: Request, shared: &Shared) {
+    if let Err((status, reason)) = check_request(&request) {
+        respond(request, text_response(status, reason));
+        return;
+    }
     let Some(address) = request.remote_addr().map(|address| address.ip()) else {
         respond(request, text_response(403, "Unknown caller"));
         return;
@@ -191,7 +195,7 @@ fn handle(mut request: Request, shared: &Shared) {
             ["v1", "chats", chat_id, action @ ("stop" | "message" | "permission")]
                 if is_plain_id(chat_id) =>
             {
-                handle_action(&mut request, shared, &caller.name, chat_id, action)
+                handle_action(&mut request, shared, &caller, chat_id, action)
             }
             _ => text_response(404, "Not found"),
         };
@@ -243,10 +247,70 @@ fn handle(mut request: Request, shared: &Shared) {
     respond(request, response);
 }
 
+/// Identity is the caller's machine, so any program there acts as its
+/// owner, including a web page open in a browser. These refuse what a page
+/// can send: browsers add `Origin` to cross-origin requests, a foreign
+/// `Host` means DNS rebinding, and a JSON body or a custom header makes a
+/// browser ask first with a CORS preflight, which this server never answers.
+fn check_request(request: &Request) -> Result<(), (u16, &'static str)> {
+    let header_value = |name: &'static str| {
+        request
+            .headers()
+            .iter()
+            .find(|header| header.field.equiv(name))
+            .map(|header| header.value.as_str())
+    };
+    if header_value("Origin").is_some() {
+        return Err((403, "Requests from web pages are refused"));
+    }
+    if !header_value("Host").is_some_and(is_allowed_host) {
+        return Err((403, "Unexpected host name"));
+    }
+    if *request.method() == Method::Post {
+        let is_json = header_value("Content-Type").is_some_and(|value| {
+            value.split(';').next().is_some_and(|media_type| {
+                media_type.trim().eq_ignore_ascii_case("application/json")
+            })
+        });
+        if !is_json {
+            return Err((400, "Expected a JSON body"));
+        }
+        if !header_value(TEAM_REQUEST_HEADER).is_some_and(|value| !value.trim().is_empty()) {
+            return Err((400, "Not a Mnemonic request"));
+        }
+    }
+    Ok(())
+}
+
+/// The names a teammate reaches this machine by: an address, a Tailscale
+/// MagicDNS name, or a bare machine name.
+fn is_allowed_host(host: &str) -> bool {
+    let host = host.trim();
+    if let Some(bracketed) = host.strip_prefix('[') {
+        return bracketed
+            .split_once(']')
+            .is_some_and(|(address, _)| address.parse::<Ipv6Addr>().is_ok());
+    }
+    let name = host.split_once(':').map_or(host, |(name, _)| name);
+    if name.parse::<IpAddr>().is_ok() {
+        return true;
+    }
+    let is_name_character =
+        |character: char| character.is_ascii_alphanumeric() || character == '-' || character == '.';
+    if name.is_empty() || !name.chars().all(is_name_character) {
+        return false;
+    }
+    !name.contains('.')
+        || name
+            .to_ascii_lowercase()
+            .strip_suffix(".ts.net")
+            .is_some_and(|prefix| !prefix.is_empty() && !prefix.ends_with('.'))
+}
+
 fn handle_action(
     request: &mut Request,
     shared: &Shared,
-    from: &str,
+    caller: &TeamCaller,
     chat_id: &str,
     action: &str,
 ) -> Response<std::io::Cursor<Vec<u8>>> {
@@ -270,7 +334,8 @@ fn handle_action(
     };
     let outcome = (shared.action_handler)(TeamAction {
         chat_id: chat_id.to_string(),
-        from: from.to_string(),
+        from: caller.name.clone(),
+        login: caller.login.clone(),
         kind,
     });
     match outcome {
@@ -311,7 +376,8 @@ fn parse_action(action: &str, body: &[u8]) -> Result<TeamActionKind, String> {
                 option_id: answer.option_id,
             })
         }
-        _ => Ok(TeamActionKind::Stop),
+        "stop" => Ok(TeamActionKind::Stop),
+        _ => Err(format!("Unknown action {action}")),
     }
 }
 
@@ -370,7 +436,8 @@ mod tests {
         TeamActionOutcome, TeamCaller, TeamClient, TeamClientError, TeamEntry, TeamWorkspace,
     };
     use std::collections::HashSet;
-    use std::net::Ipv4Addr;
+    use std::io::{BufRead as _, Write as _};
+    use std::net::{Ipv4Addr, TcpStream};
     use std::sync::Mutex;
 
     struct FixedLogin(Option<&'static str>);
@@ -436,6 +503,36 @@ mod tests {
 
     fn refused(status: u16) -> impl Fn(&TeamClientError) -> bool {
         move |err| matches!(err, TeamClientError::Refused { status: got, .. } if *got == status)
+    }
+
+    /// Sends `request` exactly as written and returns the status code of
+    /// the answer.
+    fn raw_status(address: SocketAddr, request: &str) -> Result<u16, String> {
+        let mut stream = TcpStream::connect(address).map_err(|err| err.to_string())?;
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .map_err(|err| err.to_string())?;
+        stream
+            .write_all(request.as_bytes())
+            .map_err(|err| err.to_string())?;
+        let mut status_line = String::new();
+        std::io::BufReader::new(stream)
+            .read_line(&mut status_line)
+            .map_err(|err| err.to_string())?;
+        status_line
+            .split_whitespace()
+            .nth(1)
+            .and_then(|code| code.parse().ok())
+            .ok_or_else(|| format!("No status in {status_line:?}"))
+    }
+
+    fn post_hello_message(address: SocketAddr, headers: &str) -> String {
+        let body = r#"{"text":"hello"}"#;
+        format!(
+            "POST /v1/chats/chat-1/message HTTP/1.1\r\nHost: {address}\r\n{headers}\
+             Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
     }
 
     fn workspace(id: &str) -> TeamWorkspace {
@@ -608,6 +705,46 @@ mod tests {
             .send_message("chat-1", &"a".repeat(300 * 1024))
             .is_err_and(|err| refused(413)(&err)));
         assert!(recorded.lock().map_err(|err| err.to_string())?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn a_browser_style_post_is_refused() -> Result<(), String> {
+        let (server, recorded) =
+            start_with_handler(Some("bob@example.com"), step_in_hub(true), queued())?;
+        let address = server.address();
+
+        let plain_text = post_hello_message(address, "Content-Type: text/plain\r\n");
+        assert_eq!(raw_status(address, &plain_text)?, 400);
+        let without_team_header =
+            post_hello_message(address, "Content-Type: application/json\r\n");
+        assert_eq!(raw_status(address, &without_team_header)?, 400);
+        let from_a_web_page = post_hello_message(
+            address,
+            "Content-Type: application/json\r\nX-Mnemonic-Team: 3\r\n\
+             Origin: https://example.com\r\n",
+        );
+        assert_eq!(raw_status(address, &from_a_web_page)?, 403);
+        assert!(recorded.lock().map_err(|err| err.to_string())?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn a_request_for_another_host_name_is_refused() -> Result<(), String> {
+        let server = start(Some("bob@example.com"), TeamShareHub::new())?;
+        let address = server.address();
+        let list_workspaces = |host: &str| {
+            format!("GET /v1/workspaces HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n")
+        };
+
+        assert_eq!(
+            raw_status(address, &list_workspaces("attacker.example.com"))?,
+            403
+        );
+        assert_eq!(
+            raw_status(address, &list_workspaces("jays-mac.tail1234.ts.net:47231"))?,
+            200
+        );
         Ok(())
     }
 
