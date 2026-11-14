@@ -2670,6 +2670,19 @@ impl AcpThread {
         cx.emit(AcpThreadEvent::EntryUpdated(ix));
     }
 
+    /// Withdraws a tool call's waiting request without an answer, resolving
+    /// it as cancelled. A status update alone keeps a tool call waiting.
+    pub fn clear_tool_call_authorization(&mut self, id: &acp::ToolCallId, cx: &mut Context<Self>) {
+        let Some((index, call)) = self.tool_call_mut(id) else {
+            return;
+        };
+        let ToolCallStatus::WaitingForConfirmation { current_status, .. } = &call.status else {
+            return;
+        };
+        call.status = (*current_status).into();
+        cx.emit(AcpThreadEvent::EntryUpdated(index));
+    }
+
     pub fn plan(&self) -> &Plan {
         &self.plan
     }

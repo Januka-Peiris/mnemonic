@@ -3,14 +3,15 @@
 
 use std::any::Any;
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
 use acp_thread::{
-    AcpThread, AgentConnection, ContextCompaction, ContextCompactionId, ContextCompactionStatus,
-    UserMessageId,
+    AcpThread, AgentConnection, AgentThreadEntry, AuthorizationKind, ContextCompaction,
+    ContextCompactionId, ContextCompactionStatus, PermissionOptions, RequestPermissionOutcome,
+    ToolCall, ToolCallStatus, UserMessageId,
 };
 use action_log::ActionLog;
 use agent_client_protocol::schema as acp;
@@ -19,7 +20,7 @@ use anyhow::{Result, anyhow};
 use gpui::{App, AppContext, Context, Entity, SharedString, Task, WeakEntity};
 use markdown::Markdown;
 use mnemonic_core::services::team_share_service::{
-    MAX_CHAT_WAIT, TeamChatUpdate, TeamClient, TeamEntry,
+    MAX_CHAT_WAIT, TeamChatUpdate, TeamClient, TeamEntry, TeamPermissionRequest,
 };
 use project::{AgentId, Project};
 use ui::IconName;
@@ -34,6 +35,10 @@ const READ_ONLY: &str = "This is a teammate's chat; it is read-only";
 
 /// Shows the user why an action on a teammate's chat failed.
 pub(crate) type ReportFailure = Rc<dyn Fn(SharedString, &mut App)>;
+
+/// Posts the option the viewer picked for a teammate agent's tool call, as
+/// `(tool_call_id, option_id)`.
+type AnswerPermission = Rc<dyn Fn(String, String, &mut App)>;
 
 /// A `ReportFailure` that can live in an `AgentServer`, which must be `Send`.
 pub(crate) type SendableReportFailure = Arc<dyn Fn(SharedString, &mut App) + Send + Sync>;
@@ -153,6 +158,7 @@ impl AgentConnection for TeamConnection {
             self.client.clone(),
             session_id.0.to_string(),
             thread.downgrade(),
+            self.report.clone(),
             cx,
         );
         self.polls.borrow_mut().insert(session_id, poll);
@@ -215,8 +221,29 @@ fn poll_chat(
     client: TeamClient,
     chat_id: String,
     thread: WeakEntity<AcpThread>,
+    report: ReportFailure,
     cx: &mut App,
 ) -> Task<()> {
+    let answer: AnswerPermission = Rc::new({
+        let client = client.clone();
+        let chat_id = chat_id.clone();
+        move |tool_call_id, option_id, cx| {
+            let client = client.clone();
+            let chat_id = chat_id.clone();
+            let report = report.clone();
+            cx.spawn(async move |cx| {
+                let result = cx
+                    .background_spawn(async move {
+                        client.answer_permission(&chat_id, &tool_call_id, &option_id)
+                    })
+                    .await;
+                if let Err(err) = result {
+                    cx.update(|cx| report(format!("Couldn't answer the agent: {err}").into(), cx));
+                }
+            })
+            .detach();
+        }
+    });
     cx.spawn(async move |cx| {
         let mut mirror = ChatMirror::default();
         let mut cursor: Option<String> = None;
@@ -232,7 +259,7 @@ fn poll_chat(
             match result {
                 Ok(Some(update)) => {
                     cursor = Some(update.cursor.clone());
-                    if apply_chat_update(&mut mirror, &thread, update, cx).is_err() {
+                    if apply_chat_update(&mut mirror, &thread, update, &answer, cx).is_err() {
                         return;
                     }
                 }
@@ -256,16 +283,69 @@ fn poll_chat(
 /// Applies each change in its own `thread.update`: the thread's `NewEntry`
 /// events are delivered only once an update ends, and their handlers take the
 /// last entry as the new one, so two pushes in one update break the chat view.
+///
+/// Permission requests are matched against the thread once the entries are
+/// in, as rebuilding entries drops the waiting state a request had.
 fn apply_chat_update<C: AppContext>(
     mirror: &mut ChatMirror,
     thread: &WeakEntity<AcpThread>,
-    update: TeamChatUpdate,
+    mut update: TeamChatUpdate,
+    answer: &AnswerPermission,
     cx: &mut C,
 ) -> Result<()> {
+    let permissions = std::mem::take(&mut update.permissions);
     for operation in mirror.apply(update) {
         thread.update(cx, |thread, cx| operation.apply(thread, cx))?;
     }
+    let (requests, withdrawn) = thread.read_with(cx, |thread, _| {
+        mirror.permission_changes(thread, permissions)
+    })?;
+    for tool_call_id in withdrawn {
+        thread.update(cx, |thread, cx| {
+            thread.clear_tool_call_authorization(&tool_call_id, cx)
+        })?;
+    }
+    for request in requests {
+        let answered_here = mirror.answered_here.clone();
+        let answer = answer.clone();
+        thread.update(cx, |thread, cx| {
+            request_authorization(thread, request, answered_here, answer, cx)
+        })?;
+    }
     Ok(())
+}
+
+/// Shows a sharer's waiting request as the thread's own, and passes on the
+/// option the viewer picks.
+fn request_authorization(
+    thread: &mut AcpThread,
+    request: TeamPermissionRequest,
+    answered_here: Rc<RefCell<HashSet<String>>>,
+    answer: AnswerPermission,
+    cx: &mut Context<AcpThread>,
+) {
+    let tool_call_id = request.tool_call_id;
+    let outcome = thread.request_tool_call_authorization(
+        acp::ToolCallUpdate::new(
+            acp::ToolCallId::new(tool_call_id.clone()),
+            acp::ToolCallUpdateFields::new(),
+        ),
+        PermissionOptions::Flat(request.options),
+        AuthorizationKind::PermissionGrant,
+        cx,
+    );
+    let Some(outcome) = outcome.log_err() else {
+        return;
+    };
+    cx.spawn(async move |_, cx| {
+        // A request withdrawn here resolves as cancelled, which the sharer
+        // must not hear about.
+        if let RequestPermissionOutcome::Selected(selected) = outcome.await {
+            answered_here.borrow_mut().insert(tool_call_id.clone());
+            cx.update(|cx| answer(tool_call_id, selected.option_id.0.to_string(), cx));
+        }
+    })
+    .detach();
 }
 
 /// Turns a teammate's chat updates into changes to a thread, one sharer entry
@@ -273,6 +353,9 @@ fn apply_chat_update<C: AppContext>(
 #[derive(Default)]
 pub(crate) struct ChatMirror {
     applied: Vec<TeamEntry>,
+    /// Requests the viewer answered, which stay listed until the sharer's
+    /// agent takes the answer and must not be asked again meanwhile.
+    answered_here: Rc<RefCell<HashSet<String>>>,
 }
 
 impl ChatMirror {
@@ -340,6 +423,54 @@ impl ChatMirror {
             append_entry(index + offset, &entry, operations);
             self.applied.push(entry);
         }
+    }
+
+    /// The requests to show and the tool calls whose request went away
+    /// without an answer here.
+    fn permission_changes(
+        &self,
+        thread: &AcpThread,
+        permissions: Vec<TeamPermissionRequest>,
+    ) -> (Vec<TeamPermissionRequest>, Vec<acp::ToolCallId>) {
+        let mut answered_here = self.answered_here.borrow_mut();
+        answered_here.retain(|tool_call_id| {
+            permissions
+                .iter()
+                .any(|request| request.tool_call_id == *tool_call_id)
+        });
+        let is_listed = |tool_call_id: &acp::ToolCallId| {
+            permissions
+                .iter()
+                .any(|request| *request.tool_call_id == *tool_call_id.0)
+        };
+        let withdrawn = thread
+            .entries()
+            .iter()
+            .filter_map(|entry| match entry {
+                AgentThreadEntry::ToolCall(ToolCall {
+                    id,
+                    status: ToolCallStatus::WaitingForConfirmation { .. },
+                    ..
+                }) if !is_listed(id) => Some(id.clone()),
+                _ => None,
+            })
+            .collect();
+        let requests = permissions
+            .iter()
+            .filter(|request| {
+                !answered_here.contains(&request.tool_call_id)
+                    && thread
+                        .tool_call(&acp::ToolCallId::new(request.tool_call_id.clone()))
+                        .is_some_and(|(_, tool_call)| {
+                            !matches!(
+                                tool_call.status,
+                                ToolCallStatus::WaitingForConfirmation { .. }
+                            )
+                        })
+            })
+            .cloned()
+            .collect();
+        (requests, withdrawn)
     }
 
     /// Where the sharer's entry `index` sits in the thread, which skips
@@ -571,9 +702,14 @@ fn message_suffix(previous: &TeamEntry, entry: &TeamEntry) -> Option<Vec<acp::Se
 #[cfg(test)]
 mod tests {
     use super::*;
-    use acp_thread::{AgentThreadEntry, StubAgentConnection, ThreadStatus, ToolCallStatus};
+    use acp_thread::{
+        AgentThreadEntry, SelectedPermissionOutcome, StubAgentConnection, ThreadStatus,
+        ToolCallStatus,
+    };
     use gpui::{Entity, TestAppContext};
-    use mnemonic_core::services::team_share_service::{DEFAULT_TEAM_PORT, TeamEntryChange};
+    use mnemonic_core::services::team_share_service::{
+        DEFAULT_TEAM_PORT, TeamEntryChange, TeamPermissionRequest,
+    };
     use project::{FakeFs, Project};
     use settings::SettingsStore;
     use std::rc::Rc;
@@ -634,16 +770,107 @@ mod tests {
         }
     }
 
+    fn no_answer() -> AnswerPermission {
+        Rc::new(|_, _, _| {})
+    }
+
     fn apply(
         mirror: &mut ChatMirror,
         thread: &Entity<AcpThread>,
         update: TeamChatUpdate,
         cx: &mut TestAppContext,
     ) {
-        apply_chat_update(mirror, &thread.downgrade(), update, cx)
+        apply_answering(mirror, thread, update, &no_answer(), cx);
+    }
+
+    fn apply_answering(
+        mirror: &mut ChatMirror,
+        thread: &Entity<AcpThread>,
+        update: TeamChatUpdate,
+        answer: &AnswerPermission,
+        cx: &mut TestAppContext,
+    ) {
+        apply_chat_update(mirror, &thread.downgrade(), update, answer, cx)
             .expect("the thread is still open");
         cx.executor().advance_clock(Duration::from_secs(1));
         cx.run_until_parked();
+    }
+
+    type Answers = Rc<RefCell<Vec<(String, String)>>>;
+
+    fn recording_answer() -> (Answers, AnswerPermission) {
+        let answers = Answers::default();
+        let answer: AnswerPermission = Rc::new({
+            let answers = answers.clone();
+            move |tool_call_id, option_id, _| answers.borrow_mut().push((tool_call_id, option_id))
+        });
+        (answers, answer)
+    }
+
+    fn run_tests_call() -> TeamEntry {
+        TeamEntry::Updates {
+            updates: vec![acp::SessionUpdate::ToolCall(
+                acp::ToolCall::new(acp::ToolCallId::new("call-1"), "Run the tests")
+                    .kind(acp::ToolKind::Execute)
+                    .status(acp::ToolCallStatus::Pending),
+            )],
+        }
+    }
+
+    fn asking_about_run_tests(reset: bool, changes: Vec<(usize, TeamEntry)>) -> TeamChatUpdate {
+        TeamChatUpdate {
+            permissions: vec![TeamPermissionRequest {
+                tool_call_id: "call-1".to_string(),
+                options: vec![
+                    acp::PermissionOption::new(
+                        "allow",
+                        "Allow",
+                        acp::PermissionOptionKind::AllowOnce,
+                    ),
+                    acp::PermissionOption::new(
+                        "reject",
+                        "Reject",
+                        acp::PermissionOptionKind::RejectOnce,
+                    ),
+                ],
+            }],
+            ..update(reset, 1, changes)
+        }
+    }
+
+    /// The options of `call-1` when it is waiting for confirmation.
+    fn waiting_options(thread: &Entity<AcpThread>, cx: &mut TestAppContext) -> Option<Vec<String>> {
+        thread.read_with(cx, |thread, _| {
+            let (_, tool_call) = thread.tool_call(&acp::ToolCallId::new("call-1"))?;
+            match &tool_call.status {
+                ToolCallStatus::WaitingForConfirmation {
+                    options: PermissionOptions::Flat(options),
+                    ..
+                } => Some(
+                    options
+                        .iter()
+                        .map(|option| option.option_id.0.to_string())
+                        .collect(),
+                ),
+                _ => None,
+            }
+        })
+    }
+
+    async fn waiting_on_run_tests(
+        cx: &mut TestAppContext,
+    ) -> (Entity<AcpThread>, ChatMirror, Answers, AnswerPermission) {
+        let thread = new_thread(cx).await;
+        let mut mirror = ChatMirror::default();
+        let (answers, answer) = recording_answer();
+        apply_answering(
+            &mut mirror,
+            &thread,
+            asking_about_run_tests(true, vec![(0, run_tests_call())]),
+            &answer,
+            cx,
+        );
+        (thread, mirror, answers, answer)
     }
 
     #[gpui::test]
@@ -789,6 +1016,7 @@ mod tests {
                     (2, user("Second question")),
                 ],
             ),
+            &no_answer(),
             cx,
         )
         .expect("the thread is still open");
@@ -843,6 +1071,76 @@ mod tests {
             assert_eq!(thread.status(), ThreadStatus::Idle);
             assert!(thread.entries().is_empty());
         });
+    }
+
+    #[gpui::test]
+    async fn permission_buttons_appear_for_a_waiting_request(cx: &mut TestAppContext) {
+        let (thread, _mirror, _answers, _answer) = waiting_on_run_tests(cx).await;
+        assert_eq!(
+            waiting_options(&thread, cx),
+            Some(vec!["allow".to_string(), "reject".to_string()])
+        );
+    }
+
+    #[gpui::test]
+    async fn picking_an_option_posts_the_answer_once(cx: &mut TestAppContext) {
+        let (thread, mut mirror, answers, answer) = waiting_on_run_tests(cx).await;
+        thread.update(cx, |thread, cx| {
+            thread.authorize_tool_call(
+                acp::ToolCallId::new("call-1"),
+                SelectedPermissionOutcome::new(
+                    acp::PermissionOptionId::new("allow"),
+                    acp::PermissionOptionKind::AllowOnce,
+                ),
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            *answers.borrow(),
+            vec![("call-1".to_string(), "allow".to_string())]
+        );
+
+        apply_answering(
+            &mut mirror,
+            &thread,
+            asking_about_run_tests(false, Vec::new()),
+            &answer,
+            cx,
+        );
+        assert_eq!(waiting_options(&thread, cx), None);
+        assert_eq!(answers.borrow().len(), 1);
+    }
+
+    #[gpui::test]
+    async fn a_request_answered_elsewhere_clears_without_posting(cx: &mut TestAppContext) {
+        let (thread, mut mirror, answers, answer) = waiting_on_run_tests(cx).await;
+        apply_answering(
+            &mut mirror,
+            &thread,
+            update(false, 1, Vec::new()),
+            &answer,
+            cx,
+        );
+        assert_eq!(waiting_options(&thread, cx), None);
+        assert!(answers.borrow().is_empty());
+    }
+
+    #[gpui::test]
+    async fn a_reset_asks_again_for_requests_still_waiting(cx: &mut TestAppContext) {
+        let (thread, mut mirror, answers, answer) = waiting_on_run_tests(cx).await;
+        apply_answering(
+            &mut mirror,
+            &thread,
+            asking_about_run_tests(true, vec![(0, run_tests_call())]),
+            &answer,
+            cx,
+        );
+        assert_eq!(
+            waiting_options(&thread, cx),
+            Some(vec!["allow".to_string(), "reject".to_string()])
+        );
+        assert!(answers.borrow().is_empty());
     }
 
     #[gpui::test]
