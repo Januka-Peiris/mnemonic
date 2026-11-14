@@ -275,7 +275,7 @@ fn check_request(request: &Request) -> Result<(), (u16, &'static str)> {
         if !is_json {
             return Err((400, "Expected a JSON body"));
         }
-        if !header_value(TEAM_REQUEST_HEADER).is_some_and(|value| !value.trim().is_empty()) {
+        if header_value(TEAM_REQUEST_HEADER).is_none_or(|value| value.trim().is_empty()) {
             return Err((400, "Not a Mnemonic request"));
         }
     }
