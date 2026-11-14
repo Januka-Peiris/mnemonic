@@ -43,8 +43,8 @@ pub struct TeamChat {
     pub id: String,
     pub title: String,
     pub agent: String,
-    /// Whether the chat is loaded in the sharer's app, which is the only
-    /// time its transcript can be read.
+    /// Whether the chat can be read: it is loaded in the sharer's app, or
+    /// was earlier, or has a transcript saved from an earlier session.
     pub open: bool,
 }
 
@@ -841,6 +841,53 @@ pub struct TeamFileDiff {
     pub diff: String,
 }
 
+/// Rebuilds a chat from the markdown transcript saved when its turns ended,
+/// one entry per `## User` or `## Assistant` section. Text before the first
+/// section, the file's own heading, is dropped.
+pub fn saved_chat_entries(markdown: &str) -> Vec<TeamEntry> {
+    fn finish(section: Option<(bool, String)>, entries: &mut Vec<TeamEntry>) {
+        let Some((from_user, text)) = section else {
+            return;
+        };
+        let text = text.trim();
+        if text.is_empty() {
+            return;
+        }
+        let chunk = acp::ContentChunk::new(text.to_string().into());
+        entries.push(TeamEntry::Updates {
+            updates: vec![if from_user {
+                acp::SessionUpdate::UserMessageChunk(chunk)
+            } else {
+                acp::SessionUpdate::AgentMessageChunk(chunk)
+            }],
+        });
+    }
+
+    let mut entries = Vec::new();
+    let mut section: Option<(bool, String)> = None;
+    for line in markdown.lines() {
+        let heading = match line.trim_end() {
+            "## User" | "## User (checkpoint)" => Some(true),
+            "## Assistant" => Some(false),
+            _ => None,
+        };
+        match heading {
+            Some(from_user) => {
+                finish(section.take(), &mut entries);
+                section = Some((from_user, String::new()));
+            }
+            None => {
+                if let Some((_, text)) = section.as_mut() {
+                    text.push_str(line);
+                    text.push('\n');
+                }
+            }
+        }
+    }
+    finish(section, &mut entries);
+    entries
+}
+
 /// Splits a unified diff into one item per `diff --git` section.
 pub fn split_unified_diff(diff: &str) -> Vec<TeamFileDiff> {
     let mut files: Vec<TeamFileDiff> = Vec::new();
@@ -930,6 +977,20 @@ mod tests {
                 text.into(),
             ))],
         }
+    }
+
+    #[test]
+    fn a_saved_transcript_becomes_one_entry_per_turn() {
+        let saved = "# Fix login\n\nA chat from the workspace \"crisp-panda\".\n\n## User\n\nfix it\n\n## Assistant\n\nDone.\n\n**Tool Call: Edit**\n\n## User (checkpoint)\n\nthanks\n\n";
+        let agent = TeamEntry::Updates {
+            updates: vec![acp::SessionUpdate::AgentMessageChunk(
+                acp::ContentChunk::new("Done.\n\n**Tool Call: Edit**".into()),
+            )],
+        };
+        assert_eq!(
+            saved_chat_entries(saved),
+            vec![user("fix it"), agent, user("thanks")]
+        );
     }
 
     #[test]

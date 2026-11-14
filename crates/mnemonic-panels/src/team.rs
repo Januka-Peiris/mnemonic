@@ -5,8 +5,9 @@
 
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
+use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use acp_thread::{
     AcpThread, AcpThreadEvent, AgentThreadEntry, AssistantMessageChunk, PlanEntry,
@@ -24,9 +25,9 @@ use mnemonic_core::repositories::{chat_session_repository, settings_repository};
 use mnemonic_core::services::team_share_server::{DiffSource, TeamServerConfig, TeamShareServer};
 use mnemonic_core::services::team_share_service::{
     DEFAULT_TEAM_PORT, TailscaleSelf, TailscaleWhois, TeamAgentState, TeamChat, TeamClient,
-    TeamClientError, TeamEntry, TeamShareHub, TeamWorkspace, tailscale_self,
+    TeamClientError, TeamEntry, TeamShareHub, TeamWorkspace, saved_chat_entries, tailscale_self,
 };
-use mnemonic_core::services::{git_review_service, workspace_service};
+use mnemonic_core::services::{chat_transcript_service, git_review_service, workspace_service};
 use settings::{RegisterSetting, Settings, SettingsStore};
 use ui::{CommonAnimationExt as _, Tooltip, prelude::*};
 use util::ResultExt as _;
@@ -128,6 +129,23 @@ struct ChatWatch {
     _subscription: Subscription,
 }
 
+/// A shared chat with a saved transcript on disk.
+type SavedTranscript = (PathBuf, SystemTime);
+
+/// The shared workspaces with their chats, as loaded off the main thread.
+type SharedRecords = Vec<(
+    WorkspaceSummary,
+    Vec<(ChatSessionRecord, Option<SavedTranscript>)>,
+)>;
+
+/// A closed chat whose saved transcript is newer than what is shared.
+struct TranscriptToRead {
+    workspace_id: String,
+    chat_id: String,
+    path: PathBuf,
+    modified: SystemTime,
+}
+
 pub(crate) struct TeamShare {
     applied: Option<TeamSettings>,
     hub: TeamShareHub,
@@ -140,6 +158,9 @@ pub(crate) struct TeamShare {
     /// changes, since the server stays bound to the address it started on.
     tailscale_watch: Option<Task<()>>,
     chat_watches: HashMap<String, ChatWatch>,
+    /// Chats shared from their saved transcript, as they aren't loaded in
+    /// this app, with when that transcript was written.
+    saved_chats: HashMap<String, SystemTime>,
     pub peers: Vec<PeerState>,
     pub collapsed_peers: HashSet<String>,
     /// Workspaces the user chose to share, saved in the core's settings
@@ -184,6 +205,7 @@ pub fn init(cx: &mut App) {
             publish_task: None,
             tailscale_watch: None,
             chat_watches: HashMap::new(),
+            saved_chats: HashMap::new(),
             peers: Vec::new(),
             collapsed_peers: HashSet::new(),
             shared_workspaces: load_shared_workspace_ids(),
@@ -427,6 +449,7 @@ impl TeamShare {
         self.server = None;
         self.server_key = None;
         self.chat_watches.clear();
+        self.saved_chats.clear();
         // Wakes any viewer waiting on a chat, so it hears the chat is gone
         // instead of waiting out its long-poll.
         self.hub.retain_chats(|_| false);
@@ -449,19 +472,30 @@ impl TeamShare {
                             async move { load_shared_records(&state, &shared_ids) }
                         })
                         .await;
-                    let hub = match records {
+                    let published = match records {
                         Ok(records) => this.update(cx, |this, cx| {
-                            this.publish(records, cx);
-                            this.hub.clone()
+                            let to_read = this.publish(records, cx);
+                            (this.hub.clone(), to_read)
                         }),
                         Err(err) => {
                             log::error!("Couldn't list workspaces to share: {err}");
-                            this.read_with(cx, |this, _| this.hub.clone())
+                            this.read_with(cx, |this, _| (this.hub.clone(), Vec::new()))
                         }
                     };
-                    let Ok(hub) = hub else {
+                    let Ok((hub, to_read)) = published else {
                         break;
                     };
+                    if !to_read.is_empty() {
+                        let saved = cx
+                            .background_spawn(async move { read_saved_transcripts(to_read) })
+                            .await;
+                        if this
+                            .update(cx, |this, _| this.share_saved_chats(saved))
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
                     if hub.has_viewers_within(VIEWER_WINDOW)
                         && counts_refreshed_at.is_none_or(|at| at.elapsed() >= REFRESH_COUNTS_EVERY)
                     {
@@ -491,13 +525,15 @@ impl TeamShare {
         }));
     }
 
+    /// Shares the current state of the shared workspaces, and returns the
+    /// saved transcripts to read for closed chats.
     fn publish(
         &mut self,
-        mut records: Vec<(WorkspaceSummary, Vec<ChatSessionRecord>)>,
+        mut records: SharedRecords,
         cx: &mut Context<Self>,
-    ) {
+    ) -> Vec<TranscriptToRead> {
         if self.server.is_none() {
-            return;
+            return Vec::new();
         }
         // The list was loaded off the main thread; a workspace unshared
         // meanwhile must not slip through.
@@ -510,11 +546,13 @@ impl TeamShare {
         }
 
         let mut open_chats = Vec::new();
+        let mut closed_chats = HashSet::new();
+        let mut to_read = Vec::new();
         let mut workspaces = Vec::with_capacity(records.len());
         for (summary, chat_records) in records {
             let agents = live.get(&summary.id);
             let mut chats = Vec::with_capacity(chat_records.len());
-            for record in chat_records {
+            for (record, transcript) in chat_records {
                 let live_chat = agents.and_then(|agents| {
                     agents.chats.iter().find(|chat| chat.record_id == record.id)
                 });
@@ -525,11 +563,27 @@ impl TeamShare {
                         .map(|chat| chat.title.to_string())
                         .unwrap_or(record.title),
                     agent: chat_agent_label(&record.agent).to_string(),
-                    open: thread.is_some(),
+                    open: thread.is_some() || self.hub.has_chat(&record.id),
                 });
                 if let Some(thread) = thread {
                     open_chats.push((record.id, thread));
+                    continue;
                 }
+                // A chat loaded earlier in this session keeps what it showed
+                // then, which says more than its saved transcript.
+                let shown_live =
+                    self.hub.has_chat(&record.id) && !self.saved_chats.contains_key(&record.id);
+                if let Some((path, modified)) = transcript {
+                    if !shown_live && self.saved_chats.get(&record.id) != Some(&modified) {
+                        to_read.push(TranscriptToRead {
+                            workspace_id: summary.id.clone(),
+                            chat_id: record.id.clone(),
+                            path,
+                            modified,
+                        });
+                    }
+                }
+                closed_chats.insert(record.id);
             }
             workspaces.push(TeamWorkspace {
                 pr_number: mnemonic_bridge::pr_number(&summary.id),
@@ -556,17 +610,23 @@ impl TeamShare {
             });
         }
         self.hub.set_workspaces(workspaces);
-        self.watch_chats(open_chats, cx);
+        self.watch_chats(open_chats, &closed_chats, cx);
+        to_read
     }
 
+    /// Follows the loaded chats. Closed chats keep what they last showed,
+    /// and chats no longer shared are dropped.
     fn watch_chats(
         &mut self,
         open_chats: Vec<(String, Entity<AcpThread>)>,
+        closed_chats: &HashSet<String>,
         cx: &mut Context<Self>,
     ) {
         let open_ids: HashSet<String> = open_chats.iter().map(|(id, _)| id.clone()).collect();
         self.chat_watches.retain(|id, _| open_ids.contains(id));
-        self.hub.retain_chats(|id| open_ids.contains(id));
+        self.saved_chats.retain(|id, _| closed_chats.contains(id));
+        self.hub
+            .retain_chats(|id| open_ids.contains(id) || closed_chats.contains(id));
         for (chat_id, thread) in open_chats {
             let watched = self
                 .chat_watches
@@ -630,6 +690,27 @@ impl TeamShare {
         let published = published && self.hub.set_chat_plan(chat_id, thread_plan(thread, cx));
         if !published {
             self.replace_chat(chat_id, thread, cx);
+        }
+    }
+
+    /// Shares closed chats from the transcripts just read, unless meanwhile
+    /// a chat was loaded or its workspace unshared.
+    fn share_saved_chats(&mut self, saved: Vec<(TranscriptToRead, Vec<TeamEntry>)>) {
+        if self.server.is_none() {
+            return;
+        }
+        for (transcript, entries) in saved {
+            let shown_live = self.hub.has_chat(&transcript.chat_id)
+                && !self.saved_chats.contains_key(&transcript.chat_id);
+            if shown_live
+                || self.chat_watches.contains_key(&transcript.chat_id)
+                || !self.shared_workspaces.contains(&transcript.workspace_id)
+            {
+                continue;
+            }
+            self.hub.replace_chat(&transcript.chat_id, entries);
+            self.saved_chats
+                .insert(transcript.chat_id, transcript.modified);
         }
     }
 
@@ -749,14 +830,44 @@ fn start_server(
 fn load_shared_records(
     state: &mnemonic_core::state::AppState,
     shared_ids: &HashSet<String>,
-) -> Result<Vec<(WorkspaceSummary, Vec<ChatSessionRecord>)>, String> {
+) -> Result<SharedRecords, String> {
     workspace_service::list_workspaces(state)?
         .into_iter()
         .filter(|summary| shared_ids.contains(&summary.id))
         .map(|summary| {
-            let chats = chat_session_repository::list_for_workspace(&state.db, &summary.id)?;
+            let chats = chat_session_repository::list_for_workspace(&state.db, &summary.id)?
+                .into_iter()
+                .map(|record| {
+                    let transcript = chat_transcript_service::saved_transcript_file(
+                        state,
+                        &summary.id,
+                        &record.id,
+                    );
+                    (record, transcript)
+                })
+                .collect();
             Ok((summary, chats))
         })
+        .collect()
+}
+
+fn read_saved_transcripts(
+    to_read: Vec<TranscriptToRead>,
+) -> Vec<(TranscriptToRead, Vec<TeamEntry>)> {
+    to_read
+        .into_iter()
+        .filter_map(
+            |transcript| match std::fs::read_to_string(&transcript.path) {
+                Ok(markdown) => {
+                    let entries = saved_chat_entries(&markdown);
+                    Some((transcript, entries))
+                }
+                Err(err) => {
+                    log::warn!("Couldn't read {}: {err}", transcript.path.display());
+                    None
+                }
+            },
+        )
         .collect()
 }
 
