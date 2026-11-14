@@ -7,12 +7,13 @@ use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::RecvTimeoutError;
 use std::time::{Duration, Instant, SystemTime};
 
 use acp_thread::{
-    AcpThread, AcpThreadEvent, AgentThreadEntry, AssistantMessageChunk, PermissionOptions,
-    PlanEntry, SANDBOX_AUTHORIZATION_META_KEY, SUBAGENT_SESSION_INFO_META_KEY,
+    AcpThread, AcpThreadEvent, AgentThreadEntry, AssistantMessageChunk, AuthorizationKind,
+    PermissionOptions, PlanEntry, SANDBOX_AUTHORIZATION_META_KEY, SUBAGENT_SESSION_INFO_META_KEY,
     SelectedPermissionOutcome, TOOL_NAME_META_KEY, ThreadStatus, ToolCall, ToolCallContent,
     ToolCallStatus,
 };
@@ -145,10 +146,14 @@ type SavedTranscript = (PathBuf, SystemTime);
 
 /// A teammate's action on its way to the main thread, with where to send
 /// the answer.
-type PendingAction = (
-    TeamAction,
-    std::sync::mpsc::Sender<Result<TeamActionOutcome, TeamActionError>>,
-);
+struct PendingAction {
+    action: TeamAction,
+    /// Set by whichever comes first: the main thread starting the action,
+    /// or the request giving up on it. An action its requester was told
+    /// failed must not run later.
+    claimed: Arc<AtomicBool>,
+    reply: std::sync::mpsc::Sender<Result<TeamActionOutcome, TeamActionError>>,
+}
 
 /// Marker for the notices shown when a teammate acts in a chat.
 struct TeamStepInToast;
@@ -443,7 +448,12 @@ impl TeamShare {
         self.hub = hub.clone();
         let (action_sender, mut action_receiver) = mpsc::unbounded::<PendingAction>();
         self.action_task = Some(cx.spawn(async move |this, cx| {
-            while let Some((action, reply)) = action_receiver.next().await {
+            while let Some(pending) = action_receiver.next().await {
+                if pending.claimed.swap(true, Ordering::SeqCst) {
+                    log::info!("Skipped a teammate's action that timed out while waiting");
+                    continue;
+                }
+                let PendingAction { action, reply, .. } = pending;
                 let outcome = cx.update(|cx| match this.upgrade() {
                     Some(team) => run_action(&team, action, cx),
                     None => Err(TeamActionError::Failed("Sharing stopped".into())),
@@ -710,7 +720,8 @@ impl TeamShare {
     }
 
     /// Follows the loaded chats. Closed chats keep what they last showed,
-    /// and chats no longer shared are dropped.
+    /// but idle and with nothing to answer, and chats no longer shared are
+    /// dropped.
     fn watch_chats(
         &mut self,
         open_chats: Vec<(String, Entity<AcpThread>)>,
@@ -722,6 +733,9 @@ impl TeamShare {
         self.saved_chats.retain(|id, _| closed_chats.contains(id));
         self.hub
             .retain_chats(|id| open_ids.contains(id) || closed_chats.contains(id));
+        for chat_id in closed_chats.difference(&open_ids) {
+            self.hub.set_chat_activity(chat_id, false, Vec::new());
+        }
         for (chat_id, thread) in open_chats {
             let watched = self
                 .chat_watches
@@ -935,13 +949,26 @@ fn start_server(
     // carries the action out.
     let action_handler: ActionHandler = Arc::new(move |action| {
         let (reply_sender, reply_receiver) = std::sync::mpsc::channel();
-        if action_sender
-            .unbounded_send((action, reply_sender))
-            .is_err()
-        {
+        let claimed = Arc::new(AtomicBool::new(false));
+        let pending = PendingAction {
+            action,
+            claimed: claimed.clone(),
+            reply: reply_sender,
+        };
+        if action_sender.unbounded_send(pending).is_err() {
             return Err(TeamActionError::Failed("Sharing stopped".into()));
         }
-        match reply_receiver.recv_timeout(ACTION_TIMEOUT) {
+        let outcome = match reply_receiver.recv_timeout(ACTION_TIMEOUT) {
+            Err(RecvTimeoutError::Timeout) if claimed.swap(true, Ordering::SeqCst) => {
+                // The main thread started it just now and answers without
+                // waiting on anything else.
+                reply_receiver
+                    .recv()
+                    .map_err(|_| RecvTimeoutError::Disconnected)
+            }
+            outcome => outcome,
+        };
+        match outcome {
             Ok(outcome) => outcome,
             Err(RecvTimeoutError::Timeout) => Err(TeamActionError::Failed("Timed out".into())),
             Err(RecvTimeoutError::Disconnected) => {
@@ -994,35 +1021,46 @@ fn run_action(
                 .update(cx, |view, cx| view.stop_chat(&action.chat_id, cx));
             show_step_in_notice(
                 &chat.window,
-                format!("{} stopped the agent in {}", action.from, chat.title),
+                format!("{} stopped the agent in {}", actor(&action), chat.title),
                 cx,
             );
             Ok(TeamActionOutcome { queued: false })
         }
-        TeamActionKind::Message { text } => {
-            let text = teammate_message_text(&action.from, &text);
+        TeamActionKind::Message { ref text } => {
+            let text = teammate_message_text(&action.from, text);
             chat.view.update(cx, |view, cx| {
-                view.queue_chat_message(&action.chat_id, text, cx)
-            });
+                view.queue_teammate_message(&action.chat_id, text, cx)
+            })?;
             Ok(TeamActionOutcome { queued: !idle })
         }
         TeamActionKind::Permission {
-            tool_call_id,
-            option_id,
+            ref tool_call_id,
+            ref option_id,
         } => {
-            let tool_title = answer_permission(&thread, &tool_call_id, &option_id, cx)?;
-            let rejected = thread
-                .read(cx)
-                .tool_call(&acp::ToolCallId::new(tool_call_id))
-                .is_some_and(|(_, tool_call)| matches!(tool_call.status, ToolCallStatus::Rejected));
-            let answer = if rejected { "rejected" } else { "allowed" };
+            let (tool_title, chosen) = answer_permission(&thread, tool_call_id, option_id, cx)?;
+            let answer = match chosen {
+                acp::PermissionOptionKind::RejectOnce | acp::PermissionOptionKind::RejectAlways => {
+                    "rejected"
+                }
+                _ => "allowed",
+            };
             show_step_in_notice(
                 &chat.window,
-                format!("{} {answer} {tool_title} in {}", action.from, chat.title),
+                format!("{} {answer} {tool_title} in {}", actor(&action), chat.title),
                 cx,
             );
             Ok(TeamActionOutcome { queued: false })
         }
+    }
+}
+
+/// Who acted, as the owner's notices show it. A display name is whatever
+/// the teammate chose, so their login is shown with it.
+fn actor(action: &TeamAction) -> String {
+    if action.from == action.login {
+        action.from.clone()
+    } else {
+        format!("{} ({})", action.from, action.login)
     }
 }
 
@@ -1043,31 +1081,43 @@ fn teammate_message_text(from: &str, text: &str) -> String {
 /// "always" answer leaves a standing rule in the owner's agent, which is
 /// theirs to make.
 fn once_only_options(options: &PermissionOptions) -> Vec<acp::PermissionOption> {
-    let candidates: Vec<&acp::PermissionOption> = match options {
-        PermissionOptions::Flat(options) => options.iter().collect(),
+    let (candidates, from_dropdown): (Vec<&acp::PermissionOption>, bool) = match options {
+        PermissionOptions::Flat(options) => (options.iter().collect(), false),
         PermissionOptions::Dropdown(choices)
-        | PermissionOptions::DropdownWithPatterns { choices, .. } => choices
-            .iter()
-            .flat_map(|choice| [&choice.allow, &choice.deny])
-            .collect(),
+        | PermissionOptions::DropdownWithPatterns { choices, .. } => (
+            choices
+                .iter()
+                .flat_map(|choice| [&choice.allow, &choice.deny])
+                .collect(),
+            true,
+        ),
     };
     let mut offered: Vec<acp::PermissionOption> = Vec::new();
     for option in candidates {
-        let once_only = matches!(
-            option.kind,
-            acp::PermissionOptionKind::AllowOnce | acp::PermissionOptionKind::RejectOnce
-        );
-        if once_only
-            && !offered
-                .iter()
-                .any(|offered| offered.option_id == option.option_id)
+        let name = match option.kind {
+            acp::PermissionOptionKind::AllowOnce => "Allow once",
+            acp::PermissionOptionKind::RejectOnce => "Deny once",
+            _ => continue,
+        };
+        if offered
+            .iter()
+            .any(|offered| offered.option_id == option.option_id)
         {
-            offered.push(option.clone());
+            continue;
         }
+        let mut option = option.clone();
+        // A dropdown names its choice, not the allow and deny inside it,
+        // so both would show as the same button.
+        if from_dropdown {
+            option.name = name.to_string();
+        }
+        offered.push(option);
     }
     offered
 }
 
+/// Only requests for permission are shared. An action choice, such as
+/// saving or discarding a file's unsaved changes, is the owner's to make.
 fn thread_permissions(thread: &AcpThread) -> Vec<TeamPermissionRequest> {
     thread
         .entries()
@@ -1075,7 +1125,12 @@ fn thread_permissions(thread: &AcpThread) -> Vec<TeamPermissionRequest> {
         .filter_map(|entry| {
             let AgentThreadEntry::ToolCall(ToolCall {
                 id,
-                status: ToolCallStatus::WaitingForConfirmation { options, .. },
+                status:
+                    ToolCallStatus::WaitingForConfirmation {
+                        options,
+                        kind: AuthorizationKind::PermissionGrant,
+                        ..
+                    },
                 ..
             }) = entry
             else {
@@ -1091,13 +1146,13 @@ fn thread_permissions(thread: &AcpThread) -> Vec<TeamPermissionRequest> {
 }
 
 /// Answers a waiting permission request with an option it offers
-/// teammates, and returns the tool call's title.
+/// teammates, and returns the tool call's title and the kind of answer.
 fn answer_permission(
     thread: &Entity<AcpThread>,
     tool_call_id: &str,
     option_id: &str,
     cx: &mut App,
-) -> Result<String, TeamActionError> {
+) -> Result<(String, acp::PermissionOptionKind), TeamActionError> {
     let tool_call_id = acp::ToolCallId::new(tool_call_id.to_string());
     let (option, title) = {
         let thread = thread.read(cx);
@@ -1106,9 +1161,14 @@ fn answer_permission(
         let Some((_, tool_call)) = thread.tool_call(&tool_call_id) else {
             return Err(no_longer_waiting());
         };
-        let ToolCallStatus::WaitingForConfirmation { options, .. } = &tool_call.status else {
+        let ToolCallStatus::WaitingForConfirmation { options, kind, .. } = &tool_call.status else {
             return Err(no_longer_waiting());
         };
+        if *kind != AuthorizationKind::PermissionGrant {
+            return Err(TeamActionError::NotAllowed(
+                "Only the owner can answer this".into(),
+            ));
+        }
         let Some(option) = once_only_options(options)
             .into_iter()
             .find(|option| option.option_id.0.as_ref() == option_id)
@@ -1119,6 +1179,7 @@ fn answer_permission(
         };
         (option, tool_call_title(tool_call, cx))
     };
+    let chosen = option.kind;
     thread.update(cx, |thread, cx| {
         thread.authorize_tool_call(
             tool_call_id,
@@ -1126,7 +1187,7 @@ fn answer_permission(
             cx,
         )
     });
-    Ok(title)
+    Ok((title, chosen))
 }
 
 fn load_shared_records(
@@ -1860,6 +1921,7 @@ mod tests {
     /// receives the answer, which must be kept for the request to stay open.
     async fn thread_waiting_on(
         options: PermissionOptions,
+        kind: AuthorizationKind,
         cx: &mut TestAppContext,
     ) -> (Entity<AcpThread>, Task<RequestPermissionOutcome>) {
         cx.update(|cx| {
@@ -1884,12 +1946,20 @@ mod tests {
                 thread.request_tool_call_authorization(
                     acp::ToolCallUpdate::new(tool_call_id, acp::ToolCallUpdateFields::new()),
                     options,
-                    AuthorizationKind::PermissionGrant,
+                    kind,
                     cx,
                 )
             })
             .expect("the thread asks for permission");
         (thread, answer)
+    }
+
+    /// The choice an agent offers before editing a file with unsaved changes.
+    fn save_or_discard_options() -> PermissionOptions {
+        PermissionOptions::Flat(vec![
+            acp::PermissionOption::new("save", "Save", acp::PermissionOptionKind::AllowOnce),
+            acp::PermissionOption::new("discard", "Discard", acp::PermissionOptionKind::RejectOnce),
+        ])
     }
 
     fn allow_always_and_once_options() -> PermissionOptions {
@@ -1919,7 +1989,12 @@ mod tests {
 
     #[gpui::test]
     async fn only_once_only_options_are_offered_to_teammates(cx: &mut TestAppContext) {
-        let (thread, _answer) = thread_waiting_on(allow_always_and_once_options(), cx).await;
+        let (thread, _answer) = thread_waiting_on(
+            allow_always_and_once_options(),
+            AuthorizationKind::PermissionGrant,
+            cx,
+        )
+        .await;
         let requests = thread.read_with(cx, |thread, _| thread_permissions(thread));
         let offered: Vec<Vec<String>> = requests
             .iter()
@@ -1943,16 +2018,31 @@ mod tests {
                 "Always allow",
                 acp::PermissionOptionKind::AllowAlways,
             )]),
+            AuthorizationKind::PermissionGrant,
             cx,
         )
         .await;
         let requests = always_only.read_with(cx, |thread, _| thread_permissions(thread));
         assert!(requests.is_empty());
+
+        let (dirty_buffer, _answer) = thread_waiting_on(
+            save_or_discard_options(),
+            AuthorizationKind::ActionChoice,
+            cx,
+        )
+        .await;
+        let requests = dirty_buffer.read_with(cx, |thread, _| thread_permissions(thread));
+        assert!(requests.is_empty());
     }
 
     #[gpui::test]
     async fn a_teammate_can_only_pick_an_offered_once_only_option(cx: &mut TestAppContext) {
-        let (thread, _answer) = thread_waiting_on(allow_always_and_once_options(), cx).await;
+        let (thread, _answer) = thread_waiting_on(
+            allow_always_and_once_options(),
+            AuthorizationKind::PermissionGrant,
+            cx,
+        )
+        .await;
 
         for option_id in ["always", "never-offered"] {
             let answered = cx.update(|cx| answer_permission(&thread, "run-tests", option_id, cx));
@@ -1964,11 +2054,30 @@ mod tests {
         }
 
         let answered = cx.update(|cx| answer_permission(&thread, "run-tests", "allow", cx));
-        assert_eq!(answered, Ok("Run the tests".to_string()));
+        assert_eq!(
+            answered,
+            Ok((
+                "Run the tests".to_string(),
+                acp::PermissionOptionKind::AllowOnce
+            ))
+        );
         assert!(!is_waiting(&thread, cx));
 
         let answered = cx.update(|cx| answer_permission(&thread, "run-tests", "allow", cx));
         assert!(matches!(answered, Err(TeamActionError::NothingToDo(_))));
+
+        let (dirty_buffer, _answer) = thread_waiting_on(
+            save_or_discard_options(),
+            AuthorizationKind::ActionChoice,
+            cx,
+        )
+        .await;
+        let answered = cx.update(|cx| answer_permission(&dirty_buffer, "run-tests", "discard", cx));
+        assert!(
+            matches!(answered, Err(TeamActionError::NotAllowed(_))),
+            "discard gave {answered:?}"
+        );
+        assert!(is_waiting(&dirty_buffer, cx));
     }
 
     #[test]

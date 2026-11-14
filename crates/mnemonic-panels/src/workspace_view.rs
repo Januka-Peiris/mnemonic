@@ -22,6 +22,7 @@ use mnemonic_core::models::{ChatSessionRecord, WorkspaceSummary};
 use mnemonic_core::repositories::{chat_session_repository, workspace_repository};
 use mnemonic_core::services::chat_transcript_service::{self, LinkedChat};
 use mnemonic_core::services::pr_draft_service::OpenReviewComment;
+use mnemonic_core::services::team_share_service::TeamActionError;
 use mnemonic_core::services::workspace_script_service::RunCommandPlan;
 use mnemonic_core::services::{
     checkpoint_service, terminal_service, workspace_script_service, workspace_service,
@@ -720,18 +721,48 @@ fn files_to_close(
     close
 }
 
+/// How many teammate messages may wait in one chat, so a teammate can't
+/// pile instructions up behind the owner's turn.
+const MAX_WAITING_TEAMMATE_MESSAGES: usize = 2;
+
 /// Instructions waiting for a chat to connect or finish its current turn,
 /// sent oldest first.
 #[derive(Default)]
-pub(crate) struct PendingMessages(std::collections::VecDeque<String>);
+pub(crate) struct PendingMessages(std::collections::VecDeque<PendingMessage>);
+
+struct PendingMessage {
+    text: String,
+    from_teammate: bool,
+}
 
 impl PendingMessages {
     pub(crate) fn push(&mut self, text: String) {
-        self.0.push_back(text);
+        self.0.push_back(PendingMessage {
+            text,
+            from_teammate: false,
+        });
     }
 
     pub(crate) fn take_next(&mut self) -> Option<String> {
-        self.0.pop_front()
+        self.0.pop_front().map(|message| message.text)
+    }
+
+    /// Queues a teammate's message, unless as many as they may queue are
+    /// already waiting.
+    pub(crate) fn push_from_teammate(&mut self, text: String) -> bool {
+        let waiting = self
+            .0
+            .iter()
+            .filter(|message| message.from_teammate)
+            .count();
+        if waiting >= MAX_WAITING_TEAMMATE_MESSAGES {
+            return false;
+        }
+        self.0.push_back(PendingMessage {
+            text,
+            from_teammate: true,
+        });
+        true
     }
 }
 
@@ -3496,33 +3527,44 @@ impl WorkspaceView {
         .detach();
     }
 
-    /// Stops a chat's agent the way its own Stop button does.
+    /// Stops a chat's agent the way its own Stop button does. Always on the
+    /// root thread, whose turn is the one a teammate sees running, even when
+    /// the owner is looking at one of its subagents.
     pub(crate) fn stop_chat(&mut self, record_id: &str, cx: &mut Context<Self>) {
-        let Some(chat) = self.chat_by_record(record_id) else {
+        let Some(root_thread_view) = self
+            .chat_by_record(record_id)
+            .and_then(|chat| chat.view.read(cx).root_thread_view())
+        else {
             return;
         };
-        chat.view
-            .update(cx, |conversation, cx| conversation.cancel_generation(cx));
+        root_thread_view.update(cx, |thread_view, cx| thread_view.cancel_generation(cx));
     }
 
-    /// Queues a message for a chat, sent once its agent is idle.
-    pub(crate) fn queue_chat_message(
+    /// Queues a teammate's message for a chat, sent once its agent is idle.
+    pub(crate) fn queue_teammate_message(
         &mut self,
         record_id: &str,
         text: String,
         cx: &mut Context<Self>,
-    ) {
+    ) -> Result<(), TeamActionError> {
         let Some(chat) = self
             .sessions
             .iter_mut()
             .filter_map(WorkspaceSession::chat_mut)
             .find(|chat| chat.record_id == record_id)
         else {
-            return;
+            return Err(TeamActionError::NotLoaded);
         };
-        chat.pending_messages.push(text);
+        if !chat.pending_messages.push_from_teammate(text.clone()) {
+            return Err(TeamActionError::NothingToDo(
+                "Two messages are already queued for this chat".into(),
+            ));
+        }
+        // A teammate's message must not name the owner's workspace.
+        chat.app_messages.push(text);
         let view_id = chat.view.entity_id();
         self.flush_pending(view_id, cx);
+        Ok(())
     }
 
     fn chat_by_record(&self, record_id: &str) -> Option<&ChatSession> {
@@ -5923,6 +5965,23 @@ mod tests {
         assert_eq!(pending.take_next().as_deref(), Some("a"));
         assert_eq!(pending.take_next().as_deref(), Some("b"));
         assert_eq!(pending.take_next(), None);
+    }
+
+    #[test]
+    fn at_most_two_teammate_messages_wait_per_chat() {
+        let mut pending = PendingMessages::default();
+        pending.push("from the owner".to_string());
+        assert!(pending.push_from_teammate("first".to_string()));
+        assert!(pending.push_from_teammate("second".to_string()));
+        assert!(!pending.push_from_teammate("third".to_string()));
+
+        assert_eq!(pending.take_next().as_deref(), Some("from the owner"));
+        assert!(!pending.push_from_teammate("third".to_string()));
+
+        assert_eq!(pending.take_next().as_deref(), Some("first"));
+        assert!(pending.push_from_teammate("third".to_string()));
+        assert_eq!(pending.take_next().as_deref(), Some("second"));
+        assert_eq!(pending.take_next().as_deref(), Some("third"));
     }
 
 }
