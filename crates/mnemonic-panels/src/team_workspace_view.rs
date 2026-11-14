@@ -25,7 +25,7 @@ use util::ResultExt as _;
 use workspace::item::{Item, ItemEvent};
 use workspace::{DraggedTab, Pane, Workspace, pane};
 
-use crate::team::{PeerStatus, render_agent_state, team_share};
+use crate::team::{PeerStatus, render_agent_state, show_step_in_notice, team_share};
 use crate::team_connection::TeamAgentServer;
 
 /// What the window's selected workspace id holds while a teammate's
@@ -36,6 +36,9 @@ pub(crate) fn teammate_workspace_key(host: &str, workspace_id: &str) -> String {
         mnemonic_bridge::TEAMMATE_WORKSPACE_PREFIX
     )
 }
+
+/// Hands a message typed in a teammate's chat to their agent.
+type MessageSender = Rc<dyn Fn(String, &mut Window, &mut App)>;
 
 /// One of the teammate's chats as a tab.
 pub(crate) struct TeammateChatItem {
@@ -538,6 +541,23 @@ impl TeammateWorkspaceView {
             }
         }
 
+        for item in &self.chats {
+            let Some(view) = item.read(cx).view.clone() else {
+                continue;
+            };
+            let chat_id = item.read(cx).chat_id.clone();
+            let can_step_in = live.step_in
+                && live
+                    .chats
+                    .iter()
+                    .any(|chat| chat.id == chat_id && chat.live);
+            let handler = match (can_step_in, client.clone()) {
+                (true, Some(client)) => Some(self.message_sender(chat_id, &peer_name, client)),
+                _ => None,
+            };
+            view.update(cx, |view, cx| view.set_send_handler(handler, cx));
+        }
+
         mnemonic_bridge::TeammateWorkspaceTitles::set(
             &teammate_workspace_key(&self.host, &self.workspace_id),
             mnemonic_bridge::TeammateWorkspaceTitle {
@@ -552,6 +572,36 @@ impl TeammateWorkspaceView {
         );
         self.last_known = Some(live);
         cx.notify();
+    }
+
+    /// Posts each message to the teammate's chat off the main thread, as the
+    /// mirror shows it once the teammate's chat has it.
+    fn message_sender(
+        &self,
+        chat_id: String,
+        peer_name: &SharedString,
+        client: TeamClient,
+    ) -> MessageSender {
+        let workspace = self.workspace.clone();
+        let peer_name = peer_name.clone();
+        Rc::new(move |text, _window, cx| {
+            let client = client.clone();
+            let chat_id = chat_id.clone();
+            let peer_name = peer_name.clone();
+            let workspace = workspace.clone();
+            cx.spawn(async move |cx| {
+                let result = cx
+                    .background_spawn(async move { client.send_message(&chat_id, &text) })
+                    .await;
+                let notice = match result {
+                    Ok(true) => format!("Queued until {peer_name}'s agent finishes"),
+                    Ok(false) => return,
+                    Err(err) => format!("Couldn't send the message: {err}"),
+                };
+                cx.update(|cx| show_notice(&workspace, notice, cx));
+            })
+            .detach();
+        })
     }
 
     /// Drops every chat view and the connection they share, so the open
@@ -584,7 +634,14 @@ impl TeammateWorkspaceView {
                 store
             }
         };
-        let server: Rc<dyn AgentServer> = Rc::new(TeamAgentServer::new(self.host.clone(), client));
+        let report = {
+            let workspace = self.workspace.clone();
+            Arc::new(move |message: SharedString, cx: &mut App| {
+                show_notice(&workspace, message.to_string(), cx)
+            })
+        };
+        let server: Rc<dyn AgentServer> =
+            Rc::new(TeamAgentServer::new(self.host.clone(), client, report));
         let agent = Agent::Custom {
             id: server.agent_id(),
         };
@@ -739,6 +796,12 @@ impl TeammateWorkspaceView {
                         )
                     })
             })
+    }
+}
+
+fn show_notice(workspace: &WeakEntity<Workspace>, message: String, cx: &mut App) {
+    if let Some(workspace) = workspace.upgrade() {
+        show_step_in_notice(&workspace, message, cx);
     }
 }
 

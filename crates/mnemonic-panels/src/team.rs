@@ -1026,7 +1026,7 @@ fn run_action(
     }
 }
 
-fn show_step_in_notice(window: &Entity<Workspace>, message: String, cx: &mut App) {
+pub(crate) fn show_step_in_notice(window: &Entity<Workspace>, message: String, cx: &mut App) {
     window.update(cx, |workspace, cx| {
         workspace.show_toast(
             Toast::new(NotificationId::unique::<TeamStepInToast>(), message),

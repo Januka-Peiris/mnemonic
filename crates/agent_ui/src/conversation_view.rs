@@ -298,6 +298,7 @@ impl Conversation {
                     | AcpThreadEvent::ModeUpdated(_)
                     | AcpThreadEvent::ConfigOptionsUpdated(_)
                     | AcpThreadEvent::WorkingDirectoriesUpdated
+                    | AcpThreadEvent::RemoteGeneratingChanged
                     | AcpThreadEvent::PromptUpdated => {}
                 }
             }
@@ -535,6 +536,7 @@ fn affects_thread_metadata(event: &AcpThreadEvent) -> bool {
         | AcpThreadEvent::ModeUpdated(_)
         | AcpThreadEvent::ConfigOptionsUpdated(_)
         | AcpThreadEvent::SubagentSpawned(_)
+        | AcpThreadEvent::RemoteGeneratingChanged
         | AcpThreadEvent::PromptUpdated => false,
     }
 }
@@ -566,6 +568,7 @@ pub struct ConversationView {
     notifications_suppressed: bool,
     fork_enabled: bool,
     read_only: Option<SharedString>,
+    send_handler: Option<Rc<dyn Fn(String, &mut Window, &mut App)>>,
     auth_task: Option<Task<()>>,
     loading_status: Option<SharedString>,
     /// When settings change, use this to see if the theme has changed (which
@@ -650,6 +653,33 @@ impl ConversationView {
 
     pub fn read_only(&self) -> Option<SharedString> {
         self.read_only.clone()
+    }
+
+    /// Keeps the message editor on a read-only view and hands each message
+    /// sent from it to `handler`, which delivers it to whoever owns the chat.
+    pub fn set_send_handler(
+        &mut self,
+        handler: Option<Rc<dyn Fn(String, &mut Window, &mut App)>>,
+        cx: &mut Context<Self>,
+    ) {
+        let changed = self.send_handler.is_some() != handler.is_some();
+        self.send_handler = handler;
+        if changed {
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn send_handler(&self) -> Option<Rc<dyn Fn(String, &mut Window, &mut App)>> {
+        self.send_handler.clone()
+    }
+
+    /// The notice shown in place of the message editor, if any.
+    pub(crate) fn message_editor_notice(&self) -> Option<SharedString> {
+        if self.send_handler.is_some() {
+            None
+        } else {
+            self.read_only.clone()
+        }
     }
 
     pub fn has_load_error(&self) -> bool {
@@ -871,6 +901,7 @@ impl ConversationView {
             notifications_suppressed: false,
             fork_enabled: false,
             read_only: None,
+            send_handler: None,
             auth_task: None,
             loading_status: None,
             last_theme_id: Some(cx.theme().id.clone()),
@@ -1831,6 +1862,11 @@ impl ConversationView {
             }
             AcpThreadEvent::WorkingDirectoriesUpdated => {
                 cx.notify();
+            }
+            AcpThreadEvent::RemoteGeneratingChanged => {
+                if let Some(active) = self.thread_view(&session_id) {
+                    active.update(cx, |active, cx| active.sync_generating_indicator(cx));
+                }
             }
             AcpThreadEvent::PromptUpdated => {
                 if !is_subagent && thread.read(cx).is_draft_thread() {
@@ -3564,6 +3600,61 @@ pub(crate) mod tests {
             assert_eq!(view.message_editor.read(cx).text(cx), "");
             assert_eq!(view.thread.read(cx).entries().len(), 2);
         });
+    }
+
+    #[gpui::test]
+    async fn a_send_handler_takes_the_message_and_leaves_the_thread_alone(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::default_response(), cx).await;
+        let sent = Rc::new(std::cell::RefCell::new(Vec::new()));
+        conversation_view.update(cx, |view, cx| {
+            view.set_read_only("A teammate's chat".into());
+            let sent = sent.clone();
+            view.set_send_handler(
+                Some(Rc::new(
+                    move |text: String, _window: &mut Window, _cx: &mut App| {
+                        sent.borrow_mut().push(text);
+                    },
+                )),
+                cx,
+            );
+        });
+        let message_editor = message_editor(&conversation_view, cx);
+        let thread =
+            active_thread(&conversation_view, cx).read_with(cx, |view, _| view.thread.clone());
+
+        for generating in [false, true] {
+            thread.update(cx, |thread, cx| {
+                thread.set_remote_generating(generating, cx)
+            });
+            message_editor.update_in(cx, |editor, window, cx| {
+                editor.set_text("hello", window, cx);
+            });
+            active_thread(&conversation_view, cx)
+                .update_in(cx, |view, window, cx| view.send(window, cx));
+            cx.run_until_parked();
+
+            assert_eq!(
+                sent.borrow_mut().drain(..).collect::<Vec<_>>(),
+                vec!["hello"]
+            );
+            assert_eq!(
+                message_editor.read_with(cx, |editor, cx| editor.text(cx)),
+                ""
+            );
+            assert_eq!(thread.read_with(cx, |thread, _| thread.entries().len()), 0);
+        }
+
+        message_editor.update_in(cx, |editor, window, cx| {
+            editor.set_text("  \n ", window, cx);
+        });
+        active_thread(&conversation_view, cx)
+            .update_in(cx, |view, window, cx| view.send(window, cx));
+        cx.run_until_parked();
+
+        assert!(sent.borrow().is_empty());
     }
 
     #[gpui::test]

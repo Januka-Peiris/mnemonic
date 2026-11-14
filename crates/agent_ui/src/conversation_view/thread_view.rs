@@ -1493,6 +1493,14 @@ impl ThreadView {
             return;
         }
 
+        // Before the queue-while-generating branch: a mirrored thread reports
+        // generating while the agent it mirrors works, and the message is for
+        // that agent.
+        if let Some(handler) = self.send_handler(cx) {
+            self.send_to_handler(handler, window, cx);
+            return;
+        }
+
         let message_editor = self.message_editor.clone();
 
         let is_editor_empty = message_editor.read(cx).is_empty(cx);
@@ -1565,6 +1573,29 @@ impl ThreadView {
 
         cx.emit(AcpThreadViewEvent::Interacted);
         self.send_impl(message_editor, window, cx)
+    }
+
+    fn send_handler(&self, cx: &App) -> Option<Rc<dyn Fn(String, &mut Window, &mut App)>> {
+        self.server_view
+            .upgrade()
+            .and_then(|server_view| server_view.read(cx).send_handler())
+    }
+
+    /// Never sends through the thread: a mirrored thread only gets entries
+    /// from the chat it mirrors.
+    fn send_to_handler(
+        &mut self,
+        handler: Rc<dyn Fn(String, &mut Window, &mut App)>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let text = self.message_editor.read(cx).text(cx);
+        if text.trim().is_empty() {
+            return;
+        }
+        self.message_editor
+            .update(cx, |editor, cx| editor.clear(window, cx));
+        handler(text, window, cx);
     }
 
     /// Sends a bare `/command` turn and queues everything the user typed after
@@ -1829,6 +1860,11 @@ impl ThreadView {
             return;
         }
 
+        if let Some(handler) = self.send_handler(cx) {
+            self.send_to_handler(handler, window, cx);
+            return;
+        }
+
         cx.emit(AcpThreadViewEvent::Interacted);
 
         let message_editor = self.message_editor.clone();
@@ -1983,6 +2019,11 @@ impl ThreadView {
     }
 
     pub fn cancel_generation(&mut self, cx: &mut Context<Self>) {
+        // A mirrored thread that only shows its notice offers no Stop, so
+        // Escape must not stop the agent it mirrors either.
+        if self.read_only_notice(cx).is_some() {
+            return;
+        }
         self.thread_retry_status.take();
         self.thread_error.take();
         self.user_interrupted_generation = true;
@@ -4144,7 +4185,7 @@ impl ThreadView {
     fn read_only_notice(&self, cx: &App) -> Option<SharedString> {
         self.server_view
             .upgrade()
-            .and_then(|server_view| server_view.read(cx).read_only())
+            .and_then(|server_view| server_view.read(cx).message_editor_notice())
     }
 
     pub(crate) fn render_message_editor(

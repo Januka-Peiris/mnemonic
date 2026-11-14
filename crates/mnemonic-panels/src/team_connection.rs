@@ -5,6 +5,7 @@ use std::any::Any;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::Duration;
 
 use acp_thread::{
@@ -31,6 +32,12 @@ const RETRY_CHAT_AFTER: Duration = Duration::from_secs(5);
 
 const READ_ONLY: &str = "This is a teammate's chat; it is read-only";
 
+/// Shows the user why an action on a teammate's chat failed.
+pub(crate) type ReportFailure = Rc<dyn Fn(SharedString, &mut App)>;
+
+/// A `ReportFailure` that can live in an `AgentServer`, which must be `Send`.
+pub(crate) type SendableReportFailure = Arc<dyn Fn(SharedString, &mut App) + Send + Sync>;
+
 fn team_agent_id(host: &str) -> AgentId {
     AgentId(format!("team:{host}").into())
 }
@@ -38,11 +45,16 @@ fn team_agent_id(host: &str) -> AgentId {
 pub(crate) struct TeamAgentServer {
     host: String,
     client: TeamClient,
+    report: SendableReportFailure,
 }
 
 impl TeamAgentServer {
-    pub(crate) fn new(host: String, client: TeamClient) -> Self {
-        Self { host, client }
+    pub(crate) fn new(host: String, client: TeamClient, report: SendableReportFailure) -> Self {
+        Self {
+            host,
+            client,
+            report,
+        }
     }
 }
 
@@ -61,8 +73,12 @@ impl AgentServer for TeamAgentServer {
         _project: Entity<Project>,
         _cx: &mut App,
     ) -> Task<Result<Rc<dyn AgentConnection>>> {
-        let connection: Rc<dyn AgentConnection> =
-            Rc::new(TeamConnection::new(&self.host, self.client.clone()));
+        let report = self.report.clone();
+        let connection: Rc<dyn AgentConnection> = Rc::new(TeamConnection::new(
+            &self.host,
+            self.client.clone(),
+            Rc::new(move |message, cx| report(message, cx)),
+        ));
         Task::ready(Ok(connection))
     }
 
@@ -74,14 +90,16 @@ impl AgentServer for TeamAgentServer {
 pub(crate) struct TeamConnection {
     agent_id: AgentId,
     client: TeamClient,
+    report: ReportFailure,
     polls: RefCell<HashMap<acp::SessionId, Task<()>>>,
 }
 
 impl TeamConnection {
-    pub(crate) fn new(host: &str, client: TeamClient) -> Self {
+    pub(crate) fn new(host: &str, client: TeamClient, report: ReportFailure) -> Self {
         Self {
             agent_id: team_agent_id(host),
             client,
+            report,
             polls: RefCell::new(HashMap::new()),
         }
     }
@@ -171,7 +189,20 @@ impl AgentConnection for TeamConnection {
         Task::ready(Err(anyhow!(READ_ONLY)))
     }
 
-    fn cancel(&self, _session_id: &acp::SessionId, _cx: &mut App) {}
+    fn cancel(&self, session_id: &acp::SessionId, cx: &mut App) {
+        let client = self.client.clone();
+        let chat_id = session_id.0.to_string();
+        let report = self.report.clone();
+        cx.spawn(async move |cx| {
+            let result = cx
+                .background_spawn(async move { client.stop(&chat_id) })
+                .await;
+            if let Err(err) = result {
+                cx.update(|cx| report(format!("Couldn't stop the agent: {err}").into(), cx));
+            }
+        })
+        .detach();
+    }
 
     fn into_any(self: Rc<Self>) -> Rc<dyn Any> {
         self
@@ -263,6 +294,7 @@ impl ChatMirror {
             self.applied.truncate(update.len);
         }
         operations.push(MirrorOperation::UpdatePlan(update.plan));
+        operations.push(MirrorOperation::SetGenerating(update.generating));
         operations
     }
 
@@ -334,6 +366,7 @@ pub(crate) enum MirrorOperation {
         summary: Option<String>,
     },
     UpdatePlan(Vec<acp::PlanEntry>),
+    SetGenerating(bool),
 }
 
 impl MirrorOperation {
@@ -377,6 +410,9 @@ impl MirrorOperation {
                 );
             }
             MirrorOperation::UpdatePlan(entries) => thread.update_plan(acp::Plan::new(entries), cx),
+            MirrorOperation::SetGenerating(generating) => {
+                thread.set_remote_generating(generating, cx)
+            }
         }
     }
 }
@@ -535,7 +571,7 @@ fn message_suffix(previous: &TeamEntry, entry: &TeamEntry) -> Option<Vec<acp::Se
 #[cfg(test)]
 mod tests {
     use super::*;
-    use acp_thread::{AgentThreadEntry, StubAgentConnection, ToolCallStatus};
+    use acp_thread::{AgentThreadEntry, StubAgentConnection, ThreadStatus, ToolCallStatus};
     use gpui::{Entity, TestAppContext};
     use mnemonic_core::services::team_share_service::{DEFAULT_TEAM_PORT, TeamEntryChange};
     use project::{FakeFs, Project};
@@ -789,10 +825,35 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn a_mirrored_chat_is_working_while_the_sharers_is(cx: &mut TestAppContext) {
+        let thread = new_thread(cx).await;
+        let mut mirror = ChatMirror::default();
+        let working = TeamChatUpdate {
+            generating: true,
+            ..update(true, 0, Vec::new())
+        };
+        apply(&mut mirror, &thread, working, cx);
+        thread.read_with(cx, |thread, _| {
+            assert_eq!(thread.status(), ThreadStatus::Generating);
+            assert!(thread.entries().is_empty());
+        });
+
+        apply(&mut mirror, &thread, update(false, 0, Vec::new()), cx);
+        thread.read_with(cx, |thread, _| {
+            assert_eq!(thread.status(), ThreadStatus::Idle);
+            assert!(thread.entries().is_empty());
+        });
+    }
+
+    #[gpui::test]
     async fn prompting_a_teammate_chat_is_refused(cx: &mut TestAppContext) {
         let client = TeamClient::new("teammate-mac", DEFAULT_TEAM_PORT)
             .expect("a plain machine name makes a client");
-        let connection = Rc::new(TeamConnection::new("teammate-mac", client));
+        let connection = Rc::new(TeamConnection::new(
+            "teammate-mac",
+            client,
+            Rc::new(|_, _| {}),
+        ));
         let result = cx
             .update(|cx| {
                 connection.prompt(
