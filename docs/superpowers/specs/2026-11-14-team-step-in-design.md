@@ -31,6 +31,11 @@ in the wrong direction while its owner is away from the desk.
 ## Anti-goals
 
 - No action is accepted without a Tailscale identity on the allow list.
+  That identity belongs to a machine, not a person at a keyboard: any
+  process on an allowed person's machine acts as them, and the sharer's own
+  login is always allowed. A web page open in a browser there is such a
+  process, so the server also refuses what a browser can send (see Request
+  checks).
 - No action is accepted for a workspace whose step-in switch is off, even
   from an allowed teammate.
 - The share server exposes no other way to change the sharer's machine: no
@@ -99,7 +104,12 @@ mine" and keeps the sharer's chat as the single place things happen.
   options. Only `AllowOnce` and `RejectOnce` options are sent: an "always"
   answer would leave a standing rule in the owner's agent, which is a
   setting, and that is the owner's to make. A request with no once-only
-  option is not sent. Empty unless the workspace allows stepping in.
+  option is not sent. Only permission requests
+  (`AuthorizationKind::PermissionGrant`) are sent: an action choice, such as "Save" or "Discard"
+  before the agent edits a file with unsaved changes, is the owner's to
+  make. Once-only answers flattened out of a dropdown are named "Allow once"
+  and "Deny once", as the dropdown names only its choices. Empty unless the
+  workspace allows stepping in.
 
 New routes, all POST with a JSON body, all behind the same Tailscale identity
 and allow-list check as the GET routes, plus: the chat must belong to a shared
@@ -113,30 +123,60 @@ workspace with step-in on, else 403.
 
 Responses: 200 with `{ "queued": bool }` for message (true when their agent
 was busy), 200 for the others, 403 when not allowed, 404 when the chat is not
-loaded, 409 when there is nothing to stop or the permission request is no
-longer waiting, 413 when the body is over 256 KB.
+loaded, 409 when there is nothing to stop, the permission request is no
+longer waiting, or two teammate messages are already queued for the chat,
+413 when the body is over 256 KB.
+
+### Request checks
+
+Checked on every request before the caller is identified, so a web page on
+an allowed machine cannot act as its owner:
+
+- A request with an `Origin` header is refused with 403. Browsers send it on
+  cross-origin requests; the app's client never does.
+- A request whose `Host` is missing, or whose host part (port stripped,
+  bracketed IPv6 allowed) is not an IP address, a name ending in `.ts.net`,
+  or a bare machine name with no dot, is refused with 403. This blocks DNS
+  rebinding, which would otherwise let a page read `GET /v1/workspaces`.
+- A POST must carry `Content-Type: application/json` (parameters allowed)
+  and a non-empty `X-Mnemonic-Team` header (the client sends the protocol
+  version), else 400. Either one makes a browser send a CORS preflight
+  first, which the server never answers.
 
 ### Sharer
 
 - The server hands each accepted action to an action handler and blocks the
   request thread on its answer, up to 10 seconds. In the app the handler
-  sends the action to a foreground task owned by `TeamShare`.
-- The action carries who asked: the caller's Tailscale display name, falling
-  back to the login.
-- Stop: the same path as the owner's own Stop button
-  (`ConversationView::cancel_generation`), not a bare `thread.cancel`. The
-  owner's button also marks the turn as interrupted by the user, which stops
+  sends the action to a foreground task owned by `TeamShare`. An action whose
+  request gave up waiting is skipped, never carried out later.
+- The action carries who asked: the caller's Tailscale display name,
+  collapsed to one line without control characters, falling back to the
+  login. The owner's notifications show the login next to the display name
+  when they differ, as the display name is whatever the teammate set.
+- Stop: the same path as the owner's own Stop button (the thread view's
+  `cancel_generation`), not a bare `thread.cancel`, and always on the root
+  thread, whose turn is the one checked as running, even when the owner is
+  looking at a subagent. The owner's button also marks the turn as
+  interrupted by the user, which stops
   the chat view from sending the owner's next queued message straight after.
   The workspace's pending-message queue flushes as it does after a local
   stop, so a teammate's queued message still goes out.
 - Message: pushed onto the chat's existing pending-message queue in
   `WorkspaceHost`, as `From {name} (teammate):\n\n{text}`, then flushed. The
-  queue already sends when the thread goes idle.
-- Permission: the option is looked up by id in the tool call's own options
-  (so a teammate can only pick an option the agent offered) and must be
-  `AllowOnce` or `RejectOnce`, else 403. Then `thread.authorize_tool_call`.
+  queue already sends when the thread goes idle. At most two teammate
+  messages wait per chat (counting only those not yet sent); a third is
+  refused with 409. A teammate's message is recorded like an app-sent one,
+  so it never names the workspace.
+- Permission: the request must be a permission request
+  (`AuthorizationKind::PermissionGrant`), and the option is looked up by id
+  in the tool call's own options (so a teammate can only pick an option the
+  agent offered) and must be `AllowOnce` or `RejectOnce`, else 403. Then
+  `thread.authorize_tool_call`. The notification says allowed or rejected
+  from the chosen option's kind.
 - Whether a chat is loaded (the 404) is decided on the foreground thread from
   the live chats, not from the hub, which also keeps feeds for closed chats.
+  A closed chat's kept feed is shown as not generating with no permission
+  requests.
 - Each stop and each permission answer shows a notification on the sharer's
   Mac: "{name} stopped the agent in {chat}", "{name} allowed {tool} in
   {chat}". A message needs none; it is in the chat with its label.
@@ -161,7 +201,13 @@ longer waiting, 413 when the body is over 256 KB.
   answer (answered on the sharer's Mac or by another teammate) the mirror
   clears the waiting state without posting. `AcpThread` needs a new method
   for that: a status update alone keeps a tool call waiting.
-- A failed action shows an error notification with the server's reason.
+- A failed action shows an error notification with the server's reason. A
+  message that could not be sent goes back into the editor if it is still
+  empty.
+- When the chat is no longer open on the sharer's Mac, or the sharer cannot
+  be reached, the mirror stops showing the agent as working and clears its
+  waiting permission requests without posting an answer.
+- Escape does not stop a teammate's agent; only the Stop button does.
 - With `step_in` false everything stays as in step 1.
 
 ## Left to the builder
