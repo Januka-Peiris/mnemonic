@@ -1,8 +1,8 @@
-//! Read-only sharing of workspaces and live agent chats between teammates on
-//! the same Tailscale network. Each Mnemonic serves its own state (see
+//! Sharing of workspaces and live agent chats between teammates on the same
+//! Tailscale network, and the few actions a teammate may take in a chat. Each Mnemonic serves its own state (see
 //! `team_share_server`); there is no central server.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::PathBuf;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
@@ -12,11 +12,14 @@ use agent_client_protocol::schema as acp;
 use serde::{Deserialize, Serialize};
 
 /// Bumped whenever a change to the wire types would break an older peer.
-pub const TEAM_PROTOCOL_VERSION: u32 = 2;
+pub const TEAM_PROTOCOL_VERSION: u32 = 3;
 /// Chats travel as the ACP crate's own types, so peers on different crate
 /// versions are treated as speaking different protocols.
 pub const TEAM_ACP_CRATE_VERSION: &str = "0.14.0";
 pub const DEFAULT_TEAM_PORT: u16 = 47231;
+/// Sent on every action, so a web page can't post one without a CORS
+/// preflight the share server never answers.
+pub const TEAM_REQUEST_HEADER: &str = "X-Mnemonic-Team";
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct TeamHello {
@@ -46,6 +49,10 @@ pub struct TeamChat {
     /// Whether the chat can be read: it is loaded in the sharer's app, or
     /// was earlier, or has a transcript saved from an earlier session.
     pub open: bool,
+    /// Whether the chat's agent is running in the sharer's app, so a
+    /// teammate can stop it or message it.
+    #[serde(default)]
+    pub live: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -72,6 +79,9 @@ pub struct TeamWorkspace {
     pub idle_seconds: Option<u64>,
     #[serde(default)]
     pub chats: Vec<TeamChat>,
+    /// Whether the sharer lets teammates act in this workspace's chats.
+    #[serde(default)]
+    pub step_in: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -113,7 +123,60 @@ pub struct TeamChatUpdate {
     /// The chat's current plan, sent with every update.
     #[serde(default)]
     pub plan: Vec<acp::PlanEntry>,
+    /// Whether the agent is mid-turn.
+    #[serde(default)]
+    pub generating: bool,
+    /// Permission requests the agent is waiting on.
+    #[serde(default)]
+    pub permissions: Vec<TeamPermissionRequest>,
 }
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct TeamPermissionRequest {
+    pub tool_call_id: String,
+    pub options: Vec<acp::PermissionOption>,
+}
+
+/// A teammate who passed the allow list.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TeamCaller {
+    pub login: String,
+    /// Their Tailscale display name, or their login when there isn't one.
+    pub name: String,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct TeamAction {
+    pub chat_id: String,
+    /// The caller's display name, which they choose themselves.
+    pub from: String,
+    pub login: String,
+    pub kind: TeamActionKind,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum TeamActionKind {
+    Stop,
+    Message { text: String },
+    Permission { tool_call_id: String, option_id: String },
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct TeamActionOutcome {
+    pub queued: bool,
+}
+
+/// Why an action wasn't carried out, mapped to 403, 404, 409 and 500.
+#[derive(Clone, Debug, PartialEq)]
+pub enum TeamActionError {
+    NotAllowed(String),
+    NotLoaded,
+    NothingToDo(String),
+    Failed(String),
+}
+
+pub type ActionHandler =
+    Arc<dyn Fn(TeamAction) -> Result<TeamActionOutcome, TeamActionError> + Send + Sync>;
 
 /// Where to reach a teammate: a Tailscale machine name or address, with an
 /// optional `:port`.
@@ -144,6 +207,9 @@ struct ChatFeed {
     entries: Vec<(TeamEntry, u64)>,
     plan: Vec<acp::PlanEntry>,
     plan_changed_at: u64,
+    generating: bool,
+    permissions: Vec<TeamPermissionRequest>,
+    activity_changed_at: u64,
 }
 
 struct HubState {
@@ -153,6 +219,7 @@ struct HubState {
     version: u64,
     workspaces: Vec<TeamWorkspace>,
     chats: HashMap<String, ChatFeed>,
+    step_in_chats: HashSet<String>,
     last_request: Option<Instant>,
 }
 
@@ -187,6 +254,7 @@ impl TeamShareHub {
                     version: 0,
                     workspaces: Vec::new(),
                     chats: HashMap::new(),
+                    step_in_chats: HashSet::new(),
                     last_request: None,
                 }),
                 changed: Condvar::new(),
@@ -296,6 +364,39 @@ impl TeamShareHub {
         true
     }
 
+    /// Sets whether a chat's agent is mid-turn and what it waits on. Returns
+    /// false when the chat isn't known.
+    pub fn set_chat_activity(
+        &self,
+        chat_id: &str,
+        generating: bool,
+        permissions: Vec<TeamPermissionRequest>,
+    ) -> bool {
+        let mut state = self.lock();
+        let next_version = state.version + 1;
+        let Some(feed) = state.chats.get_mut(chat_id) else {
+            return false;
+        };
+        if feed.generating == generating && feed.permissions == permissions {
+            return true;
+        }
+        feed.generating = generating;
+        feed.permissions = permissions;
+        feed.activity_changed_at = next_version;
+        state.version = next_version;
+        self.inner.changed.notify_all();
+        true
+    }
+
+    /// The chats teammates may act in, as decided by the sharer.
+    pub fn set_step_in_chats(&self, chat_ids: HashSet<String>) {
+        self.lock().step_in_chats = chat_ids;
+    }
+
+    pub fn allows_step_in(&self, chat_id: &str) -> bool {
+        self.lock().step_in_chats.contains(chat_id)
+    }
+
     pub fn remove_chat(&self, chat_id: &str) {
         if self.lock().chats.remove(chat_id).is_some() {
             self.inner.changed.notify_all();
@@ -381,13 +482,17 @@ impl TeamShareHub {
             })
             .collect();
         let changed = !changes.is_empty()
-            || since.is_none_or(|since| feed.plan_changed_at > since);
+            || since.is_none_or(|since| {
+                feed.plan_changed_at > since || feed.activity_changed_at > since
+            });
         let update = TeamChatUpdate {
             cursor: format!("{}.{}.{}", state.epoch, feed.generation, state.version),
             reset: since.is_none(),
             len: feed.entries.len(),
             changes,
             plan: feed.plan.clone(),
+            generating: feed.generating,
+            permissions: feed.permissions.clone(),
         };
         Some((update, changed))
     }
@@ -407,9 +512,9 @@ fn parse_cursor(cursor: &str) -> Option<(u64, u64, u64)> {
 /// Who a request came from, by Tailscale login. Behind a trait so the server
 /// can be tested without Tailscale.
 pub trait CallerIdentity: Send + Sync {
-    /// The caller's login, None when the address isn't a known user (such as
-    /// a tagged machine), or an error when it couldn't be checked.
-    fn login(&self, address: IpAddr) -> Result<Option<String>, String>;
+    /// The caller, None when the address isn't a known user (such as a
+    /// tagged machine), or an error when it couldn't be checked.
+    fn caller(&self, address: IpAddr) -> Result<Option<TeamCaller>, String>;
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -621,6 +726,8 @@ struct WhoisJson {
 struct WhoisUser {
     #[serde(rename = "LoginName", default)]
     login_name: String,
+    #[serde(rename = "DisplayName", default)]
+    display_name: String,
 }
 
 const WHOIS_CACHE_FOR: Duration = Duration::from_secs(60);
@@ -629,32 +736,56 @@ const WHOIS_CACHE_FOR: Duration = Duration::from_secs(60);
 /// minute so a long-polling viewer doesn't run the CLI on every request.
 #[derive(Default)]
 pub struct TailscaleWhois {
-    cache: Mutex<HashMap<IpAddr, (Option<String>, Instant)>>,
+    cache: Mutex<HashMap<IpAddr, (Option<TeamCaller>, Instant)>>,
 }
 
 impl CallerIdentity for TailscaleWhois {
-    fn login(&self, address: IpAddr) -> Result<Option<String>, String> {
+    fn caller(&self, address: IpAddr) -> Result<Option<TeamCaller>, String> {
         {
             let cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
-            if let Some((login, at)) = cache.get(&address) {
+            if let Some((caller, at)) = cache.get(&address) {
                 if at.elapsed() < WHOIS_CACHE_FOR {
-                    return Ok(login.clone());
+                    return Ok(caller.clone());
                 }
             }
         }
         let output = run_tailscale(&["whois", "--json", &address.to_string()])?;
         let whois: WhoisJson = serde_json::from_slice(&output)
             .map_err(|err| format!("Couldn't read Tailscale's whois answer: {err}"))?;
-        let login = whois
+        let caller = whois
             .user_profile
-            .map(|user| user.login_name)
-            .filter(|login| !login.is_empty());
+            .filter(|user| !user.login_name.is_empty())
+            .map(|user| {
+                let name = single_line(&user.display_name);
+                TeamCaller {
+                    name: if name.is_empty() {
+                        user.login_name.clone()
+                    } else {
+                        name
+                    },
+                    login: user.login_name,
+                }
+            });
         self.cache
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .insert(address, (login.clone(), Instant::now()));
-        Ok(login)
+            .insert(address, (caller.clone(), Instant::now()));
+        Ok(caller)
     }
+}
+
+/// A display name is chosen by its owner and ends up in chat labels and
+/// notifications, so it must not be able to fake extra lines there.
+fn single_line(name: &str) -> String {
+    name.split_whitespace()
+        .map(|word| {
+            word.chars()
+                .filter(|character| !character.is_control())
+                .collect::<String>()
+        })
+        .filter(|word| !word.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -668,6 +799,12 @@ pub enum TeamClientError {
     Incompatible {
         protocol: u32,
     },
+    /// The teammate's app declined an action, with the status and the
+    /// reason it gave.
+    Refused {
+        status: u16,
+        reason: String,
+    },
     Other(String),
 }
 
@@ -677,7 +814,9 @@ impl std::fmt::Display for TeamClientError {
             Self::Unreachable(_) => write!(f, "Offline"),
             Self::Forbidden => write!(f, "Hasn't added you to their allow list"),
             Self::Incompatible { .. } => write!(f, "On a different Mnemonic version"),
-            Self::Other(message) => write!(f, "{message}"),
+            Self::Other(message) | Self::Refused { reason: message, .. } => {
+                write!(f, "{message}")
+            }
         }
     }
 }
@@ -755,6 +894,72 @@ impl TeamClient {
         serde_json::from_slice(&bytes)
             .map(Some)
             .map_err(|err| TeamClientError::Other(format!("Unexpected answer: {err}")))
+    }
+
+    fn post(
+        &self,
+        path: &str,
+        body: serde_json::Value,
+    ) -> Result<reqwest::blocking::Response, TeamClientError> {
+        let response = self
+            .http
+            .post(format!("{}{path}", self.base_url))
+            .timeout(REQUEST_TIMEOUT)
+            .header(TEAM_REQUEST_HEADER, TEAM_PROTOCOL_VERSION.to_string())
+            .json(&body)
+            .send()
+            .map_err(|err| {
+                if err.is_connect() || err.is_timeout() {
+                    TeamClientError::Unreachable(err.to_string())
+                } else {
+                    TeamClientError::Other(err.to_string())
+                }
+            })?;
+        let status = response.status().as_u16();
+        if (200..300).contains(&status) {
+            return Ok(response);
+        }
+        let reason = match response.text() {
+            Ok(text) if !text.trim().is_empty() => text.trim().to_string(),
+            Ok(_) => format!("Request failed ({status})"),
+            Err(err) => {
+                format!("Request failed ({status}), and its reason couldn't be read: {err}")
+            }
+        };
+        Err(TeamClientError::Refused { status, reason })
+    }
+
+    /// Stops the chat's agent.
+    pub fn stop(&self, chat_id: &str) -> Result<(), TeamClientError> {
+        let path = format!("/v1/chats/{}/stop", path_segment(chat_id)?);
+        self.post(&path, serde_json::json!({})).map(|_| ())
+    }
+
+    /// Sends a message into the chat. True when the agent was busy and the
+    /// message was queued behind its current turn.
+    pub fn send_message(&self, chat_id: &str, text: &str) -> Result<bool, TeamClientError> {
+        let path = format!("/v1/chats/{}/message", path_segment(chat_id)?);
+        let response = self.post(&path, serde_json::json!({ "text": text }))?;
+        let bytes = response
+            .bytes()
+            .map_err(|err| TeamClientError::Unreachable(err.to_string()))?;
+        serde_json::from_slice::<TeamActionOutcome>(&bytes)
+            .map(|outcome| outcome.queued)
+            .map_err(|err| TeamClientError::Other(format!("Unexpected answer: {err}")))
+    }
+
+    pub fn answer_permission(
+        &self,
+        chat_id: &str,
+        tool_call_id: &str,
+        option_id: &str,
+    ) -> Result<(), TeamClientError> {
+        let path = format!("/v1/chats/{}/permission", path_segment(chat_id)?);
+        self.post(
+            &path,
+            serde_json::json!({ "tool_call_id": tool_call_id, "option_id": option_id }),
+        )
+        .map(|_| ())
     }
 
     /// Checks the teammate speaks this protocol, returning their name.
@@ -1057,6 +1262,30 @@ mod tests {
             .expect("chat is open");
         assert_eq!(third.cursor, second.cursor);
         assert!(!hub.set_chat_plan("closed", Vec::new()));
+    }
+
+    #[test]
+    fn chat_activity_bumps_only_on_change() {
+        let hub = TeamShareHub::new();
+        hub.replace_chat("chat", vec![user("one")]);
+        let first = hub.chat_update("chat", None).expect("chat is open");
+        assert!(!first.generating);
+        assert!(hub.set_chat_activity("chat", true, Vec::new()));
+
+        let second = hub
+            .wait_chat_update("chat", Some(&first.cursor), Duration::ZERO)
+            .expect("chat is open");
+        assert!(second.generating);
+        assert!(!second.reset);
+        assert!(second.changes.is_empty());
+        assert_ne!(second.cursor, first.cursor);
+
+        assert!(hub.set_chat_activity("chat", true, Vec::new()));
+        let third = hub
+            .wait_chat_update("chat", Some(&second.cursor), Duration::ZERO)
+            .expect("chat is open");
+        assert_eq!(third.cursor, second.cursor);
+        assert!(!hub.set_chat_activity("missing", true, Vec::new()));
     }
 
     #[test]

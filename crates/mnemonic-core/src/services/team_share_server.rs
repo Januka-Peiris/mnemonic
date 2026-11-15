@@ -1,7 +1,9 @@
-//! The HTTP side of team sharing. Read-only: every route is a GET, and
-//! nothing a caller sends can change this machine's state.
+//! The HTTP side of team sharing. Reads are GETs. The only writes are three
+//! POSTs on a chat (stop, message, permission), each handed to the app's
+//! action handler and only for chats the sharer has opened to step-in.
 
-use std::net::{IpAddr, SocketAddr};
+use std::io::Read as _;
+use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread::JoinHandle;
@@ -10,7 +12,8 @@ use std::time::Duration;
 use tiny_http::{Header, Method, Request, Response, Server};
 
 use crate::services::team_share_service::{
-    CallerIdentity, MAX_CHAT_WAIT, TEAM_ACP_CRATE_VERSION, TEAM_PROTOCOL_VERSION, TeamHello,
+    ActionHandler, CallerIdentity, MAX_CHAT_WAIT, TEAM_ACP_CRATE_VERSION, TEAM_PROTOCOL_VERSION,
+    TEAM_REQUEST_HEADER, TeamAction, TeamActionError, TeamActionKind, TeamCaller, TeamHello,
     TeamShareHub, TeamWorkspaceList, is_plain_id,
 };
 
@@ -31,11 +34,13 @@ pub struct TeamServerConfig {
 const MAX_ACTIVE_REQUESTS: usize = 64;
 /// Diffs past this are cut, so a vendored directory can't stall a viewer.
 const MAX_DIFF_BYTES: usize = 2 * 1024 * 1024;
+const MAX_MESSAGE_BYTES: usize = 256 * 1024;
 
 struct Shared {
     hub: TeamShareHub,
     identity: Arc<dyn CallerIdentity>,
     diff_source: DiffSource,
+    action_handler: ActionHandler,
     hello: String,
     allowed_logins: Vec<String>,
     active_requests: AtomicUsize,
@@ -54,6 +59,7 @@ impl TeamShareServer {
         hub: TeamShareHub,
         identity: Arc<dyn CallerIdentity>,
         diff_source: DiffSource,
+        action_handler: ActionHandler,
     ) -> Result<Self, String> {
         let server = Server::http((config.bind, config.port))
             .map_err(|err| format!("Couldn't listen on {}:{}: {err}", config.bind, config.port))?;
@@ -71,6 +77,7 @@ impl TeamShareServer {
             hub,
             identity,
             diff_source,
+            action_handler,
             hello,
             allowed_logins: config
                 .allowed_logins
@@ -141,19 +148,29 @@ fn accept_requests(server: &Server, shared: &Arc<Shared>) {
     }
 }
 
-fn handle(request: Request, shared: &Shared) {
-    if *request.method() != Method::Get {
-        respond(request, text_response(405, "Only GET is supported"));
+fn handle(mut request: Request, shared: &Shared) {
+    if let Err((status, reason)) = check_request(&request) {
+        respond(request, text_response(status, reason));
         return;
     }
-    let Some(caller) = request.remote_addr().map(|address| address.ip()) else {
+    let Some(address) = request.remote_addr().map(|address| address.ip()) else {
         respond(request, text_response(403, "Unknown caller"));
         return;
     };
-    match shared.identity.login(caller) {
-        Ok(Some(login)) if shared.allowed_logins.contains(&login.trim().to_lowercase()) => {}
-        Ok(Some(login)) => {
-            log::info!(target: "mnemonic_lib", "Refused a team request from {login} ({caller})");
+    let caller = match shared.identity.caller(address) {
+        Ok(Some(caller))
+            if shared
+                .allowed_logins
+                .contains(&caller.login.trim().to_lowercase()) =>
+        {
+            caller
+        }
+        Ok(Some(caller)) => {
+            log::info!(
+                target: "mnemonic_lib",
+                "Refused a team request from {} ({address})",
+                caller.login
+            );
             respond(request, text_response(403, "Not on the allow list"));
             return;
         }
@@ -162,16 +179,33 @@ fn handle(request: Request, shared: &Shared) {
             return;
         }
         Err(err) => {
-            log::warn!(target: "mnemonic_lib", "Couldn't identify {caller}: {err}");
+            log::warn!(target: "mnemonic_lib", "Couldn't identify {address}: {err}");
             respond(request, text_response(503, "Couldn't check who you are"));
             return;
         }
-    }
+    };
     shared.hub.note_request();
 
     let url = request.url().to_string();
     let (path, query) = url.split_once('?').unwrap_or((url.as_str(), ""));
     let segments: Vec<&str> = path.trim_matches('/').split('/').collect();
+    let method = request.method().clone();
+    if method == Method::Post {
+        let response = match segments.as_slice() {
+            ["v1", "chats", chat_id, action @ ("stop" | "message" | "permission")]
+                if is_plain_id(chat_id) =>
+            {
+                handle_action(&mut request, shared, &caller, chat_id, action)
+            }
+            _ => text_response(404, "Not found"),
+        };
+        respond(request, response);
+        return;
+    }
+    if method != Method::Get {
+        respond(request, text_response(405, "Only GET and POST are supported"));
+        return;
+    }
     let response = match segments.as_slice() {
         ["v1", "hello"] => json_response(200, shared.hello.clone()),
         ["v1", "workspaces"] => {
@@ -211,6 +245,140 @@ fn handle(request: Request, shared: &Shared) {
         _ => text_response(404, "Not found"),
     };
     respond(request, response);
+}
+
+/// Identity is the caller's machine, so any program there acts as its
+/// owner, including a web page open in a browser. These refuse what a page
+/// can send: browsers add `Origin` to cross-origin requests, a foreign
+/// `Host` means DNS rebinding, and a JSON body or a custom header makes a
+/// browser ask first with a CORS preflight, which this server never answers.
+fn check_request(request: &Request) -> Result<(), (u16, &'static str)> {
+    let header_value = |name: &'static str| {
+        request
+            .headers()
+            .iter()
+            .find(|header| header.field.equiv(name))
+            .map(|header| header.value.as_str())
+    };
+    if header_value("Origin").is_some() {
+        return Err((403, "Requests from web pages are refused"));
+    }
+    if !header_value("Host").is_some_and(is_allowed_host) {
+        return Err((403, "Unexpected host name"));
+    }
+    if *request.method() == Method::Post {
+        let is_json = header_value("Content-Type").is_some_and(|value| {
+            value.split(';').next().is_some_and(|media_type| {
+                media_type.trim().eq_ignore_ascii_case("application/json")
+            })
+        });
+        if !is_json {
+            return Err((400, "Expected a JSON body"));
+        }
+        if header_value(TEAM_REQUEST_HEADER).is_none_or(|value| value.trim().is_empty()) {
+            return Err((400, "Not a Mnemonic request"));
+        }
+    }
+    Ok(())
+}
+
+/// The names a teammate reaches this machine by: an address, a Tailscale
+/// MagicDNS name, or a bare machine name.
+fn is_allowed_host(host: &str) -> bool {
+    let host = host.trim();
+    if let Some(bracketed) = host.strip_prefix('[') {
+        return bracketed
+            .split_once(']')
+            .is_some_and(|(address, _)| address.parse::<Ipv6Addr>().is_ok());
+    }
+    let name = host.split_once(':').map_or(host, |(name, _)| name);
+    if name.parse::<IpAddr>().is_ok() {
+        return true;
+    }
+    let is_name_character =
+        |character: char| character.is_ascii_alphanumeric() || character == '-' || character == '.';
+    if name.is_empty() || !name.chars().all(is_name_character) {
+        return false;
+    }
+    !name.contains('.')
+        || name
+            .to_ascii_lowercase()
+            .strip_suffix(".ts.net")
+            .is_some_and(|prefix| !prefix.is_empty() && !prefix.ends_with('.'))
+}
+
+fn handle_action(
+    request: &mut Request,
+    shared: &Shared,
+    caller: &TeamCaller,
+    chat_id: &str,
+    action: &str,
+) -> Response<std::io::Cursor<Vec<u8>>> {
+    if !shared.hub.allows_step_in(chat_id) {
+        return text_response(403, "Stepping in is off for this workspace");
+    }
+    let mut body = Vec::new();
+    let read = request
+        .as_reader()
+        .take(MAX_MESSAGE_BYTES as u64 + 1)
+        .read_to_end(&mut body);
+    if let Err(err) = read {
+        return text_response(400, &format!("Couldn't read the request: {err}"));
+    }
+    if body.len() > MAX_MESSAGE_BYTES {
+        return text_response(413, "The message is too long");
+    }
+    let kind = match parse_action(action, &body) {
+        Ok(kind) => kind,
+        Err(reason) => return text_response(400, &reason),
+    };
+    let outcome = (shared.action_handler)(TeamAction {
+        chat_id: chat_id.to_string(),
+        from: caller.name.clone(),
+        login: caller.login.clone(),
+        kind,
+    });
+    match outcome {
+        Ok(outcome) => match serde_json::to_string(&outcome) {
+            Ok(body) => json_response(200, body),
+            Err(err) => text_response(500, &err.to_string()),
+        },
+        Err(TeamActionError::NotAllowed(reason)) => text_response(403, &reason),
+        Err(TeamActionError::NotLoaded) => text_response(404, "Not open"),
+        Err(TeamActionError::NothingToDo(reason)) => text_response(409, &reason),
+        Err(TeamActionError::Failed(reason)) => text_response(500, &reason),
+    }
+}
+
+fn parse_action(action: &str, body: &[u8]) -> Result<TeamActionKind, String> {
+    #[derive(serde::Deserialize)]
+    struct MessageBody {
+        text: String,
+    }
+    #[derive(serde::Deserialize)]
+    struct PermissionBody {
+        tool_call_id: String,
+        option_id: String,
+    }
+    let invalid = |err: serde_json::Error| format!("Couldn't read the request: {err}");
+    match action {
+        "message" => {
+            let message: MessageBody = serde_json::from_slice(body).map_err(invalid)?;
+            if message.text.trim().is_empty() {
+                return Err("The message is empty".to_string());
+            }
+            Ok(TeamActionKind::Message { text: message.text })
+        }
+        "permission" => {
+            let answer: PermissionBody = serde_json::from_slice(body).map_err(invalid)?;
+            Ok(TeamActionKind::Permission {
+                tool_call_id: answer.tool_call_id,
+                option_id: answer.option_id,
+            })
+        }
+        "stop" => Ok(TeamActionKind::Stop),
+        _ => Err(format!("Unknown action {action}")),
+    }
 }
 
 fn query_value<'a>(query: &'a str, key: &str) -> Option<&'a str> {
@@ -265,20 +433,47 @@ mod tests {
     use super::*;
     use agent_client_protocol::schema as acp;
     use crate::services::team_share_service::{
-        TeamClient, TeamClientError, TeamEntry, TeamWorkspace,
+        TeamActionOutcome, TeamCaller, TeamClient, TeamClientError, TeamEntry, TeamWorkspace,
     };
-    use std::net::Ipv4Addr;
+    use std::collections::HashSet;
+    use std::io::{BufRead as _, Write as _};
+    use std::net::{Ipv4Addr, TcpStream};
+    use std::sync::Mutex;
 
     struct FixedLogin(Option<&'static str>);
 
     impl CallerIdentity for FixedLogin {
-        fn login(&self, _address: IpAddr) -> Result<Option<String>, String> {
-            Ok(self.0.map(str::to_string))
+        fn caller(&self, _address: IpAddr) -> Result<Option<TeamCaller>, String> {
+            Ok(self.0.map(|login| TeamCaller {
+                login: login.to_string(),
+                name: "Bob".to_string(),
+            }))
         }
     }
 
+    type Recorded = Arc<Mutex<Vec<TeamAction>>>;
+
     fn start(login: Option<&'static str>, hub: TeamShareHub) -> Result<TeamShareServer, String> {
-        TeamShareServer::start(
+        Ok(start_with_handler(login, hub, queued())?.0)
+    }
+
+    fn start_with_handler(
+        login: Option<&'static str>,
+        hub: TeamShareHub,
+        result: Result<TeamActionOutcome, TeamActionError>,
+    ) -> Result<(TeamShareServer, Recorded), String> {
+        let recorded = Recorded::default();
+        let action_handler: ActionHandler = Arc::new({
+            let recorded = recorded.clone();
+            move |action| {
+                recorded
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .push(action);
+                result.clone()
+            }
+        });
+        let server = TeamShareServer::start(
             TeamServerConfig {
                 bind: IpAddr::V4(Ipv4Addr::LOCALHOST),
                 port: 0,
@@ -288,6 +483,55 @@ mod tests {
             hub,
             Arc::new(FixedLogin(login)),
             Arc::new(|workspace_id: &str| Ok(format!("diff of {workspace_id}"))),
+            action_handler,
+        )?;
+        Ok((server, recorded))
+    }
+
+    fn queued() -> Result<TeamActionOutcome, TeamActionError> {
+        Ok(TeamActionOutcome { queued: true })
+    }
+
+    fn step_in_hub(on: bool) -> TeamShareHub {
+        let hub = TeamShareHub::new();
+        hub.replace_chat("chat-1", Vec::new());
+        if on {
+            hub.set_step_in_chats(HashSet::from(["chat-1".to_string()]));
+        }
+        hub
+    }
+
+    fn refused(status: u16) -> impl Fn(&TeamClientError) -> bool {
+        move |err| matches!(err, TeamClientError::Refused { status: got, .. } if *got == status)
+    }
+
+    /// Sends `request` exactly as written and returns the status code of
+    /// the answer.
+    fn raw_status(address: SocketAddr, request: &str) -> Result<u16, String> {
+        let mut stream = TcpStream::connect(address).map_err(|err| err.to_string())?;
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .map_err(|err| err.to_string())?;
+        stream
+            .write_all(request.as_bytes())
+            .map_err(|err| err.to_string())?;
+        let mut status_line = String::new();
+        std::io::BufReader::new(stream)
+            .read_line(&mut status_line)
+            .map_err(|err| err.to_string())?;
+        status_line
+            .split_whitespace()
+            .nth(1)
+            .and_then(|code| code.parse().ok())
+            .ok_or_else(|| format!("No status in {status_line:?}"))
+    }
+
+    fn post_hello_message(address: SocketAddr, headers: &str) -> String {
+        let body = r#"{"text":"hello"}"#;
+        format!(
+            "POST /v1/chats/chat-1/message HTTP/1.1\r\nHost: {address}\r\n{headers}\
+             Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
         )
     }
 
@@ -305,6 +549,7 @@ mod tests {
             agent_state: Default::default(),
             idle_seconds: None,
             chats: Vec::new(),
+            step_in: false,
         }
     }
 
@@ -376,6 +621,150 @@ mod tests {
         assert_eq!(client.workspaces(), Err(TeamClientError::Forbidden));
         assert_eq!(client.diff("ws-1"), Err(TeamClientError::Forbidden));
         assert!(!hub.has_viewers_within(Duration::from_secs(60)));
+        Ok(())
+    }
+
+    #[test]
+    fn an_allowed_teammate_can_stop_message_and_answer_when_step_in_is_on() -> Result<(), String> {
+        let (server, recorded) =
+            start_with_handler(Some("bob@example.com"), step_in_hub(true), queued())?;
+        let client =
+            TeamClient::new(&server.address().to_string(), 0).map_err(|err| err.to_string())?;
+
+        assert_eq!(client.stop("chat-1"), Ok(()));
+        assert_eq!(client.send_message("chat-1", "hello"), Ok(true));
+        assert_eq!(client.answer_permission("chat-1", "call-1", "allow"), Ok(()));
+
+        let kinds: Vec<TeamActionKind> = recorded
+            .lock()
+            .map_err(|err| err.to_string())?
+            .iter()
+            .inspect(|action| {
+                assert_eq!(action.chat_id, "chat-1");
+                assert_eq!(action.from, "Bob");
+            })
+            .map(|action| action.kind.clone())
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                TeamActionKind::Stop,
+                TeamActionKind::Message {
+                    text: "hello".to_string()
+                },
+                TeamActionKind::Permission {
+                    tool_call_id: "call-1".to_string(),
+                    option_id: "allow".to_string()
+                },
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn actions_are_refused_when_step_in_is_off() -> Result<(), String> {
+        let (server, recorded) =
+            start_with_handler(Some("bob@example.com"), step_in_hub(false), queued())?;
+        let client =
+            TeamClient::new(&server.address().to_string(), 0).map_err(|err| err.to_string())?;
+
+        assert!(client.stop("chat-1").is_err_and(|err| refused(403)(&err)));
+        assert!(client
+            .send_message("chat-1", "hello")
+            .is_err_and(|err| refused(403)(&err)));
+        assert!(client
+            .answer_permission("chat-1", "call-1", "allow")
+            .is_err_and(|err| refused(403)(&err)));
+        assert!(recorded.lock().map_err(|err| err.to_string())?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn actions_are_refused_for_a_login_not_on_the_allow_list() -> Result<(), String> {
+        let (server, recorded) =
+            start_with_handler(Some("mallory@example.com"), step_in_hub(true), queued())?;
+        let client =
+            TeamClient::new(&server.address().to_string(), 0).map_err(|err| err.to_string())?;
+
+        assert!(client.stop("chat-1").is_err_and(|err| refused(403)(&err)));
+        assert!(recorded.lock().map_err(|err| err.to_string())?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn an_empty_or_oversized_message_is_refused() -> Result<(), String> {
+        let (server, recorded) =
+            start_with_handler(Some("bob@example.com"), step_in_hub(true), queued())?;
+        let client =
+            TeamClient::new(&server.address().to_string(), 0).map_err(|err| err.to_string())?;
+
+        assert!(client
+            .send_message("chat-1", "  ")
+            .is_err_and(|err| refused(400)(&err)));
+        assert!(client
+            .send_message("chat-1", &"a".repeat(300 * 1024))
+            .is_err_and(|err| refused(413)(&err)));
+        assert!(recorded.lock().map_err(|err| err.to_string())?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn a_browser_style_post_is_refused() -> Result<(), String> {
+        let (server, recorded) =
+            start_with_handler(Some("bob@example.com"), step_in_hub(true), queued())?;
+        let address = server.address();
+
+        let plain_text = post_hello_message(address, "Content-Type: text/plain\r\n");
+        assert_eq!(raw_status(address, &plain_text)?, 400);
+        let without_team_header =
+            post_hello_message(address, "Content-Type: application/json\r\n");
+        assert_eq!(raw_status(address, &without_team_header)?, 400);
+        let from_a_web_page = post_hello_message(
+            address,
+            "Content-Type: application/json\r\nX-Mnemonic-Team: 3\r\n\
+             Origin: https://example.com\r\n",
+        );
+        assert_eq!(raw_status(address, &from_a_web_page)?, 403);
+        assert!(recorded.lock().map_err(|err| err.to_string())?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn a_request_for_another_host_name_is_refused() -> Result<(), String> {
+        let server = start(Some("bob@example.com"), TeamShareHub::new())?;
+        let address = server.address();
+        let list_workspaces = |host: &str| {
+            format!("GET /v1/workspaces HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n")
+        };
+
+        assert_eq!(
+            raw_status(address, &list_workspaces("attacker.example.com"))?,
+            403
+        );
+        assert_eq!(
+            raw_status(address, &list_workspaces("jays-mac.tail1234.ts.net:47231"))?,
+            200
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_handler_error_reaches_the_client_with_its_reason() -> Result<(), String> {
+        let (server, _recorded) = start_with_handler(
+            Some("bob@example.com"),
+            step_in_hub(true),
+            Err(TeamActionError::NothingToDo("The agent isn't running".into())),
+        )?;
+        let client =
+            TeamClient::new(&server.address().to_string(), 0).map_err(|err| err.to_string())?;
+
+        assert_eq!(
+            client.stop("chat-1"),
+            Err(TeamClientError::Refused {
+                status: 409,
+                reason: "The agent isn't running".to_string()
+            })
+        );
         Ok(())
     }
 }

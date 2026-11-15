@@ -116,7 +116,7 @@ pub struct WorkspacePanel {
 impl WorkspacePanel {
     pub fn new(
         workspace: &mut Workspace,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Workspace>,
     ) -> Entity<Self> {
         let panel = cx.new(|cx| {
@@ -142,7 +142,7 @@ impl WorkspacePanel {
             panel
         });
 
-        crate::workspace_view::register_window(workspace.weak_handle(), cx);
+        crate::workspace_view::register_window(workspace.weak_handle(), window.window_handle(), cx);
         if let Some(team) = crate::team::team_share(cx) {
             panel.update(cx, |_, cx| {
                 cx.observe(&team, |_, _, cx| cx.notify()).detach();
@@ -1847,6 +1847,7 @@ impl WorkspacePanel {
             .and_then(|state| mnemonic_bridge::pr_state_color(state, cx));
         let merged_color = pr_color.filter(|_| pr_state.as_deref() == Some("merged"));
         let shared = crate::team::is_workspace_shared(&ws.id, cx);
+        let step_in = crate::team::workspace_allows_step_in(&ws.id, cx);
         let shared_indicator = crate::team::render_shared_indicator(&ws.id, cx);
         let row = h_flex()
             .id(SharedString::from(ws.id.clone()))
@@ -2009,6 +2010,18 @@ impl WorkspacePanel {
                             }
                         },
                     )
+                    .when(shared, |menu| {
+                        let workspace_id = workspace_id.clone();
+                        menu.toggleable_entry(
+                            "Let teammates step in",
+                            step_in,
+                            IconPosition::Start,
+                            None,
+                            move |_, cx| {
+                                crate::team::set_workspace_step_in(&workspace_id, !step_in, cx);
+                            },
+                        )
+                    })
                     .when(!link_candidates.is_empty(), |menu| {
                         menu.submenu("Link Workspace", {
                             let this = this.clone();

@@ -1381,6 +1381,8 @@ pub struct AcpThread {
     shared_buffers: HashMap<Entity<Buffer>, BufferSnapshot>,
     turn_id: u32,
     running_turn: Option<RunningTurn>,
+    /// A turn running somewhere else, in the agent this thread mirrors.
+    remote_generating: bool,
     connection: Rc<dyn AgentConnection>,
     token_usage: Option<TokenUsage>,
     cost: Option<SessionCost>,
@@ -1451,6 +1453,7 @@ pub enum AcpThreadEvent {
     ModeUpdated(acp::SessionModeId),
     ConfigOptionsUpdated(Vec<acp::SessionConfigOption>),
     WorkingDirectoriesUpdated,
+    RemoteGeneratingChanged,
 }
 
 impl EventEmitter<AcpThreadEvent> for AcpThread {}
@@ -1588,6 +1591,7 @@ impl AcpThread {
             provisional_title: None,
             project,
             running_turn: None,
+            remote_generating: false,
             turn_id: 0,
             connection,
             session_id,
@@ -1716,10 +1720,17 @@ impl AcpThread {
     }
 
     pub fn status(&self) -> ThreadStatus {
-        if self.running_turn.is_some() {
+        if self.running_turn.is_some() || self.remote_generating {
             ThreadStatus::Generating
         } else {
             ThreadStatus::Idle
+        }
+    }
+
+    pub fn set_remote_generating(&mut self, generating: bool, cx: &mut Context<Self>) {
+        if self.remote_generating != generating {
+            self.remote_generating = generating;
+            cx.emit(AcpThreadEvent::RemoteGeneratingChanged);
         }
     }
 
@@ -2659,6 +2670,19 @@ impl AcpThread {
         cx.emit(AcpThreadEvent::EntryUpdated(ix));
     }
 
+    /// Withdraws a tool call's waiting request without an answer, resolving
+    /// it as cancelled. A status update alone keeps a tool call waiting.
+    pub fn clear_tool_call_authorization(&mut self, id: &acp::ToolCallId, cx: &mut Context<Self>) {
+        let Some((index, call)) = self.tool_call_mut(id) else {
+            return;
+        };
+        let ToolCallStatus::WaitingForConfirmation { current_status, .. } = &call.status else {
+            return;
+        };
+        call.status = (*current_status).into();
+        cx.emit(AcpThreadEvent::EntryUpdated(index));
+    }
+
     pub fn plan(&self) -> &Plan {
         &self.plan
     }
@@ -2962,6 +2986,9 @@ impl AcpThread {
 
     pub fn cancel(&mut self, cx: &mut Context<Self>) -> Task<()> {
         let Some(turn) = self.running_turn.take() else {
+            if self.remote_generating {
+                self.connection.cancel(&self.session_id, cx);
+            }
             return Task::ready(());
         };
         self.connection.cancel(&self.session_id, cx);

@@ -18,7 +18,8 @@ use ui::{Checkbox, Headline, HeadlineSize, Switch, ToggleState, Tooltip, prelude
 use util::ResultExt as _;
 
 use crate::team::{
-    SharingStatus, TeamPeer, TeamSettings, is_workspace_shared, set_workspace_shared, team_share,
+    SharingStatus, TeamPeer, TeamSettings, is_workspace_shared, set_workspace_shared,
+    set_workspace_step_in, team_share, workspace_allows_step_in,
 };
 
 enum Devices {
@@ -216,7 +217,23 @@ impl TeamSettingsView {
                 );
             }
             let shared = is_workspace_shared(&workspace.id, cx);
+            let step_in = workspace_allows_step_in(&workspace.id, cx);
             let workspace_id = workspace.id.clone();
+            let step_in_toggle = shared.then(|| {
+                let workspace_id = workspace_id.clone();
+                Checkbox::new(
+                    SharedString::from(format!("team-step-in-{}", workspace.id)),
+                    if step_in {
+                        ToggleState::Selected
+                    } else {
+                        ToggleState::Unselected
+                    },
+                )
+                .label("Let teammates step in")
+                .on_click(move |state, _, cx| {
+                    set_workspace_step_in(&workspace_id, *state == ToggleState::Selected, cx);
+                })
+            });
             section =
                 section.child(
                     h_flex()
@@ -237,6 +254,7 @@ impl TeamSettingsView {
                                     .single_line(),
                             ),
                         )
+                        .children(step_in_toggle)
                         .child(
                             Switch::new(
                                 SharedString::from(format!("team-share-{}", workspace.id)),
