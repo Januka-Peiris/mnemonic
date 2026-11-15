@@ -1269,6 +1269,11 @@ impl ThreadMetadataStore {
         cx: &mut Context<Self>,
     ) {
         let view = conversation_view.read(cx);
+        // A read-only view mirrors someone else's chat, which isn't this
+        // machine's to record.
+        if view.read_only().is_some() {
+            return;
+        }
         let thread_id = view.thread_id;
         let Some(thread) = view.root_thread(cx) else {
             return;

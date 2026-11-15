@@ -8,16 +8,24 @@ use std::path::PathBuf;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
+use agent_client_protocol::schema as acp;
 use serde::{Deserialize, Serialize};
 
 /// Bumped whenever a change to the wire types would break an older peer.
-pub const TEAM_PROTOCOL_VERSION: u32 = 1;
+pub const TEAM_PROTOCOL_VERSION: u32 = 2;
+/// Chats travel as the ACP crate's own types, so peers on different crate
+/// versions are treated as speaking different protocols.
+pub const TEAM_ACP_CRATE_VERSION: &str = "0.14.0";
 pub const DEFAULT_TEAM_PORT: u16 = 47231;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct TeamHello {
     pub name: String,
     pub protocol: u32,
+    /// Defaulted so a peer from before protocol 2 is reported as a
+    /// different version rather than as an unreadable answer.
+    #[serde(default)]
+    pub acp_crate: String,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -35,8 +43,8 @@ pub struct TeamChat {
     pub id: String,
     pub title: String,
     pub agent: String,
-    /// Whether the chat is loaded in the sharer's app, which is the only
-    /// time its transcript can be read.
+    /// Whether the chat can be read: it is loaded in the sharer's app, or
+    /// was earlier, or has a transcript saved from an earlier session.
     pub open: bool,
 }
 
@@ -71,44 +79,13 @@ pub struct TeamWorkspaceList {
     pub workspaces: Vec<TeamWorkspace>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum TeamToolStatus {
-    Pending,
-    WaitingForApproval,
-    Running,
-    Done,
-    Failed,
-    Rejected,
-    Canceled,
-}
-
-/// One entry of a chat transcript. Deliberately independent of ACP's types
-/// so an ACP upgrade on one machine doesn't break the wire format.
+/// One entry of a chat transcript.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum TeamEntry {
-    User {
-        markdown: String,
-    },
-    Assistant {
-        markdown: String,
-        /// The model's thinking before or between its reply.
-        #[serde(default)]
-        thinking: Option<String>,
-    },
-    ToolCall {
-        title: String,
-        tool_kind: String,
-        status: TeamToolStatus,
-        #[serde(default)]
-        description: Option<String>,
-        #[serde(default)]
-        output_preview: Option<String>,
-    },
-    Plan {
-        markdown: String,
-    },
+    /// Applied in order to the end of a thread, these rebuild one entry.
+    Updates { updates: Vec<acp::SessionUpdate> },
+    CompletedPlan { entries: Vec<acp::PlanEntry> },
     Compaction {
         #[serde(default)]
         summary: Option<String>,
@@ -133,6 +110,9 @@ pub struct TeamChatUpdate {
     pub reset: bool,
     pub len: usize,
     pub changes: Vec<TeamEntryChange>,
+    /// The chat's current plan, sent with every update.
+    #[serde(default)]
+    pub plan: Vec<acp::PlanEntry>,
 }
 
 /// Where to reach a teammate: a Tailscale machine name or address, with an
@@ -162,6 +142,8 @@ struct ChatFeed {
     /// invalidates every viewer's cursor.
     generation: u64,
     entries: Vec<(TeamEntry, u64)>,
+    plan: Vec<acp::PlanEntry>,
+    plan_changed_at: u64,
 }
 
 struct HubState {
@@ -296,6 +278,24 @@ impl TeamShareHub {
         true
     }
 
+    /// Sets a chat's current plan. Returns false when the chat isn't known,
+    /// in which case the caller should replace the whole chat.
+    pub fn set_chat_plan(&self, chat_id: &str, entries: Vec<acp::PlanEntry>) -> bool {
+        let mut state = self.lock();
+        let next_version = state.version + 1;
+        let Some(feed) = state.chats.get_mut(chat_id) else {
+            return false;
+        };
+        if feed.plan == entries {
+            return true;
+        }
+        feed.plan = entries;
+        feed.plan_changed_at = next_version;
+        state.version = next_version;
+        self.inner.changed.notify_all();
+        true
+    }
+
     pub fn remove_chat(&self, chat_id: &str) {
         if self.lock().chats.remove(chat_id).is_some() {
             self.inner.changed.notify_all();
@@ -314,7 +314,7 @@ impl TeamShareHub {
     /// What changed since `cursor`, or None when the chat isn't loaded.
     pub fn chat_update(&self, chat_id: &str, cursor: Option<&str>) -> Option<TeamChatUpdate> {
         let state = self.lock();
-        Self::update_locked(&state, chat_id, cursor)
+        Self::update_locked(&state, chat_id, cursor).map(|(update, _)| update)
     }
 
     /// Like `chat_update`, but waits up to `timeout` for something to change.
@@ -329,8 +329,8 @@ impl TeamShareHub {
         let mut state = self.lock();
         let mut waited = false;
         loop {
-            let update = Self::update_locked(&state, chat_id, cursor)?;
-            if update.reset || !update.changes.is_empty() {
+            let (update, changed) = Self::update_locked(&state, chat_id, cursor)?;
+            if changed {
                 if waited {
                     drop(state);
                     std::thread::sleep(COALESCE_CHANGES);
@@ -352,11 +352,12 @@ impl TeamShareHub {
         }
     }
 
+    /// The update since `cursor`, and whether anything in it changed.
     fn update_locked(
         state: &HubState,
         chat_id: &str,
         cursor: Option<&str>,
-    ) -> Option<TeamChatUpdate> {
+    ) -> Option<(TeamChatUpdate, bool)> {
         let feed = state.chats.get(chat_id)?;
         let parsed = cursor.and_then(parse_cursor);
         let since = match parsed {
@@ -369,7 +370,7 @@ impl TeamShareHub {
             }
             _ => None,
         };
-        let changes = feed
+        let changes: Vec<TeamEntryChange> = feed
             .entries
             .iter()
             .enumerate()
@@ -379,12 +380,16 @@ impl TeamShareHub {
                 entry: entry.clone(),
             })
             .collect();
-        Some(TeamChatUpdate {
+        let changed = !changes.is_empty()
+            || since.is_none_or(|since| feed.plan_changed_at > since);
+        let update = TeamChatUpdate {
             cursor: format!("{}.{}.{}", state.epoch, feed.generation, state.version),
             reset: since.is_none(),
             len: feed.entries.len(),
             changes,
-        })
+            plan: feed.plan.clone(),
+        };
+        Some((update, changed))
     }
 }
 
@@ -757,11 +762,7 @@ impl TeamClient {
         let hello: TeamHello = self
             .get_json("/v1/hello", REQUEST_TIMEOUT)?
             .ok_or_else(|| TeamClientError::Other("Not a Mnemonic".to_string()))?;
-        if hello.protocol != TEAM_PROTOCOL_VERSION {
-            return Err(TeamClientError::Incompatible {
-                protocol: hello.protocol,
-            });
-        }
+        check_hello(&hello)?;
         Ok(hello)
     }
 
@@ -805,6 +806,15 @@ impl TeamClient {
     }
 }
 
+fn check_hello(hello: &TeamHello) -> Result<(), TeamClientError> {
+    if hello.protocol != TEAM_PROTOCOL_VERSION || hello.acp_crate != TEAM_ACP_CRATE_VERSION {
+        return Err(TeamClientError::Incompatible {
+            protocol: hello.protocol,
+        });
+    }
+    Ok(())
+}
+
 /// Ids are generated by Mnemonic, so anything that would need escaping is a
 /// bug rather than something to encode.
 fn path_segment(id: &str) -> Result<&str, TeamClientError> {
@@ -822,14 +832,165 @@ pub fn is_plain_id(id: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
+/// One file's section of a teammate's unified diff.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TeamFileDiff {
+    pub path: String,
+    pub additions: u32,
+    pub deletions: u32,
+    pub diff: String,
+}
+
+/// Rebuilds a chat from the markdown transcript saved when its turns ended,
+/// one entry per `## User` or `## Assistant` section. Text before the first
+/// section, the file's own heading, is dropped.
+pub fn saved_chat_entries(markdown: &str) -> Vec<TeamEntry> {
+    fn finish(section: Option<(bool, String)>, entries: &mut Vec<TeamEntry>) {
+        let Some((from_user, text)) = section else {
+            return;
+        };
+        let text = text.trim();
+        if text.is_empty() {
+            return;
+        }
+        let chunk = acp::ContentChunk::new(text.to_string().into());
+        entries.push(TeamEntry::Updates {
+            updates: vec![if from_user {
+                acp::SessionUpdate::UserMessageChunk(chunk)
+            } else {
+                acp::SessionUpdate::AgentMessageChunk(chunk)
+            }],
+        });
+    }
+
+    let mut entries = Vec::new();
+    let mut section: Option<(bool, String)> = None;
+    for line in markdown.lines() {
+        let heading = match line.trim_end() {
+            "## User" | "## User (checkpoint)" => Some(true),
+            "## Assistant" => Some(false),
+            _ => None,
+        };
+        match heading {
+            Some(from_user) => {
+                finish(section.take(), &mut entries);
+                section = Some((from_user, String::new()));
+            }
+            None => {
+                if let Some((_, text)) = section.as_mut() {
+                    text.push_str(line);
+                    text.push('\n');
+                }
+            }
+        }
+    }
+    finish(section, &mut entries);
+    entries
+}
+
+/// Splits a unified diff into one item per `diff --git` section.
+pub fn split_unified_diff(diff: &str) -> Vec<TeamFileDiff> {
+    let mut files: Vec<TeamFileDiff> = Vec::new();
+    let mut in_hunk = false;
+    let mut old_path: Option<String> = None;
+    let mut new_path: Option<String> = None;
+    let mut finished_paths: Vec<(Option<String>, Option<String>)> = Vec::new();
+
+    for line in diff.split_inclusive('\n') {
+        let text = line.trim_end_matches(['\n', '\r']);
+        if let Some(header) = text.strip_prefix("diff --git ") {
+            if !files.is_empty() {
+                finished_paths.push((old_path.take(), new_path.take()));
+            }
+            in_hunk = false;
+            old_path = None;
+            new_path = None;
+            let fallback = header
+                .rsplit_once(" b/")
+                .map(|(_, path)| path.to_string())
+                .unwrap_or_else(|| header.to_string());
+            files.push(TeamFileDiff {
+                path: fallback,
+                additions: 0,
+                deletions: 0,
+                diff: String::new(),
+            });
+        }
+        let Some(file) = files.last_mut() else {
+            continue;
+        };
+        file.diff.push_str(line);
+        if text.starts_with("@@") {
+            in_hunk = true;
+        } else if !in_hunk {
+            if let Some(path) = text.strip_prefix("--- ") {
+                old_path = path.strip_prefix("a/").map(str::to_string);
+            } else if let Some(path) = text.strip_prefix("+++ ") {
+                new_path = path.strip_prefix("b/").map(str::to_string);
+            }
+        } else if text.starts_with('+') {
+            file.additions += 1;
+        } else if text.starts_with('-') {
+            file.deletions += 1;
+        }
+    }
+    if !files.is_empty() {
+        finished_paths.push((old_path, new_path));
+    }
+    for (file, (old_path, new_path)) in files.iter_mut().zip(finished_paths) {
+        if let Some(path) = new_path.or(old_path) {
+            file.path = path;
+        }
+    }
+    files
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    #[test]
+    fn split_unified_diff_lists_each_file_with_counts() {
+        let diff = "diff --git a/src/lib.rs b/src/lib.rs\nindex 1..2 100644\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1,2 +1,2 @@\n keep\n-old\n+new\n+more\ndiff --git a/notes.md b/notes.md\nnew file mode 100644\n--- /dev/null\n+++ b/notes.md\n@@ -0,0 +1 @@\n+hello\n";
+        let files = split_unified_diff(diff);
+        assert_eq!(files.len(), 2);
+        assert_eq!(files[0].path, "src/lib.rs");
+        assert_eq!((files[0].additions, files[0].deletions), (2, 1));
+        assert!(files[0].diff.starts_with("diff --git a/src/lib.rs"));
+        assert!(!files[0].diff.contains("notes.md"));
+        assert_eq!(files[1].path, "notes.md");
+        assert_eq!((files[1].additions, files[1].deletions), (1, 0));
+    }
+
+    #[test]
+    fn split_unified_diff_names_deleted_files() {
+        let diff = "diff --git a/gone.txt b/gone.txt\ndeleted file mode 100644\n--- a/gone.txt\n+++ /dev/null\n@@ -1,2 +0,0 @@\n-a\n-b\n";
+        let files = split_unified_diff(diff);
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path, "gone.txt");
+        assert_eq!((files[0].additions, files[0].deletions), (0, 2));
+    }
+
     fn user(text: &str) -> TeamEntry {
-        TeamEntry::User {
-            markdown: text.to_string(),
+        TeamEntry::Updates {
+            updates: vec![acp::SessionUpdate::UserMessageChunk(acp::ContentChunk::new(
+                text.into(),
+            ))],
         }
+    }
+
+    #[test]
+    fn a_saved_transcript_becomes_one_entry_per_turn() {
+        let saved = "# Fix login\n\nA chat from the workspace \"crisp-panda\".\n\n## User\n\nfix it\n\n## Assistant\n\nDone.\n\n**Tool Call: Edit**\n\n## User (checkpoint)\n\nthanks\n\n";
+        let agent = TeamEntry::Updates {
+            updates: vec![acp::SessionUpdate::AgentMessageChunk(
+                acp::ContentChunk::new("Done.\n\n**Tool Call: Edit**".into()),
+            )],
+        };
+        assert_eq!(
+            saved_chat_entries(saved),
+            vec![user("fix it"), agent, user("thanks")]
+        );
     }
 
     #[test]
@@ -863,6 +1024,65 @@ mod tests {
         assert!(!hub.set_chat_entry("chat", 5, user("gap")));
         hub.remove_chat("chat");
         assert!(hub.chat_update("chat", Some(&third.cursor)).is_none());
+    }
+
+    #[test]
+    fn set_chat_plan_bumps_only_on_change() {
+        let hub = TeamShareHub::new();
+        hub.replace_chat("chat", vec![user("one")]);
+        let first = hub.chat_update("chat", None).expect("chat is open");
+        let plan = vec![acp::PlanEntry::new(
+            "Fix the form",
+            acp::PlanEntryPriority::High,
+            acp::PlanEntryStatus::InProgress,
+        )];
+        assert!(hub.set_chat_plan("chat", plan.clone()));
+
+        let waited_from = Instant::now();
+        let second = hub
+            .wait_chat_update("chat", Some(&first.cursor), Duration::from_secs(10))
+            .expect("chat is open");
+        assert!(
+            waited_from.elapsed() < Duration::from_secs(5),
+            "a plan-only change should end the long-poll at once"
+        );
+        assert!(!second.reset);
+        assert!(second.changes.is_empty());
+        assert_eq!(second.plan, plan);
+        assert_ne!(second.cursor, first.cursor);
+
+        assert!(hub.set_chat_plan("chat", plan));
+        let third = hub
+            .chat_update("chat", Some(&second.cursor))
+            .expect("chat is open");
+        assert_eq!(third.cursor, second.cursor);
+        assert!(!hub.set_chat_plan("closed", Vec::new()));
+    }
+
+    #[test]
+    fn acp_crate_version_matches_the_dependency_pin() {
+        let workspace_manifest = include_str!("../../../../Cargo.toml");
+        let pin = format!("agent-client-protocol = {{ version = \"={TEAM_ACP_CRATE_VERSION}\"");
+        assert!(
+            workspace_manifest.contains(&pin),
+            "The workspace no longer pins `{pin}`; update TEAM_ACP_CRATE_VERSION to match"
+        );
+    }
+
+    #[test]
+    fn hello_rejects_a_different_acp_version() {
+        let hello = |acp_crate: &str| TeamHello {
+            name: "Alice".to_string(),
+            protocol: TEAM_PROTOCOL_VERSION,
+            acp_crate: acp_crate.to_string(),
+        };
+        assert_eq!(
+            check_hello(&hello("0.13.0")),
+            Err(TeamClientError::Incompatible {
+                protocol: TEAM_PROTOCOL_VERSION
+            })
+        );
+        assert_eq!(check_hello(&hello(TEAM_ACP_CRATE_VERSION)), Ok(()));
     }
 
     #[test]

@@ -541,6 +541,32 @@ impl WorkspacePanel {
         }
     }
 
+    /// Opens a teammate's shared workspace in this window, in place of the
+    /// selected local workspace.
+    pub(crate) fn select_teammate(
+        &mut self,
+        host: String,
+        workspace_id: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.selected_workspace_id = None;
+        crate::ActiveWorkspace::set(
+            self.workspace.entity_id(),
+            Some(crate::team_workspace_view::teammate_workspace_key(
+                &host,
+                &workspace_id,
+            )),
+            cx,
+        );
+        cx.notify();
+        if let Some(workspace) = self.workspace.upgrade() {
+            workspace.update(cx, |workspace, cx| {
+                WorkspaceHost::activate_teammate(workspace, host, workspace_id, window, cx);
+            });
+        }
+    }
+
     /// Selects the workspace after or before the selected one, in the order
     /// the panel lists them, wrapping around. Collapsed projects are skipped.
     pub fn select_adjacent_workspace(

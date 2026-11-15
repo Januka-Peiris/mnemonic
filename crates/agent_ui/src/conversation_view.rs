@@ -565,6 +565,7 @@ pub struct ConversationView {
     /// notifications; this view's pop-ups would open the agent panel instead.
     notifications_suppressed: bool,
     fork_enabled: bool,
+    read_only: Option<SharedString>,
     auth_task: Option<Task<()>>,
     loading_status: Option<SharedString>,
     /// When settings change, use this to see if the theme has changed (which
@@ -638,7 +639,17 @@ impl ConversationView {
     }
 
     pub fn fork_enabled(&self) -> bool {
-        self.fork_enabled
+        self.fork_enabled && self.read_only.is_none()
+    }
+
+    /// Replaces the message editor with `notice`, for views that mirror
+    /// someone else's chat.
+    pub fn set_read_only(&mut self, notice: SharedString) {
+        self.read_only = Some(notice);
+    }
+
+    pub fn read_only(&self) -> Option<SharedString> {
+        self.read_only.clone()
     }
 
     pub fn has_load_error(&self) -> bool {
@@ -859,6 +870,7 @@ impl ConversationView {
             notification_subscriptions: HashMap::default(),
             notifications_suppressed: false,
             fork_enabled: false,
+            read_only: None,
             auth_task: None,
             loading_status: None,
             last_theme_id: Some(cx.theme().id.clone()),

@@ -364,6 +364,7 @@ dependencies = [
  "chrono",
  "client",
  "collections",
+ "db",
  "env_logger 0.11.8",
  "feature_flags",
  "fs",
@@ -11343,6 +11344,7 @@ dependencies = [
 name = "mnemonic-core"
 version = "0.1.0"
 dependencies = [
+ "agent-client-protocol",
  "env_logger 0.11.8",
  "log",
  "portable-pty",
@@ -11369,8 +11371,10 @@ name = "mnemonic-panels"
 version = "0.1.0"
 dependencies = [
  "acp_thread",
+ "action_log",
  "agent",
  "agent-client-protocol",
+ "agent_servers",
  "agent_settings",
  "agent_ui",
  "anyhow",
@@ -11390,6 +11394,7 @@ dependencies = [
  "mnemonic-core",
  "project",
  "project_panel",
+ "remote_connection",
  "serde_json",
  "settings",
  "task",
@@ -11399,6 +11404,7 @@ dependencies = [
  "ui",
  "util",
  "uuid",
+ "watch",
  "workspace",
  "zed_actions",
 ]

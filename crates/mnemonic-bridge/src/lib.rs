@@ -44,6 +44,50 @@ impl ActiveWorkspace {
     }
 }
 
+/// How the selected workspace id of a teammate's shared workspace starts,
+/// so it never matches one of this machine's workspaces.
+pub const TEAMMATE_WORKSPACE_PREFIX: &str = "team:";
+
+/// Whether a selected workspace id is a teammate's shared workspace.
+pub fn is_teammate_workspace(workspace_id: &str) -> bool {
+    workspace_id.starts_with(TEAMMATE_WORKSPACE_PREFIX)
+}
+
+/// What the title bar shows for a teammate's shared workspace, in place of
+/// the local project's name, branch and PR.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TeammateWorkspaceTitle {
+    pub peer: String,
+    pub project: String,
+    pub name: String,
+    pub branch: String,
+    pub pr_state: Option<String>,
+    pub pr_number: Option<i64>,
+}
+
+/// The title of each teammate workspace a window has shown, keyed by its
+/// selected workspace id. Written by the teammate's workspace view and
+/// observed by the title bar.
+#[derive(Clone, Default)]
+pub struct TeammateWorkspaceTitles(std::collections::HashMap<String, TeammateWorkspaceTitle>);
+
+impl Global for TeammateWorkspaceTitles {}
+
+impl TeammateWorkspaceTitles {
+    pub fn get(workspace_id: &str, cx: &App) -> Option<TeammateWorkspaceTitle> {
+        cx.try_global::<Self>()?.0.get(workspace_id).cloned()
+    }
+
+    pub fn set(workspace_id: &str, title: TeammateWorkspaceTitle, cx: &mut App) {
+        if Self::get(workspace_id, cx).as_ref() == Some(&title) {
+            return;
+        }
+        let mut titles = cx.try_global::<Self>().cloned().unwrap_or_default();
+        titles.0.insert(workspace_id.to_string(), title);
+        cx.set_global(titles);
+    }
+}
+
 /// Last terminal output time per workspace's agent, written by workspace
 /// views and read by the left panel for its attention indicators. A plain
 /// static (not a gpui Global) so high-frequency writes don't trigger

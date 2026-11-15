@@ -5,6 +5,7 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use crate::repositories::chat_session_repository;
 use crate::services::workspace_service;
@@ -37,6 +38,23 @@ fn saved_transcript(dir: &Path) -> Option<PathBuf> {
         .filter_map(Result::ok)
         .map(|entry| entry.path())
         .find(|path| path.extension().is_some_and(|extension| extension == "md"))
+}
+
+/// A chat's saved transcript and when it was last written, if it has one.
+pub fn saved_transcript_file(
+    state: &AppState,
+    workspace_id: &str,
+    chat_id: &str,
+) -> Option<(PathBuf, SystemTime)> {
+    let path = saved_transcript(&chat_dir(state, workspace_id, chat_id))?;
+    let modified = fs::metadata(&path).and_then(|metadata| metadata.modified());
+    match modified {
+        Ok(modified) => Some((path, modified)),
+        Err(err) => {
+            log::warn!(target: "mnemonic_lib", "Couldn't read {}: {err}", path.display());
+            None
+        }
+    }
 }
 
 /// Saves a chat's transcript, replacing the previous save, and returns

@@ -7,7 +7,7 @@ use git_ui::project_diff::{BranchDiff, ProjectDiff};
 use gpui::{
     actions, px, Action, Anchor, AnyElement, App, AppContext as _, Context, Entity, EventEmitter,
     Focusable, FocusHandle, IntoElement, Pixels, PromptLevel, Render, ScrollHandle, SharedString,
-    Task, WeakEntity, Window,
+    Subscription, Task, WeakEntity, Window,
 };
 use mnemonic_core::models::{
     ChangedFile, WorkspaceChangeScope, WorkspaceCheckpoint, WorkspaceCheckpointRestorePlan,
@@ -30,6 +30,7 @@ use workspace::notifications::NotificationId;
 use workspace::{OpenOptions, Panel, Toast, Workspace};
 
 use crate::ActiveWorkspace;
+use crate::team_workspace_view::{TeammateDiffState, TeammateWorkspaceView};
 use crate::workspace_panel::WorkspacePanel;
 use crate::workspace_view::WorkspaceHost;
 use crate::workspaces_settings::WorkspacesSettings;
@@ -256,6 +257,11 @@ pub struct WorkspaceDetailPanel {
     collapsed_change_folders: HashSet<String>,
     /// Shows a merged workspace's file list instead of the merged summary.
     show_merged_changes: bool,
+    /// The teammate's workspace whose changes are listed while one is selected.
+    /// Held weakly so the panel never keeps it, and its chats' polls of the
+    /// teammate, alive after the window's host drops it.
+    teammate: Option<WeakEntity<TeammateWorkspaceView>>,
+    teammate_subscription: Option<Subscription>,
 }
 
 impl WorkspaceDetailPanel {
@@ -267,6 +273,7 @@ impl WorkspaceDetailPanel {
         let workspace_handle = workspace.weak_handle();
         let panel = cx.new(|cx| {
             cx.observe_global::<ActiveWorkspace>(|this: &mut Self, cx| {
+                this.sync_teammate_view(cx);
                 let previous = this.summary.as_ref().map(|summary| summary.id.clone());
                 this.refresh(cx);
                 let current = this.summary.as_ref().map(|summary| summary.id.clone());
@@ -302,6 +309,8 @@ impl WorkspaceDetailPanel {
             let mut panel = Self {
                 focus_handle: cx.focus_handle(),
                 workspace: workspace_handle,
+                teammate: None,
+                teammate_subscription: None,
                 summary: None,
                 tab: DetailTab::Changes,
                 pr_status: None,
@@ -3099,6 +3108,180 @@ impl WorkspaceDetailPanel {
             })
     }
 
+    fn render_teammate_changes(
+        &self,
+        view: &Entity<TeammateWorkspaceView>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let view_ref = view.read(cx);
+        let state = view_ref.diff_state().clone();
+        let files = view_ref.files().to_vec();
+        let colors = cx.theme().colors();
+        let (total_additions, total_deletions) =
+            files.iter().fold((0usize, 0usize), |(additions, deletions), file| {
+                (
+                    additions.saturating_add(file.additions as usize),
+                    deletions.saturating_add(file.deletions as usize),
+                )
+            });
+        let summary = match (&state, files.len()) {
+            (TeammateDiffState::Loading, _) => "Loading changes".to_string(),
+            (_, 1) => "1 file".to_string(),
+            (_, count) => format!("{count} files"),
+        };
+
+        let header = h_flex()
+            .px_2()
+            .h(px(26.))
+            .gap_2()
+            .items_center()
+            .justify_between()
+            .border_b_1()
+            .border_color(colors.border_variant)
+            .child(
+                h_flex()
+                    .gap_2()
+                    .items_center()
+                    .child(
+                        Label::new(summary)
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
+                    )
+                    .when(!files.is_empty(), |row| {
+                        row.child(
+                            DiffStat::new(
+                                "teammate-changes-total",
+                                total_additions,
+                                total_deletions,
+                            )
+                            .label_size(LabelSize::XSmall),
+                        )
+                    }),
+            )
+            .child({
+                let view = view.clone();
+                IconButton::new("teammate-refresh-changes", IconName::RotateCw)
+                    .icon_size(IconSize::XSmall)
+                    .tooltip(Tooltip::text("Reload changes"))
+                    .on_click(move |_, window, cx| {
+                        view.update(cx, |view, cx| view.reload_diff(window, cx));
+                    })
+            });
+
+        let mut list = v_flex()
+            .id("teammate-changes-list")
+            .w_full()
+            .flex_1()
+            .min_h_0()
+            .pb_1()
+            .overflow_y_scroll();
+        for (index, file) in files.iter().enumerate() {
+            let (directory, file_name) = split_change_path(&file.path);
+            let path = file.path.clone();
+            let view = view.clone();
+            list = list.child(
+                h_flex()
+                    .id(("teammate-change-file", index))
+                    .h(px(22.))
+                    .w_full()
+                    .pl(px(6.))
+                    .pr_2()
+                    .gap_1p5()
+                    .items_center()
+                    .cursor_pointer()
+                    .border_1()
+                    .hover(|style| style.bg(colors.ghost_element_hover))
+                    .on_click(move |_, window, cx| {
+                        let view = view.clone();
+                        let path = path.clone();
+                        window.defer(cx, move |window, cx| {
+                            view.update(cx, |view, cx| view.open_file_diff(&path, window, cx));
+                        });
+                    })
+                    .child(
+                        h_flex()
+                            .id(("teammate-change-file-name", index))
+                            .min_w_0()
+                            .flex_1()
+                            .gap_1p5()
+                            .overflow_hidden()
+                            .tooltip(Tooltip::text(file.path.clone()))
+                            .child(
+                                div().flex_none().child(
+                                    Label::new(file_name.to_string())
+                                        .size(LabelSize::Small)
+                                        .single_line(),
+                                ),
+                            )
+                            .when(!directory.is_empty(), |el| {
+                                el.child(
+                                    div().min_w_0().flex_1().child(
+                                        Label::new(directory.to_string())
+                                            .size(LabelSize::XSmall)
+                                            .color(Color::Muted)
+                                            .truncate_start(),
+                                    ),
+                                )
+                            }),
+                    )
+                    .when(file.additions > 0 || file.deletions > 0, |el| {
+                        el.child(
+                            div().flex_none().child(
+                                DiffStat::new(
+                                    ("teammate-change-stat", index),
+                                    file.additions as usize,
+                                    file.deletions as usize,
+                                )
+                                .label_size(LabelSize::XSmall),
+                            ),
+                        )
+                    }),
+            );
+        }
+
+        let message = match &state {
+            TeammateDiffState::Failed(error) => Some(error.clone()),
+            TeammateDiffState::Loaded if files.is_empty() => Some("No changes".into()),
+            TeammateDiffState::Loading | TeammateDiffState::Loaded => None,
+        };
+
+        v_flex()
+            .size_full()
+            .child(header)
+            .when_some(message, |column, message| {
+                column.child(
+                    h_flex().px_2().py_2().child(
+                        Label::new(message)
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
+                    ),
+                )
+            })
+            .child(list)
+            .into_any_element()
+    }
+
+    /// Follows the teammate view while a teammate's workspace is selected, so
+    /// the list updates when its files do.
+    fn sync_teammate_view(&mut self, cx: &mut Context<Self>) {
+        let selected = ActiveWorkspace::get(self.workspace.entity_id(), cx)
+            .is_some_and(|id| mnemonic_bridge::is_teammate_workspace(&id));
+        let view = if selected {
+            self.workspace
+                .upgrade()
+                .and_then(|workspace| WorkspaceHost::teammate_view_in(workspace.read(cx), cx))
+        } else {
+            None
+        };
+        let current = self.teammate.as_ref().map(|view| view.entity_id());
+        if view.as_ref().map(|view| view.entity_id()) != current {
+            self.teammate_subscription = view
+                .as_ref()
+                .map(|view| cx.observe(view, |_, _, cx| cx.notify()));
+            self.teammate = view.map(|view| view.downgrade());
+        }
+    }
+
     fn render_empty(&self) -> impl IntoElement {
         v_flex()
             .size_full()
@@ -3197,13 +3380,19 @@ impl Panel for WorkspaceDetailPanel {
 
 impl Render for WorkspaceDetailPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        self.maybe_refresh_change_annotations(cx);
+        let teammate = self.teammate.as_ref().and_then(|view| view.upgrade());
+        if teammate.is_none() {
+            self.maybe_refresh_change_annotations(cx);
+        }
 
         let content = v_flex()
             .id("workspace-detail-panel")
             .size_full()
             .track_focus(&self.focus_handle)
             .bg(cx.theme().colors().panel_background);
+        if let Some(view) = teammate {
+            return content.child(self.render_teammate_changes(&view, cx));
+        }
 
         match self.summary.clone() {
             Some(ws) => {

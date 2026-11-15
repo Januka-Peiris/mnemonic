@@ -10,8 +10,8 @@ use std::time::Duration;
 use tiny_http::{Header, Method, Request, Response, Server};
 
 use crate::services::team_share_service::{
-    CallerIdentity, MAX_CHAT_WAIT, TEAM_PROTOCOL_VERSION, TeamHello, TeamShareHub,
-    TeamWorkspaceList, is_plain_id,
+    CallerIdentity, MAX_CHAT_WAIT, TEAM_ACP_CRATE_VERSION, TEAM_PROTOCOL_VERSION, TeamHello,
+    TeamShareHub, TeamWorkspaceList, is_plain_id,
 };
 
 /// Produces a workspace's diff. Behind a closure so tests don't need a
@@ -64,6 +64,7 @@ impl TeamShareServer {
         let hello = serde_json::to_string(&TeamHello {
             name: config.display_name,
             protocol: TEAM_PROTOCOL_VERSION,
+            acp_crate: TEAM_ACP_CRATE_VERSION.to_string(),
         })
         .map_err(|err| err.to_string())?;
         let shared = Arc::new(Shared {
@@ -262,6 +263,7 @@ fn respond(request: Request, response: Response<std::io::Cursor<Vec<u8>>>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agent_client_protocol::schema as acp;
     use crate::services::team_share_service::{
         TeamClient, TeamClientError, TeamEntry, TeamWorkspace,
     };
@@ -312,8 +314,10 @@ mod tests {
         hub.set_workspaces(vec![workspace("ws-1")]);
         hub.replace_chat(
             "chat-1",
-            vec![TeamEntry::User {
-                markdown: "Fix the login page".to_string(),
+            vec![TeamEntry::Updates {
+                updates: vec![acp::SessionUpdate::UserMessageChunk(acp::ContentChunk::new(
+                    "Fix the login page".into(),
+                ))],
             }],
         );
         let server = start(Some("bob@example.com"), hub.clone())?;
@@ -343,9 +347,10 @@ mod tests {
         hub.set_chat_entry(
             "chat-1",
             1,
-            TeamEntry::Assistant {
-                markdown: "On it".to_string(),
-                thinking: None,
+            TeamEntry::Updates {
+                updates: vec![acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new(
+                    "On it".into(),
+                ))],
             },
         );
         let update = waiting

@@ -2144,6 +2144,61 @@ impl AcpThread {
         cx.emit(AcpThreadEvent::NewEntry);
     }
 
+    /// Starts a new user message even when the last entry is one, which
+    /// `push_user_content_block` would extend instead.
+    pub fn push_new_user_message(&mut self, chunk: acp::ContentBlock, cx: &mut Context<Self>) {
+        let language_registry = self.project.read(cx).languages().clone();
+        let path_style = self.project.read(cx).path_style(cx);
+        let content = ContentBlock::new(chunk.clone(), &language_registry, path_style, cx);
+        self.push_entry(
+            AgentThreadEntry::UserMessage(UserMessage {
+                id: None,
+                content,
+                chunks: vec![chunk],
+                checkpoint: None,
+                indented: false,
+            }),
+            cx,
+        );
+    }
+
+    /// Starts a new assistant message even when the last entry is one, which
+    /// `push_assistant_content_block` would extend instead.
+    pub fn push_new_assistant_message(
+        &mut self,
+        chunk: acp::ContentBlock,
+        is_thought: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let language_registry = self.project.read(cx).languages().clone();
+        let path_style = self.project.read(cx).path_style(cx);
+        let block = ContentBlock::new(chunk, &language_registry, path_style, cx);
+        let chunk = if is_thought {
+            AssistantMessageChunk::Thought { block }
+        } else {
+            AssistantMessageChunk::Message { block }
+        };
+        self.push_entry(
+            AgentThreadEntry::AssistantMessage(AssistantMessage {
+                chunks: vec![chunk],
+                indented: false,
+                is_subagent_output: false,
+            }),
+            cx,
+        );
+    }
+
+    /// Drops every entry from `len` on.
+    pub fn truncate_entries(&mut self, len: usize, cx: &mut Context<Self>) {
+        let old_len = self.entries.len();
+        if len >= old_len {
+            return;
+        }
+        Self::flush_streaming_text(&mut self.streaming_text_buffer, cx);
+        self.entries.truncate(len);
+        cx.emit(AcpThreadEvent::EntriesRemoved(len..old_len));
+    }
+
     pub fn push_context_compaction(
         &mut self,
         compaction: ContextCompaction,
