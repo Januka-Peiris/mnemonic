@@ -13,14 +13,17 @@ in the wrong direction while its owner is away from the desk.
 
 - From a mirrored chat, stop the teammate's agent.
 - From a mirrored chat, send a message to the teammate's agent. It arrives in
-  their chat labelled with who sent it and queues if their agent is busy.
+  their chat labelled with who sent it and queues if their agent is busy. A
+  chat that is not loaded in their app is loaded to receive it.
 - From a mirrored chat, answer a permission request their agent is waiting on.
 - Nothing above works unless the sharer switched it on for that workspace.
 - The sharer can see that a teammate acted.
 
 ## Non-goals
 
-- Messaging a chat that is not loaded on the sharer's machine.
+- Reaching a teammate whose app is not running.
+- Stopping or answering for a chat that is not loaded on the sharer's
+  machine: it has no running turn and nothing waiting.
 - Images, attachments or mentions in a teammate's message. Text only.
 - Creating, closing, forking or renaming the teammate's chats.
 - Changing their model, mode or other options.
@@ -88,8 +91,9 @@ mine" and keeps the sharer's chat as the single place things happen.
   when it is true.
 - `TeamChat` gains `live: bool`: the chat is loaded in the sharer's app right
   now. `open` stays "readable", which since step 1 includes chats shown from a
-  saved transcript. A chat that is readable but not live keeps the step 1
-  read-only notice, so no control is offered that can only fail.
+  saved transcript. A chat that is readable but not live can be messaged,
+  which loads it on the sharer's machine, but offers no Stop or permission
+  buttons.
 
 ### Protocol v3
 
@@ -122,8 +126,9 @@ workspace with step-in on, else 403.
 | `/v1/chats/{id}/permission` | `{ "tool_call_id": "...", "option_id": "..." }` | Answers a waiting permission request |
 
 Responses: 200 with `{ "queued": bool }` for message (true when their agent
-was busy), 200 for the others, 403 when not allowed, 404 when the chat is not
-loaded, 409 when there is nothing to stop, the permission request is no
+was busy or the chat had to be loaded first), 200 for the others, 403 when
+not allowed, 404 when a chat to stop or answer for is not loaded, 409 when
+there is nothing to stop, the permission request is no
 longer waiting, or two teammate messages are already queued for the chat,
 413 when the body is over 256 KB.
 
@@ -167,6 +172,14 @@ an allowed machine cannot act as its owner:
   messages wait per chat (counting only those not yet sent); a third is
   refused with 409. A teammate's message is recorded like an app-sent one,
   so it never names the workspace.
+- Message to a chat that is not loaded: the sharer's app loads the chat's
+  workspace as selecting it would, with all its chats, but without showing
+  it or taking keyboard focus, then queues the message; it is sent once the
+  agent has connected. Only chats listed at the last publish, in a shared
+  workspace with step-in on, can be loaded this way. If no window shows a
+  workspace yet, the workspace is selected in the first window. The owner
+  sees "{name} started the agent in {chat} with a message". A chat whose
+  agent is still connecting queues a message the same way.
 - Permission: the request must be a permission request
   (`AuthorizationKind::PermissionGrant`), and the option is looked up by id
   in the tool call's own options (so a teammate can only pick an option the
@@ -194,7 +207,8 @@ an allowed machine cannot act as its owner:
   remote-generating flag would trap the message in the viewer's queue. The teammate view uses it
   when `step_in` is true and posts the message. The message appears through
   the mirror once the sharer's chat has it. If the answer says queued, the
-  viewer shows "Queued until {name}'s agent finishes".
+  viewer shows "Queued until {name}'s agent finishes", or "Starting {name}'s
+  agent to deliver it" when the chat was not loaded.
 - For each entry in `permissions` the mirror asks the local thread for
   authorization with those options, so the usual buttons appear. Picking one
   posts the answer. When a request leaves `permissions` without a local

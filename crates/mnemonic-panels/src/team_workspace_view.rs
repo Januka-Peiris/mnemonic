@@ -546,15 +546,13 @@ impl TeammateWorkspaceView {
                 continue;
             };
             let chat_id = item.read(cx).chat_id.clone();
-            let can_step_in = live.step_in
-                && live
-                    .chats
-                    .iter()
-                    .any(|chat| chat.id == chat_id && chat.live);
-            let handler = match (can_step_in, client.clone()) {
-                (true, Some(client)) => {
-                    Some(self.message_sender(chat_id, &peer_name, client, view.downgrade()))
-                }
+            // A chat that isn't loaded on the teammate's machine can still be
+            // messaged: the message loads it there.
+            let chat = live.chats.iter().find(|chat| chat.id == chat_id);
+            let handler = match (chat, client.clone()) {
+                (Some(chat), Some(client)) if live.step_in && chat.open => Some(
+                    self.message_sender(chat_id, chat.live, &peer_name, client, view.downgrade()),
+                ),
                 _ => None,
             };
             view.update(cx, |view, cx| view.set_send_handler(handler, cx));
@@ -582,6 +580,7 @@ impl TeammateWorkspaceView {
     fn message_sender(
         &self,
         chat_id: String,
+        chat_is_loaded: bool,
         peer_name: &SharedString,
         client: TeamClient,
         view: WeakEntity<ConversationView>,
@@ -603,7 +602,10 @@ impl TeammateWorkspaceView {
                     })
                     .await;
                 let notice = match result {
-                    Ok(true) => format!("Queued until {peer_name}'s agent finishes"),
+                    Ok(true) if chat_is_loaded => {
+                        format!("Queued until {peer_name}'s agent finishes")
+                    }
+                    Ok(true) => format!("Starting {peer_name}'s agent to deliver it"),
                     Ok(false) => return,
                     Err(err) => {
                         // The handler ran inside the chat view's update; this

@@ -4783,19 +4783,38 @@ impl Render for WorkspaceView {
 /// Every Mnemonic window, so features can reach workspaces open in any of
 /// them.
 #[derive(Default)]
-struct OpenWindows(Vec<WeakEntity<Workspace>>);
+struct OpenWindows(Vec<(WeakEntity<Workspace>, AnyWindowHandle)>);
 
 impl gpui::Global for OpenWindows {}
 
-pub(crate) fn register_window(workspace: WeakEntity<Workspace>, cx: &mut App) {
+pub(crate) fn register_window(
+    workspace: WeakEntity<Workspace>,
+    window: AnyWindowHandle,
+    cx: &mut App,
+) {
     let windows = cx.default_global::<OpenWindows>();
-    windows.0.retain(|window| window.upgrade().is_some());
-    windows.0.push(workspace);
+    windows
+        .0
+        .retain(|(workspace, _)| workspace.upgrade().is_some());
+    windows.0.push((workspace, window));
 }
 
 pub(crate) fn open_windows(cx: &App) -> Vec<Entity<Workspace>> {
+    open_window_handles(cx)
+        .into_iter()
+        .map(|(workspace, _)| workspace)
+        .collect()
+}
+
+fn open_window_handles(cx: &App) -> Vec<(Entity<Workspace>, AnyWindowHandle)> {
     cx.try_global::<OpenWindows>()
-        .map(|windows| windows.0.iter().filter_map(WeakEntity::upgrade).collect())
+        .map(|windows| {
+            windows
+                .0
+                .iter()
+                .filter_map(|(workspace, window)| Some((workspace.upgrade()?, *window)))
+                .collect()
+        })
         .unwrap_or_default()
 }
 
@@ -5173,6 +5192,32 @@ impl WorkspaceHost {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.ensure_view(summary, workspace, project, database_id, window, cx);
+        self.active = Some(ActiveView::Local(summary.id.clone()));
+        self.teammate = None;
+        if let Some(view) = self.views.get(&summary.id) {
+            view.update(cx, |view, cx| {
+                view.load_run_config(cx);
+                view.mark_seen(cx);
+            });
+            let focus_handle = view.focus_handle(cx);
+            window.focus(&focus_handle, cx);
+        }
+        cx.emit(ItemEvent::UpdateTab);
+        cx.notify();
+    }
+
+    /// Builds the workspace's view and resumes its chats, unless it is
+    /// already loaded. Doesn't change which workspace is shown.
+    fn ensure_view(
+        &mut self,
+        summary: &WorkspaceSummary,
+        workspace: WeakEntity<Workspace>,
+        project: Entity<Project>,
+        database_id: Option<WorkspaceId>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if !self.views.contains_key(&summary.id) {
             let worktree_path = summary
                 .workspace_root_path
@@ -5304,19 +5349,61 @@ impl WorkspaceHost {
             });
             self.views.insert(summary.id.clone(), view);
         }
+    }
 
-        self.active = Some(ActiveView::Local(summary.id.clone()));
-        self.teammate = None;
-        if let Some(view) = self.views.get(&summary.id) {
-            view.update(cx, |view, cx| {
-                view.load_run_config(cx);
-                view.mark_seen(cx);
-            });
-            let focus_handle = view.focus_handle(cx);
-            window.focus(&focus_handle, cx);
-        }
-        cx.emit(ItemEvent::UpdateTab);
-        cx.notify();
+    /// Loads a workspace's chats without showing it, so a teammate's message
+    /// can reach a chat its owner hasn't opened since the app started.
+    pub(crate) fn load_in_background(
+        summary: &WorkspaceSummary,
+        cx: &mut App,
+    ) -> Result<(), String> {
+        let windows = open_window_handles(cx);
+        let host_in = |workspace: &Entity<Workspace>, cx: &App| {
+            workspace.read(cx).panes().iter().find_map(|pane| {
+                pane.read(cx)
+                    .items()
+                    .find_map(|item| item.downcast::<WorkspaceHost>())
+            })
+        };
+        let hosting = windows
+            .iter()
+            .find_map(|(workspace, window)| Some((workspace, window, host_in(workspace, cx)?)));
+        let Some((workspace, window_handle, host)) = hosting else {
+            // No window shows a workspace yet, so this one opens as if its
+            // owner had selected it.
+            let Some((workspace, window_handle)) = windows.first() else {
+                return Err("No Mnemonic window is open".to_string());
+            };
+            let Some(panel) = workspace.read(cx).panel::<crate::WorkspacePanel>(cx) else {
+                return Err("The workspace list isn't available".to_string());
+            };
+            let workspace_id = summary.id.clone();
+            return window_handle
+                .update(cx, |_, window, cx| {
+                    panel.update(cx, |panel, cx| {
+                        panel.select_workspace(workspace_id, window, cx);
+                    });
+                })
+                .map_err(|err| err.to_string());
+        };
+        let workspace_handle = workspace.downgrade();
+        let (project, database_id) = {
+            let workspace = workspace.read(cx);
+            (workspace.project().clone(), workspace.database_id())
+        };
+        window_handle
+            .update(cx, |_, window, cx| {
+                // Opening chat tabs takes keyboard focus, which belongs to
+                // whatever the owner is doing in this window.
+                let focused = window.focused(cx);
+                host.update(cx, |host, cx| {
+                    host.ensure_view(summary, workspace_handle, project, database_id, window, cx);
+                });
+                if let Some(focused) = focused {
+                    window.focus(&focused, cx);
+                }
+            })
+            .map_err(|err| err.to_string())
     }
 
     fn set_active_teammate(

@@ -46,7 +46,7 @@ use crate::team_settings::open_team_window;
 use crate::team_workspace_view::teammate_workspace_key;
 use crate::workspace_panel::WorkspacePanel;
 use crate::workspace_view::{
-    LiveWorkspaceAgents, WorkspaceHost, chat_agent_label, find_open_chat, open_windows,
+    LiveWorkspaceAgents, OpenChat, WorkspaceHost, chat_agent_label, find_open_chat, open_windows,
 };
 
 /// The `team` section of the settings file.
@@ -189,6 +189,10 @@ pub(crate) struct TeamShare {
     /// Chats shared from their saved transcript, as they aren't loaded in
     /// this app, with when that transcript was written.
     saved_chats: HashMap<String, SystemTime>,
+    /// Chats a teammate's message may load: those not loaded in this app
+    /// whose workspace allows stepping in, with their workspace as last
+    /// published.
+    asleep_chats: HashMap<String, WorkspaceSummary>,
     pub peers: Vec<PeerState>,
     pub collapsed_peers: HashSet<String>,
     /// A teammate's projects folded in the sidebar, as (host, project).
@@ -243,6 +247,7 @@ pub fn init(cx: &mut App) {
             action_task: None,
             chat_watches: HashMap::new(),
             saved_chats: HashMap::new(),
+            asleep_chats: HashMap::new(),
             peers: Vec::new(),
             collapsed_peers: HashSet::new(),
             collapsed_peer_projects: HashSet::new(),
@@ -547,6 +552,7 @@ impl TeamShare {
         self.server_key = None;
         self.chat_watches.clear();
         self.saved_chats.clear();
+        self.asleep_chats.clear();
         // Wakes any viewer waiting on a chat, so it hears the chat is gone
         // instead of waiting out its long-poll.
         self.hub.retain_chats(|_| false);
@@ -644,6 +650,7 @@ impl TeamShare {
 
         let mut open_chats = Vec::new();
         let mut step_in_chats = HashSet::new();
+        let mut asleep_chats = HashMap::new();
         let mut closed_chats = HashSet::new();
         let mut to_read = Vec::new();
         let mut workspaces = Vec::with_capacity(records.len());
@@ -665,12 +672,15 @@ impl TeamShare {
                     open: thread.is_some() || self.hub.has_chat(&record.id),
                     live: thread.is_some(),
                 });
+                if step_in {
+                    step_in_chats.insert(record.id.clone());
+                }
                 if let Some(thread) = thread {
-                    if step_in {
-                        step_in_chats.insert(record.id.clone());
-                    }
                     open_chats.push((record.id, thread));
                     continue;
+                }
+                if step_in && live_chat.is_none() {
+                    asleep_chats.insert(record.id.clone(), summary.clone());
                 }
                 // A chat loaded earlier in this session keeps what it showed
                 // then, which says more than its saved transcript.
@@ -715,6 +725,7 @@ impl TeamShare {
         }
         self.hub.set_workspaces(workspaces);
         self.hub.set_step_in_chats(step_in_chats);
+        self.asleep_chats = asleep_chats;
         self.watch_chats(open_chats, &closed_chats, cx);
         to_read
     }
@@ -998,20 +1009,52 @@ fn run_action(
     action: TeamAction,
     cx: &mut App,
 ) -> Result<TeamActionOutcome, TeamActionError> {
-    let Some(chat) = find_open_chat(&action.chat_id, cx) else {
-        return Err(TeamActionError::NotLoaded);
+    let (chat, woken) = match find_open_chat(&action.chat_id, cx) {
+        Some(chat) => (chat, false),
+        None => {
+            if !matches!(action.kind, TeamActionKind::Message { .. }) {
+                return Err(TeamActionError::NotLoaded);
+            }
+            (wake_chat(team, &action.chat_id, cx)?, true)
+        }
     };
     if !team.read(cx).allows_step_in(&chat.workspace_id) {
         return Err(TeamActionError::NotAllowed(
             "Stepping in is off for this workspace".into(),
         ));
     }
-    let Some(thread) = chat.thread else {
-        return Err(TeamActionError::NotLoaded);
-    };
-    let idle = thread.read(cx).status() == ThreadStatus::Idle;
+    // None while the chat's agent is still connecting.
+    let idle = chat
+        .thread
+        .as_ref()
+        .map(|thread| thread.read(cx).status() == ThreadStatus::Idle);
     match action.kind {
+        TeamActionKind::Message { ref text } => {
+            // A chat whose agent is still connecting takes the message too;
+            // it is sent once the agent is ready.
+            let text = teammate_message_text(&action.from, text);
+            chat.view.update(cx, |view, cx| {
+                view.queue_teammate_message(&action.chat_id, text, cx)
+            })?;
+            if woken {
+                show_step_in_notice(
+                    &chat.window,
+                    format!(
+                        "{} started the agent in {} with a message",
+                        actor(&action),
+                        chat.title
+                    ),
+                    cx,
+                );
+            }
+            Ok(TeamActionOutcome {
+                queued: idle != Some(true),
+            })
+        }
         TeamActionKind::Stop => {
+            let Some(idle) = idle else {
+                return Err(TeamActionError::NotLoaded);
+            };
             if idle {
                 return Err(TeamActionError::NothingToDo(
                     "The agent isn't running".into(),
@@ -1026,17 +1069,13 @@ fn run_action(
             );
             Ok(TeamActionOutcome { queued: false })
         }
-        TeamActionKind::Message { ref text } => {
-            let text = teammate_message_text(&action.from, text);
-            chat.view.update(cx, |view, cx| {
-                view.queue_teammate_message(&action.chat_id, text, cx)
-            })?;
-            Ok(TeamActionOutcome { queued: !idle })
-        }
         TeamActionKind::Permission {
             ref tool_call_id,
             ref option_id,
         } => {
+            let Some(thread) = chat.thread else {
+                return Err(TeamActionError::NotLoaded);
+            };
             let (tool_title, chosen) = answer_permission(&thread, tool_call_id, option_id, cx)?;
             let answer = match chosen {
                 acp::PermissionOptionKind::RejectOnce | acp::PermissionOptionKind::RejectAlways => {
@@ -1052,6 +1091,26 @@ fn run_action(
             Ok(TeamActionOutcome { queued: false })
         }
     }
+}
+
+/// Loads a chat that isn't loaded in this app, with the rest of its
+/// workspace, so a teammate's message can be delivered to it.
+fn wake_chat(
+    team: &Entity<TeamShare>,
+    chat_id: &str,
+    cx: &mut App,
+) -> Result<OpenChat, TeamActionError> {
+    let Some(summary) = team.read(cx).asleep_chats.get(chat_id).cloned() else {
+        return Err(TeamActionError::NotLoaded);
+    };
+    if !team.read(cx).allows_step_in(&summary.id) {
+        return Err(TeamActionError::NotAllowed(
+            "Stepping in is off for this workspace".into(),
+        ));
+    }
+    WorkspaceHost::load_in_background(&summary, cx).map_err(TeamActionError::Failed)?;
+    find_open_chat(chat_id, cx)
+        .ok_or_else(|| TeamActionError::Failed("Couldn't open the chat".into()))
 }
 
 /// Who acted, as the owner's notices show it. A display name is whatever

@@ -116,7 +116,7 @@ pub struct WorkspacePanel {
 impl WorkspacePanel {
     pub fn new(
         workspace: &mut Workspace,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Workspace>,
     ) -> Entity<Self> {
         let panel = cx.new(|cx| {
@@ -142,7 +142,7 @@ impl WorkspacePanel {
             panel
         });
 
-        crate::workspace_view::register_window(workspace.weak_handle(), cx);
+        crate::workspace_view::register_window(workspace.weak_handle(), window.window_handle(), cx);
         if let Some(team) = crate::team::team_share(cx) {
             panel.update(cx, |_, cx| {
                 cx.observe(&team, |_, _, cx| cx.notify()).detach();
