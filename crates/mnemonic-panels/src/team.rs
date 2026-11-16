@@ -27,6 +27,7 @@ use gpui::{
 use mnemonic_bridge::AgentAttention;
 use mnemonic_core::models::{ChatSessionRecord, WorkspaceSummary};
 use mnemonic_core::repositories::{chat_session_repository, settings_repository};
+use mnemonic_core::services::team_files_service::SkipList;
 use mnemonic_core::services::team_share_server::{DiffSource, TeamServerConfig, TeamShareServer};
 use mnemonic_core::services::team_share_service::{
     ActionHandler, DEFAULT_TEAM_PORT, TailscaleSelf, TailscaleWhois, TeamAction, TeamActionError,
@@ -707,6 +708,10 @@ impl TeamShare {
                     .map(|at| at.elapsed().as_secs()),
                 chats,
                 step_in,
+                share_files: false,
+                edit_files: false,
+                remote_url: None,
+                base_branch: None,
                 id: summary.id,
                 project: summary.repo,
                 name: summary.name,
@@ -982,6 +987,10 @@ fn start_server(
             port: key.port,
             display_name,
             allowed_logins,
+            files: Arc::new(|_| None),
+            bundle_source: Arc::new(|_, _| Err("Not available yet".to_string())),
+            skip_list: Arc::new(|_| SkipList::default()),
+            batch_handler: Arc::new(|_| Err(TeamActionError::Failed("Not available yet".into()))),
         },
         hub,
         Arc::new(TailscaleWhois::default()),
