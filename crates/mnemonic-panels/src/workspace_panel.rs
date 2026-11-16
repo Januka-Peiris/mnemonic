@@ -1848,6 +1848,8 @@ impl WorkspacePanel {
         let merged_color = pr_color.filter(|_| pr_state.as_deref() == Some("merged"));
         let shared = crate::team::is_workspace_shared(&ws.id, cx);
         let step_in = crate::team::workspace_allows_step_in(&ws.id, cx);
+        let share_files = crate::team::workspace_shares_files(&ws.id, cx);
+        let edit_files = crate::team::workspace_allows_file_edits(&ws.id, cx);
         let shared_indicator = crate::team::render_shared_indicator(&ws.id, cx);
         let row = h_flex()
             .id(SharedString::from(ws.id.clone()))
@@ -2019,6 +2021,38 @@ impl WorkspacePanel {
                             None,
                             move |_, cx| {
                                 crate::team::set_workspace_step_in(&workspace_id, !step_in, cx);
+                            },
+                        )
+                    })
+                    .when(shared, |menu| {
+                        let workspace_id = workspace_id.clone();
+                        menu.toggleable_entry(
+                            "Share files",
+                            share_files,
+                            IconPosition::Start,
+                            None,
+                            move |_, cx| {
+                                crate::team::set_workspace_share_files(
+                                    &workspace_id,
+                                    !share_files,
+                                    cx,
+                                );
+                            },
+                        )
+                    })
+                    .when(shared && share_files, |menu| {
+                        let workspace_id = workspace_id.clone();
+                        menu.toggleable_entry(
+                            "Teammates can edit files",
+                            edit_files,
+                            IconPosition::Start,
+                            None,
+                            move |_, cx| {
+                                crate::team::set_workspace_file_edits(
+                                    &workspace_id,
+                                    !edit_files,
+                                    cx,
+                                );
                             },
                         )
                     })

@@ -404,9 +404,62 @@ fn hash_file(path: &Path) -> std::io::Result<(u64, String)> {
     Ok((size, format!("{:x}", hasher.finalize())))
 }
 
+/// A git remote reduced to `host/path` so teammates who cloned over ssh and
+/// https compare equal.
+pub fn normalize_remote_url(url: &str) -> String {
+    let mut remote = url.trim();
+    if let Some((_, rest)) = remote.split_once("://") {
+        remote = rest;
+        if let Some((authority, path)) = remote.split_once('/') {
+            let host = authority.rsplit('@').next().unwrap_or(authority);
+            return finish_remote(host, path);
+        }
+        return finish_remote(remote.rsplit('@').next().unwrap_or(remote), "");
+    }
+    let without_user = remote.rsplit_once('@').map_or(remote, |(_, rest)| rest);
+    match without_user.split_once(':') {
+        Some((host, path)) => finish_remote(host, path),
+        None => match without_user.split_once('/') {
+            Some((host, path)) => finish_remote(host, path),
+            None => finish_remote(without_user, ""),
+        },
+    }
+}
+
+fn finish_remote(host: &str, path: &str) -> String {
+    let path = path.trim_matches('/');
+    let path = path
+        .strip_suffix(".git")
+        .unwrap_or(path)
+        .trim_end_matches('/');
+    let host = host.to_lowercase();
+    if path.is_empty() {
+        host
+    } else {
+        format!("{host}/{path}")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remotes_compare_equal_whatever_their_spelling() {
+        for spelling in [
+            "git@GitHub.com:Acme/App.git",
+            "https://github.com/Acme/App.git",
+            "https://github.com/Acme/App/",
+            "ssh://git@github.com/Acme/App.git",
+            "  https://user@GITHUB.com/Acme/App  ",
+        ] {
+            assert_eq!(
+                normalize_remote_url(spelling),
+                "github.com/Acme/App",
+                "{spelling}"
+            );
+        }
+    }
 
     #[allow(clippy::disallowed_methods)]
     fn git(root: &Path, args: &[&str]) {

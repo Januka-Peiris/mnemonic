@@ -5,10 +5,10 @@
 
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
-use std::path::PathBuf;
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::RecvTimeoutError;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
 use acp_thread::{
@@ -27,8 +27,10 @@ use gpui::{
 use mnemonic_bridge::AgentAttention;
 use mnemonic_core::models::{ChatSessionRecord, WorkspaceSummary};
 use mnemonic_core::repositories::{chat_session_repository, settings_repository};
-use mnemonic_core::services::team_files_service::SkipList;
-use mnemonic_core::services::team_share_server::{DiffSource, TeamServerConfig, TeamShareServer};
+use mnemonic_core::services::team_files_service::{SkipList, normalize_remote_url, scan_workspace};
+use mnemonic_core::services::team_share_server::{
+    DiffSource, FileSource, SkipListSource, TeamServerConfig, TeamShareServer,
+};
 use mnemonic_core::services::team_share_service::{
     ActionHandler, DEFAULT_TEAM_PORT, TailscaleSelf, TailscaleWhois, TeamAction, TeamActionError,
     TeamActionKind, TeamActionOutcome, TeamAgentState, TeamChat, TeamClient, TeamClientError,
@@ -200,6 +202,27 @@ pub(crate) struct TeamShare {
     /// Shared workspaces whose chats teammates may act in, saved the same
     /// way.
     step_in_workspaces: HashSet<String>,
+    /// Shared workspaces whose files teammates may read, saved the same way.
+    share_files_workspaces: HashSet<String>,
+    /// Workspaces with Share files on whose files teammates may also change.
+    edit_files_workspaces: HashSet<String>,
+    skip_lists: HashMap<String, SkipList>,
+    /// What the share server's request threads read to find a workspace's
+    /// files: only workspaces with Share files on, as (root, skip list).
+    file_roots: FileRoots,
+    /// Each file-sharing workspace's normalized `origin`, looked up once.
+    remote_urls: HashMap<String, Option<String>>,
+    scan_task: Option<Task<()>>,
+}
+
+type FileRoots = Arc<Mutex<HashMap<String, (PathBuf, SkipList)>>>;
+
+fn lock_file_roots(
+    file_roots: &FileRoots,
+) -> std::sync::MutexGuard<'_, HashMap<String, (PathBuf, SkipList)>> {
+    file_roots
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// The core settings key holding the ids of shared workspaces, as JSON.
@@ -207,6 +230,10 @@ const SHARED_WORKSPACES_KEY: &str = "team_shared_workspaces";
 /// The core settings key holding the ids of workspaces teammates may step
 /// in on, as JSON.
 const STEP_IN_WORKSPACES_KEY: &str = "team_step_in_workspaces";
+const SHARE_FILES_WORKSPACES_KEY: &str = "team_share_files_workspaces";
+const EDIT_FILES_WORKSPACES_KEY: &str = "team_edit_files_workspaces";
+/// The core settings key holding each workspace's skip list, as a JSON map.
+const SKIP_LISTS_KEY: &str = "team_skip_lists";
 
 struct GlobalTeamShare(Entity<TeamShare>);
 
@@ -232,7 +259,20 @@ pub fn init(cx: &mut App) {
     })
     .detach();
     let team = cx.new(|cx| {
-        let mut team = TeamShare {
+        let mut team = TeamShare::new();
+        team.apply_settings(cx);
+        team
+    });
+    cx.set_global(GlobalTeamShare(team.clone()));
+    cx.observe_global::<SettingsStore>(move |cx| {
+        team.update(cx, |team, cx| team.apply_settings(cx));
+    })
+    .detach();
+}
+
+impl TeamShare {
+    fn new() -> Self {
+        Self {
             applied: None,
             hub: TeamShareHub::new(),
             server: None,
@@ -249,15 +289,14 @@ pub fn init(cx: &mut App) {
             collapsed_peer_projects: HashSet::new(),
             shared_workspaces: load_workspace_ids(SHARED_WORKSPACES_KEY),
             step_in_workspaces: load_workspace_ids(STEP_IN_WORKSPACES_KEY),
-        };
-        team.apply_settings(cx);
-        team
-    });
-    cx.set_global(GlobalTeamShare(team.clone()));
-    cx.observe_global::<SettingsStore>(move |cx| {
-        team.update(cx, |team, cx| team.apply_settings(cx));
-    })
-    .detach();
+            share_files_workspaces: load_workspace_ids(SHARE_FILES_WORKSPACES_KEY),
+            edit_files_workspaces: load_workspace_ids(EDIT_FILES_WORKSPACES_KEY),
+            skip_lists: load_skip_lists(),
+            file_roots: Arc::new(Mutex::new(HashMap::new())),
+            remote_urls: HashMap::new(),
+            scan_task: None,
+        }
+    }
 }
 
 pub(crate) fn team_share(cx: &App) -> Option<Entity<TeamShare>> {
@@ -318,6 +357,77 @@ pub(crate) fn set_workspace_step_in(workspace_id: &str, allowed: bool, cx: &mut 
             team.set_workspace_step_in(workspace_id, allowed, cx)
         });
     }
+}
+
+pub(crate) fn workspace_shares_files(workspace_id: &str, cx: &App) -> bool {
+    team_share(cx).is_some_and(|team| team.read(cx).shares_files(workspace_id))
+}
+
+pub(crate) fn set_workspace_share_files(workspace_id: &str, shared: bool, cx: &mut App) {
+    if let Some(team) = team_share(cx) {
+        team.update(cx, |team, cx| {
+            team.set_workspace_share_files(workspace_id, shared, cx)
+        });
+    }
+}
+
+pub(crate) fn workspace_allows_file_edits(workspace_id: &str, cx: &App) -> bool {
+    team_share(cx).is_some_and(|team| team.read(cx).allows_file_edits(workspace_id))
+}
+
+pub(crate) fn set_workspace_file_edits(workspace_id: &str, allowed: bool, cx: &mut App) {
+    if let Some(team) = team_share(cx) {
+        team.update(cx, |team, cx| {
+            team.set_workspace_file_edits(workspace_id, allowed, cx)
+        });
+    }
+}
+
+pub(crate) fn workspace_skip_list(workspace_id: &str, cx: &App) -> SkipList {
+    team_share(cx)
+        .and_then(|team| team.read(cx).skip_lists.get(workspace_id).cloned())
+        .unwrap_or_default()
+}
+
+pub(crate) fn set_workspace_skip_list(workspace_id: &str, skip_list: SkipList, cx: &mut App) {
+    if let Some(team) = team_share(cx) {
+        team.update(cx, |team, cx| {
+            team.set_workspace_skip_list(workspace_id, skip_list, cx)
+        });
+    }
+}
+
+fn load_skip_lists() -> HashMap<String, SkipList> {
+    let Some(state) = mnemonic_bridge::mnemonic_state_cloned() else {
+        return HashMap::new();
+    };
+    match settings_repository::get_value(&state.db, SKIP_LISTS_KEY) {
+        Ok(Some(json)) => serde_json::from_str(&json).unwrap_or_else(|err| {
+            log::error!("Couldn't read {SKIP_LISTS_KEY}: {err}");
+            HashMap::new()
+        }),
+        Ok(None) => HashMap::new(),
+        Err(err) => {
+            log::error!("Couldn't read {SKIP_LISTS_KEY}: {err}");
+            HashMap::new()
+        }
+    }
+}
+
+fn save_skip_lists(skip_lists: &HashMap<String, SkipList>, cx: &App) {
+    let skip_lists = skip_lists.clone();
+    cx.background_spawn(async move {
+        let Some(state) = mnemonic_bridge::mnemonic_state_cloned() else {
+            return;
+        };
+        let saved = serde_json::to_string(&skip_lists)
+            .map_err(|err| err.to_string())
+            .and_then(|json| settings_repository::set_value(&state.db, SKIP_LISTS_KEY, &json));
+        if let Err(err) = saved {
+            log::error!("Couldn't save {SKIP_LISTS_KEY}: {err}");
+        }
+    })
+    .detach();
 }
 
 fn load_workspace_ids(key: &str) -> HashSet<String> {
@@ -388,6 +498,9 @@ impl TeamShare {
         if !shared && self.step_in_workspaces.remove(workspace_id) {
             save_workspace_ids(STEP_IN_WORKSPACES_KEY, &self.step_in_workspaces, cx);
         }
+        if !shared {
+            self.stop_sharing_files(workspace_id, cx);
+        }
         self.update_sharing(cx);
         // Publishes straight away rather than on the next tick, so an
         // unshared workspace disappears for teammates at once.
@@ -412,6 +525,92 @@ impl TeamShare {
             self.start_publishing(cx);
         }
         cx.notify();
+    }
+
+    fn set_workspace_share_files(
+        &mut self,
+        workspace_id: &str,
+        shared: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if shared {
+            if !self.shared_workspaces.contains(workspace_id)
+                || !self.share_files_workspaces.insert(workspace_id.to_string())
+            {
+                return;
+            }
+            save_workspace_ids(SHARE_FILES_WORKSPACES_KEY, &self.share_files_workspaces, cx);
+        } else if !self.stop_sharing_files(workspace_id, cx) {
+            return;
+        }
+        if self.server.is_some() {
+            self.start_publishing(cx);
+        }
+        cx.notify();
+    }
+
+    /// Turns off both file switches and takes the workspace's files away
+    /// from teammates at once. True when Share files was on.
+    fn stop_sharing_files(&mut self, workspace_id: &str, cx: &mut Context<Self>) -> bool {
+        if self.edit_files_workspaces.remove(workspace_id) {
+            save_workspace_ids(EDIT_FILES_WORKSPACES_KEY, &self.edit_files_workspaces, cx);
+        }
+        let was_sharing = self.share_files_workspaces.remove(workspace_id);
+        if was_sharing {
+            save_workspace_ids(SHARE_FILES_WORKSPACES_KEY, &self.share_files_workspaces, cx);
+        }
+        lock_file_roots(&self.file_roots).remove(workspace_id);
+        self.remote_urls.remove(workspace_id);
+        self.hub.remove_file_manifest(workspace_id);
+        was_sharing
+    }
+
+    fn set_workspace_file_edits(
+        &mut self,
+        workspace_id: &str,
+        allowed: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let changed = if allowed {
+            self.shares_files(workspace_id)
+                && self.edit_files_workspaces.insert(workspace_id.to_string())
+        } else {
+            self.edit_files_workspaces.remove(workspace_id)
+        };
+        if !changed {
+            return;
+        }
+        save_workspace_ids(EDIT_FILES_WORKSPACES_KEY, &self.edit_files_workspaces, cx);
+        if self.server.is_some() {
+            self.start_publishing(cx);
+        }
+        cx.notify();
+    }
+
+    fn set_workspace_skip_list(
+        &mut self,
+        workspace_id: &str,
+        skip_list: SkipList,
+        cx: &mut Context<Self>,
+    ) {
+        if self.skip_lists.get(workspace_id) == Some(&skip_list) {
+            return;
+        }
+        if let Some((_, current)) = lock_file_roots(&self.file_roots).get_mut(workspace_id) {
+            *current = skip_list.clone();
+        }
+        self.skip_lists.insert(workspace_id.to_string(), skip_list);
+        save_skip_lists(&self.skip_lists, cx);
+        cx.notify();
+    }
+
+    fn shares_files(&self, workspace_id: &str) -> bool {
+        self.shared_workspaces.contains(workspace_id)
+            && self.share_files_workspaces.contains(workspace_id)
+    }
+
+    fn allows_file_edits(&self, workspace_id: &str) -> bool {
+        self.shares_files(workspace_id) && self.edit_files_workspaces.contains(workspace_id)
     }
 
     fn allows_step_in(&self, workspace_id: &str) -> bool {
@@ -448,6 +647,7 @@ impl TeamShare {
         let hub = TeamShareHub::new();
         self.hub = hub.clone();
         let (action_sender, mut action_receiver) = mpsc::unbounded::<PendingAction>();
+        let shared_file_roots = self.file_roots.clone();
         self.action_task = Some(cx.spawn(async move |this, cx| {
             while let Some(pending) = action_receiver.next().await {
                 if pending.claimed.swap(true, Ordering::SeqCst) {
@@ -471,7 +671,8 @@ impl TeamShare {
                         let key = key.clone();
                         let hub = hub.clone();
                         let action_sender = action_sender.clone();
-                        async move { start_server(key, hub, action_sender) }
+                        let file_roots = shared_file_roots.clone();
+                        async move { start_server(key, hub, action_sender, file_roots) }
                     })
                     .await;
                 let started = this.update(cx, |this, cx| {
@@ -485,6 +686,8 @@ impl TeamShare {
                             };
                             this.server = Some(server);
                             this.start_publishing(cx);
+                            this.scan_task =
+                                Some(Self::watch_files(hub.clone(), this.file_roots.clone(), cx));
                             this.tailscale_watch =
                                 Some(Self::watch_tailscale(key.clone(), started_as, cx));
                             true
@@ -505,6 +708,42 @@ impl TeamShare {
                 cx.background_executor().timer(RETRY_SHARING_AFTER).await;
             }
         }));
+    }
+
+    /// Rescans each file-sharing workspace while a teammate has looked
+    /// recently, in the background. The share server only hears of a change
+    /// when the manifest differs.
+    fn watch_files(hub: TeamShareHub, file_roots: FileRoots, cx: &mut Context<Self>) -> Task<()> {
+        cx.spawn(async move |_, cx| {
+            loop {
+                cx.background_executor().timer(PUBLISH_INTERVAL).await;
+                if !hub.has_viewers_within(VIEWER_WINDOW) {
+                    continue;
+                }
+                let scans: Vec<_> = lock_file_roots(&file_roots)
+                    .iter()
+                    .map(|(id, (root, skip_list))| {
+                        let id = id.clone();
+                        let root = root.clone();
+                        let skip_list = skip_list.clone();
+                        let scan =
+                            cx.background_spawn(async move { scan_workspace(&root, &skip_list) });
+                        async move { (id, scan.await) }
+                    })
+                    .collect();
+                for (id, scanned) in futures::future::join_all(scans).await {
+                    match scanned {
+                        Ok(manifest) => {
+                            let roots = lock_file_roots(&file_roots);
+                            if roots.contains_key(&id) {
+                                hub.set_file_manifest(&id, manifest);
+                            }
+                        }
+                        Err(err) => log::debug!("Couldn't scan {id}'s files: {err}"),
+                    }
+                }
+            }
+        })
     }
 
     fn watch_tailscale(
@@ -544,6 +783,7 @@ impl TeamShare {
         self.publish_task = None;
         self.tailscale_watch = None;
         self.action_task = None;
+        self.scan_task = None;
         self.server = None;
         self.server_key = None;
         self.chat_watches.clear();
@@ -559,8 +799,15 @@ impl TeamShare {
         self.publish_task = Some(cx.spawn(async move |this, cx| {
             let mut counts_refreshed_at: Option<Instant> = None;
             loop {
-                let Ok(shared_ids) = this.read_with(cx, |this, _| this.shared_workspaces.clone())
-                else {
+                let Ok((shared_ids, unlooked_ids)) = this.read_with(cx, |this, _| {
+                    let unlooked: HashSet<String> = this
+                        .share_files_workspaces
+                        .iter()
+                        .filter(|id| !this.remote_urls.contains_key(*id))
+                        .cloned()
+                        .collect();
+                    (this.shared_workspaces.clone(), unlooked)
+                }) else {
                     break;
                 };
                 if let Some(state) = mnemonic_bridge::mnemonic_state_cloned() {
@@ -571,10 +818,36 @@ impl TeamShare {
                         })
                         .await;
                     let published = match records {
-                        Ok(records) => this.update(cx, |this, cx| {
-                            let to_read = this.publish(records, cx);
-                            (this.hub.clone(), to_read)
-                        }),
+                        Ok(records) => {
+                            let to_look_up: Vec<(String, PathBuf)> = records
+                                .iter()
+                                .filter(|(summary, _)| unlooked_ids.contains(&summary.id))
+                                .filter_map(|(summary, _)| {
+                                    Some((summary.id.clone(), workspace_root(summary)?))
+                                })
+                                .collect();
+                            let remotes = if to_look_up.is_empty() {
+                                Vec::new()
+                            } else {
+                                cx.background_spawn(async move {
+                                    let mut remotes = Vec::with_capacity(to_look_up.len());
+                                    for (id, root) in to_look_up {
+                                        remotes.push((id, origin_remote(&root).await));
+                                    }
+                                    remotes
+                                })
+                                .await
+                            };
+                            this.update(cx, |this, cx| {
+                                for (id, remote) in remotes {
+                                    if this.share_files_workspaces.contains(&id) {
+                                        this.remote_urls.insert(id, remote);
+                                    }
+                                }
+                                let to_read = this.publish(records, cx);
+                                (this.hub.clone(), to_read)
+                            })
+                        }
                         Err(err) => {
                             log::error!("Couldn't list workspaces to share: {err}");
                             this.read_with(cx, |this, _| (this.hub.clone(), Vec::new()))
@@ -648,9 +921,25 @@ impl TeamShare {
         let mut closed_chats = HashSet::new();
         let mut to_read = Vec::new();
         let mut workspaces = Vec::with_capacity(records.len());
+        let mut file_roots = HashMap::new();
         for (summary, chat_records) in records {
             let agents = live.get(&summary.id);
             let step_in = self.allows_step_in(&summary.id);
+            let share_files = self.shares_files(&summary.id);
+            if share_files {
+                if let Some(root) = workspace_root(&summary) {
+                    file_roots.insert(
+                        summary.id.clone(),
+                        (
+                            root,
+                            self.skip_lists
+                                .get(&summary.id)
+                                .cloned()
+                                .unwrap_or_default(),
+                        ),
+                    );
+                }
+            }
             let mut chats = Vec::with_capacity(chat_records.len());
             for (record, transcript) in chat_records {
                 let live_chat = agents.and_then(|agents| {
@@ -708,16 +997,18 @@ impl TeamShare {
                     .map(|at| at.elapsed().as_secs()),
                 chats,
                 step_in,
-                share_files: false,
-                edit_files: false,
-                remote_url: None,
-                base_branch: None,
+                share_files,
+                edit_files: self.allows_file_edits(&summary.id),
+                remote_url: self.remote_urls.get(&summary.id).cloned().flatten(),
+                base_branch: Some(summary.branch_health.base_branch.trim().to_string())
+                    .filter(|base_branch| !base_branch.is_empty()),
                 id: summary.id,
                 project: summary.repo,
                 name: summary.name,
                 branch: summary.branch,
             });
         }
+        *lock_file_roots(&self.file_roots) = file_roots;
         self.hub.set_workspaces(workspaces);
         self.hub.set_step_in_chats(step_in_chats);
         self.watch_chats(open_chats, &closed_chats, cx);
@@ -932,6 +1223,7 @@ fn start_server(
     key: ServerKey,
     hub: TeamShareHub,
     action_sender: mpsc::UnboundedSender<PendingAction>,
+    file_roots: FileRoots,
 ) -> Result<(TeamShareServer, TailscaleSelf), String> {
     let me = tailscale_self()?;
     let display_name = [&key.display_name, &me.display_name, &me.login]
@@ -981,15 +1273,29 @@ fn start_server(
             }
         }
     });
+    let files: FileSource = Arc::new({
+        let file_roots = file_roots.clone();
+        move |workspace_id: &str| {
+            lock_file_roots(&file_roots)
+                .get(workspace_id)
+                .map(|(root, _)| root.clone())
+        }
+    });
+    let skip_list: SkipListSource = Arc::new(move |workspace_id: &str| {
+        lock_file_roots(&file_roots)
+            .get(workspace_id)
+            .map(|(_, skip_list)| skip_list.clone())
+            .unwrap_or_default()
+    });
     TeamShareServer::start(
         TeamServerConfig {
             bind: IpAddr::V4(me.ip),
             port: key.port,
             display_name,
             allowed_logins,
-            files: Arc::new(|_| None),
+            files,
             bundle_source: Arc::new(|_, _| Err("Not available yet".to_string())),
-            skip_list: Arc::new(|_| SkipList::default()),
+            skip_list,
             batch_handler: Arc::new(|_| Err(TeamActionError::Failed("Not available yet".into()))),
         },
         hub,
@@ -1193,6 +1499,30 @@ fn answer_permission(
         )
     });
     Ok((title, chosen))
+}
+
+fn workspace_root(summary: &WorkspaceSummary) -> Option<PathBuf> {
+    summary
+        .workspace_root_path
+        .as_deref()
+        .or(summary.selected_worktree_path.as_deref())
+        .map(PathBuf::from)
+}
+
+/// The normalized `origin` of the repository at `root`, None when it has no
+/// such remote.
+async fn origin_remote(root: &Path) -> Option<String> {
+    let output = util::command::new_command("git")
+        .args(["remote", "get-url", "origin"])
+        .current_dir(root)
+        .output()
+        .await
+        .log_err()?;
+    if !output.status.success() {
+        return None;
+    }
+    let url = String::from_utf8_lossy(&output.stdout);
+    Some(normalize_remote_url(&url)).filter(|url| !url.is_empty())
 }
 
 fn load_shared_records(
@@ -2083,5 +2413,27 @@ mod tests {
             "discard gave {answered:?}"
         );
         assert!(is_waiting(&dirty_buffer, cx));
+    }
+
+    #[gpui::test]
+    async fn turning_off_share_files_turns_off_edits(cx: &mut TestAppContext) {
+        let team = cx.new(|_| TeamShare::new());
+        team.update(cx, |team, cx| {
+            team.set_workspace_shared("workspace", true, cx);
+            team.set_workspace_share_files("workspace", true, cx);
+            team.set_workspace_file_edits("workspace", true, cx);
+            assert!(team.shares_files("workspace"));
+            assert!(team.allows_file_edits("workspace"));
+
+            team.set_workspace_share_files("workspace", false, cx);
+            assert!(!team.allows_file_edits("workspace"));
+            team.set_workspace_share_files("workspace", true, cx);
+            assert!(!team.allows_file_edits("workspace"));
+
+            team.set_workspace_file_edits("workspace", true, cx);
+            team.set_workspace_shared("workspace", false, cx);
+            assert!(!team.shares_files("workspace"));
+            assert!(!team.allows_file_edits("workspace"));
+        });
     }
 }
