@@ -468,6 +468,285 @@ pub fn bash(
     Ok(result)
 }
 
+pub const AGENT_MCP_SERVER_NAME: &str = "teammate_workspace";
+
+const MCP_DEFAULT_PROTOCOL_VERSION: &str = "2025-06-18";
+
+pub enum McpReply {
+    Json(String),
+    Accepted,
+}
+
+fn mcp_tool_definitions() -> serde_json::Value {
+    use serde_json::json;
+    json!([
+        {
+            "name": "Read",
+            "description": "Read a file in the shared workspace. file_path is an absolute path inside the shared workspace. Lines are numbered.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "file_path": {"type": "string", "description": "Absolute path of the file in the shared workspace"},
+                    "offset": {"type": "integer", "description": "Line number to start reading from"},
+                    "limit": {"type": "integer", "description": "Number of lines to read"}
+                },
+                "required": ["file_path"]
+            }
+        },
+        {
+            "name": "Write",
+            "description": "Write a file in the shared workspace, replacing it if it exists. file_path is an absolute path inside the shared workspace.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "file_path": {"type": "string", "description": "Absolute path of the file in the shared workspace"},
+                    "content": {"type": "string", "description": "Full content to write"}
+                },
+                "required": ["file_path", "content"]
+            }
+        },
+        {
+            "name": "Edit",
+            "description": "Replace text in a file in the shared workspace. file_path is an absolute path inside the shared workspace.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "file_path": {"type": "string", "description": "Absolute path of the file in the shared workspace"},
+                    "old_string": {"type": "string", "description": "Text to replace"},
+                    "new_string": {"type": "string", "description": "Replacement text"},
+                    "replace_all": {"type": "boolean", "description": "Replace every occurrence"}
+                },
+                "required": ["file_path", "old_string", "new_string"]
+            }
+        },
+        {
+            "name": "Glob",
+            "description": "Find files by glob pattern in the shared workspace. path is an absolute directory path in the shared workspace.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "pattern": {"type": "string", "description": "Glob pattern, for example **/*.rs"},
+                    "path": {"type": "string", "description": "Absolute directory to search in"}
+                },
+                "required": ["pattern"]
+            }
+        },
+        {
+            "name": "Grep",
+            "description": "Search file contents with a regex in the shared workspace. path is an absolute path in the shared workspace.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "pattern": {"type": "string", "description": "Regular expression to search for"},
+                    "path": {"type": "string", "description": "Absolute file or directory to search in"},
+                    "glob": {"type": "string", "description": "Glob filter for files, for example *.rs"},
+                    "output_mode": {"type": "string", "enum": ["content", "files_with_matches", "count"]},
+                    "-i": {"type": "boolean", "description": "Case insensitive search"},
+                    "-n": {"type": "boolean", "description": "Show line numbers in content mode"},
+                    "head_limit": {"type": "integer", "description": "Limit the number of results"}
+                },
+                "required": ["pattern"]
+            }
+        },
+        {
+            "name": "Bash",
+            "description": "Run a shell command in the root of the shared workspace on the sharer's Mac. The timeout is in milliseconds.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string", "description": "The command to run"},
+                    "timeout": {"type": "integer", "description": "Timeout in milliseconds"},
+                    "description": {"type": "string", "description": "What the command does"}
+                },
+                "required": ["command"]
+            }
+        }
+    ])
+}
+
+fn mcp_error_reply(id: serde_json::Value, code: i64, message: &str) -> McpReply {
+    McpReply::Json(
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "error": {"code": code, "message": message}
+        })
+        .to_string(),
+    )
+}
+
+fn mcp_result_reply(id: serde_json::Value, result: serde_json::Value) -> McpReply {
+    McpReply::Json(serde_json::json!({"jsonrpc": "2.0", "id": id, "result": result}).to_string())
+}
+
+fn mcp_request_id_text(id: &serde_json::Value) -> String {
+    match id {
+        serde_json::Value::String(text) => text.clone(),
+        other => other.to_string(),
+    }
+}
+
+fn mcp_required_str<'a>(arguments: &'a serde_json::Value, key: &str) -> Result<&'a str, String> {
+    arguments
+        .get(key)
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| format!("missing or invalid argument: {key}"))
+}
+
+fn mcp_optional_usize(arguments: &serde_json::Value, key: &str) -> Option<usize> {
+    arguments
+        .get(key)
+        .and_then(|value| value.as_u64())
+        .and_then(|value| usize::try_from(value).ok())
+}
+
+fn mcp_optional_str<'a>(arguments: &'a serde_json::Value, key: &str) -> Option<&'a str> {
+    arguments.get(key).and_then(|value| value.as_str())
+}
+
+fn mcp_flag(arguments: &serde_json::Value, key: &str) -> bool {
+    arguments
+        .get(key)
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false)
+}
+
+fn mcp_run_tool(
+    context: &AgentToolContext,
+    running: &RunningCommands,
+    call_key: &str,
+    name: &str,
+    arguments: &serde_json::Value,
+) -> Result<String, String> {
+    match name {
+        "Read" => read(
+            context,
+            mcp_required_str(arguments, "file_path")?,
+            mcp_optional_usize(arguments, "offset"),
+            mcp_optional_usize(arguments, "limit"),
+        ),
+        "Write" => write(
+            context,
+            mcp_required_str(arguments, "file_path")?,
+            mcp_required_str(arguments, "content")?,
+        ),
+        "Edit" => edit(
+            context,
+            mcp_required_str(arguments, "file_path")?,
+            mcp_required_str(arguments, "old_string")?,
+            mcp_required_str(arguments, "new_string")?,
+            mcp_flag(arguments, "replace_all"),
+        ),
+        "Glob" => glob(
+            context,
+            mcp_required_str(arguments, "pattern")?,
+            mcp_optional_str(arguments, "path"),
+        ),
+        "Grep" => {
+            let output_mode = match mcp_optional_str(arguments, "output_mode") {
+                None | Some("files_with_matches") => GrepOutputMode::FilesWithMatches,
+                Some("content") => GrepOutputMode::Content,
+                Some("count") => GrepOutputMode::Count,
+                Some(other) => return Err(format!("unknown output_mode: {other}")),
+            };
+            grep(
+                context,
+                &GrepRequest {
+                    pattern: mcp_required_str(arguments, "pattern")?.to_string(),
+                    path: mcp_optional_str(arguments, "path").map(str::to_string),
+                    glob: mcp_optional_str(arguments, "glob").map(str::to_string),
+                    output_mode,
+                    case_insensitive: mcp_flag(arguments, "-i"),
+                    line_numbers: mcp_flag(arguments, "-n"),
+                    head_limit: mcp_optional_usize(arguments, "head_limit"),
+                },
+            )
+        }
+        "Bash" => {
+            let timeout = arguments
+                .get("timeout")
+                .and_then(|value| value.as_u64())
+                .map(Duration::from_millis);
+            bash(
+                context,
+                mcp_required_str(arguments, "command")?,
+                timeout,
+                running,
+                call_key,
+            )
+        }
+        other => Err(format!("unknown tool: {other}")),
+    }
+}
+
+pub fn handle_mcp_message(
+    context: &AgentToolContext,
+    running: &RunningCommands,
+    caller_login: &str,
+    body: &[u8],
+) -> McpReply {
+    use serde_json::{Value, json};
+
+    let message: Value = match serde_json::from_slice(body) {
+        Ok(message) => message,
+        Err(error) => {
+            return mcp_error_reply(Value::Null, -32700, &format!("parse error: {error}"));
+        }
+    };
+    let method = message
+        .get("method")
+        .and_then(|method| method.as_str())
+        .unwrap_or("");
+    let Some(id) = message.get("id").cloned() else {
+        if method == "notifications/cancelled" {
+            if let Some(request_id) = message.pointer("/params/requestId") {
+                running.kill(&format!(
+                    "{caller_login}:{}",
+                    mcp_request_id_text(request_id)
+                ));
+            }
+        }
+        return McpReply::Accepted;
+    };
+    let params = message.get("params").cloned().unwrap_or(Value::Null);
+
+    match method {
+        "initialize" => {
+            let protocol_version = params
+                .get("protocolVersion")
+                .and_then(|version| version.as_str())
+                .unwrap_or(MCP_DEFAULT_PROTOCOL_VERSION);
+            mcp_result_reply(
+                id,
+                json!({
+                    "protocolVersion": protocol_version,
+                    "capabilities": {"tools": {}},
+                    "serverInfo": {"name": AGENT_MCP_SERVER_NAME, "version": "1"}
+                }),
+            )
+        }
+        "ping" => mcp_result_reply(id, json!({})),
+        "tools/list" => mcp_result_reply(id, json!({"tools": mcp_tool_definitions()})),
+        "tools/call" => {
+            let Some(name) = params.get("name").and_then(|name| name.as_str()) else {
+                return mcp_error_reply(id, -32602, "tools/call requires a tool name");
+            };
+            let arguments = params.get("arguments").cloned().unwrap_or(json!({}));
+            let call_key = format!("{caller_login}:{}", mcp_request_id_text(&id));
+            let (text, is_error) = match mcp_run_tool(context, running, &call_key, name, &arguments)
+            {
+                Ok(text) => (text, false),
+                Err(error) => (error, true),
+            };
+            mcp_result_reply(
+                id,
+                json!({"content": [{"type": "text", "text": text}], "isError": is_error}),
+            )
+        }
+        other => mcp_error_reply(id, -32601, &format!("method not found: {other}")),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -659,5 +938,147 @@ mod tests {
         let result = handle.join().expect("thread");
         assert!(started.elapsed() < Duration::from_secs(2));
         assert!(result.is_err());
+    }
+
+    fn mcp_json(
+        context: &AgentToolContext,
+        running: &RunningCommands,
+        body: serde_json::Value,
+    ) -> serde_json::Value {
+        match handle_mcp_message(context, running, "alice", body.to_string().as_bytes()) {
+            McpReply::Json(text) => serde_json::from_str(&text).expect("json reply"),
+            McpReply::Accepted => panic!("expected a JSON reply"),
+        }
+    }
+
+    #[test]
+    fn mcp_initialize_echoes_the_protocol_version() {
+        let root = temp_root("mcp-init");
+        let reply = mcp_json(
+            &context(&root),
+            &RunningCommands::default(),
+            serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}),
+        );
+        assert_eq!(reply["result"]["protocolVersion"], "2025-06-18");
+        assert!(reply["result"]["capabilities"]["tools"].is_object());
+        assert_eq!(reply["result"]["serverInfo"]["name"], "teammate_workspace");
+    }
+
+    #[test]
+    fn mcp_lists_the_six_tools_with_claude_shaped_inputs() {
+        let root = temp_root("mcp-list");
+        let reply = mcp_json(
+            &context(&root),
+            &RunningCommands::default(),
+            serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/list"}),
+        );
+        let tools = reply["result"]["tools"].as_array().expect("tools");
+        let names: Vec<&str> = tools
+            .iter()
+            .map(|tool| tool["name"].as_str().expect("name"))
+            .collect();
+        assert_eq!(names, ["Read", "Write", "Edit", "Glob", "Grep", "Bash"]);
+        assert_eq!(
+            tools[0]["inputSchema"]["required"],
+            serde_json::json!(["file_path"])
+        );
+        assert_eq!(
+            tools[2]["inputSchema"]["required"],
+            serde_json::json!(["file_path", "old_string", "new_string"])
+        );
+    }
+
+    #[test]
+    fn mcp_tool_call_returns_text_or_an_error_result() {
+        let root = temp_root("mcp-call");
+        std::fs::write(root.join("a.txt"), "hello\n").expect("write");
+        let context = context(&root);
+        let running = RunningCommands::default();
+        let ok = mcp_json(
+            &context,
+            &running,
+            serde_json::json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"Read","arguments":{"file_path": root.join("a.txt").to_string_lossy()}}}),
+        );
+        assert_eq!(ok["result"]["isError"], false);
+        assert!(
+            ok["result"]["content"][0]["text"]
+                .as_str()
+                .expect("text")
+                .contains("1\t")
+        );
+        let denied = mcp_json(
+            &context,
+            &running,
+            serde_json::json!({"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"Read","arguments":{"file_path":"/etc/passwd"}}}),
+        );
+        assert_eq!(denied["result"]["isError"], true);
+        assert!(
+            denied["result"]["content"][0]["text"]
+                .as_str()
+                .expect("text")
+                .contains("outside the workspace")
+        );
+    }
+
+    #[test]
+    fn mcp_protocol_problems_are_json_rpc_errors() {
+        let root = temp_root("mcp-errors");
+        let context = context(&root);
+        let running = RunningCommands::default();
+        let unknown = mcp_json(
+            &context,
+            &running,
+            serde_json::json!({"jsonrpc":"2.0","id":5,"method":"nope"}),
+        );
+        assert_eq!(unknown["error"]["code"], -32601);
+        match handle_mcp_message(&context, &running, "alice", b"{not json") {
+            McpReply::Json(text) => {
+                let reply: serde_json::Value = serde_json::from_str(&text).expect("json");
+                assert_eq!(reply["error"]["code"], -32700);
+            }
+            McpReply::Accepted => panic!("expected a JSON reply"),
+        }
+    }
+
+    #[test]
+    fn mcp_notifications_are_accepted_without_a_body() {
+        let root = temp_root("mcp-notify");
+        let reply = handle_mcp_message(
+            &context(&root),
+            &RunningCommands::default(),
+            "alice",
+            br#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
+        );
+        assert!(matches!(reply, McpReply::Accepted));
+    }
+
+    #[test]
+    fn mcp_cancel_kills_the_callers_command() {
+        let root = temp_root("mcp-cancel");
+        let context = context(&root);
+        let running = RunningCommands::default();
+        let handle = std::thread::spawn({
+            let context = context.clone();
+            let running = running.clone();
+            move || {
+                mcp_json(
+                    &context,
+                    &running,
+                    serde_json::json!({"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"Bash","arguments":{"command":"sleep 30"}}}),
+                )
+            }
+        });
+        std::thread::sleep(Duration::from_millis(300));
+        let started = Instant::now();
+        let reply = handle_mcp_message(
+            &context,
+            &running,
+            "alice",
+            br#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":7}}"#,
+        );
+        assert!(matches!(reply, McpReply::Accepted));
+        let result = handle.join().expect("thread");
+        assert!(started.elapsed() < Duration::from_secs(3));
+        assert_eq!(result["result"]["isError"], true);
     }
 }
