@@ -181,6 +181,10 @@ pub struct BatchFile {
     /// The sharer's file when the batch arrived, None when there was none.
     #[serde(default, with = "optional_base64")]
     pub before: Option<Vec<u8>>,
+    /// The permission bits `before` had, so undoing a deletion recreates
+    /// the file as it was.
+    #[serde(default)]
+    pub before_mode: Option<u32>,
     /// The teammate's file, None when they deleted it.
     #[serde(default, with = "optional_base64")]
     pub after: Option<Vec<u8>>,
@@ -1288,6 +1292,23 @@ pub fn follow_manifest(
     fetch: &dyn Fn(&str) -> Result<Vec<u8>, String>,
     on_progress: &dyn Fn(usize, usize),
 ) -> Result<FollowPlan, String> {
+    let round = plan_round(root, state, incoming)?;
+    carry_out_round(root, state, round, fetch, on_progress)
+}
+
+/// A follow round as planned from the copy on disk, before anything moves.
+struct PlannedRound {
+    incoming: TeamFileManifest,
+    /// The hash of each path the plan saw, as it saw it.
+    planned_hashes: HashMap<String, String>,
+    plan: FollowPlan,
+}
+
+fn plan_round(
+    root: &Path,
+    state: &CopyState,
+    incoming: &TeamFileManifest,
+) -> Result<PlannedRound, String> {
     let skip = state.skip_list();
     let incoming = TeamFileManifest {
         head_commit: incoming.head_commit.clone(),
@@ -1328,16 +1349,36 @@ pub fn follow_manifest(
     let head_moves = incoming.head_commit != state.head_commit;
     let has_local_commits =
         head_moves && has_local_commits(root, &state.head_commit, &incoming.head_commit)?;
-    let mut plan = plan_follow(
+    let plan = plan_follow(
         state,
         &local.hashes,
         &local.dirty_vs_head,
         &incoming,
         has_local_commits,
     );
+    Ok(PlannedRound {
+        incoming,
+        planned_hashes: local.hashes,
+        plan,
+    })
+}
+
+fn carry_out_round(
+    root: &Path,
+    state: &mut CopyState,
+    round: PlannedRound,
+    fetch: &dyn Fn(&str) -> Result<Vec<u8>, String>,
+    on_progress: &dyn Fn(usize, usize),
+) -> Result<FollowPlan, String> {
+    let PlannedRound {
+        incoming,
+        planned_hashes,
+        mut plan,
+    } = round;
+    let skip = state.skip_list();
     // The teammate can edit while the round runs; each file the plan saw is
     // checked again just before it is replaced, and kept if it moved.
-    let planned_hash = |path: &str| local.hashes.get(path).cloned().unwrap_or_default();
+    let planned_hash = |path: &str| planned_hashes.get(path).cloned().unwrap_or_default();
     let changed_since_planned = |path: &str| -> Result<bool, String> {
         Ok(!copy_skips(&skip, path) && hash_now(root, path)? != planned_hash(path))
     };
@@ -1358,6 +1399,22 @@ pub fn follow_manifest(
                 )),
                 ..FollowPlan::default()
             });
+        }
+        // After the move, what is on disk is taken as the copy's own, so a
+        // file the sharer never sent that was edited since planning is kept
+        // here rather than overwritten.
+        let mut kept = HashSet::new();
+        for path in plan.write.iter().chain(&plan.delete) {
+            if changed_since_planned(path)? {
+                kept.insert(path.clone());
+            }
+        }
+        if !kept.is_empty() {
+            plan.write.retain(|path| !kept.contains(path));
+            plan.delete.retain(|path| !kept.contains(path));
+            let mut kept: Vec<String> = kept.into_iter().collect();
+            kept.sort_unstable();
+            plan.both_changed.extend(kept);
         }
         move_head(root, state, &incoming.head_commit)?;
     }
@@ -1708,6 +1765,31 @@ fn read_existing(path: &str, full_path: &Path) -> Result<Option<Vec<u8>>, String
     }
 }
 
+/// The permission bits of the file at `full_path`, None when there is none.
+#[cfg(unix)]
+fn file_mode(full_path: &Path) -> Option<u32> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::symlink_metadata(full_path)
+        .ok()
+        .map(|metadata| metadata.permissions().mode() & 0o7777)
+}
+
+#[cfg(not(unix))]
+fn file_mode(_full_path: &Path) -> Option<u32> {
+    None
+}
+
+#[cfg(unix)]
+fn permissions_from_mode(mode: u32) -> Option<std::fs::Permissions> {
+    use std::os::unix::fs::PermissionsExt;
+    Some(std::fs::Permissions::from_mode(mode))
+}
+
+#[cfg(not(unix))]
+fn permissions_from_mode(_mode: u32) -> Option<std::fs::Permissions> {
+    None
+}
+
 /// Writes `content` at `full_path` with `permissions`, or removes it when
 /// None.
 fn write_batch_file(
@@ -1787,14 +1869,16 @@ enum Replaced {
     Changed(Option<Vec<u8>>),
 }
 
-/// Writes `content` at `path` with the file's permissions, or removes it
-/// when None, only while the file holds `expected` (None: nothing there).
+/// Writes `content` at `path` with the file's permissions, or `new_mode`
+/// when there is no file, or removes it when None, only while the file
+/// holds `expected` (None: nothing there).
 fn replace_if_unchanged(
     root: &Path,
     path: &str,
     full_path: &Path,
     expected: Option<&[u8]>,
     content: Option<&[u8]>,
+    new_mode: Option<u32>,
 ) -> Result<Replaced, String> {
     // Checked again just before writing, in case a link appeared on the way
     // or the sharer's side wrote the file since it was last read.
@@ -1802,11 +1886,14 @@ fn replace_if_unchanged(
     let permissions = std::fs::symlink_metadata(full_path)
         .ok()
         .map(|metadata| metadata.permissions());
+    let new_permissions = permissions
+        .clone()
+        .or_else(|| new_mode.and_then(permissions_from_mode));
     let now = read_existing(path, full_path)?;
     if now.as_deref() != expected {
         return Ok(Replaced::Changed(now));
     }
-    write_batch_file(full_path, content, permissions.as_ref())?;
+    write_batch_file(full_path, content, new_permissions.as_ref())?;
     Ok(Replaced::Written(permissions))
 }
 
@@ -1825,6 +1912,7 @@ fn write_checked_file(
         full_path,
         file.before.as_deref(),
         file.after.as_deref(),
+        None,
     )?;
     match replaced {
         Replaced::Written(permissions) => Ok(Some(permissions)),
@@ -1837,6 +1925,7 @@ fn write_checked_file(
                 BatchFileState::Held(HeldReason::ChangedSinceYourCopy)
             };
             file.before = now;
+            file.before_mode = file_mode(full_path);
             Ok(None)
         }
     }
@@ -1877,12 +1966,13 @@ pub fn apply_batch(
         let full_path = safe_relative_path(root, path)?;
         spelling.check(root, path)?;
         let before = read_existing(path, &full_path)?;
-        checked.push((change, full_path, before));
+        let before_mode = before.as_ref().and_then(|_| file_mode(&full_path));
+        checked.push((change, full_path, before, before_mode));
     }
 
     let mut files = Vec::with_capacity(checked.len());
     let mut to_write = Vec::new();
-    for (change, full_path, before) in checked {
+    for (change, full_path, before, before_mode) in checked {
         let path = change.path.as_str();
         let current_hash = before.as_deref().map(file_hash);
         let already_there = current_hash == change.content.as_deref().map(file_hash);
@@ -1901,6 +1991,7 @@ pub fn apply_batch(
         files.push(BatchFile {
             path: change.path.clone(),
             before,
+            before_mode,
             after: change.content.clone(),
             state,
         });
@@ -1986,6 +2077,7 @@ pub fn undo_batch(
             &full_path,
             file.after.as_deref(),
             file.before.as_deref(),
+            file.before_mode,
         )?;
         match replaced {
             Replaced::Written(_) => file.state = BatchFileState::Undone,
@@ -2025,6 +2117,7 @@ pub fn resolve_held(
         &full_path,
         file.before.as_deref(),
         file.after.as_deref(),
+        None,
     )?;
     match replaced {
         Replaced::Written(_) => {
@@ -2033,6 +2126,7 @@ pub fn resolve_held(
         }
         Replaced::Changed(now) => {
             file.before = now;
+            file.before_mode = file_mode(&full_path);
             Err(format!(
                 "{path} changed again since it was held, so it was left alone"
             ))
@@ -2636,6 +2730,32 @@ mod tests {
     }
 
     #[test]
+    fn an_edit_to_an_unsent_file_while_head_moves_is_kept() {
+        let sharer = repo();
+        let teammate = tempfile::tempdir().expect("tempdir");
+        let copy = clone_of(sharer.path(), teammate.path());
+        let fetch =
+            |path: &str| std::fs::read(sharer.path().join(path)).map_err(|error| error.to_string());
+        let mut state = copy_state(&head_of(sharer.path()), &[]);
+        write(sharer.path(), "changed.txt", "two");
+        git(sharer.path(), &["commit", "-q", "-am", "two"]);
+        write(sharer.path(), "new.txt", "sharer");
+        git(&copy, &["fetch", "-q", "origin"]);
+        let manifest = scan_workspace(sharer.path(), &SkipList::default()).expect("scan");
+
+        let round = plan_round(&copy, &state, &manifest).expect("plan");
+        assert!(round.plan.move_head);
+        assert!(round.plan.write.contains(&"new.txt".to_string()));
+        write(&copy, "new.txt", "teammate");
+        let plan = carry_out_round(&copy, &mut state, round, &fetch, &|_, _| {}).expect("follow");
+
+        assert_eq!(head_of(&copy), head_of(sharer.path()));
+        assert_eq!(plan.both_changed, vec!["new.txt".to_string()]);
+        assert_eq!(read(&copy, "new.txt").as_deref(), Some("teammate"));
+        assert!(!state.synced.contains_key("new.txt"));
+    }
+
+    #[test]
     fn a_tip_the_sharer_lacks_doesnt_stop_the_bundle() {
         let sharer = repo();
         let head = head_of(sharer.path());
@@ -3105,6 +3225,30 @@ mod tests {
         for file in &record.files {
             assert_eq!(file.state, BatchFileState::Undone, "{}", file.path);
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn undoing_a_deletion_restores_the_files_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = repo();
+        let root = directory.path();
+        write(root, "run.sh", "echo hi");
+        std::fs::set_permissions(root.join("run.sh"), std::fs::Permissions::from_mode(0o755))
+            .expect("chmod");
+        let mut record =
+            apply(root, vec![change("run.sh", Some("echo hi"), None)], &[]).expect("applies");
+        assert_eq!(read(root, "run.sh"), None);
+
+        let left_alone = undo_batch(root, &mut record, &HashSet::new()).expect("undoes");
+
+        assert!(left_alone.is_empty(), "{left_alone:?}");
+        assert_eq!(read(root, "run.sh").as_deref(), Some("echo hi"));
+        let mode = std::fs::metadata(root.join("run.sh"))
+            .expect("stat")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o7777, 0o755);
     }
 
     #[test]

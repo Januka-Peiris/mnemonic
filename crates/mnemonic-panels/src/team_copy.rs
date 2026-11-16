@@ -11,7 +11,10 @@ use anyhow::anyhow;
 use editor::Editor;
 use futures::StreamExt as _;
 use futures::channel::mpsc;
-use gpui::{AnyElement, App, AppContext as _, Context, Entity, PromptLevel, Task, WeakEntity};
+use gpui::{
+    AnyElement, App, AppContext as _, AsyncWindowContext, Context, Entity, PromptLevel, Task,
+    WeakEntity,
+};
 use mnemonic_core::models::{ChatSessionRecord, CreateWorkspaceInput};
 use mnemonic_core::repositories::{
     chat_session_repository, repository_repository, workspace_repository,
@@ -29,7 +32,7 @@ use ui::{Button, Tooltip, prelude::*};
 use util::ResultExt as _;
 use workspace::Workspace;
 
-use crate::team::{PeerStatus, TeamShare, team_share};
+use crate::team::{PeerStatus, TeamShare, show_step_in_notice, team_share};
 use crate::workspace_panel::WorkspacePanel;
 use crate::workspace_view::ChatAgent;
 
@@ -714,98 +717,139 @@ pub(crate) fn open_teammate_copy(
 
 /// Deletes the copy after asking, warning about edits that weren't sent.
 pub(crate) fn delete_copy(local_workspace_id: String, window: &mut Window, cx: &mut App) {
-    let Some(team) = team_share(cx) else {
-        return;
-    };
-    let Some(state) = team
-        .read(cx)
-        .copies
-        .get(&local_workspace_id)
-        .map(|copy| copy.state.clone())
-    else {
-        return;
-    };
-    let Some(app) = mnemonic_bridge::mnemonic_state_cloned() else {
-        return;
-    };
+    let team = team_share(cx);
+    // A copy missing here, because its state couldn't be saved or read or
+    // startup hasn't loaded it yet, is still deleted from its workspace
+    // record, as archiving it must never run the sharer's teardown instead.
+    let state = team.as_ref().and_then(|team| {
+        team.read(cx)
+            .copies
+            .get(&local_workspace_id)
+            .map(|copy| copy.state.clone())
+    });
     let workspace = Workspace::for_window(window, cx);
     window
         .spawn(cx, async move |cx| {
-            let detail = cx
-                .background_spawn({
-                    let app = app.clone();
-                    let state = state.clone();
-                    async move {
-                        let detail =
-                            workspace_repository::get_detail(&app.db, &state.local_workspace_id)?
-                                .ok_or_else(|| "The copy no longer exists".to_string())?;
-                        let root = detail
-                            .summary
-                            .workspace_root_path
-                            .clone()
-                            .unwrap_or_else(|| detail.worktree_path.clone());
-                        let edits = team_files_service::local_edits(
-                            &state,
-                            Path::new(&root),
-                            &state.skip_list(),
-                        )?;
-                        Ok::<_, String>((detail, root, edits))
-                    }
-                })
-                .await;
-            let (detail, root, edits) = detail.map_err(|err| anyhow!(err))?;
-            let message = match edits.len() {
-                0 => "This removes the copy's folder from this Mac.".to_string(),
-                1 => "You have 1 edit you haven't sent. It will be lost.".to_string(),
-                count => format!("You have {count} edits you haven't sent. They will be lost."),
-            };
-            let answer = cx.update(|window, cx| {
-                window.prompt(
-                    PromptLevel::Warning,
-                    &format!("Delete your copy of {}'s workspace?", state.sharer_name),
-                    Some(&message),
-                    &["Delete", "Cancel"],
-                    cx,
-                )
-            })?;
-            if answer.await? != 0 {
-                return Ok(());
-            }
-            cx.background_spawn({
-                let local_workspace_id = local_workspace_id.clone();
-                async move {
-                    workspace_service::delete_workspace(&app, &local_workspace_id)?;
-                    if let Some(repository_path) = detail.summary.repository_path.as_deref() {
-                        git_worktree_service::remove_mnemonic_worktree(repository_path, &root)?;
-                    }
-                    if let Err(err) =
-                        chat_session_repository::delete_for_workspace(&app.db, &local_workspace_id)
-                    {
-                        log::error!(
-                            "Failed to delete chat sessions for {local_workspace_id}: {err}"
+            let deleted = delete_copy_files(
+                &local_workspace_id,
+                state,
+                team.as_ref(),
+                workspace.as_ref(),
+                cx,
+            )
+            .await;
+            if let Err(err) = deleted {
+                log::error!("Couldn't delete the copy {local_workspace_id}: {err}");
+                cx.update(|_, cx| {
+                    if let Some(workspace) = &workspace {
+                        show_step_in_notice(
+                            workspace,
+                            format!("Couldn't delete the copy: {err}"),
+                            cx,
                         );
                     }
-                    team_files_service::remove_copy_state(&app.data_dir, &local_workspace_id)
-                }
-            })
-            .await
-            .map_err(|err| anyhow!(err))?;
-            team.update(cx, |team, cx| {
-                team.copies.remove(&local_workspace_id);
-                cx.notify();
-            });
-            cx.update(|_, cx| {
-                let panel =
-                    workspace.and_then(|workspace| workspace.read(cx).panel::<WorkspacePanel>(cx));
-                if let Some(panel) = panel {
-                    panel.update(cx, |panel, cx| {
-                        panel.forget_workspace(&local_workspace_id, cx)
-                    });
-                }
-            })?;
-            anyhow::Ok(())
+                })
+                .log_err();
+            }
         })
-        .detach_and_log_err(cx);
+        .detach();
+}
+
+/// Asks, then removes the copy's workspace, worktree and saved state.
+/// Without `state` the unsent edits can't be counted, so the warning says
+/// any would be lost.
+async fn delete_copy_files(
+    local_workspace_id: &str,
+    state: Option<CopyState>,
+    team: Option<&Entity<TeamShare>>,
+    workspace: Option<&Entity<Workspace>>,
+    cx: &mut AsyncWindowContext,
+) -> anyhow::Result<()> {
+    let app =
+        mnemonic_bridge::mnemonic_state_cloned().ok_or_else(|| anyhow!("Mnemonic isn't ready"))?;
+    let found = cx
+        .background_spawn({
+            let app = app.clone();
+            let state = state.clone();
+            let local_workspace_id = local_workspace_id.to_string();
+            async move {
+                let detail = workspace_repository::get_detail(&app.db, &local_workspace_id)?
+                    .ok_or_else(|| "The copy no longer exists".to_string())?;
+                let root = detail
+                    .summary
+                    .workspace_root_path
+                    .clone()
+                    .unwrap_or_else(|| detail.worktree_path.clone());
+                let edits = match &state {
+                    Some(state) => Some(team_files_service::local_edits(
+                        state,
+                        Path::new(&root),
+                        &state.skip_list(),
+                    )?),
+                    None => None,
+                };
+                Ok::<_, String>((detail, root, edits))
+            }
+        })
+        .await;
+    let (detail, root, edits) = found.map_err(|err| anyhow!(err))?;
+    let message = match edits.map(|edits| edits.len()) {
+        Some(0) => "This removes the copy's folder from this Mac.".to_string(),
+        Some(1) => "You have 1 edit you haven't sent. It will be lost.".to_string(),
+        Some(count) => format!("You have {count} edits you haven't sent. They will be lost."),
+        None => {
+            "This removes the copy's folder from this Mac. Any edits you haven't sent will be lost."
+                .to_string()
+        }
+    };
+    let title = match &state {
+        Some(state) => format!("Delete your copy of {}'s workspace?", state.sharer_name),
+        None => format!("Delete {}?", detail.summary.name),
+    };
+    let answer = cx.update(|window, cx| {
+        window.prompt(
+            PromptLevel::Warning,
+            &title,
+            Some(&message),
+            &["Delete", "Cancel"],
+            cx,
+        )
+    })?;
+    if answer.await? != 0 {
+        return Ok(());
+    }
+    cx.background_spawn({
+        let local_workspace_id = local_workspace_id.to_string();
+        async move {
+            workspace_service::delete_workspace(&app, &local_workspace_id)?;
+            if let Some(repository_path) = detail.summary.repository_path.as_deref() {
+                git_worktree_service::remove_mnemonic_worktree(repository_path, &root)?;
+            }
+            if let Err(err) =
+                chat_session_repository::delete_for_workspace(&app.db, &local_workspace_id)
+            {
+                log::error!("Failed to delete chat sessions for {local_workspace_id}: {err}");
+            }
+            team_files_service::remove_copy_state(&app.data_dir, &local_workspace_id)
+        }
+    })
+    .await
+    .map_err(|err| anyhow!(err))?;
+    if let Some(team) = team {
+        team.update(cx, |team, cx| {
+            team.copies.remove(local_workspace_id);
+            cx.notify();
+        });
+    }
+    cx.update(|_, cx| {
+        let panel = workspace.and_then(|workspace| workspace.read(cx).panel::<WorkspacePanel>(cx));
+        if let Some(panel) = panel {
+            panel.update(cx, |panel, cx| {
+                panel.forget_workspace(local_workspace_id, cx)
+            });
+        }
+    })?;
+    Ok(())
 }
 
 /// Why the teammate can't send changes to the sharer now, None when they
