@@ -23,7 +23,7 @@ const LIVE_CHATS_FILE: &str = "team_live_chats.json";
 
 /// Claude's own tools that act on files or run commands. They would act on
 /// the empty folder on this Mac, so the share server's tools replace them.
-const DISALLOWED_BUILT_IN_TOOLS: [&str; 11] = [
+const DISALLOWED_BUILT_IN_TOOLS: [&str; 13] = [
     "Read",
     "Write",
     "Edit",
@@ -32,6 +32,8 @@ const DISALLOWED_BUILT_IN_TOOLS: [&str; 11] = [
     "Bash",
     "BashOutput",
     "KillShell",
+    "Monitor",
+    "PowerShell",
     "Grep",
     "Glob",
     "LS",
@@ -214,14 +216,16 @@ pub(crate) fn live_session_extras(
 }
 
 /// Creates the chats' working directory and builds their session extras,
-/// reading the sharer's instruction files and this Mac's git identity. None
-/// when the sharer doesn't let agents work in the workspace. Blocking.
+/// reading this Mac's git identity and, when the sharer is reachable, their
+/// instruction files. None when the sharer doesn't let agents work in the
+/// workspace. Blocking.
 pub(crate) fn prepare_live_session(
     data_dir: &Path,
     host: &str,
     client: &TeamClient,
     shared: &TeamWorkspace,
     sharer_name: &str,
+    sharer_reachable: bool,
 ) -> Result<Option<(PathBuf, SessionExtras)>, String> {
     let Some(root_path) = shared.root_path.as_deref().filter(|_| shared.agents) else {
         return Ok(None);
@@ -229,7 +233,11 @@ pub(crate) fn prepare_live_session(
     let dir = live_chat_dir(data_dir, host, &shared.id);
     std::fs::create_dir_all(&dir)
         .map_err(|err| format!("Couldn't create {}: {err}", dir.display()))?;
-    let instructions = fetch_project_instructions(client, &shared.id, root_path);
+    let instructions = if sharer_reachable {
+        fetch_project_instructions(client, &shared.id, root_path)
+    } else {
+        String::new()
+    };
     let git_author = global_git_author();
     Ok(live_session_extras(
         shared,
@@ -404,6 +412,8 @@ mod tests {
                 "Bash",
                 "BashOutput",
                 "KillShell",
+                "Monitor",
+                "PowerShell",
                 "Grep",
                 "Glob",
                 "LS"

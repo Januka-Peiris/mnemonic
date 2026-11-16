@@ -15,7 +15,7 @@
 - Protocol bumps to `TEAM_PROTOCOL_VERSION = 5`; no compatibility with v4.
 - Every new route sits behind the existing `check_request` (no `Origin`, allowed `Host`, JSON body, `X-Mnemonic-Team` header on POST) and the `team.allow` whois check.
 - MCP server name passed to Claude: `teammate_workspace` (the name `workspace` is reserved by Claude and silently dropped). Tool names Claude sees: `mcp__teammate_workspace__Read`, `__Write`, `__Edit`, `__Glob`, `__Grep`, `__Bash`.
-- Built-ins to disallow, passed as `_meta.claudeCode.options.disallowedTools`: `Read, Write, Edit, MultiEdit, NotebookEdit, Bash, BashOutput, KillShell, Grep, Glob, LS`.
+- Built-ins to disallow, passed as `_meta.claudeCode.options.disallowedTools`: `Read, Write, Edit, MultiEdit, NotebookEdit, Bash, BashOutput, KillShell, Monitor, PowerShell, Grep, Glob, LS`.
 - Read tools pre-allowed via `_meta.claudeCode.options.allowedTools`: `mcp__teammate_workspace__Read, mcp__teammate_workspace__Glob, mcp__teammate_workspace__Grep`.
 - System prompt addition via `_meta.systemPrompt = {"append": "<text>"}` (the adapter maps an object to the `claude_code` preset plus `append`).
 - Bash: default timeout 120000 ms, maximum 600000 ms, output truncated to 30000 characters, cwd = workspace root, runs as Jay's user through `$SHELL -l -c`, with `GIT_AUTHOR_NAME`/`GIT_AUTHOR_EMAIL` set from Dan's git identity.

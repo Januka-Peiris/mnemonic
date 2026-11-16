@@ -461,6 +461,10 @@ impl TeammateWorkspaceView {
         })
     }
 
+    pub(crate) fn has_live_chats(&self) -> bool {
+        !self.live_chats.is_empty()
+    }
+
     pub(crate) fn files(&self) -> &[TeamFileDiff] {
         &self.files
     }
@@ -907,7 +911,7 @@ impl TeammateWorkspaceView {
             }
             return;
         }
-        if self.live_setup_task.is_some() || !self.available {
+        if self.live_setup_task.is_some() {
             return;
         }
         let Some(shared) = self
@@ -930,11 +934,21 @@ impl TeammateWorkspaceView {
         };
         let host = self.host.clone();
         let sharer_name = self.peer_name(cx);
+        // While the sharer is offline the chats still start, so their
+        // transcripts load; tool calls fail until the sharer is back.
+        let sharer_reachable = self.available;
         self.live_setup_task = Some(cx.spawn_in(window, async move |this, cx| {
             let data_dir = app.data_dir.clone();
             let prepared = cx
                 .background_spawn(async move {
-                    prepare_live_session(&data_dir, &host, &client, &shared, &sharer_name)
+                    prepare_live_session(
+                        &data_dir,
+                        &host,
+                        &client,
+                        &shared,
+                        &sharer_name,
+                        sharer_reachable,
+                    )
                 })
                 .await;
             this.update_in(cx, |this, window, cx| {

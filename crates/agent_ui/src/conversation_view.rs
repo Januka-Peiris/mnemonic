@@ -562,6 +562,9 @@ pub struct ConversationView {
     thread_store: Option<Entity<ThreadStore>>,
     pub(crate) thread_id: ThreadId,
     pub(crate) root_session_id: Option<acp::SessionId>,
+    /// The folders the view was given, used when a reset has no thread to
+    /// take them from, so the session doesn't fall back to the project's.
+    work_dirs: Option<PathList>,
     server_state: ServerState,
     focus_handle: FocusHandle,
     notifications: Vec<WindowHandle<AgentNotification>>,
@@ -743,6 +746,7 @@ impl ConversationView {
     }
 
     pub fn set_work_dirs(&mut self, work_dirs: PathList, cx: &mut Context<Self>) {
+        self.work_dirs = Some(work_dirs.clone());
         if let Some(connected) = self.as_connected() {
             connected.conversation.update(cx, |conversation, cx| {
                 conversation.set_work_dirs(work_dirs.clone(), cx);
@@ -891,6 +895,7 @@ impl ConversationView {
             thread_store,
             thread_id,
             root_session_id: resume_session_id.clone(),
+            work_dirs: work_dirs.clone(),
             server_state: Self::initial_state(
                 agent.clone(),
                 connection_store,
@@ -959,6 +964,7 @@ impl ConversationView {
                     .unwrap_or((None, None));
                 (session_id, work_dirs, title)
             });
+        let work_dirs = work_dirs.or_else(|| self.work_dirs.clone());
 
         self.loading_status = None;
 
@@ -4271,6 +4277,65 @@ pub(crate) mod tests {
             assert_eq!(
                 thread_session, resume_session_id,
                 "the live AcpThread should hold the resumed session id"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_reset_keeps_the_given_work_dirs_after_load_error(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree("/project", json!({})).await;
+        let project = Project::test(fs, [Path::new("/project")], cx).await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+
+        let thread_store = cx.update(|_window, cx| cx.new(|cx| ThreadStore::new(cx)));
+        let connection_store =
+            cx.update(|_window, cx| cx.new(|cx| AgentConnectionStore::new(project.clone(), cx)));
+        let (server, fail) = FlakyAgentServer::new(StubAgentConnection::new());
+        let work_dirs = PathList::new(&[Path::new("/scratch")]);
+
+        let conversation_view = cx.update(|window, cx| {
+            cx.new(|cx| {
+                ConversationView::new(
+                    Rc::new(server),
+                    connection_store,
+                    Agent::Custom { id: "Flaky".into() },
+                    None,
+                    None,
+                    Some(work_dirs.clone()),
+                    None,
+                    None,
+                    workspace.downgrade(),
+                    project.clone(),
+                    Some(thread_store),
+                    AgentThreadSource::AgentPanel,
+                    window,
+                    cx,
+                )
+            })
+        });
+        cx.run_until_parked();
+
+        fail.store(false, std::sync::atomic::Ordering::SeqCst);
+        project.update(cx, |project, cx| {
+            project
+                .agent_server_store()
+                .update(cx, |_store, cx| cx.emit(project::AgentServersUpdated));
+        });
+        cx.run_until_parked();
+
+        conversation_view.read_with(cx, |view, cx| {
+            let thread_view = view
+                .active_thread()
+                .expect("should have an active thread view after the retry");
+            assert_eq!(
+                thread_view.read(cx).thread.read(cx).work_dirs(),
+                Some(&work_dirs),
+                "the retried session must keep the folders the view was given"
             );
         });
     }

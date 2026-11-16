@@ -4972,10 +4972,11 @@ enum ActiveView {
 /// instant and terminals keep running.
 pub struct WorkspaceHost {
     views: HashMap<String, Entity<WorkspaceView>>,
-    /// The teammate's workspace being shown. Unlike your own it isn't kept
-    /// once another workspace is selected, so a teammate's machine is only
-    /// asked for the chats someone is looking at.
-    teammate: Option<Entity<TeammateWorkspaceView>>,
+    /// Teammates' workspaces by key. Unlike your own, one is only kept once
+    /// another workspace is selected while it has chats of your own running
+    /// in it, so a teammate's machine is otherwise only asked for the chats
+    /// someone is looking at.
+    teammates: HashMap<String, Entity<TeammateWorkspaceView>>,
     active: Option<ActiveView>,
     focus_handle: FocusHandle,
     /// Moves tabs opened in the window's own pane into the selected
@@ -5056,7 +5057,7 @@ impl WorkspaceHost {
                 let workspace_entity = cx.entity();
                 let host = cx.new(|cx| WorkspaceHost {
                     views: HashMap::new(),
-                    teammate: None,
+                    teammates: HashMap::new(),
                     active: None,
                     focus_handle: cx.focus_handle(),
                     _window_items: cx.subscribe_in(
@@ -5151,7 +5152,7 @@ impl WorkspaceHost {
     ) {
         self.ensure_view(summary, workspace, project, database_id, window, cx);
         self.active = Some(ActiveView::Local(summary.id.clone()));
-        self.teammate = None;
+        self.release_inactive_teammates(cx);
         if let Some(view) = self.views.get(&summary.id) {
             view.update(cx, |view, cx| {
                 view.load_run_config(cx);
@@ -5325,11 +5326,7 @@ impl WorkspaceHost {
         cx: &mut Context<Self>,
     ) {
         let key = teammate_workspace_key(&host, &workspace_id);
-        let current = match &self.active {
-            Some(ActiveView::Teammate(active_key)) if *active_key == key => self.teammate.clone(),
-            Some(ActiveView::Teammate(_) | ActiveView::Local(_)) | None => None,
-        };
-        let view = match current {
+        let view = match self.teammates.get(&key).cloned() {
             Some(view) => {
                 view.update(cx, |view, cx| view.reopen_closed_chats(window, cx));
                 view
@@ -5338,8 +5335,9 @@ impl WorkspaceHost {
                 TeammateWorkspaceView::new(host, workspace_id, workspace, project, window, cx)
             }),
         };
-        self.teammate = Some(view.clone());
+        self.teammates.insert(key.clone(), view.clone());
         self.active = Some(ActiveView::Teammate(key));
+        self.release_inactive_teammates(cx);
         let focus_handle = view.focus_handle(cx);
         window.focus(&focus_handle, cx);
         cx.emit(ItemEvent::UpdateTab);
@@ -5357,9 +5355,21 @@ impl WorkspaceHost {
 
     fn active_teammate(&self) -> Option<&Entity<TeammateWorkspaceView>> {
         match &self.active {
-            Some(ActiveView::Teammate(_)) => self.teammate.as_ref(),
+            Some(ActiveView::Teammate(key)) => self.teammates.get(key),
             Some(ActiveView::Local(_)) | None => None,
         }
+    }
+
+    /// Drops the teammates' workspaces that aren't shown and have none of
+    /// your own chats running in them.
+    fn release_inactive_teammates(&mut self, cx: &App) {
+        let active_key = match &self.active {
+            Some(ActiveView::Teammate(key)) => Some(key.clone()),
+            Some(ActiveView::Local(_)) | None => None,
+        };
+        self.teammates.retain(|key, view| {
+            active_key.as_ref() == Some(key) || view.read(cx).has_live_chats()
+        });
     }
 
     /// Drops the cached view for an archived workspace, clearing the host's
