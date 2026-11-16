@@ -249,7 +249,7 @@ impl WorkspacePanel {
         })
     }
 
-    fn refresh(&mut self, cx: &App) {
+    pub(crate) fn refresh(&mut self, cx: &App) {
         let state = mnemonic_bridge::mnemonic_state(cx);
         match workspace_service::list_workspaces(&state) {
             Ok(ws) => self.workspaces = ws,
@@ -691,6 +691,24 @@ impl WorkspacePanel {
         .detach();
     }
 
+    /// Drops a workspace that no longer exists from the sidebar and this
+    /// window.
+    pub(crate) fn forget_workspace(&mut self, ws_id: &str, cx: &mut Context<Self>) {
+        mnemonic_bridge::clear_agent_activity(ws_id);
+        mnemonic_bridge::clear_pr_state(ws_id);
+        if self.selected_workspace_id.as_deref() == Some(ws_id) {
+            self.selected_workspace_id = None;
+            crate::ActiveWorkspace::set(self.workspace.entity_id(), None, cx);
+        }
+        if let Some(workspace) = self.workspace.upgrade() {
+            workspace.update(cx, |workspace, cx| {
+                WorkspaceHost::remove_workspace_view(workspace, ws_id, cx);
+            });
+        }
+        self.refresh(cx);
+        cx.notify();
+    }
+
     /// Runs the configured teardown commands in the workspace's view, stops
     /// the agent session and run commands, frees the workspace's ports, moves
     /// the worktree into the archive folder, keeps the branch. There is no
@@ -773,21 +791,7 @@ impl WorkspacePanel {
 
             this.update_in(cx, |this, window, cx| {
                 match result {
-                    Ok(()) => {
-                        mnemonic_bridge::clear_agent_activity(&ws_id);
-                        mnemonic_bridge::clear_pr_state(&ws_id);
-                        if this.selected_workspace_id.as_deref() == Some(ws_id.as_str()) {
-                            this.selected_workspace_id = None;
-                            crate::ActiveWorkspace::set(this.workspace.entity_id(), None, cx);
-                        }
-                        if let Some(workspace) = this.workspace.upgrade() {
-                            workspace.update(cx, |workspace, cx| {
-                                WorkspaceHost::remove_workspace_view(workspace, &ws_id, cx);
-                            });
-                        }
-                        this.refresh(cx);
-                        cx.notify();
-                    }
+                    Ok(()) => this.forget_workspace(&ws_id, cx),
                     Err(err) => {
                         let _dismissed = window.prompt(
                             PromptLevel::Critical,
@@ -1027,6 +1031,7 @@ impl WorkspacePanel {
                     parent_workspace_id: None,
                     source_workspace_id: None,
                     derived_from_branch: None,
+                    workspace_source: None,
                 };
                 workspace_service::create_workspace(&state, input)
             })

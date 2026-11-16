@@ -9,6 +9,7 @@ use crate::repositories::{
     activity_repository, chat_session_repository, repository_repository,
     repository_settings_repository, settings_repository, workspace_repository,
 };
+use crate::services::team_files_service::TEAM_COPY_SOURCE;
 use crate::services::{
     git_worktree_service, pr_draft_service, repo_scanner_service, terminal_service,
     workspace_script_service,
@@ -35,6 +36,7 @@ pub(super) fn create_workspace(
         _ => None,
     };
 
+    let is_team_copy = input.workspace_source.as_deref() == Some(TEAM_COPY_SOURCE);
     let selected_worktree = match input.selected_worktree_id.as_deref() {
         Some(worktree_id) if !worktree_id.trim().is_empty() => {
             repository_repository::get_worktree(&state.db, worktree_id)?
@@ -92,14 +94,19 @@ pub(super) fn create_workspace(
         workspace_root_path = Some(created.path.clone());
         worktree_path = created.path;
         worktree_managed_by_mnemonic = true;
-        workspace_source = "mnemonic_managed_worktree".to_string();
+        workspace_source = input
+            .workspace_source
+            .clone()
+            .unwrap_or_else(|| "mnemonic_managed_worktree".to_string());
     } else {
         return Err(
             "Repository selection is required to create a real branch workspace".to_string(),
         );
     }
 
-    if worktree_managed_by_mnemonic {
+    // A teammate's copy holds only the sharer's files; this machine's init
+    // files would read as edits waiting to be sent.
+    if worktree_managed_by_mnemonic && !is_team_copy {
         if let Some(repository_id) = selected_repo.as_ref().map(|r| r.id.as_str()) {
             if let Ok(Some(init_files_raw)) = repository_settings_repository::get_value(
                 &state.db,
@@ -241,7 +248,10 @@ pub(super) fn create_workspace(
         .map(|value| value == "true")
         .unwrap_or(false);
 
-    if detail.summary.worktree_managed_by_mnemonic && auto_setup_enabled {
+    // A teammate's copy holds the sharer's Setup commands, which this
+    // machine never runs on its own.
+    let runs_setup = detail.summary.worktree_managed_by_mnemonic && !is_team_copy;
+    if runs_setup && auto_setup_enabled {
         match workspace_script_service::run_workspace_setup(state, &detail.summary.id) {
             Ok(sessions) if !sessions.is_empty() => {
                 let details = format!(
@@ -271,7 +281,7 @@ pub(super) fn create_workspace(
                 );
             }
         }
-    } else if detail.summary.worktree_managed_by_mnemonic {
+    } else if runs_setup {
         let _ = activity_repository::record(
             &state.db,
             &detail.summary.id,
@@ -285,7 +295,7 @@ pub(super) fn create_workspace(
         );
     }
 
-    if detail.summary.worktree_managed_by_mnemonic {
+    if runs_setup {
         if let Some(repository_id) = detail.summary.repository_id.as_deref() {
             if let Ok(Some(setup_script)) =
                 repository_settings_repository::get_value(&state.db, repository_id, "setup_script")
@@ -337,7 +347,7 @@ pub(super) fn create_workspace(
         }
     }
 
-    if detail.summary.run_tests_on_create {
+    if detail.summary.run_tests_on_create && !is_team_copy {
         if let Ok(config) =
             workspace_script_service::get_workspace_mnemonic_config(state, &detail.summary.id)
         {
@@ -744,6 +754,7 @@ pub(super) fn create_child_workspace(
             parent_workspace_id: Some(parent.summary.id.clone()),
             source_workspace_id: Some(parent.summary.id),
             derived_from_branch: Some(parent_branch),
+            workspace_source: None,
         },
     )
 }

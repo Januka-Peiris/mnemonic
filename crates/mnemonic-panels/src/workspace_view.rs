@@ -958,6 +958,8 @@ pub struct WorkspaceView {
     _window_activation: Subscription,
     _pane_refresh: Subscription,
     _diagnostics_updated: Subscription,
+    /// Redraws the line above a teammate's copy when its following changes.
+    _team_copy_watch: Option<Subscription>,
 }
 
 impl WorkspaceView {
@@ -4707,6 +4709,7 @@ impl Render for WorkspaceView {
             .on_action(cx.listener(|this, _: &ActivatePaneDown, window, cx| {
                 this.activate_pane_in_direction(SplitDirection::Down, window, cx);
             }))
+            .children(crate::team_copy::render_copy_banner(&self.workspace_id, cx))
             .child(
                 div()
                     .flex_grow(1.0)
@@ -5218,6 +5221,13 @@ impl WorkspaceHost {
                             }
                         },
                     ),
+                    _team_copy_watch: crate::team::team_share(cx).map(|team| {
+                        cx.observe(&team, |view: &mut WorkspaceView, team, cx| {
+                            if team.read(cx).copies.contains_key(&view.workspace_id) {
+                                cx.notify();
+                            }
+                        })
+                    }),
                     window_handle: window.window_handle(),
                     window_active: window.is_window_active(),
                     last_cli_activity: None,

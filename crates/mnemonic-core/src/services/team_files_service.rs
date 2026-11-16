@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 
@@ -536,6 +536,648 @@ pub fn fetch_bundle(repo: &Path, bundle: &[u8], head_commit: &str) -> Result<(),
     }
 }
 
+/// Marks a workspace that is a teammate's copy, so Mnemonic doesn't run
+/// the sharer's Setup in it.
+pub const TEAM_COPY_SOURCE: &str = "team_copy";
+
+/// A teammate's copy of a shared workspace, as this machine follows it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct CopyState {
+    pub host: String,
+    /// The sharer's name as configured for that teammate.
+    #[serde(default)]
+    pub sharer_name: String,
+    pub workspace_id: String,
+    pub local_workspace_id: String,
+    pub head_commit: String,
+    /// Each path last written from the sharer, with the hash written; an
+    /// empty hash when the sharer had deleted it.
+    pub synced: HashMap<String, String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FollowPlan {
+    pub write: Vec<String>,
+    pub delete: Vec<String>,
+    /// Paths the sharer no longer changes, returned to HEAD's version (or
+    /// removed when HEAD lacks them).
+    pub restore: Vec<String>,
+    pub both_changed: Vec<String>,
+    pub move_head: bool,
+    pub waiting_reason: Option<String>,
+}
+
+fn follow_target(entry: &TeamFileEntry) -> &str {
+    match entry.kind {
+        TeamFileKind::Deleted => "",
+        _ => entry.hash.as_str(),
+    }
+}
+
+/// What following `incoming` means for the copy. `local` holds the current
+/// hash of every relevant path that exists in the copy (paths in `synced`,
+/// in `incoming`, and in `dirty_vs_head`); `dirty_vs_head` holds the paths
+/// that differ from the copy's HEAD. A path is touched by the teammate when
+/// its local hash differs from `synced`, or, for a path not in `synced`,
+/// when it differs from HEAD at all, since git's sha1 blob ids can't be
+/// compared with these sha256 hashes.
+pub fn plan_follow(
+    state: &CopyState,
+    local: &HashMap<String, String>,
+    dirty_vs_head: &HashSet<String>,
+    incoming: &TeamFileManifest,
+    has_local_commits: bool,
+) -> FollowPlan {
+    let local_hash = |path: &str| local.get(path).map(String::as_str).unwrap_or("");
+    let touched = |path: &str| match state.synced.get(path) {
+        Some(base) => local_hash(path) != base,
+        None => dirty_vs_head.contains(path),
+    };
+    let incoming_by_path: HashMap<&str, &TeamFileEntry> = incoming
+        .entries
+        .iter()
+        .map(|entry| (entry.path.as_str(), entry))
+        .collect();
+    let mut dropped: Vec<&str> = state
+        .synced
+        .keys()
+        .map(String::as_str)
+        .filter(|path| !incoming_by_path.contains_key(path))
+        .collect();
+    dropped.sort_unstable();
+
+    let has_unsent_edits = state
+        .synced
+        .keys()
+        .chain(dirty_vs_head.iter())
+        .map(String::as_str)
+        .any(|path| {
+            let agrees = match incoming_by_path.get(path) {
+                Some(entry) => local_hash(path) == follow_target(entry),
+                None => !dirty_vs_head.contains(path),
+            };
+            touched(path) && !agrees
+        });
+
+    let head_moves = incoming.head_commit != state.head_commit;
+    let waiting_reason = if !head_moves {
+        None
+    } else if has_local_commits {
+        Some(
+            "This copy has commits of its own, so it stays on the commit it started from"
+                .to_string(),
+        )
+    } else if has_unsent_edits {
+        Some("Send or discard your edits to follow the new commit".to_string())
+    } else {
+        None
+    };
+    let mut plan = FollowPlan {
+        move_head: head_moves && waiting_reason.is_none(),
+        waiting_reason,
+        ..FollowPlan::default()
+    };
+
+    if plan.move_head {
+        for entry in &incoming.entries {
+            match entry.kind {
+                TeamFileKind::Deleted => plan.delete.push(entry.path.clone()),
+                _ => plan.write.push(entry.path.clone()),
+            }
+        }
+        plan.restore = dropped.iter().map(|path| path.to_string()).collect();
+        return plan;
+    }
+
+    for entry in &incoming.entries {
+        let path = entry.path.as_str();
+        let target = follow_target(entry);
+        let base = state.synced.get(path).map(String::as_str);
+        let follow = if local_hash(path) == target {
+            base != Some(target)
+        } else if !touched(path) {
+            true
+        } else {
+            if base != Some(target) {
+                plan.both_changed.push(entry.path.clone());
+            }
+            false
+        };
+        if follow {
+            match entry.kind {
+                TeamFileKind::Deleted => plan.delete.push(entry.path.clone()),
+                _ => plan.write.push(entry.path.clone()),
+            }
+        }
+    }
+    // A path dropped from the manifest may be in a commit this copy hasn't
+    // moved to yet, so it is only restored while both sides share HEAD.
+    if !head_moves {
+        for path in dropped {
+            if touched(path) && dirty_vs_head.contains(path) {
+                plan.both_changed.push(path.to_string());
+            } else {
+                plan.restore.push(path.to_string());
+            }
+        }
+    }
+    plan
+}
+
+/// The copy as it is on disk now: hashes of every path that differs from
+/// HEAD or is named in `paths`, and which of those differ from HEAD.
+pub struct LocalCopy {
+    pub hashes: HashMap<String, String>,
+    pub dirty_vs_head: HashSet<String>,
+}
+
+pub fn read_local_copy<'a>(
+    root: &Path,
+    skip: &SkipList,
+    paths: impl IntoIterator<Item = &'a str>,
+) -> Result<LocalCopy, String> {
+    let scan = scan_workspace(root, skip)?;
+    let mut hashes = HashMap::new();
+    let mut dirty_vs_head = HashSet::new();
+    for entry in scan.entries {
+        if !matches!(entry.kind, TeamFileKind::Deleted) {
+            hashes.insert(entry.path.clone(), entry.hash);
+        }
+        dirty_vs_head.insert(entry.path);
+    }
+    for path in paths {
+        if dirty_vs_head.contains(path) || skip.skips(path) {
+            continue;
+        }
+        let Ok(full_path) = safe_relative_path(root, path) else {
+            continue;
+        };
+        if let Some(hash) = current_hash(&full_path)? {
+            hashes.insert(path.to_string(), hash);
+        }
+    }
+    Ok(LocalCopy {
+        hashes,
+        dirty_vs_head,
+    })
+}
+
+/// The hash a scan would give the path, None when nothing is there.
+fn current_hash(full_path: &Path) -> Result<Option<String>, String> {
+    let metadata = match std::fs::symlink_metadata(full_path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("could not stat {}: {error}", full_path.display())),
+    };
+    if metadata.file_type().is_symlink() {
+        let target = std::fs::read_link(full_path)
+            .map_err(|error| format!("could not read link {}: {error}", full_path.display()))?;
+        return Ok(Some(file_hash(target.to_string_lossy().as_bytes())));
+    }
+    if !metadata.is_file() {
+        return Ok(None);
+    }
+    hash_file(full_path)
+        .map(|(_, hash)| Some(hash))
+        .map_err(|error| format!("could not read {}: {error}", full_path.display()))
+}
+
+/// The paths the teammate changed in their copy and hasn't sent.
+pub fn local_edits(state: &CopyState, root: &Path, skip: &SkipList) -> Result<Vec<String>, String> {
+    let local = read_local_copy(root, skip, state.synced.keys().map(String::as_str))?;
+    let local_hash = |path: &str| local.hashes.get(path).map(String::as_str).unwrap_or("");
+    let mut edits: Vec<String> = state
+        .synced
+        .iter()
+        .filter(|(path, base)| !skip.skips(path) && local_hash(path) != base.as_str())
+        .map(|(path, _)| path.clone())
+        .chain(
+            local
+                .dirty_vs_head
+                .iter()
+                .filter(|path| !state.synced.contains_key(*path))
+                .cloned(),
+        )
+        .collect();
+    edits.sort_unstable();
+    edits.dedup();
+    Ok(edits)
+}
+
+pub fn has_commit(repo: &Path, commit: &str) -> bool {
+    run_git(repo, &["cat-file", "-e", &format!("{commit}^{{commit}}")]).is_ok()
+}
+
+pub fn fetch_origin(repo: &Path) -> Result<(), String> {
+    run_git(repo, &["fetch", "--quiet", "origin"]).map(|_| ())
+}
+
+/// The normalized `origin` of the repository, None when it has none.
+pub fn origin_url(repo: &Path) -> Option<String> {
+    let output = run_git(repo, &["remote", "get-url", "origin"]).ok()?;
+    let url = normalize_remote_url(&String::from_utf8_lossy(&output));
+    (!url.is_empty()).then_some(url)
+}
+
+/// `wanted`, or it with the first free numeric suffix when a branch of that
+/// name exists, so a new copy never lands on an older copy's branch.
+pub fn unused_branch_name(repo: &Path, wanted: &str) -> Result<String, String> {
+    let exists = |name: &str| {
+        run_git(
+            repo,
+            &[
+                "show-ref",
+                "--verify",
+                "--quiet",
+                &format!("refs/heads/{name}"),
+            ],
+        )
+        .is_ok()
+    };
+    if !exists(wanted) {
+        return Ok(wanted.to_string());
+    }
+    (2..1000)
+        .map(|suffix| format!("{wanted}-{suffix}"))
+        .find(|name| !exists(name))
+        .ok_or_else(|| format!("Every branch name like {wanted} is taken"))
+}
+
+/// Whether HEAD has commits the sharer never had, judged against both the
+/// commit the copy started from and the sharer's new one, so a sharer who
+/// amended or rebased isn't mistaken for the teammate committing.
+pub fn has_local_commits(
+    root: &Path,
+    started_from: &str,
+    sharer_head: &str,
+) -> Result<bool, String> {
+    let output = run_git(
+        root,
+        &[
+            "rev-list",
+            "-n1",
+            "HEAD",
+            "--not",
+            started_from,
+            sharer_head,
+        ],
+    )?;
+    Ok(!output.iter().all(u8::is_ascii_whitespace))
+}
+
+#[allow(clippy::disallowed_methods)]
+fn run_git_on_paths(root: &Path, args: &[&str], paths: &[&str]) -> Result<(), String> {
+    for chunk in paths.chunks(200) {
+        let output = Command::new("git")
+            .env("GIT_LITERAL_PATHSPECS", "1")
+            .args(args)
+            .arg("--")
+            .args(chunk)
+            .current_dir(root)
+            .output()
+            .map_err(|error| format!("could not run git: {error}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "git {} failed: {}",
+                args.join(" "),
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn tracked_paths(root: &Path, commit: &str) -> Result<HashSet<String>, String> {
+    let output = run_git(root, &["ls-tree", "-r", "-z", "--name-only", commit])?;
+    Ok(output
+        .split(|byte| *byte == 0)
+        .filter(|path| !path.is_empty())
+        .map(|path| String::from_utf8_lossy(path).into_owned())
+        .collect())
+}
+
+fn remove_if_present(full_path: &Path) -> Result<(), String> {
+    match std::fs::symlink_metadata(full_path) {
+        Ok(metadata) if metadata.is_dir() => Err(format!("{} is a folder", full_path.display())),
+        Ok(_) => std::fs::remove_file(full_path)
+            .map_err(|error| format!("could not remove {}: {error}", full_path.display())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!("could not stat {}: {error}", full_path.display())),
+    }
+}
+
+/// Where an in-tree link at `path` points, relative to the root, or None
+/// when its target leaves the root or goes through `.git`.
+fn in_tree_link_target(path: &str, target: &str) -> Option<String> {
+    if target.is_empty() || Path::new(target).is_absolute() {
+        return None;
+    }
+    let mut resolved: Vec<&str> = path.split('/').collect();
+    resolved.pop();
+    for part in target.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                resolved.pop()?;
+            }
+            name if name.eq_ignore_ascii_case(".git") => return None,
+            name => resolved.push(name),
+        }
+    }
+    (!resolved.is_empty()).then(|| resolved.join("/"))
+}
+
+fn temp_path_beside(full_path: &Path) -> Result<PathBuf, String> {
+    let name = full_path
+        .file_name()
+        .ok_or_else(|| format!("{} has no file name", full_path.display()))?;
+    Ok(full_path.with_file_name(format!(
+        ".{}.{}.mnemonic-tmp",
+        name.to_string_lossy(),
+        uuid::Uuid::new_v4()
+    )))
+}
+
+fn create_parent(full_path: &Path) -> Result<(), String> {
+    match full_path.parent() {
+        Some(parent) => std::fs::create_dir_all(parent)
+            .map_err(|error| format!("could not create {}: {error}", parent.display())),
+        None => Ok(()),
+    }
+}
+
+#[cfg(unix)]
+fn set_executable(full_path: &Path, executable: bool) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = if executable { 0o755 } else { 0o644 };
+    std::fs::set_permissions(full_path, std::fs::Permissions::from_mode(mode)).map_err(|error| {
+        format!(
+            "could not set permissions on {}: {error}",
+            full_path.display()
+        )
+    })
+}
+
+#[cfg(not(unix))]
+fn set_executable(_full_path: &Path, _executable: bool) -> Result<(), String> {
+    Ok(())
+}
+
+fn replace_atomically(
+    full_path: &Path,
+    write_temp: impl FnOnce(&Path) -> Result<(), String>,
+) -> Result<(), String> {
+    create_parent(full_path)?;
+    let temp_path = temp_path_beside(full_path)?;
+    let written = write_temp(&temp_path).and_then(|()| {
+        std::fs::rename(&temp_path, full_path)
+            .map_err(|error| format!("could not replace {}: {error}", full_path.display()))
+    });
+    if written.is_err() {
+        if let Err(error) = remove_if_present(&temp_path) {
+            log::warn!("Couldn't clean up {}: {error}", temp_path.display());
+        }
+    }
+    written
+}
+
+/// Writes one of the sharer's entries into the copy, fetching its bytes
+/// only when the copy doesn't already hold them. Returns the hash now in
+/// the copy, or None when the entry may not be written here.
+pub fn write_copy_entry(
+    root: &Path,
+    entry: &TeamFileEntry,
+    fetch: &dyn Fn(&str) -> Result<Vec<u8>, String>,
+) -> Result<Option<String>, String> {
+    if SkipList::default().skips(&entry.path) {
+        return Ok(None);
+    }
+    let full_path = safe_relative_path(root, &entry.path)?;
+    match &entry.kind {
+        TeamFileKind::Deleted => {
+            remove_if_present(&full_path)?;
+            Ok(Some(String::new()))
+        }
+        TeamFileKind::File { executable } => {
+            let is_file = std::fs::symlink_metadata(&full_path)
+                .is_ok_and(|metadata| metadata.file_type().is_file());
+            if is_file && current_hash(&full_path)?.as_deref() == Some(entry.hash.as_str()) {
+                set_executable(&full_path, *executable)?;
+                return Ok(Some(entry.hash.clone()));
+            }
+            let bytes = fetch(&entry.path)?;
+            replace_atomically(&full_path, |temp_path| {
+                std::fs::write(temp_path, &bytes)
+                    .map_err(|error| format!("could not write {}: {error}", entry.path))?;
+                set_executable(temp_path, *executable)
+            })?;
+            Ok(Some(file_hash(&bytes)))
+        }
+        TeamFileKind::Symlink { target } => {
+            let inside = in_tree_link_target(&entry.path, target)
+                .is_some_and(|resolved| safe_relative_path(root, &resolved).is_ok());
+            if !inside {
+                log::warn!(
+                    "Not recreating {}: it points outside the workspace",
+                    entry.path
+                );
+                return Ok(None);
+            }
+            replace_atomically(&full_path, |temp_path| make_symlink(target, temp_path))?;
+            Ok(Some(file_hash(target.as_bytes())))
+        }
+    }
+}
+
+#[cfg(unix)]
+fn make_symlink(target: &str, link: &Path) -> Result<(), String> {
+    std::os::unix::fs::symlink(target, link)
+        .map_err(|error| format!("could not link {}: {error}", link.display()))
+}
+
+#[cfg(not(unix))]
+fn make_symlink(_target: &str, link: &Path) -> Result<(), String> {
+    Err(format!(
+        "could not link {}: links aren't supported here",
+        link.display()
+    ))
+}
+
+/// Brings the copy at `root` up to `incoming`, recording in `state` what was
+/// written as it goes, so it stays accurate when a step fails. The sharer's
+/// HEAD must already be in the copy's repository.
+pub fn follow_manifest(
+    root: &Path,
+    state: &mut CopyState,
+    incoming: &TeamFileManifest,
+    fetch: &dyn Fn(&str) -> Result<Vec<u8>, String>,
+) -> Result<FollowPlan, String> {
+    let skip = SkipList::default();
+    let incoming = TeamFileManifest {
+        head_commit: incoming.head_commit.clone(),
+        entries: incoming
+            .entries
+            .iter()
+            .filter(|entry| !skip.skips(&entry.path))
+            .cloned()
+            .collect(),
+    };
+    let local = read_local_copy(
+        root,
+        &skip,
+        state
+            .synced
+            .keys()
+            .map(String::as_str)
+            .chain(incoming.entries.iter().map(|entry| entry.path.as_str())),
+    )?;
+    let head_moves = incoming.head_commit != state.head_commit;
+    let has_local_commits =
+        head_moves && has_local_commits(root, &state.head_commit, &incoming.head_commit)?;
+    let plan = plan_follow(
+        state,
+        &local.hashes,
+        &local.dirty_vs_head,
+        &incoming,
+        has_local_commits,
+    );
+
+    if plan.move_head {
+        move_head(root, state, &incoming.head_commit)?;
+    }
+    if !plan.restore.is_empty() {
+        let tracked = tracked_paths(root, "HEAD")?;
+        let (in_head, not_in_head): (Vec<&str>, Vec<&str>) = plan
+            .restore
+            .iter()
+            .map(String::as_str)
+            .partition(|path| tracked.contains(*path));
+        run_git_on_paths(root, &["checkout", "HEAD"], &in_head)?;
+        for path in not_in_head {
+            if let Ok(full_path) = safe_relative_path(root, path) {
+                remove_if_present(&full_path)?;
+            }
+        }
+        for path in &plan.restore {
+            state.synced.remove(path);
+        }
+    }
+
+    let entries: HashMap<&str, &TeamFileEntry> = incoming
+        .entries
+        .iter()
+        .map(|entry| (entry.path.as_str(), entry))
+        .collect();
+    let mut failures = Vec::new();
+    for path in plan.write.iter().chain(&plan.delete) {
+        let Some(entry) = entries.get(path.as_str()) else {
+            continue;
+        };
+        match write_copy_entry(root, entry, fetch) {
+            Ok(Some(hash)) => {
+                state.synced.insert(path.clone(), hash);
+            }
+            Ok(None) => {}
+            Err(error) => failures.push(error),
+        }
+    }
+    match failures.first() {
+        None => Ok(plan),
+        Some(first) if failures.len() == 1 => Err(first.clone()),
+        Some(first) => Err(format!("{first} (and {} more)", failures.len() - 1)),
+    }
+}
+
+/// Takes the sharer's files off the copy, so `git reset --keep` sees no
+/// local changes in its way, then moves the copy's branch to `new_head`.
+/// The planner has already checked none of those files was the teammate's.
+fn move_head(root: &Path, state: &mut CopyState, new_head: &str) -> Result<(), String> {
+    let tracked_now = tracked_paths(root, "HEAD")?;
+    let tracked_next = tracked_paths(root, new_head)?;
+    let mut synced: Vec<String> = state.synced.keys().cloned().collect();
+    synced.sort_unstable();
+    let (in_head, not_in_head): (Vec<&str>, Vec<&str>) = synced
+        .iter()
+        .map(String::as_str)
+        .partition(|path| tracked_now.contains(*path));
+    run_git_on_paths(root, &["checkout", "HEAD"], &in_head)?;
+    for path in not_in_head
+        .into_iter()
+        .filter(|path| tracked_next.contains(*path))
+    {
+        if let Ok(full_path) = safe_relative_path(root, path) {
+            remove_if_present(&full_path)?;
+        }
+    }
+    // Recorded before the reset, so if it fails the next round sees these
+    // files as the sharer's rather than as the teammate's edits.
+    for path in &synced {
+        let hash = match safe_relative_path(root, path) {
+            Ok(full_path) => current_hash(&full_path)?.unwrap_or_default(),
+            Err(_) => String::new(),
+        };
+        state.synced.insert(path.clone(), hash);
+    }
+    run_git(root, &["reset", "--quiet", "--keep", new_head])?;
+    state.head_commit = new_head.to_string();
+    Ok(())
+}
+
+fn copy_states_dir(data_dir: &Path) -> PathBuf {
+    data_dir.join("team-copies")
+}
+
+pub fn save_copy_state(data_dir: &Path, state: &CopyState) -> Result<(), String> {
+    if state.local_workspace_id.is_empty()
+        || !state
+            .local_workspace_id
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
+    {
+        return Err(format!("{} isn't a workspace id", state.local_workspace_id));
+    }
+    let json = serde_json::to_vec_pretty(state).map_err(|error| error.to_string())?;
+    let full_path = copy_states_dir(data_dir).join(format!("{}.json", state.local_workspace_id));
+    replace_atomically(&full_path, |temp_path| {
+        std::fs::write(temp_path, &json)
+            .map_err(|error| format!("could not save {}: {error}", full_path.display()))
+    })
+}
+
+pub fn load_copy_states(data_dir: &Path) -> Result<Vec<CopyState>, String> {
+    let directory = copy_states_dir(data_dir);
+    let read_dir = match std::fs::read_dir(&directory) {
+        Ok(read_dir) => read_dir,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(format!("could not read {}: {error}", directory.display())),
+    };
+    let mut states = Vec::new();
+    for entry in read_dir {
+        let path = entry
+            .map_err(|error| format!("could not read {}: {error}", directory.display()))?
+            .path();
+        if path.extension().is_none_or(|extension| extension != "json") {
+            continue;
+        }
+        let parsed = std::fs::read(&path)
+            .map_err(|error| error.to_string())
+            .and_then(|bytes| {
+                serde_json::from_slice::<CopyState>(&bytes).map_err(|error| error.to_string())
+            });
+        match parsed {
+            Ok(state) => states.push(state),
+            Err(error) => log::error!("Couldn't read {}: {error}", path.display()),
+        }
+    }
+    Ok(states)
+}
+
+pub fn remove_copy_state(data_dir: &Path, local_workspace_id: &str) -> Result<(), String> {
+    let full_path = copy_states_dir(data_dir).join(format!("{local_workspace_id}.json"));
+    remove_if_present(&full_path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -813,5 +1455,171 @@ mod tests {
         let bundle = bundle_for(sharer.path(), &[head.clone()]).expect("bundle");
         assert!(bundle.is_empty());
         fetch_bundle(sharer.path(), &bundle, &head).expect("already present");
+    }
+
+    fn copy_state(head: &str, synced: &[(&str, &str)]) -> CopyState {
+        CopyState {
+            host: "jay-mac".to_string(),
+            sharer_name: "Jay".to_string(),
+            workspace_id: "ws-1".to_string(),
+            local_workspace_id: "ws-local".to_string(),
+            head_commit: head.to_string(),
+            synced: synced
+                .iter()
+                .map(|(path, hash)| (path.to_string(), hash.to_string()))
+                .collect(),
+        }
+    }
+
+    fn manifest(head: &str, files: &[(&str, &str)]) -> TeamFileManifest {
+        TeamFileManifest {
+            head_commit: head.to_string(),
+            entries: files
+                .iter()
+                .map(|(path, hash)| TeamFileEntry {
+                    path: path.to_string(),
+                    kind: TeamFileKind::File { executable: false },
+                    size: 1,
+                    hash: hash.to_string(),
+                })
+                .collect(),
+        }
+    }
+
+    fn hashes(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(path, hash)| (path.to_string(), hash.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn an_untouched_file_follows_the_sharer() {
+        let state = copy_state("aaaaaaa", &[(".context/plan.md", "one")]);
+        let local = hashes(&[(".context/plan.md", "one")]);
+        let incoming = manifest("aaaaaaa", &[(".context/plan.md", "two")]);
+
+        let plan = plan_follow(&state, &local, &HashSet::new(), &incoming, false);
+        assert_eq!(plan.write, vec![".context/plan.md".to_string()]);
+        assert!(plan.both_changed.is_empty());
+        assert_eq!(plan.waiting_reason, None);
+    }
+
+    #[test]
+    fn a_touched_file_is_kept_and_marked_both_changed() {
+        let state = copy_state("aaaaaaa", &[(".context/plan.md", "one")]);
+        let local = hashes(&[(".context/plan.md", "mine")]);
+        let dirty = HashSet::from([".context/plan.md".to_string()]);
+        let incoming = manifest("aaaaaaa", &[(".context/plan.md", "two")]);
+
+        let plan = plan_follow(&state, &local, &dirty, &incoming, false);
+        assert!(plan.write.is_empty());
+        assert_eq!(plan.both_changed, vec![".context/plan.md".to_string()]);
+    }
+
+    #[test]
+    fn a_new_head_waits_while_there_are_unsent_edits() {
+        let state = copy_state("aaaaaaa", &[("src/lib.rs", "one")]);
+        let local = hashes(&[("src/lib.rs", "mine")]);
+        let dirty = HashSet::from(["src/lib.rs".to_string()]);
+        let incoming = manifest("bbbbbbb", &[]);
+
+        let plan = plan_follow(&state, &local, &dirty, &incoming, false);
+        assert!(!plan.move_head);
+        assert!(plan.waiting_reason.is_some());
+        assert!(plan.restore.is_empty());
+    }
+
+    #[test]
+    fn a_new_head_waits_while_the_teammate_has_local_commits() {
+        let state = copy_state("aaaaaaa", &[("src/lib.rs", "one")]);
+        let local = hashes(&[("src/lib.rs", "one")]);
+        let dirty = HashSet::from(["src/lib.rs".to_string()]);
+        let incoming = manifest("bbbbbbb", &[]);
+
+        let waiting = plan_follow(&state, &local, &dirty, &incoming, true);
+        assert!(!waiting.move_head);
+        assert!(waiting.waiting_reason.is_some());
+
+        let following = plan_follow(&state, &local, &dirty, &incoming, false);
+        assert!(following.move_head);
+        assert_eq!(following.restore, vec!["src/lib.rs".to_string()]);
+    }
+
+    #[test]
+    fn a_copy_follows_a_new_commit_over_the_sharers_files() {
+        let sharer = repo();
+        let teammate = tempfile::tempdir().expect("tempdir");
+        let sharer_path = sharer.path().to_string_lossy().to_string();
+        git(teammate.path(), &["clone", "-q", &sharer_path, "copy"]);
+        let copy = teammate.path().join("copy");
+        write(sharer.path(), "changed.txt", "two");
+        write(sharer.path(), ".context/notes.md", "notes");
+        let fetch =
+            |path: &str| std::fs::read(sharer.path().join(path)).map_err(|error| error.to_string());
+        let mut state = copy_state(&head_of(sharer.path()), &[]);
+
+        let first = scan_workspace(sharer.path(), &SkipList::default()).expect("scan");
+        follow_manifest(&copy, &mut state, &first, &fetch).expect("first follow");
+        assert_eq!(
+            std::fs::read_to_string(copy.join("changed.txt")).expect("read"),
+            "two"
+        );
+
+        git(sharer.path(), &["commit", "-q", "-am", "two"]);
+        git(&copy, &["fetch", "-q", "origin"]);
+        let second = scan_workspace(sharer.path(), &SkipList::default()).expect("scan");
+        let plan = follow_manifest(&copy, &mut state, &second, &fetch).expect("second follow");
+
+        assert!(plan.move_head);
+        assert_eq!(head_of(&copy), head_of(sharer.path()));
+        assert_eq!(
+            std::fs::read_to_string(copy.join("changed.txt")).expect("read"),
+            "two"
+        );
+        assert_eq!(
+            std::fs::read_to_string(copy.join(".context/notes.md")).expect("read"),
+            "notes"
+        );
+        assert_eq!(
+            local_edits(&state, &copy, &SkipList::default()).expect("edits"),
+            Vec::<String>::new()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_link_out_of_the_copy_is_not_recreated() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let root = directory.path();
+        let link = |path: &str, target: &str| TeamFileEntry {
+            path: path.to_string(),
+            kind: TeamFileKind::Symlink {
+                target: target.to_string(),
+            },
+            size: 0,
+            hash: String::new(),
+        };
+        let fetch = |_: &str| Err("no fetching".to_string());
+
+        for (path, target) in [
+            ("a/out", "../../etc"),
+            ("abs", "/etc/hosts"),
+            ("g", ".git/config"),
+        ] {
+            assert_eq!(
+                write_copy_entry(root, &link(path, target), &fetch),
+                Ok(None)
+            );
+            assert!(
+                std::fs::symlink_metadata(root.join(path)).is_err(),
+                "{path}"
+            );
+        }
+        write_copy_entry(root, &link("CLAUDE.md", ".rules"), &fetch).expect("in-tree link");
+        assert_eq!(
+            std::fs::read_link(root.join("CLAUDE.md")).expect("link"),
+            PathBuf::from(".rules")
+        );
     }
 }

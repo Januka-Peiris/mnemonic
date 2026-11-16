@@ -47,6 +47,7 @@ use util::markdown::MarkdownCodeBlock;
 use workspace::notifications::NotificationId;
 use workspace::{Toast, Workspace};
 
+use crate::team_copy::{CopyFollow, resume_copies};
 use crate::team_settings::open_team_window;
 use crate::team_workspace_view::teammate_workspace_key;
 use crate::workspace_panel::WorkspacePanel;
@@ -216,6 +217,8 @@ pub(crate) struct TeamShare {
     remote_urls: HashMap<String, Option<String>>,
     scan_task: Option<Task<()>>,
     skip_list_save_count: u64,
+    /// This machine's copies of teammates' workspaces, by local workspace id.
+    pub copies: HashMap<String, CopyFollow>,
     /// The newest skip-list save written, so a slower older write can't
     /// land after a newer one.
     skip_list_written: Arc<Mutex<u64>>,
@@ -270,6 +273,7 @@ pub fn init(cx: &mut App) {
         team
     });
     cx.set_global(GlobalTeamShare(team.clone()));
+    resume_copies(&team, cx);
     cx.observe_global::<SettingsStore>(move |cx| {
         team.update(cx, |team, cx| team.apply_settings(cx));
     })
@@ -302,6 +306,7 @@ impl TeamShare {
             remote_urls: HashMap::new(),
             scan_task: None,
             skip_list_save_count: 0,
+            copies: HashMap::new(),
             skip_list_written: Arc::new(Mutex::new(0)),
         }
     }

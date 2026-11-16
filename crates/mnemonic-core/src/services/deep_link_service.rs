@@ -83,6 +83,7 @@ pub fn open_deep_link(
             parent_workspace_id: None,
             source_workspace_id: None,
             derived_from_branch: None,
+            workspace_source: None,
         },
     )?;
     let prompt_sent = send_prompt_if_present(
