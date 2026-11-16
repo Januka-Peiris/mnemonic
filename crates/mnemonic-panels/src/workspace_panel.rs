@@ -15,7 +15,7 @@ use mnemonic_core::models::{
 };
 use mnemonic_core::repositories::{
     activity_repository, chat_session_repository, repository_repository,
-    repository_settings_repository, settings_repository,
+    repository_settings_repository, settings_repository, workspace_repository,
 };
 
 #[derive(Clone)]
@@ -724,10 +724,12 @@ impl WorkspacePanel {
         // A teammate's copy holds the sharer's teardown commands, which this
         // machine never runs; it is deleted instead, after warning about
         // unsent edits.
-        let is_team_copy = self.workspaces.iter().any(|workspace| {
-            workspace.id == ws_id && workspace.workspace_source == TEAM_COPY_SOURCE
-        });
-        if is_team_copy {
+        let listed_as_team_copy = self
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.id == ws_id)
+            .map(|workspace| workspace.workspace_source == TEAM_COPY_SOURCE);
+        if listed_as_team_copy == Some(true) {
             crate::team_copy::delete_copy(ws_id, window, cx);
             return;
         }
@@ -735,6 +737,35 @@ impl WorkspacePanel {
             let Some(state) = mnemonic_bridge::mnemonic_state_cloned() else {
                 return;
             };
+            if listed_as_team_copy.is_none() {
+                // Not in the sidebar's list yet, so its record decides
+                // whether it is a teammate's copy.
+                let lookup = {
+                    let state = state.clone();
+                    let ws_id = ws_id.clone();
+                    cx.background_spawn(async move {
+                        workspace_repository::get_detail(&state.db, &ws_id)
+                    })
+                    .await
+                };
+                match lookup {
+                    Ok(Some(detail)) if detail.summary.workspace_source == TEAM_COPY_SOURCE => {
+                        this.update_in(cx, |_, window, cx| {
+                            crate::team_copy::delete_copy(ws_id, window, cx)
+                        })
+                        .log_err();
+                        return;
+                    }
+                    Ok(_) => {}
+                    Err(err) => {
+                        this.update(cx, |this, cx| {
+                            this.show_archive_toast(format!("{ws_name}: not archived: {err}"), cx)
+                        })
+                        .log_err();
+                        return;
+                    }
+                }
+            }
             let teardown = {
                 let state = state.clone();
                 let ws_id = ws_id.clone();

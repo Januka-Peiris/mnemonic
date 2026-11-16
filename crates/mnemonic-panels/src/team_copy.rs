@@ -15,9 +15,9 @@ use gpui::{
     AnyElement, App, AppContext as _, AsyncWindowContext, Context, Entity, PromptLevel, Task,
     WeakEntity,
 };
-use mnemonic_core::models::{ChatSessionRecord, CreateWorkspaceInput};
+use mnemonic_core::models::{ChatSessionRecord, CreateWorkspaceInput, WorkspaceDetail};
 use mnemonic_core::repositories::{
-    chat_session_repository, repository_repository, workspace_repository,
+    chat_session_repository, repository_repository, settings_repository, workspace_repository,
 };
 use mnemonic_core::services::team_files_service::{
     self, CopyState, FollowPlan, TEAM_COPY_SOURCE, TeamFileManifest, file_hash,
@@ -755,6 +755,31 @@ pub(crate) fn delete_copy(local_workspace_id: String, window: &mut Window, cx: &
         .detach();
 }
 
+/// Refuses unless the workspace is a teammate's copy inside Mnemonic's own
+/// workspaces folder, as deleting it force-removes that folder.
+fn check_is_managed_copy(
+    app: &AppState,
+    detail: &WorkspaceDetail,
+    root: &str,
+) -> Result<(), String> {
+    if detail.summary.workspace_source != TEAM_COPY_SOURCE {
+        return Err(format!("{} isn't a teammate's copy", detail.summary.name));
+    }
+    let managed_root = settings_repository::get_managed_workspaces_root(&app.db)?;
+    let managed_root = std::fs::canonicalize(&managed_root)
+        .map_err(|err| format!("Couldn't find the workspaces folder {managed_root}: {err}"))?;
+    let copy_root = std::fs::canonicalize(root)
+        .map_err(|err| format!("Couldn't find the copy's folder {root}: {err}"))?;
+    if copy_root == managed_root || !copy_root.starts_with(&managed_root) {
+        return Err(format!(
+            "The copy's folder {} isn't inside {}",
+            copy_root.display(),
+            managed_root.display()
+        ));
+    }
+    Ok(())
+}
+
 /// Asks, then removes the copy's workspace, worktree and saved state.
 /// Without `state` the unsent edits can't be counted, so the warning says
 /// any would be lost.
@@ -780,6 +805,7 @@ async fn delete_copy_files(
                     .workspace_root_path
                     .clone()
                     .unwrap_or_else(|| detail.worktree_path.clone());
+                check_is_managed_copy(&app, &detail, &root)?;
                 let edits = match &state {
                     Some(state) => Some(team_files_service::local_edits(
                         state,
@@ -821,10 +847,12 @@ async fn delete_copy_files(
     cx.background_spawn({
         let local_workspace_id = local_workspace_id.to_string();
         async move {
-            workspace_service::delete_workspace(&app, &local_workspace_id)?;
+            // The worktree goes first, so a failed removal leaves the
+            // workspace listed to try again.
             if let Some(repository_path) = detail.summary.repository_path.as_deref() {
                 git_worktree_service::remove_mnemonic_worktree(repository_path, &root)?;
             }
+            workspace_service::delete_workspace(&app, &local_workspace_id)?;
             if let Err(err) =
                 chat_session_repository::delete_for_workspace(&app.db, &local_workspace_id)
             {
