@@ -23,7 +23,7 @@ use project::{AgentId, Project};
 use remote::remote_client::Interactive;
 use serde::Deserialize;
 use settings::SettingsStore;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
@@ -472,7 +472,9 @@ impl AcpConnectionDefaults {
             let current_value = select.current_value.clone();
             let is_shown = |option: &acp::SessionConfigSelectOption| {
                 option.value == current_value
-                    || allowed.iter().any(|value| value.as_str() == option.value.0.as_ref())
+                    || allowed
+                        .iter()
+                        .any(|value| value.as_str() == option.value.0.as_ref())
             };
             match &mut select.options {
                 acp::SessionConfigSelectOptions::Ungrouped(options) => {
@@ -1476,31 +1478,99 @@ struct SessionDirectories {
     additional_directories: Vec<PathBuf>,
 }
 
+#[derive(Clone, Debug)]
+pub struct SessionExtras {
+    pub mcp_servers: Vec<acp::McpServer>,
+    pub meta: acp::Meta,
+}
+
+#[derive(Default)]
+struct SessionExtrasByCwd(HashMap<PathBuf, SessionExtras>);
+
+impl gpui::Global for SessionExtrasByCwd {}
+
+pub fn set_session_extras(cwd: PathBuf, extras: SessionExtras, cx: &mut App) {
+    cx.default_global::<SessionExtrasByCwd>()
+        .0
+        .insert(cwd, extras);
+}
+
+pub fn clear_session_extras(cwd: &Path, cx: &mut App) {
+    cx.default_global::<SessionExtrasByCwd>().0.remove(cwd);
+}
+
+fn session_extras_for_cwd(cwd: &Path, cx: &App) -> Option<SessionExtras> {
+    cx.try_global::<SessionExtrasByCwd>()?.0.get(cwd).cloned()
+}
+
+fn session_extras_for_work_dirs(work_dirs: &PathList, cx: &App) -> Option<SessionExtras> {
+    let cwd = work_dirs.ordered_paths().next()?;
+    session_extras_for_cwd(cwd, cx)
+}
+
+fn split_session_extras(
+    mut mcp_servers: Vec<acp::McpServer>,
+    extras: Option<SessionExtras>,
+) -> (Vec<acp::McpServer>, Option<acp::Meta>) {
+    match extras {
+        Some(extras) => {
+            mcp_servers.extend(extras.mcp_servers);
+            (mcp_servers, Some(extras.meta))
+        }
+        None => (mcp_servers, None),
+    }
+}
+
 impl SessionDirectories {
-    fn into_new_session_request(self, mcp_servers: Vec<acp::McpServer>) -> acp::NewSessionRequest {
+    fn into_new_session_request(
+        self,
+        mcp_servers: Vec<acp::McpServer>,
+        extras: Option<SessionExtras>,
+    ) -> acp::NewSessionRequest {
+        let (mcp_servers, meta) = split_session_extras(mcp_servers, extras);
         acp::NewSessionRequest::new(self.cwd)
             .additional_directories(self.additional_directories)
             .mcp_servers(mcp_servers)
+            .meta(meta)
     }
 
     fn into_load_session_request(
         self,
         session_id: acp::SessionId,
         mcp_servers: Vec<acp::McpServer>,
+        extras: Option<SessionExtras>,
     ) -> acp::LoadSessionRequest {
+        let (mcp_servers, meta) = split_session_extras(mcp_servers, extras);
         acp::LoadSessionRequest::new(session_id, self.cwd)
             .additional_directories(self.additional_directories)
             .mcp_servers(mcp_servers)
+            .meta(meta)
     }
 
     fn into_resume_session_request(
         self,
         session_id: acp::SessionId,
         mcp_servers: Vec<acp::McpServer>,
+        extras: Option<SessionExtras>,
     ) -> acp::ResumeSessionRequest {
+        let (mcp_servers, meta) = split_session_extras(mcp_servers, extras);
         acp::ResumeSessionRequest::new(session_id, self.cwd)
             .additional_directories(self.additional_directories)
             .mcp_servers(mcp_servers)
+            .meta(meta)
+    }
+
+    fn into_fork_session_request(
+        self,
+        session_id: acp::SessionId,
+        mcp_servers: Vec<acp::McpServer>,
+        extras: Option<SessionExtras>,
+    ) -> acp::ForkSessionRequest {
+        let (mcp_servers, meta) = split_session_extras(mcp_servers, extras);
+        acp::ForkSessionRequest::new(session_id, self.cwd)
+            .additional_directories(self.additional_directories)
+            .mcp_servers(mcp_servers)
+            .meta(meta)
     }
 }
 
@@ -1644,11 +1714,12 @@ impl AgentConnection for AcpConnection {
         };
         let name = self.id.0.clone();
         let mcp_servers = mcp_servers_for_project(&project, cx);
+        let extras = session_extras_for_cwd(&directories.cwd, cx);
 
         cx.spawn(async move |cx| {
             let response = into_foreground_future(
                 self.connection.send_request(
-                    directories.into_new_session_request(mcp_servers),
+                    directories.into_new_session_request(mcp_servers, extras),
                 ),
             )
             .await
@@ -1781,6 +1852,7 @@ impl AgentConnection for AcpConnection {
         }
 
         let mcp_servers = mcp_servers_for_project(&project, cx);
+        let extras = session_extras_for_work_dirs(&work_dirs, cx);
         self.open_or_create_session(
             session_id,
             project,
@@ -1789,7 +1861,11 @@ impl AgentConnection for AcpConnection {
             move |connection, session_id, directories| {
                 Box::pin(async move {
                     let response = into_foreground_future(connection.send_request(
-                        directories.into_load_session_request(session_id.clone(), mcp_servers),
+                        directories.into_load_session_request(
+                            session_id.clone(),
+                            mcp_servers,
+                            extras,
+                        ),
                     ))
                     .await
                     .map_err(map_acp_error)?;
@@ -1823,6 +1899,7 @@ impl AgentConnection for AcpConnection {
         }
 
         let mcp_servers = mcp_servers_for_project(&project, cx);
+        let extras = session_extras_for_work_dirs(&work_dirs, cx);
         self.open_or_create_session(
             session_id,
             project,
@@ -1831,7 +1908,11 @@ impl AgentConnection for AcpConnection {
             move |connection, session_id, directories| {
                 Box::pin(async move {
                     let response = into_foreground_future(connection.send_request(
-                        directories.into_resume_session_request(session_id.clone(), mcp_servers),
+                        directories.into_resume_session_request(
+                            session_id.clone(),
+                            mcp_servers,
+                            extras,
+                        ),
                     ))
                     .await
                     .map_err(map_acp_error)?;
@@ -1871,9 +1952,8 @@ impl AgentConnection for AcpConnection {
             .and_then(|session| session.thread.upgrade())
             .map(|thread| mcp_servers_for_project(thread.read(cx).project(), cx))
             .unwrap_or_default();
-        let request = acp::ForkSessionRequest::new(session_id, directories.cwd)
-            .additional_directories(directories.additional_directories)
-            .mcp_servers(mcp_servers);
+        let extras = session_extras_for_cwd(&directories.cwd, cx);
+        let request = directories.into_fork_session_request(session_id, mcp_servers, extras);
         let connection = self.connection.clone();
         cx.foreground_executor().spawn(async move {
             let response = into_foreground_future(connection.send_request(request))
@@ -2511,9 +2591,10 @@ pub mod test_support {
             )
             .on_receive_request(
                 async move |req: acp::ForkSessionRequest, responder, _cx| {
-                    responder.respond(acp::ForkSessionResponse::new(acp::SessionId::new(
-                        format!("{}-fork", req.session_id),
-                    )))
+                    responder.respond(acp::ForkSessionResponse::new(acp::SessionId::new(format!(
+                        "{}-fork",
+                        req.session_id
+                    ))))
                 },
                 agent_client_protocol::on_receive_request!(),
             )
@@ -2641,6 +2722,80 @@ mod tests {
 
     use super::*;
     use settings::Settings as _;
+
+    #[test]
+    fn session_requests_carry_extras_for_their_cwd() {
+        let extras = SessionExtras {
+            mcp_servers: vec![acp::McpServer::Http(acp::McpServerHttp::new(
+                "teammate_workspace",
+                "http://127.0.0.1:1/mcp",
+            ))],
+            meta: acp::Meta::from_iter([(
+                "claudeCode".to_string(),
+                serde_json::json!({"options": {"disallowedTools": ["Read", "Bash"]}}),
+            )]),
+        };
+        let directories = SessionDirectories {
+            cwd: "/tmp/x".into(),
+            additional_directories: Vec::new(),
+        };
+        let session_id = acp::SessionId::new("session");
+
+        let serialized = [
+            serde_json::to_value(
+                directories
+                    .clone()
+                    .into_new_session_request(Vec::new(), Some(extras.clone())),
+            ),
+            serde_json::to_value(directories.clone().into_load_session_request(
+                session_id.clone(),
+                Vec::new(),
+                Some(extras.clone()),
+            )),
+            serde_json::to_value(directories.clone().into_resume_session_request(
+                session_id.clone(),
+                Vec::new(),
+                Some(extras.clone()),
+            )),
+            serde_json::to_value(directories.clone().into_fork_session_request(
+                session_id,
+                Vec::new(),
+                Some(extras),
+            )),
+        ];
+        for value in serialized {
+            let value = value.expect("request serializes");
+            assert_eq!(value["mcpServers"][0]["name"], "teammate_workspace");
+            assert_eq!(
+                value["_meta"]["claudeCode"]["options"]["disallowedTools"][0],
+                "Read"
+            );
+        }
+
+        let plain = serde_json::to_value(directories.into_new_session_request(Vec::new(), None))
+            .expect("request serializes");
+        assert!(
+            plain["mcpServers"]
+                .as_array()
+                .is_none_or(|servers| servers.is_empty())
+        );
+        assert!(plain.get("_meta").is_none());
+    }
+
+    #[gpui::test]
+    fn session_extras_are_looked_up_by_cwd(cx: &mut gpui::TestAppContext) {
+        let extras = SessionExtras {
+            mcp_servers: Vec::new(),
+            meta: acp::Meta::new(),
+        };
+        cx.update(|cx| {
+            set_session_extras("/tmp/x".into(), extras, cx);
+            assert!(session_extras_for_cwd(Path::new("/tmp/x"), cx).is_some());
+            assert!(session_extras_for_cwd(Path::new("/tmp/y"), cx).is_none());
+            clear_session_extras(Path::new("/tmp/x"), cx);
+            assert!(session_extras_for_cwd(Path::new("/tmp/x"), cx).is_none());
+        });
+    }
 
     #[test]
     fn terminal_auth_task_builds_spawn_from_prebuilt_command() {
@@ -2810,12 +2965,15 @@ mod tests {
         );
 
         let session_id = acp::SessionId::new("session-1");
-        let new_session_request = directories.clone().into_new_session_request(Vec::new());
-        let load_session_request = directories
+        let new_session_request = directories
             .clone()
-            .into_load_session_request(session_id.clone(), Vec::new());
+            .into_new_session_request(Vec::new(), None);
+        let load_session_request =
+            directories
+                .clone()
+                .into_load_session_request(session_id.clone(), Vec::new(), None);
         let resume_session_request =
-            directories.into_resume_session_request(session_id, Vec::new());
+            directories.into_resume_session_request(session_id, Vec::new(), None);
 
         assert_eq!(
             new_session_request.cwd,
@@ -3079,7 +3237,10 @@ mod tests {
                 )
             })
             .await;
-        assert!(result.is_err(), "fork_session should fail without the capability");
+        assert!(
+            result.is_err(),
+            "fork_session should fail without the capability"
+        );
     }
 
     async fn connect_session_delete_test_agent(
