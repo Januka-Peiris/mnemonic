@@ -7,11 +7,11 @@ use std::{
 
 use anyhow::{Context as _, Result, bail};
 use collections::HashMap;
-use fs::{Fs, RemoveOptions};
-use futures::StreamExt;
+use fs::{Fs, MTime, RemoveOptions, RenameOptions};
+use futures::{FutureExt as _, StreamExt, future::Shared};
 use gpui::{
-    AppContext as _, AsyncApp, Context, Entity, EventEmitter, SharedString, Subscription, Task,
-    TaskExt,
+    App, AppContext as _, AsyncApp, Context, Entity, EventEmitter, Global, SharedString,
+    Subscription, Task, TaskExt,
 };
 use http_client::{HttpClient, github::AssetKind};
 use node_runtime::NodeRuntime;
@@ -430,6 +430,7 @@ impl AgentServerStore {
                                         distribution_env: agent.env.clone(),
                                         settings_env: env.clone(),
                                         new_version_available_tx: None,
+                                        loading_status_tx: None,
                                     })
                                         as Box<dyn ExternalAgentServer>,
                                     ExternalAgentSource::Registry,
@@ -1108,6 +1109,201 @@ async fn remove_stale_versioned_archive_cache_dirs(
     Ok(())
 }
 
+type RegistryInstall = Shared<Task<Result<(), Arc<anyhow::Error>>>>;
+
+// Every project has its own `AgentServerStore`, so in-flight installs are tracked
+// globally. Without this, each window installs the same version at once and the
+// finished copies replace each other's destination directory.
+#[derive(Default)]
+struct RegistryInstalls(HashMap<PathBuf, RegistryInstall>);
+
+impl Global for RegistryInstalls {}
+
+fn shared_registry_install(
+    version_dir: PathBuf,
+    cx: &mut App,
+    start_install: impl FnOnce(&mut App) -> Task<Result<()>>,
+) -> RegistryInstall {
+    if let Some(install) = cx.default_global::<RegistryInstalls>().0.get(&version_dir) {
+        return install.clone();
+    }
+
+    let install = start_install(cx);
+    let install = cx
+        .spawn({
+            let version_dir = version_dir.clone();
+            async move |cx| {
+                let result = install.await.map_err(Arc::new);
+                cx.update(|cx| {
+                    cx.default_global::<RegistryInstalls>()
+                        .0
+                        .remove(&version_dir);
+                });
+                result
+            }
+        })
+        .shared();
+    cx.default_global::<RegistryInstalls>()
+        .0
+        .insert(version_dir, install.clone());
+    install
+}
+
+fn install_registry_archive(
+    http_client: Arc<dyn HttpClient>,
+    archive_url: String,
+    provided_sha256: Option<String>,
+    version_dir: PathBuf,
+    cx: &mut App,
+) -> RegistryInstall {
+    shared_registry_install(version_dir.clone(), cx, |cx| {
+        cx.background_spawn(async move {
+            download_registry_archive(http_client, &archive_url, provided_sha256, &version_dir)
+                .await
+        })
+    })
+}
+
+fn install_registry_npx_package(
+    fs: Arc<dyn Fs>,
+    node_runtime: NodeRuntime,
+    package: String,
+    version_dir: PathBuf,
+    cx: &mut App,
+) -> RegistryInstall {
+    shared_registry_install(version_dir.clone(), cx, |cx| {
+        cx.background_spawn(async move {
+            let base_dir = version_dir
+                .parent()
+                .with_context(|| format!("install directory has no parent: {version_dir:?}"))?;
+            // npm installs in place, so install into a staging directory and rename it, so
+            // an interrupted install never looks like a complete one.
+            let staging_dir = tempfile::Builder::new()
+                .prefix(".tmp-npm-install-")
+                .tempdir_in(base_dir)
+                .with_context(|| format!("creating npm staging directory in {base_dir:?}"))?;
+            node_runtime
+                .run_npm_subcommand(
+                    Some(staging_dir.path()),
+                    "install",
+                    &[package.as_str(), "--no-audit", "--no-fund"],
+                )
+                .await
+                .with_context(|| format!("installing {package}"))?;
+            fs.rename(
+                staging_dir.path(),
+                &version_dir,
+                RenameOptions {
+                    overwrite: true,
+                    ignore_if_exists: false,
+                    create_parents: false,
+                },
+            )
+            .await
+            .with_context(|| format!("moving {package} into {version_dir:?}"))
+        })
+    })
+}
+
+async fn download_registry_archive(
+    http_client: Arc<dyn HttpClient>,
+    archive_url: &str,
+    provided_sha256: Option<String>,
+    version_dir: &Path,
+) -> Result<()> {
+    let sha256 = if let Some(provided_sha) = provided_sha256 {
+        Some(provided_sha)
+    } else if let Some(github_archive) = github_release_archive_from_url(archive_url) {
+        if let Ok(release) = ::http_client::github::get_release_by_tag_name(
+            &github_archive.repo_name_with_owner,
+            &github_archive.tag,
+            http_client.clone(),
+        )
+        .await
+        {
+            if let Some(asset) = release
+                .assets
+                .iter()
+                .find(|a| a.name == github_archive.asset_name)
+            {
+                asset.digest.as_ref().and_then(|d| {
+                    d.strip_prefix("sha256:")
+                        .map(|s| s.to_string())
+                        .or_else(|| Some(d.clone()))
+                })
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    match registry_archive_kind_for_url(archive_url)? {
+        RegistryArchiveKind::Archive(asset_kind) => {
+            ::http_client::github_download::download_server_binary(
+                &*http_client,
+                archive_url,
+                sha256.as_deref(),
+                version_dir,
+                asset_kind,
+            )
+            .await
+        }
+        RegistryArchiveKind::RawBinary { file_name } => {
+            ::http_client::github_download::download_server_raw_binary(
+                &*http_client,
+                archive_url,
+                sha256.as_deref(),
+                version_dir,
+                &file_name,
+            )
+            .await
+        }
+    }
+}
+
+async fn newest_installed_version_dir(
+    fs: &dyn Fs,
+    base_dir: &Path,
+    required_file: Option<&str>,
+) -> Option<PathBuf> {
+    let mut entries = fs.read_dir(base_dir).await.log_err()?;
+    let mut newest: Option<(PathBuf, MTime)> = None;
+    while let Some(entry) = entries.next().await {
+        let Some(entry) = entry.log_err() else {
+            continue;
+        };
+        let is_versioned_dir = entry.file_name().is_some_and(|name| {
+            name.to_string_lossy()
+                .starts_with(VERSIONED_ARCHIVE_CACHE_DIR_PREFIX)
+        });
+        if !is_versioned_dir {
+            continue;
+        }
+        let Some(metadata) = fs.metadata(&entry).await.log_err().flatten() else {
+            continue;
+        };
+        if !metadata.is_dir {
+            continue;
+        }
+        if let Some(required_file) = required_file
+            && !fs.is_file(&entry.join(required_file)).await
+        {
+            continue;
+        }
+        if newest
+            .as_ref()
+            .is_none_or(|(_, newest_mtime)| metadata.mtime.bad_is_greater_than(*newest_mtime))
+        {
+            newest = Some((entry, metadata.mtime));
+        }
+    }
+    newest.map(|(dir, _)| dir)
+}
+
 struct LocalRegistryArchiveAgent {
     fs: Arc<dyn Fs>,
     http_client: Arc<dyn HttpClient>,
@@ -1207,71 +1403,45 @@ impl ExternalAgentServer for LocalRegistryArchiveAgent {
             env.extend(settings_env);
 
             let archive_url = &target_config.archive;
+            let cmd = &target_config.cmd;
             let version_dir =
                 versioned_archive_cache_dir(&dir, Some(version.as_ref()), archive_url);
 
-            if !fs.is_dir(&version_dir).await {
-                let mut loading_status_tx = loading_status_tx;
-                if let Some(tx) = loading_status_tx.as_mut() {
-                    tx.send(Some(format!("Installing {}…", version.as_ref())))
-                        .ok();
-                }
-
-                let sha256 = if let Some(provided_sha) = &target_config.sha256 {
-                    Some(provided_sha.clone())
-                } else if let Some(github_archive) = github_release_archive_from_url(archive_url) {
-                    if let Ok(release) = ::http_client::github::get_release_by_tag_name(
-                        &github_archive.repo_name_with_owner,
-                        &github_archive.tag,
+            let install_dir = if fs.is_dir(&version_dir).await {
+                version_dir.clone()
+            } else {
+                let install = cx.update(|cx| {
+                    install_registry_archive(
                         http_client.clone(),
+                        archive_url.clone(),
+                        target_config.sha256.clone(),
+                        version_dir.clone(),
+                        cx,
                     )
-                    .await
-                    {
-                        if let Some(asset) = release
-                            .assets
-                            .iter()
-                            .find(|a| a.name == github_archive.asset_name)
-                        {
-                            asset.digest.as_ref().and_then(|d| {
-                                d.strip_prefix("sha256:")
-                                    .map(|s| s.to_string())
-                                    .or_else(|| Some(d.clone()))
-                            })
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    }
+                });
+                // A registry release must not block starting the agent: keep running an
+                // older install while the new version downloads in the background.
+                let relative_cmd = cmd.strip_prefix("./").or_else(|| cmd.strip_prefix(".\\"));
+                if let Some(previous_dir) =
+                    newest_installed_version_dir(fs.as_ref(), &dir, relative_cmd).await
+                {
+                    log::info!(
+                        "starting {registry_id} from {previous_dir:?} while version {version} installs"
+                    );
+                    previous_dir
                 } else {
-                    None
-                };
-
-                match registry_archive_kind_for_url(archive_url)? {
-                    RegistryArchiveKind::Archive(asset_kind) => {
-                        ::http_client::github_download::download_server_binary(
-                            &*http_client,
-                            archive_url,
-                            sha256.as_deref(),
-                            &version_dir,
-                            asset_kind,
-                        )
-                        .await?;
+                    let mut loading_status_tx = loading_status_tx;
+                    if let Some(tx) = loading_status_tx.as_mut() {
+                        tx.send(Some(format!("Installing {}…", version.as_ref())))
+                            .ok();
                     }
-                    RegistryArchiveKind::RawBinary { file_name } => {
-                        ::http_client::github_download::download_server_raw_binary(
-                            &*http_client,
-                            archive_url,
-                            sha256.as_deref(),
-                            &version_dir,
-                            &file_name,
-                        )
-                        .await?;
-                    }
+                    install
+                        .await
+                        .map_err(|error| anyhow::anyhow!("{error:#}"))?;
+                    version_dir.clone()
                 }
-            }
+            };
 
-            let cmd = &target_config.cmd;
 
             let cmd_path = if cmd == "node" {
                 node_runtime.binary_path().await?
@@ -1281,7 +1451,7 @@ impl ExternalAgentServer for LocalRegistryArchiveAgent {
                 }
 
                 if cmd.starts_with("./") || cmd.starts_with(".\\") {
-                    let cmd_path = version_dir.join(&cmd[2..]);
+                    let cmd_path = install_dir.join(&cmd[2..]);
                     anyhow::ensure!(
                         fs.is_file(&cmd_path).await,
                         "Missing command {} after extraction",
@@ -1293,17 +1463,19 @@ impl ExternalAgentServer for LocalRegistryArchiveAgent {
                 }
             };
 
-            cx.background_spawn({
-                let fs = fs.clone();
-                let dir = dir.clone();
-                let version_dir = version_dir.clone();
-                async move {
-                    remove_stale_versioned_archive_cache_dirs(fs, &dir, &version_dir)
-                        .await
-                        .log_err();
-                }
-            })
-            .detach();
+            if install_dir == version_dir {
+                cx.background_spawn({
+                    let fs = fs.clone();
+                    let dir = dir.clone();
+                    let version_dir = version_dir.clone();
+                    async move {
+                        remove_stale_versioned_archive_cache_dirs(fs, &dir, &version_dir)
+                            .await
+                            .log_err();
+                    }
+                })
+                .detach();
+            }
 
             let mut args = target_config.args.clone();
             args.extend(extra_args);
@@ -1338,6 +1510,7 @@ struct LocalRegistryNpxAgent {
     distribution_env: HashMap<String, String>,
     settings_env: HashMap<String, String>,
     new_version_available_tx: Option<watch::Sender<Option<String>>>,
+    loading_status_tx: Option<watch::Sender<Option<String>>>,
 }
 
 impl ExternalAgentServer for LocalRegistryNpxAgent {
@@ -1351,6 +1524,14 @@ impl ExternalAgentServer for LocalRegistryNpxAgent {
 
     fn set_new_version_available_tx(&mut self, tx: watch::Sender<Option<String>>) {
         self.new_version_available_tx = Some(tx);
+    }
+
+    fn take_loading_status_tx(&mut self) -> Option<watch::Sender<Option<String>>> {
+        self.loading_status_tx.take()
+    }
+
+    fn set_loading_status_tx(&mut self, tx: watch::Sender<Option<String>>) {
+        self.loading_status_tx = Some(tx);
     }
 
     fn get_command(
@@ -1367,6 +1548,8 @@ impl ExternalAgentServer for LocalRegistryNpxAgent {
         let args = self.args.clone();
         let distribution_env = self.distribution_env.clone();
         let settings_env = self.settings_env.clone();
+        let version = self.version.clone();
+        let loading_status_tx = self.loading_status_tx.take();
 
         cx.spawn(async move |cx| {
             let mut env = project_environment
@@ -1376,18 +1559,69 @@ impl ExternalAgentServer for LocalRegistryNpxAgent {
                 .await
                 .unwrap_or_default();
 
-            let prefix_dir = paths::external_agents_dir()
+            let dir = paths::external_agents_dir()
                 .join("registry")
                 .join("npx")
                 .join(sanitize_path_component(&registry_id));
-            fs.create_dir(&prefix_dir).await?;
+            fs.create_dir(&dir).await?;
+
+            let version_dir = versioned_archive_cache_dir(&dir, Some(version.as_ref()), &package);
+            let package_json = format!("node_modules/{}/package.json", npm_package_name(&package));
+
+            let install_dir = if fs.is_dir(&version_dir).await {
+                version_dir.clone()
+            } else {
+                let install = cx.update(|cx| {
+                    install_registry_npx_package(
+                        fs.clone(),
+                        node_runtime.clone(),
+                        package.clone(),
+                        version_dir.clone(),
+                        cx,
+                    )
+                });
+                // The package spec is a version ceiling, so an older install still satisfies
+                // it and npm runs that copy while the new version installs in the background.
+                if let Some(previous_dir) =
+                    newest_installed_version_dir(fs.as_ref(), &dir, Some(&package_json)).await
+                {
+                    log::info!(
+                        "starting {registry_id} from {previous_dir:?} while version {version} installs"
+                    );
+                    previous_dir
+                } else {
+                    let mut loading_status_tx = loading_status_tx;
+                    if let Some(tx) = loading_status_tx.as_mut() {
+                        tx.send(Some(format!("Installing {}…", version.as_ref())))
+                            .ok();
+                    }
+                    install
+                        .await
+                        .map_err(|error| anyhow::anyhow!("{error:#}"))?;
+                    version_dir.clone()
+                }
+            };
+
+            if install_dir == version_dir {
+                cx.background_spawn({
+                    let fs = fs.clone();
+                    let dir = dir.clone();
+                    let version_dir = version_dir.clone();
+                    async move {
+                        remove_stale_versioned_archive_cache_dirs(fs, &dir, &version_dir)
+                            .await
+                            .log_err();
+                    }
+                })
+                .detach();
+            }
 
             let mut exec_args = vec!["--yes".to_string(), "--".to_string(), package];
             exec_args.extend(args);
 
             let npm_command = node_runtime
                 .npm_command(
-                    Some(&prefix_dir),
+                    Some(&install_dir),
                     "exec",
                     &exec_args.iter().map(|a| a.as_str()).collect::<Vec<_>>(),
                 )
@@ -1397,6 +1631,10 @@ impl ExternalAgentServer for LocalRegistryNpxAgent {
             env.extend(distribution_env);
             env.extend(extra_env);
             env.extend(settings_env);
+            // `npm exec` finds the package installed under `--prefix`, but only puts
+            // `node_modules/.bin` on PATH relative to the working directory (the project), so
+            // its bin would not be found without this.
+            prepend_to_path(&mut env, &install_dir.join("node_modules").join(".bin"))?;
 
             let mut args = npm_command.args;
             args.extend(extra_args);
@@ -1440,6 +1678,32 @@ impl ExternalAgentServer for LocalRegistryNpxAgent {
 /// strips during parsing. PS only re-adds CRT-style transport quotes around native command args
 /// containing whitespace, so `package@<=0.25.3` reaches cmd.exe bare and the unquoted `<` is
 /// interpreted as input redirection. See zed-industries/zed#55921.
+fn prepend_to_path(env: &mut HashMap<String, String>, directory: &Path) -> Result<()> {
+    let key = env
+        .keys()
+        .find(|key| key.eq_ignore_ascii_case("PATH"))
+        .cloned()
+        .unwrap_or_else(|| "PATH".to_string());
+    let existing = env
+        .get(&key)
+        .cloned()
+        .or_else(|| std::env::var(&key).ok())
+        .unwrap_or_default();
+    let path = std::env::join_paths(
+        std::iter::once(directory.to_path_buf()).chain(std::env::split_paths(&existing)),
+    )
+    .context("building PATH for npm agent")?;
+    env.insert(key, path.to_string_lossy().into_owned());
+    Ok(())
+}
+
+fn npm_package_name(package_spec: &str) -> &str {
+    match package_spec.rsplit_once('@') {
+        Some((package_name, _)) if !package_name.is_empty() => package_name,
+        _ => package_spec,
+    }
+}
+
 fn bounded_npm_package_spec(package_spec: &str) -> String {
     let Some((package_name, version)) = package_spec.rsplit_once('@') else {
         return package_spec.to_string();
@@ -2156,5 +2420,77 @@ mod tests {
                 "agent-b tx should have been transferred"
             );
         });
+    }
+
+    #[gpui::test]
+    async fn test_newest_installed_version_dir_picks_newest_complete_install(
+        cx: &mut TestAppContext,
+    ) {
+        let fs = fs::FakeFs::new(cx.executor());
+        let base_dir = Path::new("/agents/claude-acp");
+
+        // FakeFs increments mtime on every create, so later creates are newer.
+        for dir_name in [
+            "v_older",
+            "v_newer",
+            "v_missing_command",
+            ".tmp-github-download-abc",
+        ] {
+            let dir = base_dir.join(dir_name);
+            fs.create_dir(&dir).await.unwrap();
+            if dir_name != "v_missing_command" {
+                fs.insert_file(dir.join("claude-agent-acp"), Vec::new())
+                    .await;
+            }
+        }
+
+        let installed_dir =
+            newest_installed_version_dir(fs.as_ref(), base_dir, Some("claude-agent-acp")).await;
+
+        assert_eq!(installed_dir, Some(base_dir.join("v_newer")));
+    }
+
+    #[gpui::test]
+    async fn test_concurrent_registry_archive_installs_share_one_download(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let http_client: Arc<dyn HttpClient> = http_client::FakeHttpClient::create({
+            let requests = requests.clone();
+            move |_| {
+                let requests = requests.clone();
+                async move {
+                    requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Ok(http_client::Response::builder()
+                        .status(404)
+                        .body(Default::default())
+                        .unwrap())
+                }
+            }
+        });
+        let temp_dir = tempfile::tempdir().unwrap();
+        let version_dir = temp_dir.path().join("v_1");
+        let archive_url =
+            "https://github.com/owner/agent/releases/download/v1/agent.zip".to_string();
+        let start_install = |cx: &mut TestAppContext| {
+            cx.update(|cx| {
+                install_registry_archive(
+                    http_client.clone(),
+                    archive_url.clone(),
+                    Some("digest".to_string()),
+                    version_dir.clone(),
+                    cx,
+                )
+            })
+        };
+
+        let first = start_install(cx);
+        let second = start_install(cx);
+        assert!(first.await.is_err());
+        assert!(second.await.is_err());
+        assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        // A failed install must not stick, or the agent could never be installed.
+        assert!(start_install(cx).await.is_err());
+        assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 }
