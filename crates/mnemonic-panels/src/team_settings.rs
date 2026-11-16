@@ -22,9 +22,9 @@ use util::ResultExt as _;
 
 use crate::team::{
     SharingStatus, TeamPeer, TeamSettings, is_workspace_shared, repo_skip_list, set_repo_skip_list,
-    set_workspace_file_edits, set_workspace_share_files, set_workspace_shared,
-    set_workspace_step_in, team_share, workspace_allows_file_edits, workspace_allows_step_in,
-    workspace_shares_files,
+    set_workspace_agents, set_workspace_file_edits, set_workspace_share_files,
+    set_workspace_shared, set_workspace_step_in, team_share, workspace_allows_agents,
+    workspace_allows_file_edits, workspace_allows_step_in, workspace_shares_files,
 };
 
 enum Devices {
@@ -270,6 +270,22 @@ impl TeamSettingsView {
                     set_workspace_step_in(&workspace_id, *state == ToggleState::Selected, cx);
                 })
             });
+            let agents = workspace_allows_agents(&workspace.id, cx);
+            let agents_toggle = shared.then(|| {
+                let workspace_id = workspace_id.clone();
+                Checkbox::new(
+                    SharedString::from(format!("team-agents-{}", workspace.id)),
+                    if agents {
+                        ToggleState::Selected
+                    } else {
+                        ToggleState::Unselected
+                    },
+                )
+                .label("Teammates' agents can work here")
+                .on_click(move |state, _, cx| {
+                    set_workspace_agents(&workspace_id, *state == ToggleState::Selected, cx);
+                })
+            });
             let share_files = shared && workspace_shares_files(&workspace.id, cx);
             let file_edits = share_files && workspace_allows_file_edits(&workspace.id, cx);
             let share_files_toggle = shared.then(|| {
@@ -323,6 +339,7 @@ impl TeamSettingsView {
                             ),
                         )
                         .children(step_in_toggle)
+                        .children(agents_toggle)
                         .children(share_files_toggle)
                         .children(file_edits_toggle)
                         .child(

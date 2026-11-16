@@ -31,7 +31,8 @@ use mnemonic_core::services::team_files_service::{
     self, HashCache, SkipList, TeamBatchOutcome, normalize_remote_url, scan_workspace_cached,
 };
 use mnemonic_core::services::team_share_server::{
-    BundleSource, DiffSource, FileSource, SkipListSource, TeamServerConfig, TeamShareServer,
+    AgentWriteCheck, BundleSource, DiffSource, FileSource, SkipListSource, TeamServerConfig,
+    TeamShareServer,
 };
 use mnemonic_core::services::team_share_service::{
     ActionHandler, BatchHandler, DEFAULT_TEAM_PORT, TailscaleSelf, TailscaleWhois, TeamAction,
@@ -165,6 +166,16 @@ struct PendingAction {
     reply: std::sync::mpsc::Sender<Result<TeamActionOutcome, TeamActionError>>,
 }
 
+/// A teammate's agent about to write a file, waiting for the main thread to
+/// say whether the sharer has unsaved edits in it.
+struct PendingWriteCheck {
+    root: PathBuf,
+    path: PathBuf,
+    display_name: String,
+    claimed: Arc<AtomicBool>,
+    reply: std::sync::mpsc::Sender<Result<(), TeamActionError>>,
+}
+
 /// A teammate's batch of file changes on its way to the main thread, with
 /// the same claim as `PendingAction`.
 struct PendingBatch {
@@ -205,6 +216,8 @@ pub(crate) struct TeamShare {
     action_task: Option<Task<()>>,
     /// Applies teammates' batches of file changes, one at a time.
     batch_task: Option<Task<()>>,
+    /// Checks teammates' agents' writes against unsaved editor changes.
+    write_check_task: Option<Task<()>>,
     chat_watches: HashMap<String, ChatWatch>,
     /// Chats shared from their saved transcript, as they aren't loaded in
     /// this app, with when that transcript was written.
@@ -219,6 +232,9 @@ pub(crate) struct TeamShare {
     /// Shared workspaces whose chats teammates may act in, saved the same
     /// way.
     step_in_workspaces: HashSet<String>,
+    /// Shared workspaces where teammates' agents may work, saved the same
+    /// way.
+    agent_workspaces: HashSet<String>,
     /// Shared workspaces whose files teammates may read, saved the same way.
     share_files_workspaces: HashSet<String>,
     /// Workspaces with Share files on whose files teammates may also change.
@@ -229,6 +245,9 @@ pub(crate) struct TeamShare {
     /// What the share server's request threads read to find a workspace's
     /// files: only workspaces with Share files on, as (root, skip list).
     file_roots: FileRoots,
+    /// What the share server's request threads read to find the folder a
+    /// teammate's agent works in: only workspaces with agents on.
+    agent_roots: AgentRoots,
     /// Each file-sharing workspace's normalized `origin`, looked up once.
     remote_urls: HashMap<String, Option<String>>,
     scan_task: Option<Task<()>>,
@@ -244,6 +263,15 @@ pub(crate) struct TeamShare {
 }
 
 type FileRoots = Arc<Mutex<HashMap<String, (PathBuf, SkipList)>>>;
+type AgentRoots = Arc<Mutex<HashMap<String, PathBuf>>>;
+
+fn lock_agent_roots(
+    agent_roots: &AgentRoots,
+) -> std::sync::MutexGuard<'_, HashMap<String, PathBuf>> {
+    agent_roots
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 fn lock_file_roots(
     file_roots: &FileRoots,
@@ -258,6 +286,9 @@ const SHARED_WORKSPACES_KEY: &str = "team_shared_workspaces";
 /// The core settings key holding the ids of workspaces teammates may step
 /// in on, as JSON.
 const STEP_IN_WORKSPACES_KEY: &str = "team_step_in_workspaces";
+/// The core settings key holding the ids of workspaces where teammates'
+/// agents may work, as JSON.
+const AGENT_WORKSPACES_KEY: &str = "team_agent_workspaces";
 const SHARE_FILES_WORKSPACES_KEY: &str = "team_share_files_workspaces";
 const EDIT_FILES_WORKSPACES_KEY: &str = "team_edit_files_workspaces";
 /// The core settings key holding each repo's skip list, as a JSON map.
@@ -301,6 +332,13 @@ pub fn init(cx: &mut App) {
 
 impl TeamShare {
     fn new() -> Self {
+        let shared_workspaces = load_workspace_ids(SHARED_WORKSPACES_KEY);
+        let saved_agent_workspaces = load_saved_workspace_ids(AGENT_WORKSPACES_KEY);
+        let first_run = saved_agent_workspaces.is_none();
+        let agent_workspaces = initial_agent_workspaces(saved_agent_workspaces, &shared_workspaces);
+        if first_run {
+            save_workspace_ids_now(AGENT_WORKSPACES_KEY, &agent_workspaces);
+        }
         Self {
             applied: None,
             hub: TeamShareHub::new(),
@@ -312,17 +350,20 @@ impl TeamShare {
             tailscale_watch: None,
             action_task: None,
             batch_task: None,
+            write_check_task: None,
             chat_watches: HashMap::new(),
             saved_chats: HashMap::new(),
             peers: Vec::new(),
             collapsed_peers: HashSet::new(),
             collapsed_peer_projects: HashSet::new(),
-            shared_workspaces: load_workspace_ids(SHARED_WORKSPACES_KEY),
+            shared_workspaces,
             step_in_workspaces: load_workspace_ids(STEP_IN_WORKSPACES_KEY),
+            agent_workspaces,
             share_files_workspaces: load_workspace_ids(SHARE_FILES_WORKSPACES_KEY),
             edit_files_workspaces: load_workspace_ids(EDIT_FILES_WORKSPACES_KEY),
             skip_lists: load_skip_lists(),
             file_roots: Arc::new(Mutex::new(HashMap::new())),
+            agent_roots: Arc::new(Mutex::new(HashMap::new())),
             remote_urls: HashMap::new(),
             scan_task: None,
             skip_list_save_count: 0,
@@ -389,6 +430,18 @@ pub(crate) fn set_workspace_step_in(workspace_id: &str, allowed: bool, cx: &mut 
     if let Some(team) = team_share(cx) {
         team.update(cx, |team, cx| {
             team.set_workspace_step_in(workspace_id, allowed, cx)
+        });
+    }
+}
+
+pub(crate) fn workspace_allows_agents(workspace_id: &str, cx: &App) -> bool {
+    team_share(cx).is_some_and(|team| team.read(cx).allows_agents(workspace_id))
+}
+
+pub(crate) fn set_workspace_agents(workspace_id: &str, allowed: bool, cx: &mut App) {
+    if let Some(team) = team_share(cx) {
+        team.update(cx, |team, cx| {
+            team.set_workspace_agents(workspace_id, allowed, cx)
         });
     }
 }
@@ -475,21 +528,50 @@ fn save_skip_lists(
 }
 
 fn load_workspace_ids(key: &str) -> HashSet<String> {
-    let Some(state) = mnemonic_bridge::mnemonic_state_cloned() else {
-        return HashSet::new();
-    };
+    load_saved_workspace_ids(key).unwrap_or_default()
+}
+
+/// The saved ids, or None when nothing was ever saved under `key`, which
+/// is different from a saved empty list.
+fn load_saved_workspace_ids(key: &str) -> Option<HashSet<String>> {
+    let state = mnemonic_bridge::mnemonic_state_cloned()?;
     match settings_repository::get_value(&state.db, key) {
-        Ok(Some(json)) => serde_json::from_str::<Vec<String>>(&json)
-            .map(|ids| ids.into_iter().collect())
-            .unwrap_or_else(|err| {
-                log::error!("Couldn't read {key}: {err}");
-                HashSet::new()
-            }),
-        Ok(None) => HashSet::new(),
+        Ok(Some(json)) => Some(
+            serde_json::from_str::<Vec<String>>(&json)
+                .map(|ids| ids.into_iter().collect())
+                .unwrap_or_else(|err| {
+                    log::error!("Couldn't read {key}: {err}");
+                    HashSet::new()
+                }),
+        ),
+        Ok(None) => None,
         Err(err) => {
             log::error!("Couldn't read {key}: {err}");
-            HashSet::new()
+            Some(HashSet::new())
         }
+    }
+}
+
+/// A first run, with nothing saved, turns agents on for the workspaces
+/// already shared.
+fn initial_agent_workspaces(
+    saved: Option<HashSet<String>>,
+    shared: &HashSet<String>,
+) -> HashSet<String> {
+    saved.unwrap_or_else(|| shared.clone())
+}
+
+fn save_workspace_ids_now(key: &str, ids: &HashSet<String>) {
+    let Some(state) = mnemonic_bridge::mnemonic_state_cloned() else {
+        return;
+    };
+    let mut ids: Vec<&String> = ids.iter().collect();
+    ids.sort();
+    let saved = serde_json::to_string(&ids)
+        .map_err(|err| err.to_string())
+        .and_then(|json| settings_repository::set_value(&state.db, key, &json));
+    if let Err(err) = saved {
+        log::error!("Couldn't save {key}: {err}");
     }
 }
 
@@ -542,6 +624,7 @@ impl TeamShare {
         if shared {
             for (ids, key) in [
                 (&mut self.step_in_workspaces, STEP_IN_WORKSPACES_KEY),
+                (&mut self.agent_workspaces, AGENT_WORKSPACES_KEY),
                 (&mut self.share_files_workspaces, SHARE_FILES_WORKSPACES_KEY),
                 (&mut self.edit_files_workspaces, EDIT_FILES_WORKSPACES_KEY),
             ] {
@@ -553,6 +636,10 @@ impl TeamShare {
             if self.step_in_workspaces.remove(workspace_id) {
                 save_workspace_ids(STEP_IN_WORKSPACES_KEY, &self.step_in_workspaces, cx);
             }
+            if self.agent_workspaces.remove(workspace_id) {
+                save_workspace_ids(AGENT_WORKSPACES_KEY, &self.agent_workspaces, cx);
+            }
+            lock_agent_roots(&self.agent_roots).remove(workspace_id);
             self.stop_sharing_files(workspace_id, cx);
         }
         self.update_sharing(cx);
@@ -575,6 +662,26 @@ impl TeamShare {
             return;
         }
         save_workspace_ids(STEP_IN_WORKSPACES_KEY, &self.step_in_workspaces, cx);
+        if self.server.is_some() {
+            self.start_publishing(cx);
+        }
+        cx.notify();
+    }
+
+    fn set_workspace_agents(&mut self, workspace_id: &str, allowed: bool, cx: &mut Context<Self>) {
+        let changed = if allowed {
+            self.shared_workspaces.contains(workspace_id)
+                && self.agent_workspaces.insert(workspace_id.to_string())
+        } else {
+            self.agent_workspaces.remove(workspace_id)
+        };
+        if !changed {
+            return;
+        }
+        save_workspace_ids(AGENT_WORKSPACES_KEY, &self.agent_workspaces, cx);
+        if !allowed {
+            lock_agent_roots(&self.agent_roots).remove(workspace_id);
+        }
         if self.server.is_some() {
             self.start_publishing(cx);
         }
@@ -670,6 +777,11 @@ impl TeamShare {
         self.shares_files(workspace_id) && self.edit_files_workspaces.contains(workspace_id)
     }
 
+    fn allows_agents(&self, workspace_id: &str) -> bool {
+        self.shared_workspaces.contains(workspace_id)
+            && self.agent_workspaces.contains(workspace_id)
+    }
+
     fn allows_step_in(&self, workspace_id: &str) -> bool {
         self.shared_workspaces.contains(workspace_id)
             && self.step_in_workspaces.contains(workspace_id)
@@ -705,6 +817,27 @@ impl TeamShare {
         self.hub = hub.clone();
         let (action_sender, mut action_receiver) = mpsc::unbounded::<PendingAction>();
         let shared_file_roots = self.file_roots.clone();
+        let shared_agent_roots = self.agent_roots.clone();
+        let (write_check_sender, mut write_check_receiver) = mpsc::unbounded::<PendingWriteCheck>();
+        self.write_check_task = Some(cx.spawn(async move |_, cx| {
+            while let Some(pending) = write_check_receiver.next().await {
+                if pending.claimed.swap(true, Ordering::SeqCst) {
+                    log::info!("Skipped a write check that timed out while waiting");
+                    continue;
+                }
+                let PendingWriteCheck {
+                    root,
+                    path,
+                    display_name,
+                    reply,
+                    ..
+                } = pending;
+                let outcome = cx.update(|cx| check_agent_write(&root, &path, &display_name, cx));
+                if reply.send(outcome).is_err() {
+                    log::warn!("A write check finished after its request gave up");
+                }
+            }
+        }));
         let (batch_sender, mut batch_receiver) = mpsc::unbounded::<PendingBatch>();
         self.batch_task = Some(cx.spawn(async move |this, cx| {
             while let Some(pending) = batch_receiver.next().await {
@@ -744,8 +877,18 @@ impl TeamShare {
                         let action_sender = action_sender.clone();
                         let batch_sender = batch_sender.clone();
                         let file_roots = shared_file_roots.clone();
+                        let agent_roots = shared_agent_roots.clone();
+                        let write_check_sender = write_check_sender.clone();
                         async move {
-                            start_server(key, hub, action_sender, batch_sender, file_roots)
+                            start_server(
+                                key,
+                                hub,
+                                action_sender,
+                                batch_sender,
+                                write_check_sender,
+                                file_roots,
+                                agent_roots,
+                            )
                         }
                     })
                     .await;
@@ -1007,10 +1150,16 @@ impl TeamShare {
         let mut to_read = Vec::new();
         let mut workspaces = Vec::with_capacity(records.len());
         let mut file_roots = HashMap::new();
+        let mut agent_roots = HashMap::new();
         for (summary, chat_records) in records {
             let agents = live.get(&summary.id);
             let step_in = self.allows_step_in(&summary.id);
             let share_files = self.shares_files(&summary.id);
+            let agents_allowed = self.allows_agents(&summary.id);
+            let agent_root = workspace_root(&summary).filter(|_| agents_allowed);
+            if let Some(root) = &agent_root {
+                agent_roots.insert(summary.id.clone(), root.clone());
+            }
             if share_files {
                 if let Some(root) = workspace_root(&summary) {
                     file_roots.insert(
@@ -1093,8 +1242,8 @@ impl TeamShare {
                     .cloned()
                     .unwrap_or_default()
                     .patterns,
-                agents: false,
-                root_path: None,
+                agents: agent_root.is_some(),
+                root_path: agent_root.map(|root| root.to_string_lossy().into_owned()),
                 id: summary.id,
                 project: summary.repo,
                 name: summary.name,
@@ -1108,6 +1257,7 @@ impl TeamShare {
             }
             *roots = file_roots;
         }
+        *lock_agent_roots(&self.agent_roots) = agent_roots;
         self.hub.set_workspaces(workspaces);
         self.hub.set_step_in_chats(step_in_chats);
         self.watch_chats(open_chats, &closed_chats, cx);
@@ -1323,7 +1473,9 @@ fn start_server(
     hub: TeamShareHub,
     action_sender: mpsc::UnboundedSender<PendingAction>,
     batch_sender: mpsc::UnboundedSender<PendingBatch>,
+    write_check_sender: mpsc::UnboundedSender<PendingWriteCheck>,
     file_roots: FileRoots,
+    agent_roots: AgentRoots,
 ) -> Result<(TeamShareServer, TailscaleSelf), String> {
     let me = tailscale_self()?;
     let display_name = [&key.display_name, &me.display_name, &me.login]
@@ -1370,6 +1522,35 @@ fn start_server(
         }
         wait_for_reply(&reply_receiver, &claimed, BATCH_TIMEOUT)
     });
+    let agent_write_check: AgentWriteCheck = Arc::new({
+        let agent_roots = agent_roots.clone();
+        let display_name = display_name.clone();
+        move |workspace_id: &str, path: &Path| {
+            let root = lock_agent_roots(&agent_roots)
+                .get(workspace_id)
+                .cloned()
+                .ok_or_else(|| "Teammates' agents can't work in this workspace".to_string())?;
+            let (reply_sender, reply_receiver) = std::sync::mpsc::channel();
+            let claimed = Arc::new(AtomicBool::new(false));
+            let pending = PendingWriteCheck {
+                root,
+                path: path.to_path_buf(),
+                display_name: display_name.clone(),
+                claimed: claimed.clone(),
+                reply: reply_sender,
+            };
+            if write_check_sender.unbounded_send(pending).is_err() {
+                return Err("Sharing stopped".to_string());
+            }
+            wait_for_reply(&reply_receiver, &claimed, ACTION_TIMEOUT).map_err(|err| match err {
+                TeamActionError::Invalid(message)
+                | TeamActionError::NotAllowed(message)
+                | TeamActionError::NothingToDo(message)
+                | TeamActionError::Failed(message) => message,
+                TeamActionError::NotLoaded => "That file isn't loaded".to_string(),
+            })
+        }
+    });
     let files: FileSource = Arc::new({
         let file_roots = file_roots.clone();
         move |workspace_id: &str| {
@@ -1404,10 +1585,10 @@ fn start_server(
             bundle_source,
             skip_list,
             batch_handler,
-            agent_roots: Arc::new(|_| None),
-            agent_write_check: Arc::new(|_, _| {
-                Err("Teammates' agents aren't set up yet".to_string())
+            agent_roots: Arc::new(move |workspace_id: &str| {
+                lock_agent_roots(&agent_roots).get(workspace_id).cloned()
             }),
+            agent_write_check,
         },
         hub,
         Arc::new(TailscaleWhois::default()),
@@ -1438,6 +1619,28 @@ fn wait_for_reply<T>(
             Err(TeamActionError::Failed("Sharing stopped".into()))
         }
     }
+}
+
+fn check_agent_write(
+    root: &Path,
+    path: &Path,
+    display_name: &str,
+    cx: &App,
+) -> Result<(), TeamActionError> {
+    let Some(relative) = path
+        .strip_prefix(root)
+        .ok()
+        .and_then(|relative| relative.to_str())
+        .map(|relative| relative.replace('\\', "/"))
+    else {
+        return Ok(());
+    };
+    if unsaved_paths(root, cx).contains(&relative) {
+        return Err(TeamActionError::Failed(format!(
+            "{relative} has unsaved changes in {display_name}'s editor"
+        )));
+    }
+    Ok(())
 }
 
 /// The paths, relative to `root`, of files with unsaved edits in any open
@@ -2729,6 +2932,39 @@ mod tests {
             assert!(team.shares_files("workspace"));
             assert!(team.allows_file_edits("workspace"));
         });
+    }
+
+    #[gpui::test]
+    async fn sharing_turns_on_teammates_agents(cx: &mut TestAppContext) {
+        let team = cx.new(|_| TeamShare::new());
+        team.update(cx, |team, cx| {
+            team.set_workspace_shared("workspace", true, cx);
+            assert!(team.allows_agents("workspace"));
+        });
+    }
+
+    #[gpui::test]
+    async fn unsharing_turns_off_teammates_agents(cx: &mut TestAppContext) {
+        let team = cx.new(|_| TeamShare::new());
+        team.update(cx, |team, cx| {
+            team.set_workspace_shared("workspace", true, cx);
+            team.set_workspace_shared("workspace", false, cx);
+            assert!(!team.allows_agents("workspace"));
+            team.set_workspace_shared("workspace", true, cx);
+            assert!(team.allows_agents("workspace"));
+        });
+    }
+
+    #[test]
+    fn agents_start_on_for_workspaces_already_shared() {
+        let shared: HashSet<String> = ["a", "b"].into_iter().map(String::from).collect();
+        assert_eq!(initial_agent_workspaces(None, &shared), shared);
+        let saved: HashSet<String> = ["a"].into_iter().map(String::from).collect();
+        assert_eq!(
+            initial_agent_workspaces(Some(saved.clone()), &shared),
+            saved
+        );
+        assert!(initial_agent_workspaces(Some(HashSet::new()), &shared).is_empty());
     }
 
     #[gpui::test]
