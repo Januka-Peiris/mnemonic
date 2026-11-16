@@ -34,6 +34,11 @@ workspace marked as his, the way git records who wrote a commit.
   can open it to see what changed and undo it as a whole.
 - A file both sides changed since Dan's copy of it is held back. Jay sees
   both versions and picks one; the rest of the batch applies.
+- A teammate's messages always run on the teammate's own agent. Messaging
+  Jay's agent from the mirror (step 2) is removed; the mirror's message box
+  is replaced by "Work on this in your copy", which opens Dan's copy of the
+  workspace and starts a new chat of his own there. Stopping Jay's agent and
+  answering its permission requests from the mirror stay as in step 2.
 - Two per-workspace switches on Jay's side, both off by default: "Share
   files" (Dan can get the copy) and "Teammates can edit files" (Dan can send
   changes; needs "Share files").
@@ -108,8 +113,15 @@ Jay picked A. Jay also picked sending edits back as a batch rather than live
   feature. When Jay commits and his branch moves, Dan's copy follows the
   new commit as long as Dan has no unsent edits; otherwise it waits and
   says so.
-- The agent working in Dan's copy is Dan's own, running on Dan's Mac (Jay's
-  choice). Stepping in on Jay's agent stays step 2.
+- The agent working in Dan's copy is Dan's own, running on Dan's Mac with
+  Dan's account and his own global agent instructions (Jay's choice). The
+  project's instruction files come from the copy, so they match Jay's.
+- Step 2's teammate message route (`/v1/chats/{id}/message`), its client
+  call, the queued-message handling and the "load an unloaded chat to
+  receive a message" path are removed, so a teammate can never run Jay's
+  agent (Jay's choice). Stop and permission routes stay.
+- "Work on this in your copy" starts an empty chat; it does not carry over
+  the mirrored chat's history. (Claude's call.)
 - Approach A, protocol v4. `/v1/workspaces` carries both new switches per
   workspace so the viewer knows what to offer.
 - Conflict: a file Jay's side changed since Dan's base is held back whole;
