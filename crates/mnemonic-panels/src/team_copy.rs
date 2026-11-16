@@ -6,6 +6,8 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::anyhow;
+use futures::StreamExt as _;
+use futures::channel::mpsc;
 use gpui::{AnyElement, App, AppContext as _, Context, Entity, PromptLevel, Task, WeakEntity};
 use mnemonic_core::models::{ChatSessionRecord, CreateWorkspaceInput};
 use mnemonic_core::repositories::{
@@ -14,6 +16,7 @@ use mnemonic_core::repositories::{
 use mnemonic_core::services::team_files_service::{
     self, CopyState, FollowPlan, SkipList, TEAM_COPY_SOURCE, TeamFileManifest,
 };
+use mnemonic_core::services::team_share_server::MAX_BUNDLE_HAVE;
 use mnemonic_core::services::team_share_service::{
     MAX_CHAT_WAIT, TeamClient, TeamClientError, TeamFileUpdate, TeamWorkspace,
 };
@@ -30,8 +33,19 @@ use crate::workspace_view::ChatAgent;
 /// How long to wait before asking again after the sharer couldn't be
 /// reached, wasn't sharing, or a step failed.
 const RETRY_AFTER: Duration = Duration::from_secs(15);
+/// Rounds writing fewer files than this don't show progress, unless the
+/// copy is being filled for the first time.
+const SHOW_PROGRESS_FROM: usize = 20;
+/// How many files pass between progress updates.
+const PROGRESS_STEP: usize = 10;
 
 pub(crate) enum CopyStatus {
+    /// Writing the sharer's files, `done` of `total`; both 0 until the
+    /// first list of files arrives.
+    Copying {
+        done: usize,
+        total: usize,
+    },
     Following,
     /// The copy stays on the commit it started from, for this reason.
     Waiting(SharedString),
@@ -68,7 +82,7 @@ pub(crate) fn resume_copies(team: &Entity<TeamShare>, cx: &mut App) {
         };
         team.update(cx, |team, cx| {
             for copy in copies {
-                start_following(team, copy, cx);
+                start_following(team, copy, CopyStatus::Following, cx);
             }
         })
         .log_err();
@@ -76,14 +90,19 @@ pub(crate) fn resume_copies(team: &Entity<TeamShare>, cx: &mut App) {
     .detach();
 }
 
-pub(crate) fn start_following(team: &mut TeamShare, state: CopyState, cx: &mut Context<TeamShare>) {
+pub(crate) fn start_following(
+    team: &mut TeamShare,
+    state: CopyState,
+    status: CopyStatus,
+    cx: &mut Context<TeamShare>,
+) {
     let local_workspace_id = state.local_workspace_id.clone();
     let follow = follow(local_workspace_id.clone(), cx);
     team.copies.insert(
         local_workspace_id,
         CopyFollow {
             state,
-            status: CopyStatus::Following,
+            status,
             both_changed: Vec::new(),
             _follow: follow,
         },
@@ -212,12 +231,35 @@ fn follow(local_workspace_id: String, cx: &mut Context<TeamShare>) -> Task<()> {
                 }
             };
 
+            let (progress_sender, mut progress) = mpsc::unbounded::<(usize, usize)>();
+            let show_progress = cx.spawn({
+                let this = this.clone();
+                let local_workspace_id = local_workspace_id.clone();
+                async move |cx| {
+                    while let Some((done, total)) = progress.next().await {
+                        this.update(cx, |team, cx| {
+                            let Some(copy) = team.copies.get_mut(&local_workspace_id) else {
+                                return;
+                            };
+                            // Small rounds pass too quickly to be worth a line;
+                            // a first copy always shows how far it has got.
+                            let copying = matches!(copy.status, CopyStatus::Copying { .. });
+                            if copying || total >= SHOW_PROGRESS_FROM {
+                                copy.status = CopyStatus::Copying { done, total };
+                                cx.notify();
+                            }
+                        })
+                        .log_err();
+                    }
+                }
+            });
             let outcome = cx
                 .background_spawn({
                     let manifest = manifest.clone();
-                    async move { apply_manifest(state, manifest, client) }
+                    async move { apply_manifest(state, manifest, client, progress_sender) }
                 })
                 .await;
+            show_progress.await;
             let Some((state, result)) = outcome else {
                 this.update(cx, |team, cx| {
                     team.copies.remove(&local_workspace_id);
@@ -271,6 +313,7 @@ fn apply_manifest(
     mut state: CopyState,
     manifest: TeamFileManifest,
     client: TeamClient,
+    progress: mpsc::UnboundedSender<(usize, usize)>,
 ) -> Option<(CopyState, Result<FollowPlan, String>)> {
     let Some(app) = mnemonic_bridge::mnemonic_state_cloned() else {
         return Some((state, Err("Mnemonic isn't ready".to_string())));
@@ -295,16 +338,28 @@ fn apply_manifest(
         }
         Err(err) => return Some((state, Err(err))),
     };
-    let result = ensure_commit(&root, &client, &state.workspace_id, &manifest.head_commit)
-        .and_then(|()| {
-            let workspace_id = state.workspace_id.clone();
-            let fetch = |path: &str| {
-                client
-                    .file(&workspace_id, path)
-                    .map_err(|err| format!("Couldn't fetch {path}: {err}"))
-            };
-            team_files_service::follow_manifest(&root, &mut state, &manifest, &fetch)
-        });
+    let result = ensure_commit(
+        &root,
+        &client,
+        &state.workspace_id,
+        state.base_branch.as_deref(),
+        &manifest.head_commit,
+    )
+    .and_then(|()| {
+        let workspace_id = state.workspace_id.clone();
+        let fetch = |path: &str| {
+            client
+                .file(&workspace_id, path)
+                .map_err(|err| format!("Couldn't fetch {path}: {err}"))
+        };
+        let on_progress = |done: usize, total: usize| {
+            if done == total || done % PROGRESS_STEP == 0 {
+                // The receiver only goes away when following stops.
+                progress.unbounded_send((done, total)).ok();
+            }
+        };
+        team_files_service::follow_manifest(&root, &mut state, &manifest, &fetch, &on_progress)
+    });
     if let Err(err) = team_files_service::save_copy_state(&app.data_dir, &state) {
         log::error!("Couldn't save the copy {}: {err}", state.local_workspace_id);
     }
@@ -317,6 +372,7 @@ fn ensure_commit(
     repo: &Path,
     client: &TeamClient,
     workspace_id: &str,
+    base_branch: Option<&str>,
     commit: &str,
 ) -> Result<(), String> {
     if team_files_service::has_commit(repo, commit) {
@@ -328,8 +384,9 @@ fn ensure_commit(
     if team_files_service::has_commit(repo, commit) {
         return Ok(());
     }
+    let have = team_files_service::have_commits(repo, base_branch, MAX_BUNDLE_HAVE);
     let bundle = client
-        .bundle(workspace_id, &[])
+        .bundle(workspace_id, &have)
         .map_err(|err| format!("Couldn't get the sharer's commits: {err}"))?;
     team_files_service::fetch_bundle(repo, &bundle, commit)
 }
@@ -364,8 +421,8 @@ struct NewCopy {
     agent_label: &'static str,
 }
 
-/// Runs off the main thread: makes the worktree, writes the sharer's files
-/// into it and saves the copy.
+/// Runs off the main thread: makes the worktree at the sharer's commit and
+/// saves the copy, for the follow loop to fill.
 fn create_copy(app: &AppState, copy: NewCopy) -> Result<CopyState, String> {
     let NewCopy {
         host,
@@ -401,7 +458,13 @@ fn create_copy(app: &AppState, copy: NewCopy) -> Result<CopyState, String> {
         Err(err) => return Err(format!("Couldn't reach {sharer_name}: {err}")),
     };
     let repository_path = Path::new(&repository.path);
-    ensure_commit(repository_path, &client, &shared.id, &manifest.head_commit)?;
+    ensure_commit(
+        repository_path,
+        &client,
+        &shared.id,
+        shared.base_branch.as_deref(),
+        &manifest.head_commit,
+    )?;
     let branch = team_files_service::unused_branch_name(
         repository_path,
         &format!("team/{}/{}", branch_slug(&sharer_name), shared.branch),
@@ -427,31 +490,17 @@ fn create_copy(app: &AppState, copy: NewCopy) -> Result<CopyState, String> {
             workspace_source: Some(TEAM_COPY_SOURCE.to_string()),
         },
     )?;
-    let root = PathBuf::from(
-        detail
-            .summary
-            .workspace_root_path
-            .clone()
-            .unwrap_or_else(|| detail.worktree_path.clone()),
-    );
-    let mut state = CopyState {
+    let state = CopyState {
         host,
         sharer_name,
         workspace_id: shared.id.clone(),
         local_workspace_id: detail.summary.id.clone(),
-        head_commit: manifest.head_commit.clone(),
+        base_branch: shared.base_branch.clone(),
+        head_commit: manifest.head_commit,
         synced: Default::default(),
     };
-    let fetch = |path: &str| {
-        client
-            .file(&shared.id, path)
-            .map_err(|err| format!("Couldn't fetch {path}: {err}"))
-    };
-    // A file that couldn't be fetched now is fetched by the follow loop,
-    // which starts from the whole manifest.
-    if let Err(err) = team_files_service::follow_manifest(&root, &mut state, &manifest, &fetch) {
-        log::error!("Couldn't copy every file of {}: {err}", shared.id);
-    }
+    // The follow loop writes the sharer's files, starting from the whole
+    // list, and shows its progress above the copy.
     team_files_service::save_copy_state(&app.data_dir, &state)?;
     let record = ChatSessionRecord {
         id: uuid::Uuid::new_v4().to_string(),
@@ -487,7 +536,8 @@ fn select_local_workspace(
 }
 
 /// Opens this machine's copy of a teammate's shared workspace, making it
-/// first when there isn't one yet.
+/// first when there isn't one yet. A new copy opens as soon as its worktree
+/// exists; its banner shows the sharer's files arriving.
 #[expect(
     dead_code,
     reason = "The mirror's \"Work on this in your copy\" button calls this"
@@ -556,7 +606,9 @@ pub(crate) fn open_teammate_copy(
             .await
             .map_err(|err| anyhow!(err))?;
         let local_workspace_id = state.local_workspace_id.clone();
-        team.update(cx, |team, cx| start_following(team, state, cx));
+        team.update(cx, |team, cx| {
+            start_following(team, state, CopyStatus::Copying { done: 0, total: 0 }, cx)
+        });
         cx.update(|window, cx| {
             select_local_workspace(workspace, local_workspace_id.clone(), window, cx);
         })?;
@@ -667,6 +719,13 @@ pub(crate) fn render_copy_banner(local_workspace_id: &str, cx: &App) -> Option<A
     let copy = team.read(cx).copies.get(local_workspace_id)?;
     let name = &copy.state.sharer_name;
     let (message, can_delete): (SharedString, bool) = match &copy.status {
+        CopyStatus::Copying { total: 0, .. } => {
+            (format!("Copying {name}'s files...").into(), false)
+        }
+        CopyStatus::Copying { done, total } => (
+            format!("Copying {name}'s files: {done} of {total}").into(),
+            false,
+        ),
         CopyStatus::SharingStopped => (
             format!("{name} stopped sharing these files, so this copy no longer follows them.")
                 .into(),

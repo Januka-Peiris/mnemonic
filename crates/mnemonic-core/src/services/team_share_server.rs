@@ -51,7 +51,7 @@ const MAX_ACTIVE_REQUESTS: usize = 64;
 const MAX_DIFF_BYTES: usize = 2 * 1024 * 1024;
 const MAX_ACTION_BODY_BYTES: usize = 16 * 1024;
 const MAX_BATCH_BODY_BYTES: usize = 512 * 1024 * 1024;
-const MAX_BUNDLE_HAVE: usize = 64;
+pub const MAX_BUNDLE_HAVE: usize = 64;
 
 struct Shared {
     hub: TeamShareHub,
