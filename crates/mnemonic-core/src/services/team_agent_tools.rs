@@ -1,0 +1,588 @@
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use globset::Glob;
+use ignore::WalkBuilder;
+use regex::RegexBuilder;
+
+use super::team_files_service::safe_relative_path;
+
+const DEFAULT_READ_LIMIT: usize = 2000;
+const GLOB_RESULT_LIMIT: usize = 100;
+const BASH_OUTPUT_LIMIT: usize = 30000;
+const BASH_DEFAULT_TIMEOUT: Duration = Duration::from_secs(120);
+
+#[derive(Clone, Debug)]
+pub struct GitAuthor {
+    pub name: String,
+    pub email: String,
+}
+
+pub type WriteGuard = Arc<dyn Fn(&Path) -> Result<(), String> + Send + Sync>;
+
+#[derive(Clone)]
+pub struct AgentToolContext {
+    pub root: PathBuf,
+    pub git_author: Option<GitAuthor>,
+    pub can_write: WriteGuard,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum GrepOutputMode {
+    #[default]
+    FilesWithMatches,
+    Content,
+    Count,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct GrepRequest {
+    pub pattern: String,
+    pub path: Option<String>,
+    pub glob: Option<String>,
+    pub output_mode: GrepOutputMode,
+    pub case_insensitive: bool,
+    pub line_numbers: bool,
+    pub head_limit: Option<usize>,
+}
+
+#[derive(Clone, Default)]
+pub struct RunningCommands {
+    process_groups: Arc<Mutex<HashMap<String, i32>>>,
+}
+
+impl RunningCommands {
+    pub fn kill(&self, call_key: &str) -> bool {
+        let process_group = self
+            .process_groups
+            .lock()
+            .ok()
+            .and_then(|groups| groups.get(call_key).copied());
+        match process_group {
+            Some(process_group) => {
+                kill_process_group(process_group);
+                true
+            }
+            None => false,
+        }
+    }
+
+    fn register(&self, call_key: &str, process_group: i32) {
+        if let Ok(mut groups) = self.process_groups.lock() {
+            groups.insert(call_key.to_string(), process_group);
+        }
+    }
+
+    fn unregister(&self, call_key: &str) {
+        if let Ok(mut groups) = self.process_groups.lock() {
+            groups.remove(call_key);
+        }
+    }
+}
+
+fn kill_process_group(process_group: i32) {
+    // SAFETY: killpg only sends a signal; the id came from a child we spawned.
+    unsafe {
+        libc::killpg(process_group, libc::SIGKILL);
+    }
+}
+
+pub fn resolve_agent_path(root: &Path, path: &str, for_write: bool) -> Result<PathBuf, String> {
+    let relative = if Path::new(path).is_absolute() {
+        let canonical_root = root.canonicalize().ok();
+        Path::new(path)
+            .strip_prefix(root)
+            .ok()
+            .or_else(|| {
+                canonical_root
+                    .as_deref()
+                    .and_then(|canonical| Path::new(path).strip_prefix(canonical).ok())
+            })
+            .ok_or_else(|| format!("{path} is outside the workspace"))?
+            .to_string_lossy()
+            .into_owned()
+    } else {
+        path.to_string()
+    };
+    let relative = if relative.is_empty() {
+        ".".to_string()
+    } else {
+        relative
+    };
+
+    if for_write {
+        return safe_relative_path(root, &relative);
+    }
+
+    let canonical_root = root
+        .canonicalize()
+        .map_err(|error| format!("could not open the workspace: {error}"))?;
+    let canonical = canonical_root
+        .join(&relative)
+        .canonicalize()
+        .map_err(|error| format!("could not find {path}: {error}"))?;
+    if !canonical.starts_with(&canonical_root) {
+        return Err(format!("{path} is outside the workspace"));
+    }
+    Ok(canonical)
+}
+
+pub fn read(
+    context: &AgentToolContext,
+    file_path: &str,
+    offset: Option<usize>,
+    limit: Option<usize>,
+) -> Result<String, String> {
+    let resolved = resolve_agent_path(&context.root, file_path, false)?;
+    let bytes =
+        std::fs::read(&resolved).map_err(|error| format!("could not read {file_path}: {error}"))?;
+    if bytes.contains(&0) {
+        return Err(format!("{file_path} is a binary file"));
+    }
+    let text = String::from_utf8_lossy(&bytes);
+    let start = offset.unwrap_or(1).max(1);
+    let limit = limit.unwrap_or(DEFAULT_READ_LIMIT);
+    let lines: Vec<String> = text
+        .lines()
+        .enumerate()
+        .skip(start - 1)
+        .take(limit)
+        .map(|(index, line)| format!("{}\t{line}", index + 1))
+        .collect();
+    Ok(lines.join("\n"))
+}
+
+pub fn write(context: &AgentToolContext, file_path: &str, content: &str) -> Result<String, String> {
+    let resolved = resolve_agent_path(&context.root, file_path, true)?;
+    (context.can_write)(&resolved)?;
+    if let Some(parent) = resolved.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|error| format!("could not create folders for {file_path}: {error}"))?;
+    }
+    std::fs::write(&resolved, content)
+        .map_err(|error| format!("could not write {file_path}: {error}"))?;
+    Ok(format!("Wrote {file_path}"))
+}
+
+pub fn edit(
+    context: &AgentToolContext,
+    file_path: &str,
+    old_string: &str,
+    new_string: &str,
+    replace_all: bool,
+) -> Result<String, String> {
+    if old_string.is_empty() {
+        return Err("old_string is empty".to_string());
+    }
+    let resolved = resolve_agent_path(&context.root, file_path, true)?;
+    (context.can_write)(&resolved)?;
+    let text = std::fs::read_to_string(&resolved)
+        .map_err(|error| format!("could not read {file_path}: {error}"))?;
+    let matches = text.matches(old_string).count();
+    if matches == 0 {
+        return Err(format!("old_string was not found in {file_path}"));
+    }
+    if matches > 1 && !replace_all {
+        return Err(format!(
+            "old_string has {matches} matches in {file_path}; add more context or set replace_all"
+        ));
+    }
+    let updated = if replace_all {
+        text.replace(old_string, new_string)
+    } else {
+        text.replacen(old_string, new_string, 1)
+    };
+    std::fs::write(&resolved, updated)
+        .map_err(|error| format!("could not write {file_path}: {error}"))?;
+    Ok(format!("Edited {file_path} ({matches} replaced)"))
+}
+
+fn walk_files(base: &Path) -> impl Iterator<Item = PathBuf> {
+    WalkBuilder::new(base)
+        .hidden(false)
+        .require_git(false)
+        .filter_entry(|entry| entry.file_name() != ".git")
+        .build()
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().is_some_and(|kind| kind.is_file()))
+        .map(|entry| entry.into_path())
+}
+
+fn relative_to_root(context: &AgentToolContext, path: &Path) -> String {
+    let canonical_root = context
+        .root
+        .canonicalize()
+        .unwrap_or_else(|_| context.root.clone());
+    path.strip_prefix(&canonical_root)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .into_owned()
+}
+
+pub fn glob(
+    context: &AgentToolContext,
+    pattern: &str,
+    path: Option<&str>,
+) -> Result<String, String> {
+    let base = resolve_agent_path(&context.root, path.unwrap_or("."), false)?;
+    let matcher = Glob::new(pattern)
+        .map_err(|error| format!("invalid glob {pattern}: {error}"))?
+        .compile_matcher();
+    let mut found: Vec<(std::time::SystemTime, String)> = walk_files(&base)
+        .filter(|file| {
+            file.strip_prefix(&base)
+                .is_ok_and(|relative| matcher.is_match(relative))
+        })
+        .map(|file| {
+            let modified = std::fs::metadata(&file)
+                .and_then(|metadata| metadata.modified())
+                .unwrap_or(std::time::UNIX_EPOCH);
+            (modified, relative_to_root(context, &file))
+        })
+        .collect();
+    found.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
+    found.truncate(GLOB_RESULT_LIMIT);
+    if found.is_empty() {
+        return Ok("No files found".to_string());
+    }
+    Ok(found
+        .into_iter()
+        .map(|(_, path)| path)
+        .collect::<Vec<_>>()
+        .join("\n"))
+}
+
+pub fn grep(context: &AgentToolContext, request: &GrepRequest) -> Result<String, String> {
+    let base = resolve_agent_path(&context.root, request.path.as_deref().unwrap_or("."), false)?;
+    let regex = RegexBuilder::new(&request.pattern)
+        .case_insensitive(request.case_insensitive)
+        .build()
+        .map_err(|error| format!("invalid pattern: {error}"))?;
+    let file_filter = request
+        .glob
+        .as_deref()
+        .map(|pattern| {
+            Glob::new(pattern)
+                .map(|glob| glob.compile_matcher())
+                .map_err(|error| format!("invalid glob {pattern}: {error}"))
+        })
+        .transpose()?;
+
+    let mut lines = Vec::new();
+    for file in walk_files(&base) {
+        if let Some(filter) = &file_filter {
+            let relative = file.strip_prefix(&base).unwrap_or(&file);
+            let name_matches = file
+                .file_name()
+                .is_some_and(|name| filter.is_match(Path::new(name)));
+            if !filter.is_match(relative) && !name_matches {
+                continue;
+            }
+        }
+        let Ok(bytes) = std::fs::read(&file) else {
+            continue;
+        };
+        if bytes.contains(&0) {
+            continue;
+        }
+        let text = String::from_utf8_lossy(&bytes);
+        let display = relative_to_root(context, &file);
+        match request.output_mode {
+            GrepOutputMode::FilesWithMatches => {
+                if text.lines().any(|line| regex.is_match(line)) {
+                    lines.push(display);
+                }
+            }
+            GrepOutputMode::Count => {
+                let count = text.lines().filter(|line| regex.is_match(line)).count();
+                if count > 0 {
+                    lines.push(format!("{display}:{count}"));
+                }
+            }
+            GrepOutputMode::Content => {
+                for (index, line) in text.lines().enumerate() {
+                    if regex.is_match(line) {
+                        if request.line_numbers {
+                            lines.push(format!("{display}:{}:{line}", index + 1));
+                        } else {
+                            lines.push(format!("{display}:{line}"));
+                        }
+                    }
+                }
+            }
+        }
+        if request.head_limit.is_some_and(|limit| lines.len() >= limit) {
+            break;
+        }
+    }
+    if let Some(limit) = request.head_limit {
+        lines.truncate(limit);
+    }
+    if lines.is_empty() {
+        return Ok("No matches found".to_string());
+    }
+    Ok(lines.join("\n"))
+}
+
+fn drain<R: std::io::Read + Send + 'static>(mut stream: R) -> std::thread::JoinHandle<Vec<u8>> {
+    std::thread::spawn(move || {
+        let mut buffer = Vec::new();
+        stream.read_to_end(&mut buffer).ok();
+        buffer
+    })
+}
+
+#[allow(clippy::disallowed_methods)]
+pub fn bash(
+    context: &AgentToolContext,
+    command: &str,
+    timeout: Option<Duration>,
+    running: &RunningCommands,
+    call_key: &str,
+) -> Result<String, String> {
+    use std::os::unix::process::CommandExt as _;
+
+    let timeout = timeout.unwrap_or(BASH_DEFAULT_TIMEOUT);
+    let shell = std::env::var("SHELL")
+        .ok()
+        .filter(|shell| !shell.is_empty())
+        .unwrap_or_else(|| "/bin/zsh".to_string());
+    let mut process = std::process::Command::new(shell);
+    process
+        .args(["-l", "-c", command])
+        .current_dir(&context.root)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0);
+    if let Some(author) = &context.git_author {
+        process
+            .env("GIT_AUTHOR_NAME", &author.name)
+            .env("GIT_AUTHOR_EMAIL", &author.email)
+            .env("GIT_COMMITTER_NAME", &author.name)
+            .env("GIT_COMMITTER_EMAIL", &author.email);
+    }
+    let mut child = process
+        .spawn()
+        .map_err(|error| format!("could not start the shell: {error}"))?;
+    let process_group = child.id() as i32;
+    running.register(call_key, process_group);
+
+    let stdout = child.stdout.take().map(drain);
+    let stderr = child.stderr.take().map(drain);
+
+    let started = Instant::now();
+    let outcome = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Ok(status),
+            Ok(None) => {}
+            Err(error) => break Err(format!("could not wait for the command: {error}")),
+        }
+        if started.elapsed() >= timeout {
+            kill_process_group(process_group);
+            child.wait().ok();
+            running.unregister(call_key);
+            return Err(format!(
+                "command timed out after {:.1}s and was killed",
+                timeout.as_secs_f64()
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    running.unregister(call_key);
+    // Leftover background children can hold the pipes open past the shell's exit.
+    kill_process_group(process_group);
+
+    let status = outcome?;
+    let mut output = Vec::new();
+    for handle in [stdout, stderr].into_iter().flatten() {
+        if let Ok(bytes) = handle.join() {
+            output.extend(bytes);
+        }
+    }
+    let output = String::from_utf8_lossy(&output).into_owned();
+
+    use std::os::unix::process::ExitStatusExt as _;
+    if let Some(signal) = status.signal() {
+        return Err(format!("command was killed by signal {signal}\n{output}"));
+    }
+    let code = status.code().unwrap_or(-1);
+    let mut result = format!("exit {code}\n{output}");
+    if result.chars().count() > BASH_OUTPUT_LIMIT {
+        result = result.chars().take(BASH_OUTPUT_LIMIT).collect();
+        result.push_str("\n[output truncated]");
+    }
+    Ok(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_root(name: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "mnemonic-agent-tools-{name}-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).expect("create temp root");
+        root.canonicalize().expect("canonical temp root")
+    }
+
+    fn context(root: &Path) -> AgentToolContext {
+        AgentToolContext {
+            root: root.to_path_buf(),
+            git_author: None,
+            can_write: Arc::new(|_| Ok(())),
+        }
+    }
+
+    #[test]
+    fn paths_resolve_inside_the_root_only() {
+        let root = temp_root("paths");
+        std::fs::write(root.join("a.txt"), "a").expect("write");
+        std::fs::create_dir_all(root.join("sub")).expect("mkdir");
+        std::fs::write(root.join("sub/b.txt"), "b").expect("write");
+        std::fs::create_dir_all(root.join(".git")).expect("mkdir");
+        std::fs::write(root.join(".git/config"), "").expect("write");
+        std::os::unix::fs::symlink(root.join("a.txt"), root.join("link")).expect("symlink");
+        std::os::unix::fs::symlink("/etc", root.join("out")).expect("symlink");
+
+        let absolute = root.join("a.txt");
+        assert!(resolve_agent_path(&root, absolute.to_str().expect("utf8"), false).is_ok());
+        assert!(resolve_agent_path(&root, "sub/b.txt", false).is_ok());
+        assert!(resolve_agent_path(&root, "link", false).is_ok());
+        assert!(resolve_agent_path(&root, "link", true).is_err());
+        assert!(resolve_agent_path(&root, "out/passwd", false).is_err());
+        assert!(resolve_agent_path(&root, "../x", false).is_err());
+        assert!(resolve_agent_path(&root, "/etc/passwd", false).is_err());
+        assert!(resolve_agent_path(&root, ".git/config", true).is_err());
+    }
+
+    #[test]
+    fn read_numbers_lines_and_honours_offset_and_limit() {
+        let root = temp_root("read");
+        std::fs::write(root.join("f.txt"), "one\ntwo\nthree\n").expect("write");
+        let context = context(&root);
+        assert_eq!(
+            read(&context, "f.txt", Some(2), Some(1)).expect("read"),
+            "2\ttwo"
+        );
+        assert_eq!(
+            read(&context, "f.txt", None, None).expect("read"),
+            "1\tone\n2\ttwo\n3\tthree"
+        );
+    }
+
+    #[test]
+    fn read_refuses_binary_files() {
+        let root = temp_root("binary");
+        std::fs::write(root.join("bin"), [1u8, 0, 2]).expect("write");
+        assert!(read(&context(&root), "bin", None, None).is_err());
+    }
+
+    #[test]
+    fn edit_requires_a_unique_match_unless_replace_all() {
+        let root = temp_root("edit");
+        std::fs::write(root.join("f.txt"), "a a").expect("write");
+        let context = context(&root);
+        let error = edit(&context, "f.txt", "a", "b", false).expect_err("ambiguous edit");
+        assert!(error.contains("2 matches"), "{error}");
+        assert_eq!(
+            std::fs::read_to_string(root.join("f.txt")).expect("read"),
+            "a a"
+        );
+        edit(&context, "f.txt", "a", "b", true).expect("replace all");
+        assert_eq!(
+            std::fs::read_to_string(root.join("f.txt")).expect("read"),
+            "b b"
+        );
+    }
+
+    #[test]
+    fn write_and_edit_ask_can_write_first() {
+        let root = temp_root("can-write");
+        std::fs::write(root.join("f.txt"), "original").expect("write");
+        let mut context = context(&root);
+        context.can_write = Arc::new(|_| Err("has unsaved changes in Jay's editor".to_string()));
+        let error = write(&context, "f.txt", "new").expect_err("write refused");
+        assert!(error.contains("has unsaved changes in Jay's editor"));
+        let error = edit(&context, "f.txt", "original", "new", false).expect_err("edit refused");
+        assert!(error.contains("has unsaved changes in Jay's editor"));
+        assert_eq!(
+            std::fs::read_to_string(root.join("f.txt")).expect("read"),
+            "original"
+        );
+    }
+
+    #[test]
+    fn grep_and_glob_skip_gitignored_files() {
+        let root = temp_root("ignore");
+        std::fs::write(root.join(".gitignore"), "target\n").expect("write");
+        std::fs::create_dir_all(root.join("target")).expect("mkdir");
+        std::fs::create_dir_all(root.join("src")).expect("mkdir");
+        std::fs::write(root.join("target/x.rs"), "needle").expect("write");
+        std::fs::write(root.join("src/y.rs"), "needle").expect("write");
+        let context = context(&root);
+
+        let request = GrepRequest {
+            pattern: "needle".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(grep(&context, &request).expect("grep"), "src/y.rs");
+        assert_eq!(glob(&context, "**/*.rs", None).expect("glob"), "src/y.rs");
+    }
+
+    #[test]
+    fn bash_runs_in_the_root_with_the_git_author() {
+        let root = temp_root("bash");
+        let mut context = context(&root);
+        context.git_author = Some(GitAuthor {
+            name: "Dan".to_string(),
+            email: "dan@example.com".to_string(),
+        });
+        let output = bash(
+            &context,
+            "pwd && echo $GIT_AUTHOR_NAME",
+            None,
+            &RunningCommands::default(),
+            "k",
+        )
+        .expect("bash");
+        assert!(output.contains(root.to_str().expect("utf8")), "{output}");
+        assert!(output.contains("Dan"), "{output}");
+    }
+
+    #[test]
+    fn bash_reports_a_timeout() {
+        let root = temp_root("timeout");
+        let error = bash(
+            &context(&root),
+            "sleep 5",
+            Some(Duration::from_millis(200)),
+            &RunningCommands::default(),
+            "k",
+        )
+        .expect_err("timeout");
+        assert!(error.contains("timed out after 0.2s"), "{error}");
+    }
+
+    #[test]
+    fn killing_a_running_command_stops_it() {
+        let root = temp_root("kill");
+        let context = context(&root);
+        let running = RunningCommands::default();
+        let handle = std::thread::spawn({
+            let running = running.clone();
+            move || bash(&context, "sleep 30", None, &running, "k")
+        });
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(running.kill("k"));
+        let started = Instant::now();
+        let result = handle.join().expect("thread");
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(result.is_err());
+    }
+}
