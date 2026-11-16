@@ -22,7 +22,6 @@ use mnemonic_core::models::{ChatSessionRecord, WorkspaceSummary};
 use mnemonic_core::repositories::{chat_session_repository, workspace_repository};
 use mnemonic_core::services::chat_transcript_service::{self, LinkedChat};
 use mnemonic_core::services::pr_draft_service::OpenReviewComment;
-use mnemonic_core::services::team_share_service::TeamActionError;
 use mnemonic_core::services::workspace_script_service::RunCommandPlan;
 use mnemonic_core::services::{
     checkpoint_service, terminal_service, workspace_script_service, workspace_service,
@@ -721,48 +720,18 @@ fn files_to_close(
     close
 }
 
-/// How many teammate messages may wait in one chat, so a teammate can't
-/// pile instructions up behind the owner's turn.
-const MAX_WAITING_TEAMMATE_MESSAGES: usize = 2;
-
 /// Instructions waiting for a chat to connect or finish its current turn,
 /// sent oldest first.
 #[derive(Default)]
-pub(crate) struct PendingMessages(std::collections::VecDeque<PendingMessage>);
-
-struct PendingMessage {
-    text: String,
-    from_teammate: bool,
-}
+pub(crate) struct PendingMessages(std::collections::VecDeque<String>);
 
 impl PendingMessages {
     pub(crate) fn push(&mut self, text: String) {
-        self.0.push_back(PendingMessage {
-            text,
-            from_teammate: false,
-        });
+        self.0.push_back(text);
     }
 
     pub(crate) fn take_next(&mut self) -> Option<String> {
-        self.0.pop_front().map(|message| message.text)
-    }
-
-    /// Queues a teammate's message, unless as many as they may queue are
-    /// already waiting.
-    pub(crate) fn push_from_teammate(&mut self, text: String) -> bool {
-        let waiting = self
-            .0
-            .iter()
-            .filter(|message| message.from_teammate)
-            .count();
-        if waiting >= MAX_WAITING_TEAMMATE_MESSAGES {
-            return false;
-        }
-        self.0.push_back(PendingMessage {
-            text,
-            from_teammate: true,
-        });
-        true
+        self.0.pop_front()
     }
 }
 
@@ -989,6 +958,8 @@ pub struct WorkspaceView {
     _window_activation: Subscription,
     _pane_refresh: Subscription,
     _diagnostics_updated: Subscription,
+    /// Redraws the line above a teammate's copy when its following changes.
+    _team_copy_watch: Option<Subscription>,
 }
 
 impl WorkspaceView {
@@ -3540,33 +3511,6 @@ impl WorkspaceView {
         root_thread_view.update(cx, |thread_view, cx| thread_view.cancel_generation(cx));
     }
 
-    /// Queues a teammate's message for a chat, sent once its agent is idle.
-    pub(crate) fn queue_teammate_message(
-        &mut self,
-        record_id: &str,
-        text: String,
-        cx: &mut Context<Self>,
-    ) -> Result<(), TeamActionError> {
-        let Some(chat) = self
-            .sessions
-            .iter_mut()
-            .filter_map(WorkspaceSession::chat_mut)
-            .find(|chat| chat.record_id == record_id)
-        else {
-            return Err(TeamActionError::NotLoaded);
-        };
-        if !chat.pending_messages.push_from_teammate(text.clone()) {
-            return Err(TeamActionError::NothingToDo(
-                "Two messages are already queued for this chat".into(),
-            ));
-        }
-        // A teammate's message must not name the owner's workspace.
-        chat.app_messages.push(text);
-        let view_id = chat.view.entity_id();
-        self.flush_pending(view_id, cx);
-        Ok(())
-    }
-
     fn chat_by_record(&self, record_id: &str) -> Option<&ChatSession> {
         self.sessions
             .iter()
@@ -4765,6 +4709,7 @@ impl Render for WorkspaceView {
             .on_action(cx.listener(|this, _: &ActivatePaneDown, window, cx| {
                 this.activate_pane_in_direction(SplitDirection::Down, window, cx);
             }))
+            .children(crate::team_copy::render_copy_banner(&self.workspace_id, cx))
             .child(
                 div()
                     .flex_grow(1.0)
@@ -4826,6 +4771,18 @@ pub(crate) struct OpenChat {
     pub title: SharedString,
     /// None until the agent has connected.
     pub thread: Option<Entity<acp_thread::AcpThread>>,
+}
+
+/// The window whose host has the workspace open, if any.
+pub(crate) fn find_workspace_window(workspace_id: &str, cx: &App) -> Option<Entity<Workspace>> {
+    open_windows(cx).into_iter().find(|window| {
+        window.read(cx).panes().iter().any(|pane| {
+            pane.read(cx)
+                .items()
+                .filter_map(|item| item.downcast::<WorkspaceHost>())
+                .any(|host| host.read(cx).views.contains_key(workspace_id))
+        })
+    })
 }
 
 /// Finds a loaded chat by its record id, in whichever window holds it.
@@ -5276,6 +5233,13 @@ impl WorkspaceHost {
                             }
                         },
                     ),
+                    _team_copy_watch: crate::team::team_share(cx).map(|team| {
+                        cx.observe(&team, |view: &mut WorkspaceView, team, cx| {
+                            if team.read(cx).copies.contains_key(&view.workspace_id) {
+                                cx.notify();
+                            }
+                        })
+                    }),
                     window_handle: window.window_handle(),
                     window_active: window.is_window_active(),
                     last_cli_activity: None,
@@ -5349,61 +5313,6 @@ impl WorkspaceHost {
             });
             self.views.insert(summary.id.clone(), view);
         }
-    }
-
-    /// Loads a workspace's chats without showing it, so a teammate's message
-    /// can reach a chat its owner hasn't opened since the app started.
-    pub(crate) fn load_in_background(
-        summary: &WorkspaceSummary,
-        cx: &mut App,
-    ) -> Result<(), String> {
-        let windows = open_window_handles(cx);
-        let host_in = |workspace: &Entity<Workspace>, cx: &App| {
-            workspace.read(cx).panes().iter().find_map(|pane| {
-                pane.read(cx)
-                    .items()
-                    .find_map(|item| item.downcast::<WorkspaceHost>())
-            })
-        };
-        let hosting = windows
-            .iter()
-            .find_map(|(workspace, window)| Some((workspace, window, host_in(workspace, cx)?)));
-        let Some((workspace, window_handle, host)) = hosting else {
-            // No window shows a workspace yet, so this one opens as if its
-            // owner had selected it.
-            let Some((workspace, window_handle)) = windows.first() else {
-                return Err("No Mnemonic window is open".to_string());
-            };
-            let Some(panel) = workspace.read(cx).panel::<crate::WorkspacePanel>(cx) else {
-                return Err("The workspace list isn't available".to_string());
-            };
-            let workspace_id = summary.id.clone();
-            return window_handle
-                .update(cx, |_, window, cx| {
-                    panel.update(cx, |panel, cx| {
-                        panel.select_workspace(workspace_id, window, cx);
-                    });
-                })
-                .map_err(|err| err.to_string());
-        };
-        let workspace_handle = workspace.downgrade();
-        let (project, database_id) = {
-            let workspace = workspace.read(cx);
-            (workspace.project().clone(), workspace.database_id())
-        };
-        window_handle
-            .update(cx, |_, window, cx| {
-                // Opening chat tabs takes keyboard focus, which belongs to
-                // whatever the owner is doing in this window.
-                let focused = window.focused(cx);
-                host.update(cx, |host, cx| {
-                    host.ensure_view(summary, workspace_handle, project, database_id, window, cx);
-                });
-                if let Some(focused) = focused {
-                    window.focus(&focused, cx);
-                }
-            })
-            .map_err(|err| err.to_string())
     }
 
     fn set_active_teammate(
@@ -6052,23 +5961,6 @@ mod tests {
         assert_eq!(pending.take_next().as_deref(), Some("a"));
         assert_eq!(pending.take_next().as_deref(), Some("b"));
         assert_eq!(pending.take_next(), None);
-    }
-
-    #[test]
-    fn at_most_two_teammate_messages_wait_per_chat() {
-        let mut pending = PendingMessages::default();
-        pending.push("from the owner".to_string());
-        assert!(pending.push_from_teammate("first".to_string()));
-        assert!(pending.push_from_teammate("second".to_string()));
-        assert!(!pending.push_from_teammate("third".to_string()));
-
-        assert_eq!(pending.take_next().as_deref(), Some("from the owner"));
-        assert!(!pending.push_from_teammate("third".to_string()));
-
-        assert_eq!(pending.take_next().as_deref(), Some("first"));
-        assert!(pending.push_from_teammate("third".to_string()));
-        assert_eq!(pending.take_next().as_deref(), Some("second"));
-        assert_eq!(pending.take_next().as_deref(), Some("third"));
     }
 
 }

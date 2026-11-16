@@ -106,6 +106,10 @@ pub struct CreateWorkspaceInput {
     pub parent_workspace_id: Option<String>,
     pub source_workspace_id: Option<String>,
     pub derived_from_branch: Option<String>,
+    /// Overrides how the workspace is marked as made, as for a teammate's
+    /// copy, which never runs Setup.
+    #[serde(default)]
+    pub workspace_source: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -1,5 +1,6 @@
 use crate::models::{CleanupWorkspaceInput, CleanupWorkspaceResult};
 use crate::repositories::{activity_repository, terminal_repository, workspace_repository};
+use crate::services::team_files_service::TEAM_COPY_SOURCE;
 use crate::services::{
     terminal_service, workspace_health_service, workspace_port_service, workspace_script_service,
     workspace_service,
@@ -30,7 +31,9 @@ pub fn cleanup_workspace(
         workspace_script_service::get_workspace_mnemonic_config(state, &input.workspace_id)
             .unwrap_or_default();
     let mut teardown_sessions = 0u32;
-    if config.warning.is_none() {
+    // A teammate's copy holds the sharer's commands, never run here.
+    let is_team_copy = workspace.summary.workspace_source == TEAM_COPY_SOURCE;
+    if config.warning.is_none() && !is_team_copy {
         for (index, command) in config.teardown.iter().enumerate() {
             match workspace_script_service::start_command_terminal(
                 state,

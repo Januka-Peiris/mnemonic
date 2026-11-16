@@ -13,6 +13,9 @@ use mnemonic_core::models::{
     ChangedFile, WorkspaceChangeScope, WorkspaceCheckpoint, WorkspaceCheckpointRestorePlan,
     WorkspacePort, WorkspacePrComment, WorkspacePrStatus, WorkspaceSummary,
 };
+use mnemonic_core::services::team_files_service::{
+    self, BatchFile, BatchFileState, BatchRecord, HeldReason,
+};
 use mnemonic_core::services::{
     checkpoint_service, conflict_detection_service, git_review_service, pr_draft_service,
     review_cockpit_service, workspace_port_service, workspace_service,
@@ -24,13 +27,15 @@ use ui::{
     Label, PopoverMenu, TintColor, Tooltip, prelude::*,
 };
 use std::time::{Duration, Instant};
+use util::ResultExt as _;
 
 use workspace::dock::{DockPosition, PanelEvent};
 use workspace::notifications::NotificationId;
 use workspace::{OpenOptions, Panel, Toast, Workspace};
 
 use crate::ActiveWorkspace;
-use crate::team_workspace_view::{TeammateDiffState, TeammateWorkspaceView};
+use crate::team;
+use crate::team_workspace_view::{TeammateDiffItem, TeammateDiffState, TeammateWorkspaceView};
 use crate::workspace_panel::WorkspacePanel;
 use crate::workspace_view::WorkspaceHost;
 use crate::workspaces_settings::WorkspacesSettings;
@@ -196,6 +201,9 @@ const RESTORE_PROMPT_FILE_LIMIT: usize = 8;
 const COMMENT_PREVIEW_CHARS: usize = 140;
 /// Characters of each review comment body sent to the agent.
 const COMMENT_PROMPT_BODY_CHARS: usize = 4000;
+/// Bytes of either side of a teammate's file past which its diff isn't
+/// built.
+const BATCH_DIFF_MAX_BYTES: usize = 512 * 1024;
 
 pub struct WorkspaceDetailPanel {
     focus_handle: FocusHandle,
@@ -262,6 +270,17 @@ pub struct WorkspaceDetailPanel {
     /// teammate, alive after the window's host drops it.
     teammate: Option<WeakEntity<TeammateWorkspaceView>>,
     teammate_subscription: Option<Subscription>,
+    /// Teammates' batches applied to the selected workspace, oldest first.
+    batches: Vec<BatchRecord>,
+    /// Replacing it cancels a load still in flight.
+    batches_task: Option<Task<()>>,
+    /// The team's batch count last loaded, to reload when another arrives.
+    batches_generation: u64,
+    expanded_batches: HashSet<String>,
+    /// An undo or a held file's resolution writing files.
+    batch_action_task: Option<Task<()>>,
+    batch_message: Option<SharedString>,
+    _team_subscription: Option<Subscription>,
 }
 
 impl WorkspaceDetailPanel {
@@ -301,10 +320,24 @@ impl WorkspaceDetailPanel {
                     this.selected_change = None;
                     this.collapsed_change_folders.clear();
                     this.show_merged_changes = false;
+                    this.batches.clear();
+                    this.expanded_batches.clear();
+                    this.batch_message = None;
+                    this.load_batches(cx);
                 }
                 cx.notify();
             })
             .detach();
+
+            let team_subscription = team::team_share(cx).map(|team| {
+                cx.observe(&team, |this: &mut Self, team, cx| {
+                    let generation = team.read(cx).batch_generation;
+                    if generation != this.batches_generation {
+                        this.batches_generation = generation;
+                        this.load_batches(cx);
+                    }
+                })
+            });
 
             let mut panel = Self {
                 focus_handle: cx.focus_handle(),
@@ -349,8 +382,16 @@ impl WorkspaceDetailPanel {
                 selected_change: None,
                 collapsed_change_folders: HashSet::new(),
                 show_merged_changes: false,
+                batches: Vec::new(),
+                batches_task: None,
+                batches_generation: 0,
+                expanded_batches: HashSet::new(),
+                batch_action_task: None,
+                batch_message: None,
+                _team_subscription: team_subscription,
             };
             panel.refresh(cx);
+            panel.load_batches(cx);
             panel
         });
 
@@ -3261,6 +3302,540 @@ impl WorkspaceDetailPanel {
             .into_any_element()
     }
 
+    /// Reads the selected workspace's teammate batches off the main thread.
+    fn load_batches(&mut self, cx: &mut Context<Self>) {
+        let Some(workspace_id) = self
+            .current_workspace_id()
+            .filter(|id| !mnemonic_bridge::is_teammate_workspace(id))
+            .map(str::to_string)
+        else {
+            self.batches.clear();
+            self.batches_task = None;
+            return;
+        };
+        self.batches_task = Some(cx.spawn(async move |this, cx| {
+            let loaded = cx
+                .background_spawn({
+                    let workspace_id = workspace_id.clone();
+                    async move {
+                        let app = mnemonic_bridge::mnemonic_state_cloned()
+                            .ok_or_else(|| "Mnemonic isn't ready".to_string())?;
+                        team_files_service::load_batch_records(&app.data_dir, &workspace_id)
+                    }
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                if this.current_workspace_id() != Some(workspace_id.as_str()) {
+                    return;
+                }
+                match loaded {
+                    Ok(records) => this.batches = records,
+                    Err(err) => {
+                        log::error!("Couldn't load teammates' changes: {err}");
+                        this.batch_message =
+                            Some(format!("Couldn't load teammates' changes: {err}").into());
+                    }
+                }
+                cx.notify();
+            })
+            .log_err();
+        }));
+    }
+
+    fn open_batch_file_diff(
+        &mut self,
+        batch_id: &str,
+        path: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(record) = self.batches.iter().find(|record| record.id == batch_id) else {
+            return;
+        };
+        let Some(file) = record.files.iter().find(|file| file.path == path).cloned() else {
+            return;
+        };
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+        let teammate = teammate_name(record).to_string();
+        let languages = workspace.read(cx).project().read(cx).languages().clone();
+        let workspace = workspace.downgrade();
+        let title = SharedString::from(
+            path.rsplit('/')
+                .next()
+                .filter(|name| !name.is_empty())
+                .unwrap_or(path)
+                .to_string(),
+        );
+        cx.spawn_in(window, async move |_, cx| {
+            let text = cx
+                .background_spawn(async move { batch_file_diff(&file, &teammate) })
+                .await;
+            let language = languages.language_for_name("Diff").await.log_err();
+            workspace
+                .update_in(cx, |workspace, window, cx| {
+                    let item = TeammateDiffItem::new(title, text, language, window, cx);
+                    workspace.add_item_to_active_pane(Box::new(item), None, true, window, cx);
+                })
+                .log_err();
+        })
+        .detach();
+    }
+
+    /// Runs `action` on a copy of the batch off the main thread, saves the
+    /// result whatever happened, and reloads the list.
+    fn run_batch_action(
+        &mut self,
+        batch_id: &str,
+        action: impl FnOnce(&Path, &mut BatchRecord) -> Result<String, String> + Send + 'static,
+        cx: &mut Context<Self>,
+    ) {
+        if self.batch_action_task.is_some() {
+            return;
+        }
+        let Some(summary) = self.summary.as_ref() else {
+            return;
+        };
+        let Some(root) = team::workspace_root(summary) else {
+            self.batch_message = Some("This workspace has no folder".into());
+            cx.notify();
+            return;
+        };
+        let Some(record) = self
+            .batches
+            .iter()
+            .find(|record| record.id == batch_id)
+            .cloned()
+        else {
+            return;
+        };
+        let workspace_id = summary.id.clone();
+        self.batch_message = None;
+        self.batch_action_task = Some(cx.spawn(async move |this, cx| {
+            let message = cx
+                .background_spawn({
+                    let workspace_id = workspace_id.clone();
+                    async move {
+                        let lock = team_files_service::workspace_files_lock(&workspace_id);
+                        let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                        let mut record = record;
+                        let outcome = action(&root, &mut record);
+                        let saved = mnemonic_bridge::mnemonic_state_cloned()
+                            .ok_or_else(|| "Mnemonic isn't ready".to_string())
+                            .and_then(|app| {
+                                team_files_service::save_batch_record(
+                                    &app.data_dir,
+                                    &workspace_id,
+                                    &record,
+                                )
+                            });
+                        let mut message = match outcome {
+                            Ok(message) | Err(message) => message,
+                        };
+                        if let Err(err) = saved {
+                            log::error!("Couldn't save teammate batch {}: {err}", record.id);
+                            message.push_str(&format!(" (couldn't record it: {err})"));
+                        }
+                        message
+                    }
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                this.batch_action_task = None;
+                if this.current_workspace_id() == Some(workspace_id.as_str()) {
+                    this.batch_message = Some(message.into());
+                    this.load_batches(cx);
+                }
+                cx.notify();
+            })
+            .log_err();
+        }));
+        cx.notify();
+    }
+
+    fn undo_teammate_batch(&mut self, batch_id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if self.batch_action_task.is_some() {
+            return;
+        }
+        let Some(record) = self.batches.iter().find(|record| record.id == batch_id) else {
+            return;
+        };
+        let held: Vec<String> = record
+            .files
+            .iter()
+            .filter(|file| matches!(file.state, BatchFileState::Held(_)))
+            .map(|file| file.path.clone())
+            .collect();
+        if held.is_empty() {
+            self.start_undo(batch_id.to_string(), cx);
+            return;
+        }
+        let answer = window.prompt(
+            PromptLevel::Warning,
+            &format!("Undo {}'s changes?", teammate_name(record)),
+            Some(&format!(
+                "These files are still held and will keep your version:\n{}",
+                held.join("\n")
+            )),
+            &["Undo", "Cancel"],
+            cx,
+        );
+        let batch_id = batch_id.to_string();
+        cx.spawn(async move |this, cx| {
+            if answer.await == Ok(0) {
+                this.update(cx, |this, cx| this.start_undo(batch_id, cx))
+                    .log_err();
+            }
+        })
+        .detach();
+    }
+
+    fn start_undo(&mut self, batch_id: String, cx: &mut Context<Self>) {
+        let unsaved = self
+            .summary
+            .as_ref()
+            .and_then(team::workspace_root)
+            .map(|root| team::unsaved_paths(&root, cx))
+            .unwrap_or_default();
+        self.run_batch_action(
+            &batch_id,
+            move |root, record| {
+                let teammate = teammate_name(record).to_string();
+                let states_before: Vec<BatchFileState> =
+                    record.files.iter().map(|file| file.state).collect();
+                let undone = team_files_service::undo_batch(root, record, &unsaved);
+                let changed_to = |state: BatchFileState| {
+                    record
+                        .files
+                        .iter()
+                        .zip(&states_before)
+                        .filter(|(file, before)| file.state == state && **before != state)
+                        .count()
+                };
+                let files = |count: usize| if count == 1 { "file" } else { "files" };
+                let undone_count = changed_to(BatchFileState::Undone);
+                let kept_count = changed_to(BatchFileState::Kept);
+                let mut message = format!(
+                    "Undid {undone_count} {} of {teammate}'s",
+                    files(undone_count)
+                );
+                if kept_count > 0 {
+                    message.push_str(&format!(", kept yours for {kept_count}"));
+                }
+                match undone {
+                    Ok(left_alone) if left_alone.is_empty() => Ok(message),
+                    Ok(left_alone) => {
+                        message.push_str(&format!(
+                            ", left {} alone: {}",
+                            left_alone.len(),
+                            left_alone.join(", ")
+                        ));
+                        Ok(message)
+                    }
+                    Err(err) => Err(format!("{message}, then stopped: {err}")),
+                }
+            },
+            cx,
+        );
+    }
+
+    fn resolve_held_file(
+        &mut self,
+        batch_id: &str,
+        path: &str,
+        take_teammates: bool,
+        cx: &mut Context<Self>,
+    ) {
+        // Checked for every take, not only files held as unsaved, since
+        // writing under an editor's unsaved edits would set them at odds.
+        if take_teammates {
+            let root = self.summary.as_ref().and_then(team::workspace_root);
+            let still_unsaved = root.is_some_and(|root| {
+                let wanted = team_files_service::fold_case(path);
+                team::unsaved_paths(&root, cx)
+                    .iter()
+                    .any(|unsaved| team_files_service::fold_case(unsaved) == wanted)
+            });
+            if still_unsaved {
+                self.batch_message = Some(
+                    format!("{path} still has unsaved changes. Save or discard them first.").into(),
+                );
+                cx.notify();
+                return;
+            }
+        }
+        let path = path.to_string();
+        self.run_batch_action(
+            batch_id,
+            move |root, record| {
+                let teammate = teammate_name(record).to_string();
+                team_files_service::resolve_held(root, record, &path, take_teammates)
+                    .map(|()| {
+                        if take_teammates {
+                            format!("Took {teammate}'s {path}")
+                        } else {
+                            format!("Kept your {path}")
+                        }
+                    })
+                    .map_err(|err| {
+                        if take_teammates {
+                            format!("Couldn't take {teammate}'s {path}: {err}")
+                        } else {
+                            format!("Couldn't keep your {path}: {err}")
+                        }
+                    })
+            },
+            cx,
+        );
+    }
+
+    /// The selected workspace's teammate batches, newest first, under its
+    /// changed files. None when it has had none.
+    fn render_teammate_batches(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if self.batches.is_empty() && self.batch_message.is_none() {
+            return None;
+        }
+        let hover_color = cx.theme().colors().ghost_element_hover;
+        let border_color = cx.theme().colors().border_variant;
+        let busy = self.batch_action_task.is_some();
+        let mut list = v_flex()
+            .id("teammate-batches")
+            .w_full()
+            .max_h(px(280.))
+            .pb_1()
+            .overflow_y_scroll();
+        for (batch_index, record) in self.batches.iter().enumerate().rev() {
+            let expanded = self.expanded_batches.contains(&record.id);
+            let teammate = teammate_name(record).to_string();
+            let undoable = record.files.iter().any(|file| {
+                matches!(
+                    file.state,
+                    BatchFileState::Applied | BatchFileState::Taken | BatchFileState::Held(_)
+                )
+            });
+            let batch_id = record.id.clone();
+            list = list.child(
+                h_flex()
+                    .id(("teammate-batch", batch_index))
+                    .px_2()
+                    .h(px(24.))
+                    .gap_1()
+                    .items_center()
+                    .cursor_pointer()
+                    .hover(move |style| style.bg(hover_color))
+                    .tooltip(Tooltip::text(format!("{teammate} ({})", record.login)))
+                    .on_click(cx.listener({
+                        let batch_id = batch_id.clone();
+                        move |this, _, _, cx| {
+                            if !this.expanded_batches.remove(&batch_id) {
+                                this.expanded_batches.insert(batch_id.clone());
+                            }
+                            cx.notify();
+                        }
+                    }))
+                    .child(
+                        Icon::new(if expanded {
+                            IconName::ChevronDown
+                        } else {
+                            IconName::ChevronRight
+                        })
+                        .size(IconSize::XSmall)
+                        .color(Color::Muted),
+                    )
+                    .child(
+                        div().min_w_0().flex_1().child(
+                            Label::new(batch_title(record))
+                                .size(LabelSize::XSmall)
+                                .single_line()
+                                .truncate(),
+                        ),
+                    )
+                    .when(undoable, |row| {
+                        row.child(
+                            Button::new(("teammate-batch-undo", batch_index), "Undo")
+                                .style(ButtonStyle::Subtle)
+                                .label_size(LabelSize::XSmall)
+                                .disabled(busy)
+                                .tooltip(Tooltip::text(
+                                    "Put back each file this batch changed, unless it changed since",
+                                ))
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.undo_teammate_batch(&batch_id, window, cx);
+                                })),
+                        )
+                    }),
+            );
+            if let Some(note) = record
+                .note
+                .as_deref()
+                .filter(|note| !note.trim().is_empty())
+            {
+                list = list.child(
+                    h_flex().pl(px(26.)).pr_2().child(
+                        Label::new(note.to_string())
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
+                    ),
+                );
+            }
+            if expanded {
+                for (file_index, file) in record.files.iter().enumerate() {
+                    list = list.child(self.render_batch_file(
+                        record,
+                        batch_index,
+                        file_index,
+                        file,
+                        busy,
+                        cx,
+                    ));
+                }
+            }
+        }
+
+        Some(
+            v_flex()
+                .w_full()
+                .flex_none()
+                .border_t_1()
+                .border_color(border_color)
+                .child(
+                    h_flex().px_2().h(px(26.)).items_center().child(
+                        Label::new("Teammate changes")
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
+                    ),
+                )
+                .when_some(self.batch_message.clone(), |column, message| {
+                    column.child(
+                        h_flex().px_2().pb_1().child(
+                            Label::new(message)
+                                .size(LabelSize::XSmall)
+                                .color(Color::Muted),
+                        ),
+                    )
+                })
+                .child(list)
+                .into_any_element(),
+        )
+    }
+
+    fn render_batch_file(
+        &self,
+        record: &BatchRecord,
+        batch_index: usize,
+        file_index: usize,
+        file: &BatchFile,
+        busy: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let hover_color = cx.theme().colors().ghost_element_hover;
+        let teammate = teammate_name(record);
+        let (directory, file_name) = split_change_path(&file.path);
+        let element_index = batch_index
+            .saturating_mul(100_000)
+            .saturating_add(file_index);
+        let state_label = match file.state {
+            BatchFileState::Applied => None,
+            BatchFileState::Held(HeldReason::ChangedSinceYourCopy) => {
+                Some(("Changed on both sides".to_string(), Color::Warning))
+            }
+            BatchFileState::Held(HeldReason::UnsavedInEditor) => {
+                Some(("Unsaved in your editor".to_string(), Color::Warning))
+            }
+            BatchFileState::Held(HeldReason::NeedsApproval) => {
+                Some(("Needs your approval".to_string(), Color::Warning))
+            }
+            BatchFileState::Kept => Some(("Kept yours".to_string(), Color::Muted)),
+            BatchFileState::Taken => Some((format!("Took {teammate}'s"), Color::Muted)),
+            BatchFileState::Undone => Some(("Undone".to_string(), Color::Muted)),
+        };
+        let batch_id = record.id.clone();
+        let path = file.path.clone();
+        let row = h_flex()
+            .id(("teammate-batch-file", element_index))
+            .h(px(22.))
+            .w_full()
+            .pl(px(26.))
+            .pr_2()
+            .gap_1p5()
+            .items_center()
+            .cursor_pointer()
+            .hover(move |style| style.bg(hover_color))
+            .tooltip(Tooltip::text(file.path.clone()))
+            .on_click(cx.listener({
+                let batch_id = batch_id.clone();
+                let path = path.clone();
+                move |this, _, window, cx| {
+                    this.open_batch_file_diff(&batch_id, &path, window, cx);
+                }
+            }))
+            .child(
+                div().flex_none().child(
+                    Label::new(file_name.to_string())
+                        .size(LabelSize::Small)
+                        .single_line(),
+                ),
+            )
+            .child(
+                div().min_w_0().flex_1().child(
+                    Label::new(directory.to_string())
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted)
+                        .truncate_start(),
+                ),
+            )
+            .when_some(state_label, |row, (label, color)| {
+                row.child(
+                    div()
+                        .flex_none()
+                        .child(Label::new(label).size(LabelSize::XSmall).color(color)),
+                )
+            });
+
+        let BatchFileState::Held(reason) = file.state else {
+            return row.into_any_element();
+        };
+        let take_label = if reason == HeldReason::NeedsApproval {
+            "Approve".to_string()
+        } else {
+            format!("Take {teammate}'s")
+        };
+        v_flex()
+            .w_full()
+            .child(row)
+            .child(
+                h_flex()
+                    .pl(px(26.))
+                    .pr_2()
+                    .pb_1()
+                    .gap_1()
+                    .child(
+                        Button::new(("teammate-batch-keep", element_index), "Keep mine")
+                            .style(ButtonStyle::Subtle)
+                            .label_size(LabelSize::XSmall)
+                            .disabled(busy)
+                            .on_click(cx.listener({
+                                let batch_id = batch_id.clone();
+                                let path = path.clone();
+                                move |this, _, _, cx| {
+                                    this.resolve_held_file(&batch_id, &path, false, cx);
+                                }
+                            })),
+                    )
+                    .child(
+                        Button::new(("teammate-batch-take", element_index), take_label)
+                            .style(ButtonStyle::Subtle)
+                            .label_size(LabelSize::XSmall)
+                            .disabled(busy)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.resolve_held_file(&batch_id, &path, true, cx);
+                            })),
+                    ),
+            )
+            .into_any_element()
+    }
+
     /// Follows the teammate view while a teammate's workspace is selected, so
     /// the list updates when its files do.
     fn sync_teammate_view(&mut self, cx: &mut Context<Self>) {
@@ -3299,6 +3874,65 @@ impl WorkspaceDetailPanel {
                     .color(Color::Muted),
             )
     }
+}
+
+/// The teammate who sent `record`, by display name, or login without one.
+fn teammate_name(record: &BatchRecord) -> &str {
+    if record.name.trim().is_empty() {
+        &record.login
+    } else {
+        &record.name
+    }
+}
+
+/// "Dan changed 3 files · 2:14pm", in local time, with the date when it
+/// wasn't today.
+fn batch_title(record: &BatchRecord) -> String {
+    let count = record.files.len();
+    let files = if count == 1 { "file" } else { "files" };
+    let mut title = format!("{} changed {count} {files}", teammate_name(record));
+    if let Ok(at) = chrono::DateTime::parse_from_rfc3339(&record.at) {
+        let at = at.with_timezone(&chrono::Local);
+        let time = at.format("%-I:%M%P");
+        if at.date_naive() == chrono::Local::now().date_naive() {
+            title.push_str(&format!(" \u{b7} {time}"));
+        } else {
+            title.push_str(&format!(" \u{b7} {} {time}", at.format("%b %-d")));
+        }
+    }
+    title
+}
+
+/// A unified diff of `file` from the owner's version to the teammate's.
+fn batch_file_diff(file: &BatchFile, teammate: &str) -> String {
+    fn as_text(content: Option<&[u8]>) -> Option<&str> {
+        match content {
+            None => Some(""),
+            Some(bytes) if bytes.len() <= BATCH_DIFF_MAX_BYTES => std::str::from_utf8(bytes).ok(),
+            Some(_) => None,
+        }
+    }
+    let (Some(before), Some(after)) = (
+        as_text(file.before.as_deref()),
+        as_text(file.after.as_deref()),
+    ) else {
+        return "Binary or too large to show\n".to_string();
+    };
+    let ours = match (&file.state, &file.before) {
+        (_, None) => "(no file)".to_string(),
+        (BatchFileState::Held(_) | BatchFileState::Kept, Some(_)) => {
+            format!("{} (yours)", file.path)
+        }
+        (_, Some(_)) => format!("{} (before)", file.path),
+    };
+    let theirs = match &file.after {
+        None => format!("(deleted by {teammate})"),
+        Some(_) => format!("{} ({teammate}'s)", file.path),
+    };
+    format!(
+        "--- {ours}\n+++ {theirs}\n{}",
+        language::unified_diff(before, after)
+    )
 }
 
 impl Focusable for WorkspaceDetailPanel {
@@ -3398,7 +4032,16 @@ impl Render for WorkspaceDetailPanel {
             Some(ws) => {
                 let body = match self.tab {
                     DetailTab::AllFiles => self.render_file_tree(cx).into_any_element(),
-                    DetailTab::Changes => self.render_changes(&ws, window, cx),
+                    DetailTab::Changes => {
+                        let changes = self.render_changes(&ws, window, cx);
+                        v_flex()
+                            .w_full()
+                            .flex_1()
+                            .min_h_0()
+                            .child(changes)
+                            .children(self.render_teammate_batches(cx))
+                            .into_any_element()
+                    }
                     DetailTab::Checks => self.render_checks(cx).into_any_element(),
                     DetailTab::Ports => self.render_ports(cx).into_any_element(),
                     DetailTab::Checkpoints => self.render_checkpoints(cx).into_any_element(),

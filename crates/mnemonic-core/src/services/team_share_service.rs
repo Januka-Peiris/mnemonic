@@ -11,8 +11,10 @@ use std::time::{Duration, Instant};
 use agent_client_protocol::schema as acp;
 use serde::{Deserialize, Serialize};
 
+use crate::services::team_files_service::{TeamBatchOutcome, TeamChangeBatch, TeamFileManifest};
+
 /// Bumped whenever a change to the wire types would break an older peer.
-pub const TEAM_PROTOCOL_VERSION: u32 = 3;
+pub const TEAM_PROTOCOL_VERSION: u32 = 4;
 /// Chats travel as the ACP crate's own types, so peers on different crate
 /// versions are treated as speaking different protocols.
 pub const TEAM_ACP_CRATE_VERSION: &str = "0.14.0";
@@ -82,6 +84,19 @@ pub struct TeamWorkspace {
     /// Whether the sharer lets teammates act in this workspace's chats.
     #[serde(default)]
     pub step_in: bool,
+    /// Whether the sharer lets teammates copy this workspace's files.
+    #[serde(default)]
+    pub share_files: bool,
+    /// Whether teammates may also send changes back. Implies `share_files`.
+    #[serde(default)]
+    pub edit_files: bool,
+    #[serde(default)]
+    pub remote_url: Option<String>,
+    #[serde(default)]
+    pub base_branch: Option<String>,
+    /// The sharer's skip list for the workspace's files.
+    #[serde(default)]
+    pub skip_patterns: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -157,18 +172,18 @@ pub struct TeamAction {
 #[derive(Clone, Debug, PartialEq)]
 pub enum TeamActionKind {
     Stop,
-    Message { text: String },
     Permission { tool_call_id: String, option_id: String },
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct TeamActionOutcome {
-    pub queued: bool,
-}
+pub struct TeamActionOutcome {}
 
-/// Why an action wasn't carried out, mapped to 403, 404, 409 and 500.
+/// Why an action wasn't carried out, mapped to 400, 403, 404, 409 and 500.
 #[derive(Clone, Debug, PartialEq)]
 pub enum TeamActionError {
+    /// The request itself can't be carried out, as a batch naming a path
+    /// a teammate may not write.
+    Invalid(String),
     NotAllowed(String),
     NotLoaded,
     NothingToDo(String),
@@ -177,6 +192,27 @@ pub enum TeamActionError {
 
 pub type ActionHandler =
     Arc<dyn Fn(TeamAction) -> Result<TeamActionOutcome, TeamActionError> + Send + Sync>;
+
+/// A teammate's batch of file changes, held or applied by the sharer's app.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TeamBatchRequest {
+    pub workspace_id: String,
+    pub from: String,
+    pub login: String,
+    pub batch: TeamChangeBatch,
+}
+
+pub type BatchHandler =
+    Arc<dyn Fn(TeamBatchRequest) -> Result<TeamBatchOutcome, TeamActionError> + Send + Sync>;
+
+/// The workspace's whole file manifest, replaced rather than patched on
+/// each change.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct TeamFileUpdate {
+    pub cursor: String,
+    /// None when the wait ended with the viewer's cursor still current.
+    pub manifest: Option<TeamFileManifest>,
+}
 
 /// Where to reach a teammate: a Tailscale machine name or address, with an
 /// optional `:port`.
@@ -220,6 +256,8 @@ struct HubState {
     workspaces: Vec<TeamWorkspace>,
     chats: HashMap<String, ChatFeed>,
     step_in_chats: HashSet<String>,
+    /// Each workspace's manifest and the hub version it last changed at.
+    manifests: HashMap<String, (TeamFileManifest, u64)>,
     last_request: Option<Instant>,
 }
 
@@ -255,6 +293,7 @@ impl TeamShareHub {
                     workspaces: Vec::new(),
                     chats: HashMap::new(),
                     step_in_chats: HashSet::new(),
+                    manifests: HashMap::new(),
                     last_request: None,
                 }),
                 changed: Condvar::new(),
@@ -278,6 +317,68 @@ impl TeamShareHub {
 
     pub fn workspaces(&self) -> Vec<TeamWorkspace> {
         self.lock().workspaces.clone()
+    }
+
+    pub fn set_file_manifest(&self, workspace_id: &str, manifest: TeamFileManifest) {
+        let mut state = self.lock();
+        if state
+            .manifests
+            .get(workspace_id)
+            .is_some_and(|(current, _)| *current == manifest)
+        {
+            return;
+        }
+        state.version += 1;
+        let version = state.version;
+        state
+            .manifests
+            .insert(workspace_id.to_string(), (manifest, version));
+        self.inner.changed.notify_all();
+    }
+
+    pub fn file_manifest(&self, workspace_id: &str) -> Option<TeamFileManifest> {
+        self.lock()
+            .manifests
+            .get(workspace_id)
+            .map(|(manifest, _)| manifest.clone())
+    }
+
+    pub fn remove_file_manifest(&self, workspace_id: &str) {
+        let mut state = self.lock();
+        if state.manifests.remove(workspace_id).is_some() {
+            self.inner.changed.notify_all();
+        }
+    }
+
+    /// The manifest when it differs from the one `cursor` names, waiting up
+    /// to `wait` for that to be so. A cursor from another run of the app
+    /// never matches, so a reconnect always gets the current manifest.
+    pub fn wait_file_manifest(
+        &self,
+        workspace_id: &str,
+        cursor: Option<&str>,
+        wait: Duration,
+    ) -> Option<TeamFileUpdate> {
+        let deadline = Instant::now() + wait;
+        let mut state = self.lock();
+        loop {
+            let (manifest, changed_at) = state.manifests.get(workspace_id)?;
+            let current = format!("{}.{}", state.epoch, changed_at);
+            let unchanged = cursor == Some(current.as_str());
+            let now = Instant::now();
+            if !unchanged || now >= deadline {
+                return Some(TeamFileUpdate {
+                    manifest: (!unchanged).then(|| manifest.clone()),
+                    cursor: current,
+                });
+            }
+            state = self
+                .inner
+                .changed
+                .wait_timeout(state, deadline - now)
+                .map(|(guard, _)| guard)
+                .unwrap_or_else(|poisoned| poisoned.into_inner().0);
+        }
     }
 
     pub fn has_workspace(&self, workspace_id: &str) -> bool {
@@ -823,6 +924,10 @@ impl std::fmt::Display for TeamClientError {
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(4);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
+const FILE_TIMEOUT: Duration = Duration::from_secs(300);
+/// Longer than the sharer waits for its app to take the batch (120 s), so
+/// a batch taken just before then isn't reported failed after applying.
+const BATCH_TIMEOUT: Duration = Duration::from_secs(150);
 /// The longest a chat request waits for changes, shared by both ends.
 pub const MAX_CHAT_WAIT: Duration = Duration::from_secs(25);
 
@@ -901,12 +1006,21 @@ impl TeamClient {
         path: &str,
         body: serde_json::Value,
     ) -> Result<reqwest::blocking::Response, TeamClientError> {
+        self.post_json(path, &body, REQUEST_TIMEOUT)
+    }
+
+    fn post_json(
+        &self,
+        path: &str,
+        body: &impl Serialize,
+        timeout: Duration,
+    ) -> Result<reqwest::blocking::Response, TeamClientError> {
         let response = self
             .http
             .post(format!("{}{path}", self.base_url))
-            .timeout(REQUEST_TIMEOUT)
+            .timeout(timeout)
             .header(TEAM_REQUEST_HEADER, TEAM_PROTOCOL_VERSION.to_string())
-            .json(&body)
+            .json(body)
             .send()
             .map_err(|err| {
                 if err.is_connect() || err.is_timeout() {
@@ -933,19 +1047,6 @@ impl TeamClient {
     pub fn stop(&self, chat_id: &str) -> Result<(), TeamClientError> {
         let path = format!("/v1/chats/{}/stop", path_segment(chat_id)?);
         self.post(&path, serde_json::json!({})).map(|_| ())
-    }
-
-    /// Sends a message into the chat. True when the agent was busy and the
-    /// message was queued behind its current turn.
-    pub fn send_message(&self, chat_id: &str, text: &str) -> Result<bool, TeamClientError> {
-        let path = format!("/v1/chats/{}/message", path_segment(chat_id)?);
-        let response = self.post(&path, serde_json::json!({ "text": text }))?;
-        let bytes = response
-            .bytes()
-            .map_err(|err| TeamClientError::Unreachable(err.to_string()))?;
-        serde_json::from_slice::<TeamActionOutcome>(&bytes)
-            .map(|outcome| outcome.queued)
-            .map_err(|err| TeamClientError::Other(format!("Unexpected answer: {err}")))
     }
 
     pub fn answer_permission(
@@ -989,6 +1090,91 @@ impl TeamClient {
             .map_err(|err| TeamClientError::Unreachable(err.to_string()))
     }
 
+    fn get_bytes(&self, path: &str, timeout: Duration) -> Result<Vec<u8>, TeamClientError> {
+        let response = self
+            .http
+            .get(format!("{}{path}", self.base_url))
+            .timeout(timeout)
+            .send()
+            .map_err(|err| {
+                if err.is_connect() || err.is_timeout() {
+                    TeamClientError::Unreachable(err.to_string())
+                } else {
+                    TeamClientError::Other(err.to_string())
+                }
+            })?;
+        let status = response.status().as_u16();
+        if !(200..300).contains(&status) {
+            let reason = match response.text() {
+                Ok(text) if !text.trim().is_empty() => text.trim().to_string(),
+                _ => format!("Request failed ({status})"),
+            };
+            return Err(TeamClientError::Refused { status, reason });
+        }
+        response
+            .bytes()
+            .map(|bytes| bytes.to_vec())
+            .map_err(|err| TeamClientError::Unreachable(err.to_string()))
+    }
+
+    /// Waits up to `wait` for the workspace's file manifest to change from
+    /// `cursor`. None when there is no manifest yet or the workspace is
+    /// unknown; sharing being off is `Err(Forbidden)`. The update's manifest
+    /// is None when the cursor was still current.
+    pub fn files(
+        &self,
+        workspace_id: &str,
+        cursor: Option<&str>,
+        wait: Duration,
+    ) -> Result<Option<TeamFileUpdate>, TeamClientError> {
+        let wait = wait.min(MAX_CHAT_WAIT);
+        let mut path = format!(
+            "/v1/workspaces/{}/files?wait={}",
+            path_segment(workspace_id)?,
+            wait.as_secs()
+        );
+        if let Some(cursor) = cursor {
+            path.push_str("&cursor=");
+            path.push_str(cursor);
+        }
+        self.get_json(&path, wait + REQUEST_TIMEOUT)
+    }
+
+    /// One file's bytes, as the sharer has it now.
+    pub fn file(&self, workspace_id: &str, path: &str) -> Result<Vec<u8>, TeamClientError> {
+        let url = format!(
+            "/v1/workspaces/{}/file?path={}",
+            path_segment(workspace_id)?,
+            percent_encode(path)
+        );
+        self.get_bytes(&url, FILE_TIMEOUT)
+    }
+
+    /// A git bundle of the workspace's history, leaving out what the
+    /// `have` commits already contain.
+    pub fn bundle(&self, workspace_id: &str, have: &[String]) -> Result<Vec<u8>, TeamClientError> {
+        let url = format!(
+            "/v1/workspaces/{}/bundle?have={}",
+            path_segment(workspace_id)?,
+            have.join(",")
+        );
+        self.get_bytes(&url, FILE_TIMEOUT)
+    }
+
+    pub fn send_changes(
+        &self,
+        workspace_id: &str,
+        batch: &TeamChangeBatch,
+    ) -> Result<TeamBatchOutcome, TeamClientError> {
+        let path = format!("/v1/workspaces/{}/changes", path_segment(workspace_id)?);
+        let response = self.post_json(&path, batch, BATCH_TIMEOUT)?;
+        let bytes = response
+            .bytes()
+            .map_err(|err| TeamClientError::Unreachable(err.to_string()))?;
+        serde_json::from_slice(&bytes)
+            .map_err(|err| TeamClientError::Other(format!("Unexpected answer: {err}")))
+    }
+
     /// Waits up to `wait` for the chat to change after `cursor`. None when
     /// the chat isn't loaded in the teammate's app.
     pub fn chat(
@@ -1028,6 +1214,35 @@ fn path_segment(id: &str) -> Result<&str, TeamClientError> {
     } else {
         Err(TeamClientError::Other(format!("Unexpected id \"{id}\"")))
     }
+}
+
+fn percent_encode(text: &str) -> String {
+    let mut encoded = String::with_capacity(text.len());
+    for byte in text.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~' | b'/') {
+            encoded.push(char::from(byte));
+        } else {
+            encoded.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    encoded
+}
+
+pub fn percent_decode(text: &str) -> Option<String> {
+    let bytes = text.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            let hex = text.get(index + 1..index + 3)?;
+            decoded.push(u8::from_str_radix(hex, 16).ok()?);
+            index += 3;
+        } else {
+            decoded.push(bytes[index]);
+            index += 1;
+        }
+    }
+    String::from_utf8(decoded).ok()
 }
 
 pub fn is_plain_id(id: &str) -> bool {

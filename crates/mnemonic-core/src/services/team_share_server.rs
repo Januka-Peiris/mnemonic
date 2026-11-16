@@ -1,8 +1,9 @@
-//! The HTTP side of team sharing. Reads are GETs. The only writes are three
-//! POSTs on a chat (stop, message, permission), each handed to the app's
+//! The HTTP side of team sharing. Reads are GETs. The only writes are two
+//! POSTs on a chat (stop, permission), each handed to the app's
 //! action handler and only for chats the sharer has opened to step-in.
 
 use std::io::Read as _;
+use std::path::PathBuf;
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -11,15 +12,25 @@ use std::time::Duration;
 
 use tiny_http::{Header, Method, Request, Response, Server};
 
+use crate::services::team_files_service::{SkipList, TeamFileKind, safe_relative_path};
 use crate::services::team_share_service::{
-    ActionHandler, CallerIdentity, MAX_CHAT_WAIT, TEAM_ACP_CRATE_VERSION, TEAM_PROTOCOL_VERSION,
-    TEAM_REQUEST_HEADER, TeamAction, TeamActionError, TeamActionKind, TeamCaller, TeamHello,
-    TeamShareHub, TeamWorkspaceList, is_plain_id,
+    ActionHandler, BatchHandler, CallerIdentity, MAX_CHAT_WAIT, TEAM_ACP_CRATE_VERSION, TEAM_PROTOCOL_VERSION,
+    TEAM_REQUEST_HEADER, TeamAction, TeamActionError, TeamActionKind, TeamBatchRequest, TeamCaller, TeamHello,
+    TeamShareHub, TeamWorkspaceList, is_plain_id, percent_decode,
 };
 
 /// Produces a workspace's diff. Behind a closure so tests don't need a
 /// database or a git repository.
 pub type DiffSource = Arc<dyn Fn(&str) -> Result<String, String> + Send + Sync>;
+
+/// A workspace's root, or None unless its "Share files" switch is on.
+pub type FileSource = Arc<dyn Fn(&str) -> Option<PathBuf> + Send + Sync>;
+
+/// A git bundle of a workspace's history without the given commits.
+pub type BundleSource = Arc<dyn Fn(&str, &[String]) -> Result<Vec<u8>, String> + Send + Sync>;
+
+/// The files a workspace never serves or accepts.
+pub type SkipListSource = Arc<dyn Fn(&str) -> SkipList + Send + Sync>;
 
 pub struct TeamServerConfig {
     pub bind: IpAddr,
@@ -27,6 +38,10 @@ pub struct TeamServerConfig {
     pub display_name: String,
     /// Tailscale logins allowed to read, compared case-insensitively.
     pub allowed_logins: Vec<String>,
+    pub files: FileSource,
+    pub bundle_source: BundleSource,
+    pub skip_list: SkipListSource,
+    pub batch_handler: BatchHandler,
 }
 
 /// Long-polls hold a thread each, so this caps what a misbehaving caller
@@ -34,13 +49,19 @@ pub struct TeamServerConfig {
 const MAX_ACTIVE_REQUESTS: usize = 64;
 /// Diffs past this are cut, so a vendored directory can't stall a viewer.
 const MAX_DIFF_BYTES: usize = 2 * 1024 * 1024;
-const MAX_MESSAGE_BYTES: usize = 256 * 1024;
+const MAX_ACTION_BODY_BYTES: usize = 16 * 1024;
+const MAX_BATCH_BODY_BYTES: usize = 512 * 1024 * 1024;
+pub const MAX_BUNDLE_HAVE: usize = 64;
 
 struct Shared {
     hub: TeamShareHub,
     identity: Arc<dyn CallerIdentity>,
     diff_source: DiffSource,
     action_handler: ActionHandler,
+    files: FileSource,
+    bundle_source: BundleSource,
+    skip_list: SkipListSource,
+    batch_handler: BatchHandler,
     hello: String,
     allowed_logins: Vec<String>,
     active_requests: AtomicUsize,
@@ -78,6 +99,10 @@ impl TeamShareServer {
             identity,
             diff_source,
             action_handler,
+            files: config.files,
+            bundle_source: config.bundle_source,
+            skip_list: config.skip_list,
+            batch_handler: config.batch_handler,
             hello,
             allowed_logins: config
                 .allowed_logins
@@ -192,10 +217,13 @@ fn handle(mut request: Request, shared: &Shared) {
     let method = request.method().clone();
     if method == Method::Post {
         let response = match segments.as_slice() {
-            ["v1", "chats", chat_id, action @ ("stop" | "message" | "permission")]
+            ["v1", "chats", chat_id, action @ ("stop" | "permission")]
                 if is_plain_id(chat_id) =>
             {
                 handle_action(&mut request, shared, &caller, chat_id, action)
+            }
+            ["v1", "workspaces", workspace_id, "changes"] if is_plain_id(workspace_id) => {
+                handle_changes(&mut request, shared, &caller, workspace_id)
             }
             _ => text_response(404, "Not found"),
         };
@@ -225,6 +253,40 @@ fn handle(mut request: Request, shared: &Shared) {
                 }
             } else {
                 text_response(404, "No such workspace")
+            }
+        }
+        ["v1", "workspaces", workspace_id, "files"] if is_plain_id(workspace_id) => {
+            if let Err(refusal) = shared_root(shared, workspace_id, false) {
+                respond(request, refusal);
+                return;
+            }
+            let cursor = query_value(query, "cursor");
+            let wait = query_value(query, "wait")
+                .and_then(|wait| wait.parse::<u64>().ok())
+                .map(Duration::from_secs)
+                .unwrap_or_default()
+                .min(MAX_CHAT_WAIT);
+            match shared.hub.wait_file_manifest(workspace_id, cursor, wait) {
+                Some(update) => match serde_json::to_string(&update) {
+                    Ok(body) => json_response(200, body),
+                    Err(err) => text_response(500, &err.to_string()),
+                },
+                None => text_response(404, "No files yet"),
+            }
+        }
+        ["v1", "workspaces", workspace_id, "file"] if is_plain_id(workspace_id) => {
+            match serve_file(shared, workspace_id, query) {
+                Ok(response) => {
+                    respond(request, response);
+                    return;
+                }
+                Err(refusal) => refusal,
+            }
+        }
+        ["v1", "workspaces", workspace_id, "bundle"] if is_plain_id(workspace_id) => {
+            match shared_root(shared, workspace_id, false) {
+                Err(refusal) => refusal,
+                Ok(_) => serve_bundle(shared, workspace_id, query),
             }
         }
         ["v1", "chats", chat_id] if is_plain_id(chat_id) => {
@@ -320,13 +382,13 @@ fn handle_action(
     let mut body = Vec::new();
     let read = request
         .as_reader()
-        .take(MAX_MESSAGE_BYTES as u64 + 1)
+        .take(MAX_ACTION_BODY_BYTES as u64 + 1)
         .read_to_end(&mut body);
     if let Err(err) = read {
         return text_response(400, &format!("Couldn't read the request: {err}"));
     }
-    if body.len() > MAX_MESSAGE_BYTES {
-        return text_response(413, "The message is too long");
+    if body.len() > MAX_ACTION_BODY_BYTES {
+        return text_response(413, "The request is too long");
     }
     let kind = match parse_action(action, &body) {
         Ok(kind) => kind,
@@ -338,11 +400,18 @@ fn handle_action(
         login: caller.login.clone(),
         kind,
     });
+    outcome_response(outcome)
+}
+
+fn outcome_response<T: serde::Serialize>(
+    outcome: Result<T, TeamActionError>,
+) -> Response<std::io::Cursor<Vec<u8>>> {
     match outcome {
         Ok(outcome) => match serde_json::to_string(&outcome) {
             Ok(body) => json_response(200, body),
             Err(err) => text_response(500, &err.to_string()),
         },
+        Err(TeamActionError::Invalid(reason)) => text_response(400, &reason),
         Err(TeamActionError::NotAllowed(reason)) => text_response(403, &reason),
         Err(TeamActionError::NotLoaded) => text_response(404, "Not open"),
         Err(TeamActionError::NothingToDo(reason)) => text_response(409, &reason),
@@ -350,11 +419,157 @@ fn handle_action(
     }
 }
 
-fn parse_action(action: &str, body: &[u8]) -> Result<TeamActionKind, String> {
-    #[derive(serde::Deserialize)]
-    struct MessageBody {
-        text: String,
+/// The workspace's root when teammates may read its files (and edit them,
+/// when `for_edit`), else the response that refuses.
+fn shared_root(
+    shared: &Shared,
+    workspace_id: &str,
+    for_edit: bool,
+) -> Result<PathBuf, Response<std::io::Cursor<Vec<u8>>>> {
+    let Some(workspace) = shared
+        .hub
+        .workspaces()
+        .into_iter()
+        .find(|workspace| workspace.id == workspace_id)
+    else {
+        return Err(text_response(404, "No such workspace"));
+    };
+    let root = workspace
+        .share_files
+        .then(|| (shared.files)(workspace_id))
+        .flatten();
+    let Some(root) = root else {
+        return Err(text_response(403, "Sharing files is off for this workspace"));
+    };
+    if for_edit && !workspace.edit_files {
+        return Err(text_response(403, "Editing files is off for this workspace"));
     }
+    Ok(root)
+}
+
+#[allow(clippy::disallowed_methods)]
+fn is_git_tracked(root: &std::path::Path, path: &str) -> bool {
+    std::process::Command::new("git")
+        .args(["ls-files", "--error-unmatch", "--", path])
+        .env("GIT_LITERAL_PATHSPECS", "1")
+        .current_dir(root)
+        .output()
+        .is_ok_and(|output| output.status.success())
+}
+
+fn serve_file(
+    shared: &Shared,
+    workspace_id: &str,
+    query: &str,
+) -> Result<Response<std::fs::File>, Response<std::io::Cursor<Vec<u8>>>> {
+    let root = shared_root(shared, workspace_id, false)?;
+    let path = query_value(query, "path")
+        .and_then(percent_decode)
+        .ok_or_else(|| text_response(400, "Missing path"))?;
+    let resolved =
+        safe_relative_path(&root, &path).map_err(|reason| text_response(400, &reason))?;
+    let not_found = || text_response(404, "No such file");
+    if (shared.skip_list)(workspace_id).skips(&path) {
+        return Err(not_found());
+    }
+    let in_manifest = shared
+        .hub
+        .file_manifest(workspace_id)
+        .is_some_and(|manifest| {
+            manifest
+                .entries
+                .iter()
+                .any(|entry| entry.path == path && !matches!(entry.kind, TeamFileKind::Deleted))
+        });
+    if !in_manifest && !is_git_tracked(&root, &path) {
+        return Err(not_found());
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let file = options.open(&resolved).map_err(|_| not_found())?;
+    if !file.metadata().is_ok_and(|metadata| metadata.is_file()) {
+        return Err(not_found());
+    }
+    let mut response = Response::from_file(file);
+    if let Some(header) = header("Content-Type", "application/octet-stream") {
+        response.add_header(header);
+    }
+    Ok(response)
+}
+
+fn serve_bundle(
+    shared: &Shared,
+    workspace_id: &str,
+    query: &str,
+) -> Response<std::io::Cursor<Vec<u8>>> {
+    let have: Vec<String> = query_value(query, "have")
+        .unwrap_or_default()
+        .split(',')
+        .filter(|commit| !commit.is_empty())
+        .map(str::to_string)
+        .collect();
+    let is_commit = |commit: &String| {
+        (7..=64).contains(&commit.len()) && commit.chars().all(|c| c.is_ascii_hexdigit())
+    };
+    if have.len() > MAX_BUNDLE_HAVE || !have.iter().all(is_commit) {
+        return text_response(400, "Unexpected commits");
+    }
+    match (shared.bundle_source)(workspace_id, &have) {
+        Ok(bytes) => {
+            let mut response = Response::from_data(bytes);
+            if let Some(header) = header("Content-Type", "application/octet-stream") {
+                response.add_header(header);
+            }
+            response
+        }
+        Err(reason) => text_response(500, &reason),
+    }
+}
+
+fn handle_changes(
+    request: &mut Request,
+    shared: &Shared,
+    caller: &TeamCaller,
+    workspace_id: &str,
+) -> Response<std::io::Cursor<Vec<u8>>> {
+    if let Err(refusal) = shared_root(shared, workspace_id, true) {
+        return refusal;
+    }
+    if request
+        .body_length()
+        .is_some_and(|length| length > MAX_BATCH_BODY_BYTES)
+    {
+        return text_response(413, "The request is too long");
+    }
+    let mut body = Vec::new();
+    let read = request
+        .as_reader()
+        .take(MAX_BATCH_BODY_BYTES as u64 + 1)
+        .read_to_end(&mut body);
+    if let Err(err) = read {
+        return text_response(400, &format!("Couldn't read the request: {err}"));
+    }
+    if body.len() > MAX_BATCH_BODY_BYTES {
+        return text_response(413, "The request is too long");
+    }
+    let batch = match serde_json::from_slice(&body) {
+        Ok(batch) => batch,
+        Err(err) => return text_response(400, &format!("Couldn't read the request: {err}")),
+    };
+    outcome_response((shared.batch_handler)(TeamBatchRequest {
+        workspace_id: workspace_id.to_string(),
+        from: caller.name.clone(),
+        login: caller.login.clone(),
+        batch,
+    }))
+}
+
+fn parse_action(action: &str, body: &[u8]) -> Result<TeamActionKind, String> {
     #[derive(serde::Deserialize)]
     struct PermissionBody {
         tool_call_id: String,
@@ -362,13 +577,6 @@ fn parse_action(action: &str, body: &[u8]) -> Result<TeamActionKind, String> {
     }
     let invalid = |err: serde_json::Error| format!("Couldn't read the request: {err}");
     match action {
-        "message" => {
-            let message: MessageBody = serde_json::from_slice(body).map_err(invalid)?;
-            if message.text.trim().is_empty() {
-                return Err("The message is empty".to_string());
-            }
-            Ok(TeamActionKind::Message { text: message.text })
-        }
         "permission" => {
             let answer: PermissionBody = serde_json::from_slice(body).map_err(invalid)?;
             Ok(TeamActionKind::Permission {
@@ -422,7 +630,7 @@ fn text_response(status: u16, body: &str) -> Response<std::io::Cursor<Vec<u8>>> 
     response
 }
 
-fn respond(request: Request, response: Response<std::io::Cursor<Vec<u8>>>) {
+fn respond<R: std::io::Read>(request: Request, response: Response<R>) {
     if let Err(err) = request.respond(response) {
         log::debug!(target: "mnemonic_lib", "A team request ended early: {err}");
     }
@@ -434,6 +642,9 @@ mod tests {
     use agent_client_protocol::schema as acp;
     use crate::services::team_share_service::{
         TeamActionOutcome, TeamCaller, TeamClient, TeamClientError, TeamEntry, TeamWorkspace,
+    };
+    use crate::services::team_files_service::{
+        TeamChangeBatch, TeamFileEntry, TeamFileManifest, file_hash,
     };
     use std::collections::HashSet;
     use std::io::{BufRead as _, Write as _};
@@ -454,7 +665,7 @@ mod tests {
     type Recorded = Arc<Mutex<Vec<TeamAction>>>;
 
     fn start(login: Option<&'static str>, hub: TeamShareHub) -> Result<TeamShareServer, String> {
-        Ok(start_with_handler(login, hub, queued())?.0)
+        Ok(start_with_handler(login, hub, accepted())?.0)
     }
 
     fn start_with_handler(
@@ -479,6 +690,10 @@ mod tests {
                 port: 0,
                 display_name: "Alice".to_string(),
                 allowed_logins: vec!["Bob@Example.com".to_string()],
+                files: Arc::new(|_| None),
+                bundle_source: Arc::new(|_, _| Err("No bundles".to_string())),
+                skip_list: Arc::new(|_| SkipList::default()),
+                batch_handler: Arc::new(|_| Err(TeamActionError::Failed("Unused".to_string()))),
             },
             hub,
             Arc::new(FixedLogin(login)),
@@ -488,8 +703,8 @@ mod tests {
         Ok((server, recorded))
     }
 
-    fn queued() -> Result<TeamActionOutcome, TeamActionError> {
-        Ok(TeamActionOutcome { queued: true })
+    fn accepted() -> Result<TeamActionOutcome, TeamActionError> {
+        Ok(TeamActionOutcome {})
     }
 
     fn step_in_hub(on: bool) -> TeamShareHub {
@@ -550,7 +765,170 @@ mod tests {
             idle_seconds: None,
             chats: Vec::new(),
             step_in: false,
+            share_files: false,
+            edit_files: false,
+            remote_url: None,
+            base_branch: None,
+            skip_patterns: Vec::new(),
         }
+    }
+
+    fn start_sharing_files(
+        root: PathBuf,
+        share_files: bool,
+        edit_files: bool,
+        hub: TeamShareHub,
+    ) -> Result<TeamShareServer, String> {
+        hub.set_workspaces(vec![TeamWorkspace {
+            share_files,
+            edit_files,
+            ..workspace("ws-1")
+        }]);
+        TeamShareServer::start(
+            TeamServerConfig {
+                bind: IpAddr::V4(Ipv4Addr::LOCALHOST),
+                port: 0,
+                display_name: "Alice".to_string(),
+                allowed_logins: vec!["bob@example.com".to_string()],
+                files: Arc::new(move |_| Some(root.clone())),
+                bundle_source: Arc::new(|_, _| Ok(b"bundle".to_vec())),
+                skip_list: Arc::new(|_| SkipList::default()),
+                batch_handler: Arc::new(|_| Err(TeamActionError::Failed("Unused".to_string()))),
+            },
+            hub,
+            Arc::new(FixedLogin(Some("bob@example.com"))),
+            Arc::new(|_: &str| Ok(String::new())),
+            Arc::new(|_| Ok(TeamActionOutcome {})),
+        )
+    }
+
+    fn manifest_of(path: &str, bytes: &[u8]) -> TeamFileManifest {
+        TeamFileManifest {
+            head_commit: "abc1234".to_string(),
+            entries: vec![TeamFileEntry {
+                path: path.to_string(),
+                kind: TeamFileKind::File { executable: false },
+                size: bytes.len() as u64,
+                hash: file_hash(bytes),
+            }],
+        }
+    }
+
+    #[test]
+    fn file_routes_are_refused_when_share_files_is_off() -> Result<(), String> {
+        let root = tempfile::tempdir().map_err(|err| err.to_string())?;
+        let server = start_sharing_files(
+            root.path().to_path_buf(),
+            false,
+            false,
+            TeamShareHub::new(),
+        )?;
+        let client =
+            TeamClient::new(&server.address().to_string(), 0).map_err(|err| err.to_string())?;
+
+        assert!(client
+            .files("ws-1", None, Duration::ZERO)
+            .is_err_and(|err| err == TeamClientError::Forbidden));
+        assert!(client
+            .file("ws-1", "a.txt")
+            .is_err_and(|err| refused(403)(&err)));
+        assert!(client
+            .bundle("ws-1", &[])
+            .is_err_and(|err| refused(403)(&err)));
+        Ok(())
+    }
+
+    #[test]
+    fn a_teammate_reads_the_manifest_and_a_file() -> Result<(), String> {
+        let root = tempfile::tempdir().map_err(|err| err.to_string())?;
+        std::fs::write(root.path().join("a.txt"), b"hello").map_err(|err| err.to_string())?;
+        let hub = TeamShareHub::new();
+        let manifest = manifest_of("a.txt", b"hello");
+        hub.set_file_manifest("ws-1", manifest.clone());
+        let server = start_sharing_files(root.path().to_path_buf(), true, false, hub.clone())?;
+        let client =
+            TeamClient::new(&server.address().to_string(), 0).map_err(|err| err.to_string())?;
+
+        let update = client
+            .files("ws-1", None, Duration::ZERO)
+            .map_err(|err| err.to_string())?
+            .ok_or("manifest should be served")?;
+        assert_eq!(update.manifest, Some(manifest));
+        assert_eq!(client.file("ws-1", "a.txt"), Ok(b"hello".to_vec()));
+        assert_eq!(client.bundle("ws-1", &[]), Ok(b"bundle".to_vec()));
+
+        let waiting = std::thread::spawn({
+            let client = client.clone();
+            let cursor = update.cursor.clone();
+            move || client.files("ws-1", Some(&cursor), Duration::from_secs(10))
+        });
+        std::thread::sleep(Duration::from_millis(200));
+        let newer = manifest_of("b.txt", b"x");
+        hub.set_file_manifest("ws-1", newer.clone());
+        let next = waiting
+            .join()
+            .map_err(|_| "poller panicked")?
+            .map_err(|err| err.to_string())?
+            .ok_or("manifest should be served")?;
+        assert_eq!(next.manifest, Some(newer));
+        assert_ne!(next.cursor, update.cursor);
+
+        let unchanged = client
+            .files("ws-1", Some(&next.cursor), Duration::ZERO)
+            .map_err(|err| err.to_string())?
+            .ok_or("manifest should be served")?;
+        assert_eq!(unchanged.manifest, None);
+        assert_eq!(unchanged.cursor, next.cursor);
+        Ok(())
+    }
+
+    #[test]
+    fn a_file_outside_the_manifest_or_on_the_skip_list_is_not_served() -> Result<(), String> {
+        let root = tempfile::tempdir().map_err(|err| err.to_string())?;
+        std::fs::write(root.path().join(".env"), b"SECRET=1").map_err(|err| err.to_string())?;
+        std::fs::write(root.path().join("unlisted.txt"), b"x").map_err(|err| err.to_string())?;
+        std::fs::create_dir(root.path().join(".claude")).map_err(|err| err.to_string())?;
+        std::fs::write(root.path().join(".claude/settings.local.json"), b"{}")
+            .map_err(|err| err.to_string())?;
+        let hub = TeamShareHub::new();
+        hub.set_file_manifest("ws-1", manifest_of(".env", b"SECRET=1"));
+        let server = start_sharing_files(root.path().to_path_buf(), true, false, hub)?;
+        let client =
+            TeamClient::new(&server.address().to_string(), 0).map_err(|err| err.to_string())?;
+
+        assert!(client.file("ws-1", ".env").is_err_and(|err| refused(404)(&err)));
+        assert!(client
+            .file("ws-1", "unlisted.txt")
+            .is_err_and(|err| refused(404)(&err)));
+        assert!(client
+            .file("ws-1", "../x")
+            .is_err_and(|err| refused(400)(&err)));
+        assert!(client
+            .file("ws-1", ".claude/./settings.local.json")
+            .is_err_and(|err| refused(400)(&err)));
+        Ok(())
+    }
+
+    #[test]
+    fn changes_are_refused_when_edit_files_is_off() -> Result<(), String> {
+        let root = tempfile::tempdir().map_err(|err| err.to_string())?;
+        let server = start_sharing_files(
+            root.path().to_path_buf(),
+            true,
+            false,
+            TeamShareHub::new(),
+        )?;
+        let client =
+            TeamClient::new(&server.address().to_string(), 0).map_err(|err| err.to_string())?;
+        let batch = TeamChangeBatch {
+            note: None,
+            changes: Vec::new(),
+        };
+
+        assert!(client
+            .send_changes("ws-1", &batch)
+            .is_err_and(|err| refused(403)(&err)));
+        Ok(())
     }
 
     #[test]
@@ -625,14 +1003,13 @@ mod tests {
     }
 
     #[test]
-    fn an_allowed_teammate_can_stop_message_and_answer_when_step_in_is_on() -> Result<(), String> {
+    fn an_allowed_teammate_can_stop_and_answer_when_step_in_is_on() -> Result<(), String> {
         let (server, recorded) =
-            start_with_handler(Some("bob@example.com"), step_in_hub(true), queued())?;
+            start_with_handler(Some("bob@example.com"), step_in_hub(true), accepted())?;
         let client =
             TeamClient::new(&server.address().to_string(), 0).map_err(|err| err.to_string())?;
 
         assert_eq!(client.stop("chat-1"), Ok(()));
-        assert_eq!(client.send_message("chat-1", "hello"), Ok(true));
         assert_eq!(client.answer_permission("chat-1", "call-1", "allow"), Ok(()));
 
         let kinds: Vec<TeamActionKind> = recorded
@@ -649,9 +1026,6 @@ mod tests {
             kinds,
             vec![
                 TeamActionKind::Stop,
-                TeamActionKind::Message {
-                    text: "hello".to_string()
-                },
                 TeamActionKind::Permission {
                     tool_call_id: "call-1".to_string(),
                     option_id: "allow".to_string()
@@ -662,16 +1036,28 @@ mod tests {
     }
 
     #[test]
+    fn a_message_to_the_owners_agent_is_not_found() -> Result<(), String> {
+        let (server, recorded) =
+            start_with_handler(Some("bob@example.com"), step_in_hub(true), accepted())?;
+        let address = server.address();
+
+        let request = post_hello_message(
+            address,
+            "Content-Type: application/json\r\nX-Mnemonic-Team: 3\r\n",
+        );
+        assert_eq!(raw_status(address, &request)?, 404);
+        assert!(recorded.lock().map_err(|err| err.to_string())?.is_empty());
+        Ok(())
+    }
+
+    #[test]
     fn actions_are_refused_when_step_in_is_off() -> Result<(), String> {
         let (server, recorded) =
-            start_with_handler(Some("bob@example.com"), step_in_hub(false), queued())?;
+            start_with_handler(Some("bob@example.com"), step_in_hub(false), accepted())?;
         let client =
             TeamClient::new(&server.address().to_string(), 0).map_err(|err| err.to_string())?;
 
         assert!(client.stop("chat-1").is_err_and(|err| refused(403)(&err)));
-        assert!(client
-            .send_message("chat-1", "hello")
-            .is_err_and(|err| refused(403)(&err)));
         assert!(client
             .answer_permission("chat-1", "call-1", "allow")
             .is_err_and(|err| refused(403)(&err)));
@@ -682,7 +1068,7 @@ mod tests {
     #[test]
     fn actions_are_refused_for_a_login_not_on_the_allow_list() -> Result<(), String> {
         let (server, recorded) =
-            start_with_handler(Some("mallory@example.com"), step_in_hub(true), queued())?;
+            start_with_handler(Some("mallory@example.com"), step_in_hub(true), accepted())?;
         let client =
             TeamClient::new(&server.address().to_string(), 0).map_err(|err| err.to_string())?;
 
@@ -692,26 +1078,9 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_or_oversized_message_is_refused() -> Result<(), String> {
-        let (server, recorded) =
-            start_with_handler(Some("bob@example.com"), step_in_hub(true), queued())?;
-        let client =
-            TeamClient::new(&server.address().to_string(), 0).map_err(|err| err.to_string())?;
-
-        assert!(client
-            .send_message("chat-1", "  ")
-            .is_err_and(|err| refused(400)(&err)));
-        assert!(client
-            .send_message("chat-1", &"a".repeat(300 * 1024))
-            .is_err_and(|err| refused(413)(&err)));
-        assert!(recorded.lock().map_err(|err| err.to_string())?.is_empty());
-        Ok(())
-    }
-
-    #[test]
     fn a_browser_style_post_is_refused() -> Result<(), String> {
         let (server, recorded) =
-            start_with_handler(Some("bob@example.com"), step_in_hub(true), queued())?;
+            start_with_handler(Some("bob@example.com"), step_in_hub(true), accepted())?;
         let address = server.address();
 
         let plain_text = post_hello_message(address, "Content-Type: text/plain\r\n");

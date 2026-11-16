@@ -27,6 +27,7 @@ pub mod review_cockpit_service;
 pub mod review_summary_service;
 pub mod settings_service;
 pub mod task_lifecycle_service;
+pub mod team_files_service;
 pub mod team_share_server;
 pub mod team_share_service;
 pub mod worktree_discovery_service;

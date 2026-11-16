@@ -15,7 +15,7 @@ use mnemonic_core::models::{
 };
 use mnemonic_core::repositories::{
     activity_repository, chat_session_repository, repository_repository,
-    repository_settings_repository, settings_repository,
+    repository_settings_repository, settings_repository, workspace_repository,
 };
 
 #[derive(Clone)]
@@ -54,6 +54,7 @@ const PROJECT_SETUP_SCRIPT_KEY: &str = "setup_script";
 const PROJECT_RUN_SCRIPT_KEY: &str = workspace_script_service::PROJECT_RUN_SCRIPT_KEY;
 const PROJECT_INIT_FILES_KEY: &str = "workspace_init_files";
 const WORKSPACE_ORDER_KEY: &str = "panel_workspace_order";
+use mnemonic_core::services::team_files_service::TEAM_COPY_SOURCE;
 use mnemonic_core::services::{
     environment_service, pr_draft_service, repo_scanner_service, workspace_port_service, workspace_script_service,
     workspace_service,
@@ -249,7 +250,7 @@ impl WorkspacePanel {
         })
     }
 
-    fn refresh(&mut self, cx: &App) {
+    pub(crate) fn refresh(&mut self, cx: &App) {
         let state = mnemonic_bridge::mnemonic_state(cx);
         match workspace_service::list_workspaces(&state) {
             Ok(ws) => self.workspaces = ws,
@@ -691,6 +692,24 @@ impl WorkspacePanel {
         .detach();
     }
 
+    /// Drops a workspace that no longer exists from the sidebar and this
+    /// window.
+    pub(crate) fn forget_workspace(&mut self, ws_id: &str, cx: &mut Context<Self>) {
+        mnemonic_bridge::clear_agent_activity(ws_id);
+        mnemonic_bridge::clear_pr_state(ws_id);
+        if self.selected_workspace_id.as_deref() == Some(ws_id) {
+            self.selected_workspace_id = None;
+            crate::ActiveWorkspace::set(self.workspace.entity_id(), None, cx);
+        }
+        if let Some(workspace) = self.workspace.upgrade() {
+            workspace.update(cx, |workspace, cx| {
+                WorkspaceHost::remove_workspace_view(workspace, ws_id, cx);
+            });
+        }
+        self.refresh(cx);
+        cx.notify();
+    }
+
     /// Runs the configured teardown commands in the workspace's view, stops
     /// the agent session and run commands, frees the workspace's ports, moves
     /// the worktree into the archive folder, keeps the branch. There is no
@@ -702,10 +721,51 @@ impl WorkspacePanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // A teammate's copy holds the sharer's teardown commands, which this
+        // machine never runs; it is deleted instead, after warning about
+        // unsent edits.
+        let listed_as_team_copy = self
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.id == ws_id)
+            .map(|workspace| workspace.workspace_source == TEAM_COPY_SOURCE);
+        if listed_as_team_copy == Some(true) {
+            crate::team_copy::delete_copy(ws_id, window, cx);
+            return;
+        }
         cx.spawn_in(window, async move |this, cx| {
             let Some(state) = mnemonic_bridge::mnemonic_state_cloned() else {
                 return;
             };
+            if listed_as_team_copy.is_none() {
+                // Not in the sidebar's list yet, so its record decides
+                // whether it is a teammate's copy.
+                let lookup = {
+                    let state = state.clone();
+                    let ws_id = ws_id.clone();
+                    cx.background_spawn(async move {
+                        workspace_repository::get_detail(&state.db, &ws_id)
+                    })
+                    .await
+                };
+                match lookup {
+                    Ok(Some(detail)) if detail.summary.workspace_source == TEAM_COPY_SOURCE => {
+                        this.update_in(cx, |_, window, cx| {
+                            crate::team_copy::delete_copy(ws_id, window, cx)
+                        })
+                        .log_err();
+                        return;
+                    }
+                    Ok(_) => {}
+                    Err(err) => {
+                        this.update(cx, |this, cx| {
+                            this.show_archive_toast(format!("{ws_name}: not archived: {err}"), cx)
+                        })
+                        .log_err();
+                        return;
+                    }
+                }
+            }
             let teardown = {
                 let state = state.clone();
                 let ws_id = ws_id.clone();
@@ -773,21 +833,7 @@ impl WorkspacePanel {
 
             this.update_in(cx, |this, window, cx| {
                 match result {
-                    Ok(()) => {
-                        mnemonic_bridge::clear_agent_activity(&ws_id);
-                        mnemonic_bridge::clear_pr_state(&ws_id);
-                        if this.selected_workspace_id.as_deref() == Some(ws_id.as_str()) {
-                            this.selected_workspace_id = None;
-                            crate::ActiveWorkspace::set(this.workspace.entity_id(), None, cx);
-                        }
-                        if let Some(workspace) = this.workspace.upgrade() {
-                            workspace.update(cx, |workspace, cx| {
-                                WorkspaceHost::remove_workspace_view(workspace, &ws_id, cx);
-                            });
-                        }
-                        this.refresh(cx);
-                        cx.notify();
-                    }
+                    Ok(()) => this.forget_workspace(&ws_id, cx),
                     Err(err) => {
                         let _dismissed = window.prompt(
                             PromptLevel::Critical,
@@ -1027,6 +1073,7 @@ impl WorkspacePanel {
                     parent_workspace_id: None,
                     source_workspace_id: None,
                     derived_from_branch: None,
+                    workspace_source: None,
                 };
                 workspace_service::create_workspace(&state, input)
             })
@@ -1848,6 +1895,8 @@ impl WorkspacePanel {
         let merged_color = pr_color.filter(|_| pr_state.as_deref() == Some("merged"));
         let shared = crate::team::is_workspace_shared(&ws.id, cx);
         let step_in = crate::team::workspace_allows_step_in(&ws.id, cx);
+        let share_files = crate::team::workspace_shares_files(&ws.id, cx);
+        let edit_files = crate::team::workspace_allows_file_edits(&ws.id, cx);
         let shared_indicator = crate::team::render_shared_indicator(&ws.id, cx);
         let row = h_flex()
             .id(SharedString::from(ws.id.clone()))
@@ -2019,6 +2068,38 @@ impl WorkspacePanel {
                             None,
                             move |_, cx| {
                                 crate::team::set_workspace_step_in(&workspace_id, !step_in, cx);
+                            },
+                        )
+                    })
+                    .when(shared, |menu| {
+                        let workspace_id = workspace_id.clone();
+                        menu.toggleable_entry(
+                            "Share files",
+                            share_files,
+                            IconPosition::Start,
+                            None,
+                            move |_, cx| {
+                                crate::team::set_workspace_share_files(
+                                    &workspace_id,
+                                    !share_files,
+                                    cx,
+                                );
+                            },
+                        )
+                    })
+                    .when(shared && share_files, |menu| {
+                        let workspace_id = workspace_id.clone();
+                        menu.toggleable_entry(
+                            "Teammates can edit files",
+                            edit_files,
+                            IconPosition::Start,
+                            None,
+                            move |_, cx| {
+                                crate::team::set_workspace_file_edits(
+                                    &workspace_id,
+                                    !edit_files,
+                                    cx,
+                                );
                             },
                         )
                     })
