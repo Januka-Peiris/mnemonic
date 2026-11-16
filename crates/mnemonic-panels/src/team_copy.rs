@@ -604,13 +604,32 @@ fn select_local_workspace(
     });
 }
 
+/// The local workspace holding this machine's copy of a teammate's workspace.
+/// A copy removed from the sidebar stays listed until its follow loop next
+/// notices, so it is checked against the workspaces that exist.
+pub(crate) fn existing_copy(
+    team: &Entity<TeamShare>,
+    app: &AppState,
+    host: &str,
+    workspace_id: &str,
+    cx: &App,
+) -> Option<String> {
+    team.read(cx)
+        .copies
+        .values()
+        .find(|copy| copy.state.host == host && copy.state.workspace_id == workspace_id)
+        .map(|copy| copy.state.local_workspace_id.clone())
+        .filter(|local_workspace_id| {
+            matches!(
+                workspace_repository::get_detail(&app.db, local_workspace_id),
+                Ok(Some(_))
+            )
+        })
+}
+
 /// Opens this machine's copy of a teammate's shared workspace, making it
 /// first when there isn't one yet. A new copy opens as soon as its worktree
 /// exists; its banner shows the sharer's files arriving.
-#[expect(
-    dead_code,
-    reason = "The mirror's \"Work on this in your copy\" button calls this"
-)]
 pub(crate) fn open_teammate_copy(
     host: &str,
     shared: &TeamWorkspace,
@@ -624,20 +643,7 @@ pub(crate) fn open_teammate_copy(
         return Task::ready(Err(anyhow!("Mnemonic isn't ready")));
     };
     let workspace = Workspace::for_window(window, cx);
-    // A copy removed from the sidebar stays listed until its follow loop
-    // next notices, so it is checked against the workspaces that exist.
-    let existing = team
-        .read(cx)
-        .copies
-        .values()
-        .find(|copy| copy.state.host == host && copy.state.workspace_id == shared.id)
-        .map(|copy| copy.state.local_workspace_id.clone())
-        .filter(|local_workspace_id| {
-            matches!(
-                workspace_repository::get_detail(&app.db, local_workspace_id),
-                Ok(Some(_))
-            )
-        });
+    let existing = existing_copy(&team, &app, host, &shared.id, cx);
     if let Some(local_workspace_id) = existing {
         select_local_workspace(workspace, local_workspace_id.clone(), window, cx);
         return Task::ready(Ok(local_workspace_id));

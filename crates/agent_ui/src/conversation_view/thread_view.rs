@@ -641,6 +641,7 @@ pub struct ThreadView {
     // panics.
     read_only_notice: Option<SharedString>,
     read_only_can_stop: bool,
+    read_only_action: Option<ReadOnlyAction>,
     pub skill_loading_issues: Vec<SkillLoadingIssue>,
     /// Issues the user has explicitly dismissed. Each entry is matched against
     /// emitted issues by full equality; when an issue no longer appears in the
@@ -848,6 +849,7 @@ impl ThreadView {
         initial_content: Option<AgentInitialContent>,
         read_only_notice: Option<SharedString>,
         read_only_can_stop: bool,
+        read_only_action: Option<ReadOnlyAction>,
         mut subscriptions: Vec<Subscription>,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -1096,6 +1098,7 @@ impl ThreadView {
             generating_indicator_in_list: false,
             read_only_notice,
             read_only_can_stop,
+            read_only_action,
             skill_loading_issues: Vec::new(),
             dismissed_skill_loading_issues: HashSet::default(),
         };
@@ -4164,10 +4167,12 @@ impl ThreadView {
         &mut self,
         notice: Option<SharedString>,
         can_stop: bool,
+        action: Option<ReadOnlyAction>,
         cx: &mut Context<Self>,
     ) {
         self.read_only_notice = notice;
         self.read_only_can_stop = can_stop;
+        self.read_only_action = action;
         cx.notify();
     }
 
@@ -4188,12 +4193,20 @@ impl ThreadView {
         if let Some(notice) = self.read_only_notice() {
             let can_stop = self.read_only_can_stop
                 && self.thread.read(cx).status() != ThreadStatus::Idle;
+            let action = self.read_only_action.clone();
             return h_flex()
                 .w_full()
                 .p_2()
                 .gap_2()
                 .justify_between()
                 .child(Label::new(notice).color(Color::Muted))
+                .when_some(action, |this, (label, on_click)| {
+                    this.child(
+                        Button::new("read-only-action", label)
+                            .style(ButtonStyle::Filled)
+                            .on_click(move |_, window, cx| on_click(window, cx)),
+                    )
+                })
                 .when(can_stop, |this| {
                     this.child(
                         IconButton::new("stop-mirrored-agent", IconName::Stop)

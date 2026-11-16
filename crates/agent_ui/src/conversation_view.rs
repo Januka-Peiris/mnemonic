@@ -110,6 +110,9 @@ const TOKEN_THRESHOLD: u64 = 250;
 pub(crate) const DRAFT_PROMPT_PERSIST_DEBOUNCE: Duration = Duration::from_millis(250);
 
 mod thread_view;
+/// A labelled button for a read-only view, with what it does when clicked.
+pub type ReadOnlyAction = (SharedString, Rc<dyn Fn(&mut Window, &mut App)>);
+
 pub use thread_view::*;
 
 pub struct QueuedMessage {
@@ -569,6 +572,7 @@ pub struct ConversationView {
     fork_enabled: bool,
     read_only: Option<SharedString>,
     read_only_can_stop: bool,
+    read_only_action: Option<ReadOnlyAction>,
     auth_task: Option<Task<()>>,
     loading_status: Option<SharedString>,
     /// When settings change, use this to see if the theme has changed (which
@@ -661,6 +665,13 @@ impl ConversationView {
         }
     }
 
+    /// A labelled button shown beside a read-only view's notice, for the
+    /// mirror's way into the viewer's own copy.
+    pub fn set_read_only_action(&mut self, action: Option<ReadOnlyAction>, cx: &mut Context<Self>) {
+        self.read_only_action = action;
+        self.sync_read_only_to_thread_views(cx);
+    }
+
     pub fn read_only(&self) -> Option<SharedString> {
         self.read_only.clone()
     }
@@ -672,8 +683,9 @@ impl ConversationView {
         for thread_view in connected.threads.values() {
             let notice = self.read_only.clone();
             let can_stop = self.read_only_can_stop;
+            let action = self.read_only_action.clone();
             thread_view.update(cx, |thread_view, cx| {
-                thread_view.set_read_only(notice, can_stop, cx)
+                thread_view.set_read_only(notice, can_stop, action, cx)
             });
         }
     }
@@ -898,6 +910,7 @@ impl ConversationView {
             fork_enabled: false,
             read_only: None,
             read_only_can_stop: false,
+            read_only_action: None,
             auth_task: None,
             loading_status: None,
             last_theme_id: Some(cx.theme().id.clone()),
@@ -1364,6 +1377,7 @@ impl ConversationView {
                 initial_content,
                 self.read_only.clone(),
                 self.read_only_can_stop,
+                self.read_only_action.clone(),
                 subscriptions,
                 window,
                 cx,

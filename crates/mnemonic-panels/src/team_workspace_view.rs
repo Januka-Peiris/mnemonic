@@ -3,13 +3,16 @@
 //! chat, each a real chat view following the teammate's chat.
 
 use std::any::Any;
+use std::cell::Cell;
 use std::collections::HashSet;
 use std::rc::Rc;
 use std::sync::Arc;
 
 use agent_client_protocol::schema as acp;
 use agent_servers::AgentServer;
-use agent_ui::{Agent, AgentConnectionStore, AgentThreadSource, ConversationView};
+use agent_ui::{
+    Agent, AgentConnectionStore, AgentThreadSource, ConversationView, ReadOnlyAction,
+};
 use editor::Editor;
 use gpui::{
     Action as _, App, AppContext as _, Context, Entity, EventEmitter, FocusHandle, Focusable,
@@ -27,6 +30,9 @@ use workspace::{DraggedTab, Pane, Workspace, pane};
 
 use crate::team::{PeerStatus, render_agent_state, show_step_in_notice, team_share};
 use crate::team_connection::TeamAgentServer;
+use crate::team_copy::{existing_copy, open_teammate_copy};
+use crate::workspace_view::WorkspaceHost;
+use zed_actions::mnemonic::AgentSessionKind;
 
 /// What the window's selected workspace id holds while a teammate's
 /// workspace is selected. It never matches a local workspace's id.
@@ -190,6 +196,8 @@ pub(crate) struct TeammateWorkspaceView {
     available: bool,
     /// The workspace as last listed, kept while the teammate is unreachable.
     last_known: Option<TeamWorkspace>,
+    /// Set while "Work on this in your copy" is opening the copy.
+    copy_in_flight: Rc<Cell<bool>>,
     files: Vec<TeamFileDiff>,
     diff_state: TeammateDiffState,
     /// Replacing it cancels a load still in flight.
@@ -226,6 +234,7 @@ impl TeammateWorkspaceView {
             client_url: None,
             available: false,
             last_known: None,
+            copy_in_flight: Rc::new(Cell::new(false)),
             files: Vec::new(),
             diff_state: TeammateDiffState::Loading,
             diff_task: None,
@@ -562,7 +571,12 @@ impl TeammateWorkspaceView {
                     .chats
                     .iter()
                     .any(|chat| chat.id == chat_id && chat.open);
-            view.update(cx, |view, cx| view.set_read_only_can_stop(can_stop, cx));
+            let (notice, action) = self.read_only_presentation(&peer_name, &live);
+            view.update(cx, |view, cx| {
+                view.set_read_only(notice, cx);
+                view.set_read_only_action(action, cx);
+                view.set_read_only_can_stop(can_stop, cx);
+            });
         }
 
         mnemonic_bridge::TeammateWorkspaceTitles::set(
@@ -579,6 +593,37 @@ impl TeammateWorkspaceView {
         );
         self.last_known = Some(live);
         cx.notify();
+    }
+
+    fn read_only_presentation(
+        &self,
+        peer_name: &SharedString,
+        live: &TeamWorkspace,
+    ) -> (SharedString, Option<ReadOnlyAction>) {
+        if !live.share_files {
+            let notice = format!(
+                "{peer_name}'s agent. Read-only. {peer_name} hasn't shared this workspace's files."
+            );
+            return (notice.into(), None);
+        }
+        let host = self.host.clone();
+        let shared = live.clone();
+        let workspace = self.workspace.clone();
+        let in_flight = self.copy_in_flight.clone();
+        let on_click: Rc<dyn Fn(&mut Window, &mut App)> = Rc::new(move |window, cx| {
+            work_in_copy(
+                host.clone(),
+                shared.clone(),
+                workspace.clone(),
+                in_flight.clone(),
+                window,
+                cx,
+            );
+        });
+        (
+            format!("{peer_name}'s agent. Read-only.").into(),
+            Some(("Work on this in your copy".into(), on_click)),
+        )
     }
 
     /// Drops every chat view and the connection they share, so the open
@@ -774,6 +819,61 @@ impl TeammateWorkspaceView {
                     })
             })
     }
+}
+
+/// Opens the copy of the teammate's workspace, then starts a fresh chat in
+/// it. A copy made just now already starts with an empty chat of the default
+/// agent, so only a copy that existed gets another.
+fn work_in_copy(
+    host: String,
+    shared: TeamWorkspace,
+    workspace: WeakEntity<Workspace>,
+    in_flight: Rc<Cell<bool>>,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    if in_flight.replace(true) {
+        return;
+    }
+    let existed = team_share(cx)
+        .zip(mnemonic_bridge::mnemonic_state_cloned())
+        .and_then(|(team, app)| existing_copy(&team, &app, &host, &shared.id, cx))
+        .is_some();
+    let opened = open_teammate_copy(&host, &shared, window, cx);
+    window
+        .spawn(cx, async move |cx| {
+            let result = opened.await;
+            in_flight.set(false);
+            let local_workspace_id = match result {
+                Ok(local_workspace_id) => local_workspace_id,
+                Err(err) => {
+                    cx.update(|_, cx| show_notice(&workspace, err.to_string(), cx))
+                        .log_err();
+                    return;
+                }
+            };
+            if !existed {
+                return;
+            }
+            cx.update(|window, cx| {
+                let started = workspace
+                    .update(cx, |workspace, cx| {
+                        WorkspaceHost::add_session_for_workspace(
+                            workspace,
+                            &local_workspace_id,
+                            AgentSessionKind::DefaultChat,
+                            window,
+                            cx,
+                        )
+                    })
+                    .unwrap_or(false);
+                if !started {
+                    show_notice(&workspace, "Couldn't start a new chat in your copy".into(), cx);
+                }
+            })
+            .log_err();
+        })
+        .detach();
 }
 
 fn show_notice(workspace: &WeakEntity<Workspace>, message: String, cx: &mut App) {
