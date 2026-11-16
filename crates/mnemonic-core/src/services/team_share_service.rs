@@ -175,9 +175,12 @@ pub enum TeamActionKind {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct TeamActionOutcome {}
 
-/// Why an action wasn't carried out, mapped to 403, 404, 409 and 500.
+/// Why an action wasn't carried out, mapped to 400, 403, 404, 409 and 500.
 #[derive(Clone, Debug, PartialEq)]
 pub enum TeamActionError {
+    /// The request itself can't be carried out, as a batch naming a path
+    /// a teammate may not write.
+    Invalid(String),
     NotAllowed(String),
     NotLoaded,
     NothingToDo(String),

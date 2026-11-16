@@ -28,16 +28,16 @@ use mnemonic_bridge::AgentAttention;
 use mnemonic_core::models::{ChatSessionRecord, WorkspaceSummary};
 use mnemonic_core::repositories::{chat_session_repository, settings_repository};
 use mnemonic_core::services::team_files_service::{
-    self, SkipList, normalize_remote_url, scan_workspace,
+    self, SkipList, TeamBatchOutcome, normalize_remote_url, scan_workspace,
 };
 use mnemonic_core::services::team_share_server::{
     BundleSource, DiffSource, FileSource, SkipListSource, TeamServerConfig, TeamShareServer,
 };
 use mnemonic_core::services::team_share_service::{
-    ActionHandler, DEFAULT_TEAM_PORT, TailscaleSelf, TailscaleWhois, TeamAction, TeamActionError,
-    TeamActionKind, TeamActionOutcome, TeamAgentState, TeamChat, TeamClient, TeamClientError,
-    TeamEntry, TeamPermissionRequest, TeamShareHub, TeamWorkspace, saved_chat_entries,
-    tailscale_self,
+    ActionHandler, BatchHandler, DEFAULT_TEAM_PORT, TailscaleSelf, TailscaleWhois, TeamAction,
+    TeamActionError, TeamActionKind, TeamActionOutcome, TeamAgentState, TeamBatchRequest,
+    TeamCaller, TeamChat, TeamClient, TeamClientError, TeamEntry, TeamPermissionRequest,
+    TeamShareHub, TeamWorkspace, saved_chat_entries, tailscale_self,
 };
 use mnemonic_core::services::{chat_transcript_service, git_review_service, workspace_service};
 use settings::{RegisterSetting, Settings, SettingsStore};
@@ -52,7 +52,8 @@ use crate::team_settings::open_team_window;
 use crate::team_workspace_view::teammate_workspace_key;
 use crate::workspace_panel::WorkspacePanel;
 use crate::workspace_view::{
-    LiveWorkspaceAgents, WorkspaceHost, chat_agent_label, find_open_chat, open_windows,
+    LiveWorkspaceAgents, WorkspaceHost, chat_agent_label, find_open_chat, find_workspace_window,
+    open_windows,
 };
 
 /// The `team` section of the settings file.
@@ -113,6 +114,9 @@ const VIEWER_WINDOW: Duration = Duration::from_secs(120);
 const REFRESH_COUNTS_EVERY: Duration = Duration::from_secs(60);
 /// How long a teammate's request waits for the app to carry out its action.
 const ACTION_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long a teammate's batch of file changes waits to be applied, longer
+/// than an action as a batch can carry large files.
+const BATCH_TIMEOUT: Duration = Duration::from_secs(120);
 
 pub(crate) enum SharingStatus {
     Off,
@@ -161,6 +165,14 @@ struct PendingAction {
     reply: std::sync::mpsc::Sender<Result<TeamActionOutcome, TeamActionError>>,
 }
 
+/// A teammate's batch of file changes on its way to the main thread, with
+/// the same claim as `PendingAction`.
+struct PendingBatch {
+    request: TeamBatchRequest,
+    claimed: Arc<AtomicBool>,
+    reply: std::sync::mpsc::Sender<Result<TeamBatchOutcome, TeamActionError>>,
+}
+
 /// Marker for the notices shown when a teammate acts in a chat.
 struct TeamStepInToast;
 
@@ -191,6 +203,8 @@ pub(crate) struct TeamShare {
     tailscale_watch: Option<Task<()>>,
     /// Carries out teammates' actions on the main thread.
     action_task: Option<Task<()>>,
+    /// Applies teammates' batches of file changes, one at a time.
+    batch_task: Option<Task<()>>,
     chat_watches: HashMap<String, ChatWatch>,
     /// Chats shared from their saved transcript, as they aren't loaded in
     /// this app, with when that transcript was written.
@@ -292,6 +306,7 @@ impl TeamShare {
             publish_task: None,
             tailscale_watch: None,
             action_task: None,
+            batch_task: None,
             chat_watches: HashMap::new(),
             saved_chats: HashMap::new(),
             peers: Vec::new(),
@@ -679,6 +694,20 @@ impl TeamShare {
         self.hub = hub.clone();
         let (action_sender, mut action_receiver) = mpsc::unbounded::<PendingAction>();
         let shared_file_roots = self.file_roots.clone();
+        let (batch_sender, mut batch_receiver) = mpsc::unbounded::<PendingBatch>();
+        self.batch_task = Some(cx.spawn(async move |this, cx| {
+            while let Some(pending) = batch_receiver.next().await {
+                if pending.claimed.swap(true, Ordering::SeqCst) {
+                    log::info!("Skipped a teammate's batch that timed out while waiting");
+                    continue;
+                }
+                let PendingBatch { request, reply, .. } = pending;
+                let outcome = apply_teammate_batch(&this, request, cx).await;
+                if reply.send(outcome).is_err() {
+                    log::warn!("A teammate's batch finished after their request gave up");
+                }
+            }
+        }));
         self.action_task = Some(cx.spawn(async move |this, cx| {
             while let Some(pending) = action_receiver.next().await {
                 if pending.claimed.swap(true, Ordering::SeqCst) {
@@ -702,8 +731,11 @@ impl TeamShare {
                         let key = key.clone();
                         let hub = hub.clone();
                         let action_sender = action_sender.clone();
+                        let batch_sender = batch_sender.clone();
                         let file_roots = shared_file_roots.clone();
-                        async move { start_server(key, hub, action_sender, file_roots) }
+                        async move {
+                            start_server(key, hub, action_sender, batch_sender, file_roots)
+                        }
                     })
                     .await;
                 let started = this.update(cx, |this, cx| {
@@ -814,6 +846,7 @@ impl TeamShare {
         self.publish_task = None;
         self.tailscale_watch = None;
         self.action_task = None;
+        self.batch_task = None;
         self.scan_task = None;
         self.server = None;
         self.server_key = None;
@@ -1260,6 +1293,7 @@ fn start_server(
     key: ServerKey,
     hub: TeamShareHub,
     action_sender: mpsc::UnboundedSender<PendingAction>,
+    batch_sender: mpsc::UnboundedSender<PendingBatch>,
     file_roots: FileRoots,
 ) -> Result<(TeamShareServer, TailscaleSelf), String> {
     let me = tailscale_self()?;
@@ -1292,23 +1326,20 @@ fn start_server(
         if action_sender.unbounded_send(pending).is_err() {
             return Err(TeamActionError::Failed("Sharing stopped".into()));
         }
-        let outcome = match reply_receiver.recv_timeout(ACTION_TIMEOUT) {
-            Err(RecvTimeoutError::Timeout) if claimed.swap(true, Ordering::SeqCst) => {
-                // The main thread started it just now and answers without
-                // waiting on anything else.
-                reply_receiver
-                    .recv()
-                    .map_err(|_| RecvTimeoutError::Disconnected)
-            }
-            outcome => outcome,
+        wait_for_reply(&reply_receiver, &claimed, ACTION_TIMEOUT)
+    });
+    let batch_handler: BatchHandler = Arc::new(move |request| {
+        let (reply_sender, reply_receiver) = std::sync::mpsc::channel();
+        let claimed = Arc::new(AtomicBool::new(false));
+        let pending = PendingBatch {
+            request,
+            claimed: claimed.clone(),
+            reply: reply_sender,
         };
-        match outcome {
-            Ok(outcome) => outcome,
-            Err(RecvTimeoutError::Timeout) => Err(TeamActionError::Failed("Timed out".into())),
-            Err(RecvTimeoutError::Disconnected) => {
-                Err(TeamActionError::Failed("Sharing stopped".into()))
-            }
+        if batch_sender.unbounded_send(pending).is_err() {
+            return Err(TeamActionError::Failed("Sharing stopped".into()));
         }
+        wait_for_reply(&reply_receiver, &claimed, BATCH_TIMEOUT)
     });
     let files: FileSource = Arc::new({
         let file_roots = file_roots.clone();
@@ -1343,7 +1374,7 @@ fn start_server(
             files,
             bundle_source,
             skip_list,
-            batch_handler: Arc::new(|_| Err(TeamActionError::Failed("Not available yet".into()))),
+            batch_handler,
         },
         hub,
         Arc::new(TailscaleWhois::default()),
@@ -1351,6 +1382,148 @@ fn start_server(
         action_handler,
     )
     .map(|server| (server, me))
+}
+
+/// Waits on a request thread for the main thread's answer. Once the main
+/// thread has claimed the work, it is waited for to the end, as it will run
+/// whatever the requester is told.
+fn wait_for_reply<T>(
+    reply_receiver: &std::sync::mpsc::Receiver<Result<T, TeamActionError>>,
+    claimed: &AtomicBool,
+    timeout: Duration,
+) -> Result<T, TeamActionError> {
+    let outcome = match reply_receiver.recv_timeout(timeout) {
+        Err(RecvTimeoutError::Timeout) if claimed.swap(true, Ordering::SeqCst) => reply_receiver
+            .recv()
+            .map_err(|_| RecvTimeoutError::Disconnected),
+        outcome => outcome,
+    };
+    match outcome {
+        Ok(outcome) => outcome,
+        Err(RecvTimeoutError::Timeout) => Err(TeamActionError::Failed("Timed out".into())),
+        Err(RecvTimeoutError::Disconnected) => {
+            Err(TeamActionError::Failed("Sharing stopped".into()))
+        }
+    }
+}
+
+/// The paths, relative to `root`, of files with unsaved edits in any open
+/// editor.
+fn unsaved_paths(root: &Path, cx: &App) -> HashSet<String> {
+    let mut unsaved = HashSet::new();
+    for window in open_windows(cx) {
+        let project = window.read(cx).project().read(cx);
+        for project_path in project.dirty_buffers(cx) {
+            let Some(absolute_path) = project.absolute_path(&project_path, cx) else {
+                continue;
+            };
+            if let Some(relative) = absolute_path
+                .strip_prefix(root)
+                .ok()
+                .and_then(|relative| relative.to_str())
+            {
+                unsaved.insert(relative.replace('\\', "/"));
+            }
+        }
+    }
+    unsaved
+}
+
+/// Applies a teammate's batch to the workspace it names, checking again
+/// here that they may, records it, and tells the owner.
+async fn apply_teammate_batch(
+    team: &WeakEntity<TeamShare>,
+    request: TeamBatchRequest,
+    cx: &mut gpui::AsyncApp,
+) -> Result<TeamBatchOutcome, TeamActionError> {
+    let workspace_id = request.workspace_id.clone();
+    let (root, skip_list, workspace_name, unsaved) = cx.update(|cx| {
+        let team = team
+            .upgrade()
+            .ok_or_else(|| TeamActionError::Failed("Sharing stopped".into()))?;
+        let team = team.read(cx);
+        if !team.allows_file_edits(&workspace_id) {
+            return Err(TeamActionError::NotAllowed(
+                "Editing files is off for this workspace".into(),
+            ));
+        }
+        let (root, skip_list) = lock_file_roots(&team.file_roots)
+            .get(&workspace_id)
+            .cloned()
+            .ok_or_else(|| {
+                TeamActionError::NotAllowed("Sharing files is off for this workspace".into())
+            })?;
+        let workspace_name = team
+            .hub
+            .workspaces()
+            .into_iter()
+            .find(|workspace| workspace.id == workspace_id)
+            .map(|workspace| workspace.name)
+            .unwrap_or_else(|| workspace_id.clone());
+        let unsaved = unsaved_paths(&root, cx);
+        Ok((root, skip_list, workspace_name, unsaved))
+    })?;
+    let caller = TeamCaller {
+        login: request.login.clone(),
+        name: request.from.clone(),
+    };
+    let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let record = cx
+        .background_spawn({
+            let workspace_id = workspace_id.clone();
+            async move {
+                let record = team_files_service::apply_batch(
+                    &root,
+                    &skip_list,
+                    &request.batch,
+                    &unsaved,
+                    &caller,
+                    &now,
+                )
+                .map_err(TeamActionError::Invalid)?;
+                match mnemonic_bridge::mnemonic_state_cloned() {
+                    Some(app) => {
+                        if let Err(err) = team_files_service::save_batch_record(
+                            &app.data_dir,
+                            &workspace_id,
+                            &record,
+                        ) {
+                            log::error!("Couldn't save a teammate's batch {}: {err}", record.id);
+                        }
+                    }
+                    None => log::error!(
+                        "Couldn't save a teammate's batch {}: Mnemonic isn't ready",
+                        record.id
+                    ),
+                }
+                Ok(record)
+            }
+        })
+        .await?;
+    let outcome = record.outcome();
+    let message = batch_notice(
+        &actor_name(&record.name, &record.login),
+        outcome.applied.len(),
+        outcome.held.len(),
+        &workspace_name,
+    );
+    cx.update(|cx| {
+        if let Some(window) =
+            find_workspace_window(&workspace_id, cx).or_else(|| open_windows(cx).into_iter().next())
+        {
+            show_step_in_notice(&window, message, cx);
+        }
+    });
+    Ok(outcome)
+}
+
+fn batch_notice(actor: &str, applied: usize, held: usize, workspace_name: &str) -> String {
+    let files = if applied == 1 { "file" } else { "files" };
+    let mut message = format!("{actor} changed {applied} {files} in {workspace_name}");
+    if held > 0 {
+        message.push_str(&format!(", {held} held for you"));
+    }
+    message
 }
 
 /// Carries out a teammate's action on the chat it names, checking again
@@ -1416,13 +1589,17 @@ fn run_action(
     }
 }
 
+fn actor(action: &TeamAction) -> String {
+    actor_name(&action.from, &action.login)
+}
+
 /// Who acted, as the owner's notices show it. A display name is whatever
 /// the teammate chose, so their login is shown with it.
-fn actor(action: &TeamAction) -> String {
-    if action.from == action.login {
-        action.from.clone()
+fn actor_name(from: &str, login: &str) -> String {
+    if from == login {
+        from.to_string()
     } else {
-        format!("{} ({})", action.from, action.login)
+        format!("{from} ({login})")
     }
 }
 

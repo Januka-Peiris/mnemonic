@@ -2,10 +2,13 @@
 //! machine's own clone at the sharer's commit, with the sharer's files laid
 //! over it, kept following the sharer while they share its files.
 
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::anyhow;
+use editor::Editor;
 use futures::StreamExt as _;
 use futures::channel::mpsc;
 use gpui::{AnyElement, App, AppContext as _, Context, Entity, PromptLevel, Task, WeakEntity};
@@ -14,7 +17,7 @@ use mnemonic_core::repositories::{
     chat_session_repository, repository_repository, workspace_repository,
 };
 use mnemonic_core::services::team_files_service::{
-    self, CopyState, FollowPlan, SkipList, TEAM_COPY_SOURCE, TeamFileManifest,
+    self, CopyState, FollowPlan, SkipList, TEAM_COPY_SOURCE, TeamFileManifest, file_hash,
 };
 use mnemonic_core::services::team_share_server::MAX_BUNDLE_HAVE;
 use mnemonic_core::services::team_share_service::{
@@ -22,7 +25,7 @@ use mnemonic_core::services::team_share_service::{
 };
 use mnemonic_core::services::{git_worktree_service, workspace_service};
 use mnemonic_core::state::AppState;
-use ui::{Button, prelude::*};
+use ui::{Button, Tooltip, prelude::*};
 use util::ResultExt as _;
 use workspace::Workspace;
 
@@ -55,12 +58,56 @@ pub(crate) enum CopyStatus {
     Failed(SharedString),
 }
 
+/// The only owner of a copy's `CopyState`: the follow loop, sending and
+/// discarding all change it here, and saves go through `save_state`.
 pub(crate) struct CopyFollow {
     pub state: CopyState,
     pub status: CopyStatus,
     /// Files the teammate changed that the sharer has changed since.
     pub both_changed: Vec<String>,
+    /// The sharer's file list as last followed, for discarding an edit.
+    last_manifest: Option<TeamFileManifest>,
+    /// Files the sharer held back from a send, with the hash sent. Shown as
+    /// held until the teammate changes or discards them.
+    held: HashMap<String, String>,
+    send: Option<SendPanel>,
+    save_count: u64,
+    /// The newest save written, so a slower older save can't land after it.
+    saved: Arc<Mutex<u64>>,
     _follow: Task<()>,
+}
+
+/// The open "Send changes" list under the copy's banner.
+struct SendPanel {
+    note: Entity<Editor>,
+    /// Each unsent edit with its hash now; None while they are read.
+    edits: Option<BTreeMap<String, String>>,
+    busy: bool,
+    message: Option<SharedString>,
+}
+
+/// Saves the copy's state off the main thread.
+fn save_state(copy: &mut CopyFollow, cx: &mut App) {
+    let Some(app) = mnemonic_bridge::mnemonic_state_cloned() else {
+        return;
+    };
+    copy.save_count += 1;
+    let count = copy.save_count;
+    let state = copy.state.clone();
+    let saved = copy.saved.clone();
+    cx.background_spawn(async move {
+        let mut written = saved
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if *written > count {
+            return;
+        }
+        if let Err(err) = team_files_service::save_copy_state(&app.data_dir, &state) {
+            log::error!("Couldn't save the copy {}: {err}", state.local_workspace_id);
+        }
+        *written = count;
+    })
+    .detach();
 }
 
 /// Starts following every copy saved on this machine.
@@ -104,6 +151,11 @@ pub(crate) fn start_following(
             state,
             status,
             both_changed: Vec::new(),
+            last_manifest: None,
+            held: HashMap::new(),
+            send: None,
+            save_count: 0,
+            saved: Arc::new(Mutex::new(0)),
             _follow: follow,
         },
     );
@@ -253,6 +305,15 @@ fn follow(local_workspace_id: String, cx: &mut Context<TeamShare>) -> Task<()> {
                     }
                 }
             });
+            // A send or discard during the long poll changed the live state.
+            let Ok(Some(state)) = this.read_with(cx, |team, _| {
+                team.copies
+                    .get(&local_workspace_id)
+                    .map(|copy| copy.state.clone())
+            }) else {
+                break;
+            };
+            let started_from = state.clone();
             let outcome = cx
                 .background_spawn({
                     let manifest = manifest.clone();
@@ -272,12 +333,15 @@ fn follow(local_workspace_id: String, cx: &mut Context<TeamShare>) -> Task<()> {
             recheck = result
                 .as_ref()
                 .is_ok_and(|plan| plan.waiting_reason.is_some() || !plan.both_changed.is_empty());
-            last_manifest = Some(manifest);
+            last_manifest = Some(manifest.clone());
             let updated = this.update(cx, |team, cx| {
                 let Some(copy) = team.copies.get_mut(&local_workspace_id) else {
                     return false;
                 };
-                copy.state = state;
+                copy.state =
+                    team_files_service::merge_follow_round(&started_from, state, &copy.state);
+                copy.last_manifest = Some(manifest);
+                save_state(copy, cx);
                 match result {
                     Ok(plan) => {
                         copy.status = match plan.waiting_reason {
@@ -306,9 +370,22 @@ fn follow(local_workspace_id: String, cx: &mut Context<TeamShare>) -> Task<()> {
     })
 }
 
-/// Runs off the main thread: brings the copy up to the manifest and saves
-/// what it now holds. None when the copy's workspace was removed, so
-/// following it stops.
+/// The copy's folder, None when its workspace no longer exists.
+fn copy_root(app: &AppState, local_workspace_id: &str) -> Result<Option<PathBuf>, String> {
+    Ok(
+        workspace_repository::get_detail(&app.db, local_workspace_id)?.map(|detail| {
+            PathBuf::from(
+                detail
+                    .summary
+                    .workspace_root_path
+                    .unwrap_or(detail.worktree_path),
+            )
+        }),
+    )
+}
+
+/// Runs off the main thread: brings the copy up to the manifest. None when
+/// the copy's workspace was removed, so following it stops.
 fn apply_manifest(
     mut state: CopyState,
     manifest: TeamFileManifest,
@@ -318,13 +395,8 @@ fn apply_manifest(
     let Some(app) = mnemonic_bridge::mnemonic_state_cloned() else {
         return Some((state, Err("Mnemonic isn't ready".to_string())));
     };
-    let root = match workspace_repository::get_detail(&app.db, &state.local_workspace_id) {
-        Ok(Some(detail)) => PathBuf::from(
-            detail
-                .summary
-                .workspace_root_path
-                .unwrap_or(detail.worktree_path),
-        ),
+    let root = match copy_root(&app, &state.local_workspace_id) {
+        Ok(Some(root)) => root,
         Ok(None) => {
             if let Err(err) =
                 team_files_service::remove_copy_state(&app.data_dir, &state.local_workspace_id)
@@ -360,9 +432,6 @@ fn apply_manifest(
         };
         team_files_service::follow_manifest(&root, &mut state, &manifest, &fetch, &on_progress)
     });
-    if let Err(err) = team_files_service::save_copy_state(&app.data_dir, &state) {
-        log::error!("Couldn't save the copy {}: {err}", state.local_workspace_id);
-    }
     Some((state, result))
 }
 
@@ -712,11 +781,464 @@ fn delete_copy(local_workspace_id: String, window: &mut Window, cx: &mut App) {
         .detach_and_log_err(cx);
 }
 
-/// A line above a teammate's copy when it isn't simply following the
-/// sharer. None for any other workspace.
+/// Why the teammate can't send changes to the sharer now, None when they
+/// can.
+fn why_cant_send(team: &TeamShare, state: &CopyState) -> Option<String> {
+    let name = &state.sharer_name;
+    let Some(peer) = team.peer(&state.host) else {
+        return Some(format!("{name} isn't one of your teammates"));
+    };
+    if !matches!(peer.status, PeerStatus::Online) || peer.client.is_none() {
+        return Some(format!("{name} isn't connected"));
+    }
+    match peer
+        .workspaces
+        .iter()
+        .find(|workspace| workspace.id == state.workspace_id)
+    {
+        Some(workspace) if workspace.share_files && workspace.edit_files => None,
+        Some(workspace) if workspace.share_files => Some(format!(
+            "{name} hasn't turned on \"Teammates can edit files\""
+        )),
+        _ => Some(format!("{name} isn't sharing these files")),
+    }
+}
+
+fn update_copy(
+    team: &Entity<TeamShare>,
+    local_workspace_id: &str,
+    cx: &mut App,
+    update: impl FnOnce(&mut CopyFollow, &mut Context<TeamShare>),
+) {
+    team.update(cx, |team, cx| {
+        if let Some(copy) = team.copies.get_mut(local_workspace_id) {
+            update(copy, cx);
+            cx.notify();
+        }
+    });
+}
+
+fn set_send_message(
+    team: &Entity<TeamShare>,
+    local_workspace_id: &str,
+    message: String,
+    cx: &mut App,
+) {
+    update_copy(team, local_workspace_id, cx, |copy, _| {
+        if let Some(panel) = copy.send.as_mut() {
+            panel.busy = false;
+            panel.message = Some(message.into());
+        }
+    });
+}
+
+fn open_send_panel(local_workspace_id: String, window: &mut Window, cx: &mut App) {
+    let Some(team) = team_share(cx) else {
+        return;
+    };
+    let Some(sharer_name) = team
+        .read(cx)
+        .copies
+        .get(&local_workspace_id)
+        .map(|copy| copy.state.sharer_name.clone())
+    else {
+        return;
+    };
+    let note = cx.new(|cx| {
+        let mut editor = Editor::single_line(window, cx);
+        editor.set_placeholder_text(&format!("Optional note for {sharer_name}"), window, cx);
+        editor
+    });
+    update_copy(&team, &local_workspace_id, cx, |copy, _| {
+        copy.send = Some(SendPanel {
+            note,
+            edits: None,
+            busy: false,
+            message: None,
+        });
+    });
+    refresh_edits(&team, local_workspace_id, cx);
+}
+
+/// Reads the copy's unsent edits again for the open send list, and stops
+/// showing a file as held once it has changed since it was sent.
+fn refresh_edits(team: &Entity<TeamShare>, local_workspace_id: String, cx: &mut App) {
+    let Some(state) = team
+        .read(cx)
+        .copies
+        .get(&local_workspace_id)
+        .map(|copy| copy.state.clone())
+    else {
+        return;
+    };
+    let Some(app) = mnemonic_bridge::mnemonic_state_cloned() else {
+        return;
+    };
+    let team = team.downgrade();
+    cx.spawn(async move |cx| {
+        let edits = cx
+            .background_spawn(async move {
+                let root = copy_root(&app, &state.local_workspace_id)?
+                    .ok_or_else(|| "The copy no longer exists".to_string())?;
+                team_files_service::local_edit_hashes(&state, &root, &SkipList::default())
+            })
+            .await;
+        team.update(cx, |team, cx| {
+            let Some(copy) = team.copies.get_mut(&local_workspace_id) else {
+                return;
+            };
+            let Some(panel) = copy.send.as_mut() else {
+                return;
+            };
+            match edits {
+                Ok(edits) => {
+                    copy.held
+                        .retain(|path, sent_hash| edits.get(path) == Some(sent_hash));
+                    panel.edits = Some(edits);
+                }
+                Err(err) => {
+                    panel.edits = Some(BTreeMap::new());
+                    panel.message = Some(format!("Couldn't read your changes: {err}").into());
+                }
+            }
+            cx.notify();
+        })
+        .log_err();
+    })
+    .detach();
+}
+
+fn sent_message(sharer_name: &str, applied: usize, held: usize, left_out: &[String]) -> String {
+    let mut message = format!("Sent to {sharer_name}: {applied} applied");
+    if held > 0 {
+        message.push_str(&format!(", {held} held by {sharer_name}"));
+    }
+    if !left_out.is_empty() {
+        message.push_str(&format!(
+            ". Links and folders can't be sent: {}",
+            left_out.join(", ")
+        ));
+    }
+    message
+}
+
+/// Sends every unsent edit in the list to the sharer as one batch.
+fn send_changes(local_workspace_id: String, window: &mut Window, cx: &mut App) {
+    let Some(team) = team_share(cx) else {
+        return;
+    };
+    let Some(app) = mnemonic_bridge::mnemonic_state_cloned() else {
+        return;
+    };
+    let Some((state, client, paths, note_editor, reason)) = ({
+        let team = team.read(cx);
+        team.copies.get(&local_workspace_id).and_then(|copy| {
+            let panel = copy.send.as_ref().filter(|panel| !panel.busy)?;
+            let paths: Vec<String> = panel.edits.as_ref()?.keys().cloned().collect();
+            let client = team
+                .peer(&copy.state.host)
+                .and_then(|peer| peer.client.clone());
+            Some((
+                copy.state.clone(),
+                client,
+                paths,
+                panel.note.clone(),
+                why_cant_send(team, &copy.state),
+            ))
+        })
+    }) else {
+        return;
+    };
+    let client = match (client, reason) {
+        (Some(client), None) => client,
+        (_, reason) => {
+            let reason = reason.unwrap_or_else(|| format!("{} isn't connected", state.sharer_name));
+            set_send_message(&team, &local_workspace_id, reason, cx);
+            return;
+        }
+    };
+    let note = note_editor.read(cx).text(cx).trim().to_string();
+    let note = (!note.is_empty()).then_some(note);
+    update_copy(&team, &local_workspace_id, cx, |copy, _| {
+        if let Some(panel) = copy.send.as_mut() {
+            panel.busy = true;
+            panel.message = Some("Sending...".into());
+        }
+    });
+    window
+        .spawn(cx, async move |cx| {
+            let sent = cx
+                .background_spawn({
+                    let state = state.clone();
+                    async move {
+                        let root = copy_root(&app, &state.local_workspace_id)?
+                            .ok_or_else(|| "The copy no longer exists".to_string())?;
+                        let outgoing =
+                            team_files_service::build_batch(&state, &root, &paths, note)?;
+                        if outgoing.batch.changes.is_empty() {
+                            return Err("There is nothing to send".to_string());
+                        }
+                        let outcome = client
+                            .send_changes(&state.workspace_id, &outgoing.batch)
+                            .map_err(|err| err.to_string())?;
+                        Ok((outgoing, outcome))
+                    }
+                })
+                .await;
+            let sent_well = sent.is_ok();
+            team.update(cx, |team, cx| {
+                let Some(copy) = team.copies.get_mut(&local_workspace_id) else {
+                    return;
+                };
+                let message = match sent {
+                    Ok((outgoing, outcome)) => {
+                        team_files_service::record_sent(&mut copy.state, &outgoing.batch, &outcome);
+                        for held in &outcome.held {
+                            if let Some(change) = outgoing
+                                .batch
+                                .changes
+                                .iter()
+                                .find(|change| change.path == held.path)
+                            {
+                                let sent_hash =
+                                    change.content.as_deref().map(file_hash).unwrap_or_default();
+                                copy.held.insert(held.path.clone(), sent_hash);
+                            }
+                        }
+                        save_state(copy, cx);
+                        sent_message(
+                            &copy.state.sharer_name,
+                            outcome.applied.len(),
+                            outcome.held.len(),
+                            &outgoing.left_out,
+                        )
+                    }
+                    Err(err) => format!("Couldn't send your changes: {err}"),
+                };
+                if let Some(panel) = copy.send.as_mut() {
+                    panel.busy = false;
+                    panel.message = Some(message.into());
+                }
+                cx.notify();
+            });
+            if sent_well {
+                cx.update(|window, cx| {
+                    note_editor.update(cx, |editor, cx| editor.clear(window, cx));
+                    refresh_edits(&team, local_workspace_id, cx);
+                })?;
+            }
+            anyhow::Ok(())
+        })
+        .detach_and_log_err(cx);
+}
+
+/// Replaces the teammate's edit to `path` with the sharer's current
+/// version, after asking.
+fn discard_change(local_workspace_id: String, path: String, window: &mut Window, cx: &mut App) {
+    let Some(team) = team_share(cx) else {
+        return;
+    };
+    let Some(app) = mnemonic_bridge::mnemonic_state_cloned() else {
+        return;
+    };
+    let Some((state, manifest, client)) = ({
+        let team = team.read(cx);
+        team.copies.get(&local_workspace_id).map(|copy| {
+            let client = team
+                .peer(&copy.state.host)
+                .and_then(|peer| peer.client.clone());
+            (copy.state.clone(), copy.last_manifest.clone(), client)
+        })
+    }) else {
+        return;
+    };
+    let sharer_name = state.sharer_name.clone();
+    let Some(manifest) = manifest else {
+        set_send_message(
+            &team,
+            &local_workspace_id,
+            format!("Wait until this copy has caught up with {sharer_name}"),
+            cx,
+        );
+        return;
+    };
+    let entry = manifest
+        .entries
+        .into_iter()
+        .find(|entry| entry.path == path);
+    let answer = window.prompt(
+        PromptLevel::Warning,
+        &format!("Discard your changes to {path}?"),
+        Some(&format!("This takes {sharer_name}'s current version.")),
+        &["Discard", "Cancel"],
+        cx,
+    );
+    window
+        .spawn(cx, async move |cx| {
+            if answer.await? != 0 {
+                return Ok(());
+            }
+            let discarded = cx
+                .background_spawn({
+                    let path = path.clone();
+                    async move {
+                        let root = copy_root(&app, &state.local_workspace_id)?
+                            .ok_or_else(|| "The copy no longer exists".to_string())?;
+                        let fetch = |wanted: &str| match &client {
+                            Some(client) => client
+                                .file(&state.workspace_id, wanted)
+                                .map_err(|err| format!("Couldn't fetch {wanted}: {err}")),
+                            None => Err(format!("Can't reach {}", state.sharer_name)),
+                        };
+                        team_files_service::discard_edit(&root, &path, entry.as_ref(), &fetch)
+                    }
+                })
+                .await;
+            team.update(cx, |team, cx| {
+                let Some(copy) = team.copies.get_mut(&local_workspace_id) else {
+                    return;
+                };
+                match discarded {
+                    Ok(synced) => {
+                        match synced {
+                            Some(hash) => {
+                                copy.state.synced.insert(path.clone(), hash);
+                            }
+                            None => {
+                                copy.state.synced.remove(&path);
+                            }
+                        }
+                        copy.held.remove(&path);
+                        save_state(copy, cx);
+                    }
+                    Err(err) => {
+                        if let Some(panel) = copy.send.as_mut() {
+                            panel.message = Some(format!("Couldn't discard {path}: {err}").into());
+                        }
+                    }
+                }
+                cx.notify();
+            });
+            cx.update(|_, cx| refresh_edits(&team, local_workspace_id, cx))?;
+            anyhow::Ok(())
+        })
+        .detach_and_log_err(cx);
+}
+
+fn render_send_panel(
+    local_workspace_id: &str,
+    copy: &CopyFollow,
+    panel: &SendPanel,
+    cant_send: Option<String>,
+    cx: &App,
+) -> AnyElement {
+    let name = &copy.state.sharer_name;
+    let count = panel.edits.as_ref().map_or(0, BTreeMap::len);
+    let list = match &panel.edits {
+        None => Label::new("Looking for your changes...")
+            .size(LabelSize::Small)
+            .color(Color::Muted)
+            .into_any_element(),
+        Some(edits) if edits.is_empty() => Label::new("You have no changes to send.")
+            .size(LabelSize::Small)
+            .color(Color::Muted)
+            .into_any_element(),
+        Some(edits) => v_flex()
+            .id("team-copy-edits")
+            .max_h(px(200.))
+            .overflow_y_scroll()
+            .children(edits.iter().map(|(path, hash)| {
+                let held = copy.held.get(path) == Some(hash);
+                let local_workspace_id = local_workspace_id.to_string();
+                let discard_path = path.clone();
+                h_flex()
+                    .gap_2()
+                    .items_center()
+                    .child(Label::new(path.clone()).size(LabelSize::Small))
+                    .when(held, |row| {
+                        row.child(
+                            Label::new(format!("held by {name}"))
+                                .size(LabelSize::Small)
+                                .color(Color::Warning),
+                        )
+                    })
+                    .child(
+                        Button::new(SharedString::from(format!("discard-{path}")), "Discard")
+                            .disabled(panel.busy)
+                            .on_click(move |_, window, cx| {
+                                discard_change(
+                                    local_workspace_id.clone(),
+                                    discard_path.clone(),
+                                    window,
+                                    cx,
+                                )
+                            }),
+                    )
+            }))
+            .into_any_element(),
+    };
+    let send_label = if count == 1 {
+        "Send 1 file".to_string()
+    } else {
+        format!("Send {count} files")
+    };
+    let send_id = local_workspace_id.to_string();
+    let close_id = local_workspace_id.to_string();
+    v_flex()
+        .w_full()
+        .px_2()
+        .pb_1()
+        .gap_1()
+        .child(list)
+        .child(
+            div()
+                .px_1()
+                .py_0p5()
+                .border_1()
+                .rounded_sm()
+                .border_color(cx.theme().colors().border_variant)
+                .child(panel.note.clone()),
+        )
+        .child(
+            h_flex()
+                .gap_2()
+                .items_center()
+                .child(
+                    Button::new("send-team-copy-changes", send_label)
+                        .disabled(panel.busy || count == 0 || cant_send.is_some())
+                        .on_click(move |_, window, cx| send_changes(send_id.clone(), window, cx)),
+                )
+                .child(
+                    Button::new("close-team-copy-send", "Close").on_click(move |_, _, cx| {
+                        if let Some(team) = team_share(cx) {
+                            update_copy(&team, &close_id, cx, |copy, _| copy.send = None);
+                        }
+                    }),
+                )
+                .when_some(cant_send, |row, reason| {
+                    row.child(
+                        Label::new(reason)
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    )
+                })
+                .when_some(panel.message.clone(), |row, message| {
+                    row.child(
+                        Label::new(message)
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    )
+                }),
+        )
+        .into_any_element()
+}
+
+/// The lines above a teammate's copy: how following the sharer is going,
+/// and sending changes back. None for any other workspace.
 pub(crate) fn render_copy_banner(local_workspace_id: &str, cx: &App) -> Option<AnyElement> {
     let team = team_share(cx)?;
-    let copy = team.read(cx).copies.get(local_workspace_id)?;
+    let team = team.read(cx);
+    let copy = team.copies.get(local_workspace_id)?;
     let name = &copy.state.sharer_name;
     let (message, can_delete): (SharedString, bool) = match &copy.status {
         CopyStatus::Copying { total: 0, .. } => {
@@ -739,7 +1261,9 @@ pub(crate) fn render_copy_banner(local_workspace_id: &str, cx: &App) -> Option<A
             format!("Couldn't follow {name}'s files: {error}").into(),
             false,
         ),
-        CopyStatus::Following if copy.both_changed.is_empty() => return None,
+        CopyStatus::Following if copy.both_changed.is_empty() => {
+            (format!("Following {name}'s files.").into(), false)
+        }
         CopyStatus::Following => {
             let count = copy.both_changed.len();
             let files = copy
@@ -759,27 +1283,53 @@ pub(crate) fn render_copy_banner(local_workspace_id: &str, cx: &App) -> Option<A
             )
         }
     };
-    let local_workspace_id = local_workspace_id.to_string();
+    let can_send = matches!(copy.status, CopyStatus::Following | CopyStatus::Waiting(_));
+    let cant_send = why_cant_send(team, &copy.state);
+    let delete_id = local_workspace_id.to_string();
+    let send_id = local_workspace_id.to_string();
+    let line = h_flex()
+        .w_full()
+        .px_2()
+        .py_1()
+        .gap_2()
+        .items_center()
+        .child(
+            div().flex_grow(1.0).overflow_hidden().child(
+                Label::new(message)
+                    .size(LabelSize::Small)
+                    .color(Color::Muted),
+            ),
+        )
+        .when(can_send && copy.send.is_none(), |banner| {
+            banner.child(
+                Button::new("send-team-copy", format!("Send changes to {name}"))
+                    .disabled(cant_send.is_some())
+                    .when_some(cant_send.clone(), |button, reason| {
+                        button.tooltip(Tooltip::text(reason))
+                    })
+                    .on_click(move |_, window, cx| open_send_panel(send_id.clone(), window, cx)),
+            )
+        })
+        .when(can_delete, |banner| {
+            banner.child(
+                Button::new("delete-team-copy", "Delete copy")
+                    .on_click(move |_, window, cx| delete_copy(delete_id.clone(), window, cx)),
+            )
+        });
     Some(
-        h_flex()
+        v_flex()
             .w_full()
-            .px_2()
-            .py_1()
-            .gap_2()
-            .items_center()
             .border_b_1()
             .border_color(cx.theme().colors().border_variant)
             .bg(cx.theme().colors().surface_background)
-            .child(
-                div().flex_grow(1.0).overflow_hidden().child(
-                    Label::new(message)
-                        .size(LabelSize::Small)
-                        .color(Color::Muted),
-                ),
-            )
-            .when(can_delete, |banner| {
-                banner.child(Button::new("delete-team-copy", "Delete copy").on_click(
-                    move |_, window, cx| delete_copy(local_workspace_id.clone(), window, cx),
+            .child(line)
+            .when_some(copy.send.as_ref(), |banner, panel| {
+                banner.child(render_send_panel(
+                    local_workspace_id,
+                    copy,
+                    panel,
+                    cant_send,
+                    cx,
                 ))
             })
             .into_any_element(),

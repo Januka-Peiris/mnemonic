@@ -411,6 +411,7 @@ fn outcome_response<T: serde::Serialize>(
             Ok(body) => json_response(200, body),
             Err(err) => text_response(500, &err.to_string()),
         },
+        Err(TeamActionError::Invalid(reason)) => text_response(400, &reason),
         Err(TeamActionError::NotAllowed(reason)) => text_response(403, &reason),
         Err(TeamActionError::NotLoaded) => text_response(404, "Not open"),
         Err(TeamActionError::NothingToDo(reason)) => text_response(409, &reason),

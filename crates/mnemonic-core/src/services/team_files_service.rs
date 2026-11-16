@@ -4,6 +4,8 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 
+use crate::services::team_share_service::TeamCaller;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct TeamFileEntry {
@@ -148,6 +150,67 @@ pub enum HeldReason {
     ChangedSinceYourCopy,
     NeedsApproval,
     UnsavedInEditor,
+}
+
+/// A teammate's batch as the sharer's app recorded it, with each file's
+/// contents before and after, so it can be shown and undone.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct BatchRecord {
+    pub id: String,
+    pub login: String,
+    pub name: String,
+    pub at: String,
+    pub note: Option<String>,
+    pub files: Vec<BatchFile>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct BatchFile {
+    pub path: String,
+    /// The sharer's file when the batch arrived, None when there was none.
+    #[serde(default, with = "optional_base64")]
+    pub before: Option<Vec<u8>>,
+    /// The teammate's file, None when they deleted it.
+    #[serde(default, with = "optional_base64")]
+    pub after: Option<Vec<u8>>,
+    pub state: BatchFileState,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BatchFileState {
+    Applied,
+    Held(HeldReason),
+    /// The owner kept their version of a held file.
+    Kept,
+    /// The owner took the teammate's version of a held file.
+    Taken,
+    Undone,
+}
+
+impl BatchRecord {
+    pub fn outcome(&self) -> TeamBatchOutcome {
+        let mut outcome = TeamBatchOutcome {
+            batch_id: self.id.clone(),
+            applied: Vec::new(),
+            held: Vec::new(),
+        };
+        for file in &self.files {
+            match file.state {
+                BatchFileState::Applied | BatchFileState::Taken => {
+                    outcome.applied.push(file.path.clone())
+                }
+                BatchFileState::Held(reason) => outcome.held.push(HeldFile {
+                    path: file.path.clone(),
+                    reason,
+                }),
+                BatchFileState::Kept | BatchFileState::Undone => {}
+            }
+        }
+        outcome
+    }
 }
 
 mod optional_base64 {
@@ -776,24 +839,31 @@ fn current_hash(full_path: &Path) -> Result<Option<String>, String> {
 
 /// The paths the teammate changed in their copy and hasn't sent.
 pub fn local_edits(state: &CopyState, root: &Path, skip: &SkipList) -> Result<Vec<String>, String> {
+    Ok(local_edit_hashes(state, root, skip)?.into_keys().collect())
+}
+
+/// Each path the teammate changed and hasn't sent, with its hash in the
+/// copy now; an empty hash when they deleted it.
+pub fn local_edit_hashes(
+    state: &CopyState,
+    root: &Path,
+    skip: &SkipList,
+) -> Result<BTreeMap<String, String>, String> {
     let local = read_local_copy(root, skip, state.synced.keys().map(String::as_str))?;
-    let local_hash = |path: &str| local.hashes.get(path).map(String::as_str).unwrap_or("");
-    let mut edits: Vec<String> = state
+    let local_hash = |path: &str| local.hashes.get(path).cloned().unwrap_or_default();
+    let synced_edits = state
         .synced
         .iter()
         .filter(|(path, base)| !skip.skips(path) && local_hash(path) != base.as_str())
-        .map(|(path, _)| path.clone())
-        .chain(
-            local
-                .dirty_vs_head
-                .iter()
-                .filter(|path| !state.synced.contains_key(*path))
-                .cloned(),
-        )
-        .collect();
-    edits.sort_unstable();
-    edits.dedup();
-    Ok(edits)
+        .map(|(path, _)| path);
+    let head_edits = local
+        .dirty_vs_head
+        .iter()
+        .filter(|path| !state.synced.contains_key(*path));
+    Ok(synced_edits
+        .chain(head_edits)
+        .map(|path| (path.clone(), local_hash(path)))
+        .collect())
 }
 
 pub fn has_commit(repo: &Path, commit: &str) -> bool {
@@ -1139,18 +1209,7 @@ pub fn follow_manifest(
         move_head(root, state, &incoming.head_commit)?;
     }
     if !plan.restore.is_empty() {
-        let tracked = tracked_paths(root, "HEAD")?;
-        let (in_head, not_in_head): (Vec<&str>, Vec<&str>) = plan
-            .restore
-            .iter()
-            .map(String::as_str)
-            .partition(|path| tracked.contains(*path));
-        run_git_on_paths(root, &["checkout", "HEAD"], &in_head)?;
-        for path in not_in_head {
-            if let Ok(full_path) = safe_relative_path(root, path) {
-                remove_if_present(&full_path)?;
-            }
-        }
+        restore_to_head(root, &plan.restore)?;
         for path in &plan.restore {
             state.synced.remove(path);
         }
@@ -1182,6 +1241,22 @@ pub fn follow_manifest(
         Some(first) if failures.len() == 1 => Err(first.clone()),
         Some(first) => Err(format!("{first} (and {} more)", failures.len() - 1)),
     }
+}
+
+/// Returns each path to HEAD's version, removing it when HEAD lacks it.
+fn restore_to_head(root: &Path, paths: &[String]) -> Result<(), String> {
+    let tracked = tracked_paths(root, "HEAD")?;
+    let (in_head, not_in_head): (Vec<&str>, Vec<&str>) = paths
+        .iter()
+        .map(String::as_str)
+        .partition(|path| tracked.contains(*path));
+    run_git_on_paths(root, &["checkout", "HEAD"], &in_head)?;
+    for path in not_in_head {
+        if let Ok(full_path) = safe_relative_path(root, path) {
+            remove_if_present(&full_path)?;
+        }
+    }
+    Ok(())
 }
 
 /// Takes the sharer's files off the copy, so `git reset --keep` sees no
@@ -1283,9 +1358,340 @@ pub fn remove_copy_state(data_dir: &Path, local_workspace_id: &str) -> Result<()
     remove_if_present(&full_path)
 }
 
+/// Merges a follow round's result into the copy's live state: the round's
+/// paths, except those a send or discard changed while the round ran, as
+/// the round started from an older state and would otherwise undo them.
+pub fn merge_follow_round(
+    started_from: &CopyState,
+    round: CopyState,
+    live: &CopyState,
+) -> CopyState {
+    let mut merged = round;
+    for path in started_from.synced.keys().chain(live.synced.keys()) {
+        let live_hash = live.synced.get(path);
+        if live_hash == started_from.synced.get(path) {
+            continue;
+        }
+        match live_hash {
+            Some(hash) => {
+                merged.synced.insert(path.clone(), hash.clone());
+            }
+            None => {
+                merged.synced.remove(path);
+            }
+        }
+    }
+    merged
+}
+
+/// A batch ready to send, and the edits that can't be sent in one.
+pub struct OutgoingBatch {
+    pub batch: TeamChangeBatch,
+    /// Links and folders, which a batch can't carry.
+    pub left_out: Vec<String>,
+}
+
+/// Builds the batch for `paths` in the copy at `root`. Each change's base is
+/// the sharer's version the copy last had: the hash last written from the
+/// sharer, or for a path never written from them, its hash at the sharer's
+/// commit, since the sharer's file then matched that commit.
+pub fn build_batch(
+    state: &CopyState,
+    root: &Path,
+    paths: &[String],
+    note: Option<String>,
+) -> Result<OutgoingBatch, String> {
+    let mut in_head: Option<HashSet<String>> = None;
+    let mut changes = Vec::new();
+    let mut left_out = Vec::new();
+    for path in paths {
+        let full_path = match safe_relative_path(root, path) {
+            Ok(full_path) => full_path,
+            Err(reason) => {
+                log::warn!("Not sending {path}: {reason}");
+                left_out.push(path.clone());
+                continue;
+            }
+        };
+        let content = match std::fs::symlink_metadata(&full_path) {
+            Ok(metadata) if metadata.is_file() => Some(
+                std::fs::read(&full_path)
+                    .map_err(|error| format!("could not read {path}: {error}"))?,
+            ),
+            Ok(_) => {
+                left_out.push(path.clone());
+                continue;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(format!("could not stat {path}: {error}")),
+        };
+        let base_hash = match state.synced.get(path) {
+            Some(hash) => (!hash.is_empty()).then(|| hash.clone()),
+            None => {
+                let tracked = match &mut in_head {
+                    Some(tracked) => tracked,
+                    None => in_head.insert(tracked_paths(root, &state.head_commit)?),
+                };
+                if tracked.contains(path) {
+                    let blob = run_git(
+                        root,
+                        &["cat-file", "blob", &format!("{}:{path}", state.head_commit)],
+                    )?;
+                    Some(file_hash(&blob))
+                } else {
+                    None
+                }
+            }
+        };
+        changes.push(TeamFileChange {
+            path: path.clone(),
+            base_hash,
+            content,
+        });
+    }
+    Ok(OutgoingBatch {
+        batch: TeamChangeBatch { note, changes },
+        left_out,
+    })
+}
+
+/// Records the files the sharer applied from `batch` as the sharer's, so
+/// they stop counting as unsent edits. Held files stay the teammate's.
+pub fn record_sent(state: &mut CopyState, batch: &TeamChangeBatch, outcome: &TeamBatchOutcome) {
+    let applied: HashSet<&str> = outcome.applied.iter().map(String::as_str).collect();
+    for change in &batch.changes {
+        if applied.contains(change.path.as_str()) {
+            let hash = change.content.as_deref().map(file_hash).unwrap_or_default();
+            state.synced.insert(change.path.clone(), hash);
+        }
+    }
+}
+
+/// Returns the copy's `path` to the sharer's version: `entry` when the
+/// sharer's file list names it, else the copy's HEAD, which the sharer's
+/// file then matches. The new hash to record as synced, or None when the
+/// path is no longer the sharer's change.
+pub fn discard_edit(
+    root: &Path,
+    path: &str,
+    entry: Option<&TeamFileEntry>,
+    fetch: &dyn Fn(&str) -> Result<Vec<u8>, String>,
+) -> Result<Option<String>, String> {
+    match entry {
+        Some(entry) => write_copy_entry(root, entry, fetch)?
+            .map(Some)
+            .ok_or_else(|| format!("{path} can't be written in this copy")),
+        None => {
+            restore_to_head(root, &[path.to_string()])?;
+            Ok(None)
+        }
+    }
+}
+
+fn is_plain_id(id: &str) -> bool {
+    !id.is_empty()
+        && id
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
+}
+
+/// A batch id that sorts by when it arrived, given `now` in one fixed
+/// format.
+fn batch_id(now: &str) -> String {
+    let stamp: String = now.chars().filter(char::is_ascii_alphanumeric).collect();
+    let suffix: String = uuid::Uuid::new_v4()
+        .simple()
+        .to_string()
+        .chars()
+        .take(8)
+        .collect();
+    format!("{stamp}-{suffix}")
+}
+
+/// What is at `full_path` now: its bytes, or None when nothing is there.
+fn read_existing(path: &str, full_path: &Path) -> Result<Option<Vec<u8>>, String> {
+    match std::fs::symlink_metadata(full_path) {
+        Ok(metadata) if metadata.is_file() => std::fs::read(full_path)
+            .map(Some)
+            .map_err(|error| format!("could not read {path}: {error}")),
+        Ok(_) => Err(format!("{path} isn't a file")),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(format!("could not stat {path}: {error}")),
+    }
+}
+
+/// Writes `content` at `full_path`, or removes it when None, keeping an
+/// existing file's permissions.
+fn write_batch_file(full_path: &Path, content: Option<&[u8]>) -> Result<(), String> {
+    let Some(bytes) = content else {
+        return remove_if_present(full_path);
+    };
+    let permissions = std::fs::symlink_metadata(full_path)
+        .ok()
+        .map(|metadata| metadata.permissions());
+    replace_atomically(full_path, |temp_path| {
+        std::fs::write(temp_path, bytes)
+            .map_err(|error| format!("could not write {}: {error}", full_path.display()))?;
+        match permissions {
+            Some(permissions) => {
+                std::fs::set_permissions(temp_path, permissions).map_err(|error| {
+                    format!(
+                        "could not set permissions on {}: {error}",
+                        full_path.display()
+                    )
+                })
+            }
+            None => Ok(()),
+        }
+    })
+}
+
+/// Applies a teammate's batch to the workspace at `root`. Every path is
+/// checked before anything is written, and one that may not be written
+/// rejects the whole batch. A change applies when the file still matches
+/// the base the teammate started from; otherwise, or when the file has
+/// unsaved edits in an editor (`unsaved`, relative to `root`) or makes
+/// something run, it is held and left alone. When a write fails, the
+/// files already written are put back.
+pub fn apply_batch(
+    root: &Path,
+    skip: &SkipList,
+    batch: &TeamChangeBatch,
+    unsaved: &HashSet<String>,
+    caller: &TeamCaller,
+    now: &str,
+) -> Result<BatchRecord, String> {
+    let mut seen = HashSet::new();
+    let mut checked = Vec::with_capacity(batch.changes.len());
+    for change in &batch.changes {
+        let path = change.path.as_str();
+        if !seen.insert(path) {
+            return Err(format!("{path} is in the batch twice"));
+        }
+        if skip.skips(path) {
+            return Err(format!("{path} can't be changed by teammates"));
+        }
+        let full_path = safe_relative_path(root, path)?;
+        let before = read_existing(path, &full_path)?;
+        checked.push((change, full_path, before));
+    }
+
+    let mut files = Vec::with_capacity(checked.len());
+    let mut to_write = Vec::new();
+    for (change, full_path, before) in checked {
+        let path = change.path.as_str();
+        let current_hash = before.as_deref().map(file_hash);
+        let already_there = current_hash == change.content.as_deref().map(file_hash);
+        let state = if already_there {
+            BatchFileState::Applied
+        } else if unsaved.contains(path) {
+            BatchFileState::Held(HeldReason::UnsavedInEditor)
+        } else if current_hash != change.base_hash {
+            BatchFileState::Held(HeldReason::ChangedSinceYourCopy)
+        } else if needs_approval(path) {
+            BatchFileState::Held(HeldReason::NeedsApproval)
+        } else {
+            to_write.push((path, full_path, files.len()));
+            BatchFileState::Applied
+        };
+        files.push(BatchFile {
+            path: change.path.clone(),
+            before,
+            after: change.content.clone(),
+            state,
+        });
+    }
+
+    let mut written: Vec<(&Path, Option<&[u8]>)> = Vec::new();
+    for (path, full_path, index) in &to_write {
+        let Some(file) = files.get(*index) else {
+            continue;
+        };
+        // Checked again just before writing, in case a link appeared on the
+        // way since the batch was checked.
+        let result = safe_relative_path(root, path)
+            .and_then(|_| write_batch_file(full_path, file.after.as_deref()));
+        if let Err(error) = result {
+            for (written_path, before) in written.into_iter().rev() {
+                if let Err(undo_error) = write_batch_file(written_path, before) {
+                    log::error!(
+                        "Couldn't put back {} after a failed batch: {undo_error}",
+                        written_path.display()
+                    );
+                }
+            }
+            return Err(error);
+        }
+        written.push((full_path.as_path(), file.before.as_deref()));
+    }
+
+    Ok(BatchRecord {
+        id: batch_id(now),
+        login: caller.login.clone(),
+        name: caller.name.clone(),
+        at: now.to_string(),
+        note: batch.note.clone(),
+        files,
+    })
+}
+
+fn batches_dir(data_dir: &Path, workspace_id: &str) -> Result<PathBuf, String> {
+    if !is_plain_id(workspace_id) {
+        return Err(format!("{workspace_id} isn't a workspace id"));
+    }
+    Ok(data_dir.join("team-batches").join(workspace_id))
+}
+
+pub fn save_batch_record(
+    data_dir: &Path,
+    workspace_id: &str,
+    record: &BatchRecord,
+) -> Result<(), String> {
+    if !is_plain_id(&record.id) {
+        return Err(format!("{} isn't a batch id", record.id));
+    }
+    let json = serde_json::to_vec_pretty(record).map_err(|error| error.to_string())?;
+    let full_path = batches_dir(data_dir, workspace_id)?.join(format!("{}.json", record.id));
+    replace_atomically(&full_path, |temp_path| {
+        std::fs::write(temp_path, &json)
+            .map_err(|error| format!("could not save {}: {error}", full_path.display()))
+    })
+}
+
+/// The workspace's batches, oldest first.
+pub fn load_batch_records(data_dir: &Path, workspace_id: &str) -> Result<Vec<BatchRecord>, String> {
+    let directory = batches_dir(data_dir, workspace_id)?;
+    let read_dir = match std::fs::read_dir(&directory) {
+        Ok(read_dir) => read_dir,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(format!("could not read {}: {error}", directory.display())),
+    };
+    let mut records = Vec::new();
+    for entry in read_dir {
+        let path = entry
+            .map_err(|error| format!("could not read {}: {error}", directory.display()))?
+            .path();
+        if path.extension().is_none_or(|extension| extension != "json") {
+            continue;
+        }
+        let parsed = std::fs::read(&path)
+            .map_err(|error| error.to_string())
+            .and_then(|bytes| {
+                serde_json::from_slice::<BatchRecord>(&bytes).map_err(|error| error.to_string())
+            });
+        match parsed {
+            Ok(record) => records.push(record),
+            Err(error) => log::error!("Couldn't read {}: {error}", path.display()),
+        }
+    }
+    records.sort_by(|left, right| left.id.cmp(&right.id));
+    Ok(records)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::services::team_share_service::TeamCaller;
 
     #[test]
     fn the_secret_floor_holds_with_no_patterns() {
@@ -1803,5 +2209,345 @@ mod tests {
         let teammate = tempfile::tempdir().expect("tempdir");
         git(teammate.path(), &["init", "-q"]);
         fetch_bundle(teammate.path(), &bundle, &head).expect("fetch");
+    }
+
+    fn read(root: &Path, path: &str) -> Option<String> {
+        std::fs::read_to_string(root.join(path)).ok()
+    }
+
+    fn change(path: &str, base: Option<&str>, content: Option<&str>) -> TeamFileChange {
+        TeamFileChange {
+            path: path.to_string(),
+            base_hash: base.map(|base| file_hash(base.as_bytes())),
+            content: content.map(|content| content.as_bytes().to_vec()),
+        }
+    }
+
+    fn batch(changes: Vec<TeamFileChange>) -> TeamChangeBatch {
+        TeamChangeBatch {
+            note: Some("tidied the plan".to_string()),
+            changes,
+        }
+    }
+
+    fn dan() -> TeamCaller {
+        TeamCaller {
+            login: "dan@example.com".to_string(),
+            name: "Dan".to_string(),
+        }
+    }
+
+    const NOW: &str = "2026-11-16T14:14:05.123Z";
+
+    fn apply(
+        root: &Path,
+        changes: Vec<TeamFileChange>,
+        unsaved: &[&str],
+    ) -> Result<BatchRecord, String> {
+        let unsaved = unsaved.iter().map(|path| path.to_string()).collect();
+        apply_batch(
+            root,
+            &SkipList::default(),
+            &batch(changes),
+            &unsaved,
+            &dan(),
+            NOW,
+        )
+    }
+
+    fn state_of<'a>(record: &'a BatchRecord, path: &str) -> &'a BatchFile {
+        record
+            .files
+            .iter()
+            .find(|file| file.path == path)
+            .unwrap_or_else(|| panic!("{path} is in the record"))
+    }
+
+    #[test]
+    fn a_matching_base_applies_and_records_before_and_after() {
+        let directory = repo();
+        let root = directory.path();
+        write(root, ".context/plan.md", "one");
+        #[cfg(unix)]
+        set_executable(&root.join(".context/plan.md"), true).expect("chmod");
+
+        let record = apply(
+            root,
+            vec![
+                change(".context/plan.md", Some("one"), Some("two")),
+                change("notes/new.md", None, Some("hello")),
+                change("gone.txt", Some("gone"), None),
+            ],
+            &[],
+        )
+        .expect("applies");
+
+        assert_eq!(read(root, ".context/plan.md").as_deref(), Some("two"));
+        assert_eq!(read(root, "notes/new.md").as_deref(), Some("hello"));
+        assert_eq!(read(root, "gone.txt"), None);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(root.join(".context/plan.md"))
+                .expect("stat")
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o111, 0o111, "kept executable");
+        }
+
+        assert_eq!(record.login, "dan@example.com");
+        assert_eq!(record.name, "Dan");
+        assert_eq!(record.at, NOW);
+        assert_eq!(record.note.as_deref(), Some("tidied the plan"));
+        let plan = state_of(&record, ".context/plan.md");
+        assert_eq!(plan.state, BatchFileState::Applied);
+        assert_eq!(plan.before.as_deref(), Some(b"one".as_slice()));
+        assert_eq!(plan.after.as_deref(), Some(b"two".as_slice()));
+        let new = state_of(&record, "notes/new.md");
+        assert_eq!(new.before, None);
+        assert_eq!(new.after.as_deref(), Some(b"hello".as_slice()));
+        let gone = state_of(&record, "gone.txt");
+        assert_eq!(gone.before.as_deref(), Some(b"gone".as_slice()));
+        assert_eq!(gone.after, None);
+
+        let outcome = record.outcome();
+        assert_eq!(outcome.batch_id, record.id);
+        assert_eq!(outcome.applied.len(), 3);
+        assert!(outcome.held.is_empty());
+    }
+
+    #[test]
+    fn a_changed_base_is_held_and_untouched() {
+        let directory = repo();
+        let root = directory.path();
+        write(root, "changed.txt", "jay's");
+
+        let record = apply(
+            root,
+            vec![
+                change("changed.txt", Some("one"), Some("dan's")),
+                change("kept.txt", Some("kept"), Some("kept by dan")),
+            ],
+            &[],
+        )
+        .expect("applies the rest");
+
+        assert_eq!(read(root, "changed.txt").as_deref(), Some("jay's"));
+        assert_eq!(read(root, "kept.txt").as_deref(), Some("kept by dan"));
+        let held = state_of(&record, "changed.txt");
+        assert_eq!(
+            held.state,
+            BatchFileState::Held(HeldReason::ChangedSinceYourCopy)
+        );
+        assert_eq!(held.before.as_deref(), Some(b"jay's".as_slice()));
+        assert_eq!(held.after.as_deref(), Some(b"dan's".as_slice()));
+        assert_eq!(
+            record.outcome().held,
+            vec![HeldFile {
+                path: "changed.txt".to_string(),
+                reason: HeldReason::ChangedSinceYourCopy,
+            }]
+        );
+    }
+
+    #[test]
+    fn a_command_running_file_is_held_for_approval() {
+        let directory = repo();
+        let root = directory.path();
+
+        let record = apply(
+            root,
+            vec![
+                change(".claude/settings.json", None, Some("{\"hooks\":{}}")),
+                change(".envrc", None, Some("export X=1")),
+            ],
+            &[],
+        )
+        .expect("holds");
+
+        assert_eq!(read(root, ".claude/settings.json"), None);
+        assert_eq!(read(root, ".envrc"), None);
+        for file in &record.files {
+            assert_eq!(
+                file.state,
+                BatchFileState::Held(HeldReason::NeedsApproval),
+                "{}",
+                file.path
+            );
+        }
+    }
+
+    #[test]
+    fn a_file_with_unsaved_edits_is_held() {
+        let directory = repo();
+        let root = directory.path();
+
+        let record = apply(
+            root,
+            vec![change("kept.txt", Some("kept"), Some("dan's"))],
+            &["kept.txt"],
+        )
+        .expect("holds");
+
+        assert_eq!(read(root, "kept.txt").as_deref(), Some("kept"));
+        assert_eq!(
+            state_of(&record, "kept.txt").state,
+            BatchFileState::Held(HeldReason::UnsavedInEditor)
+        );
+    }
+
+    #[test]
+    fn a_skipped_or_escaping_path_rejects_the_whole_batch() {
+        let directory = repo();
+        let root = directory.path();
+        let outside = tempfile::tempdir().expect("tempdir");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(outside.path(), root.join("link")).expect("link");
+
+        let mut bad_paths = vec![
+            ".env",
+            "config/.env.local",
+            "server.pem",
+            "node_modules/x.js",
+            ".git/config",
+            "../outside.txt",
+            "/tmp/outside.txt",
+            "a/../kept.txt",
+            "",
+        ];
+        if cfg!(unix) {
+            bad_paths.push("link/x.txt");
+        }
+        for bad_path in bad_paths {
+            let result = apply(
+                root,
+                vec![
+                    change("kept.txt", Some("kept"), Some("dan's")),
+                    change(bad_path, None, Some("bad")),
+                ],
+                &[],
+            );
+            assert!(result.is_err(), "{bad_path:?} rejects the batch");
+            assert_eq!(
+                read(root, "kept.txt").as_deref(),
+                Some("kept"),
+                "{bad_path:?}"
+            );
+        }
+        assert!(
+            std::fs::read_dir(outside.path())
+                .expect("read")
+                .next()
+                .is_none()
+        );
+
+        let twice = apply(
+            root,
+            vec![
+                change("kept.txt", Some("kept"), Some("first")),
+                change("kept.txt", Some("kept"), Some("second")),
+            ],
+            &[],
+        );
+        assert!(twice.is_err(), "a path named twice rejects the batch");
+        assert_eq!(read(root, "kept.txt").as_deref(), Some("kept"));
+    }
+
+    #[test]
+    fn a_new_file_that_now_exists_is_held() {
+        let directory = repo();
+        let root = directory.path();
+        write(root, ".context/new.md", "jay's");
+
+        let record = apply(
+            root,
+            vec![change(".context/new.md", None, Some("dan's"))],
+            &[],
+        )
+        .expect("holds");
+
+        assert_eq!(read(root, ".context/new.md").as_deref(), Some("jay's"));
+        assert_eq!(
+            state_of(&record, ".context/new.md").state,
+            BatchFileState::Held(HeldReason::ChangedSinceYourCopy)
+        );
+    }
+
+    #[test]
+    fn a_file_from_the_sharers_head_is_sent_with_its_head_hash() {
+        let directory = repo();
+        let root = directory.path();
+        let head = String::from_utf8_lossy(&run_git(root, &["rev-parse", "HEAD"]).expect("head"))
+            .trim()
+            .to_string();
+        write(root, ".context/plan.md", "dan's plan");
+        write(root, "changed.txt", "dan's");
+        write(root, "new.txt", "new");
+        std::fs::remove_file(root.join("gone.txt")).expect("rm");
+        let state = copy_state(&head, &[(".context/plan.md", "jay-plan-hash")]);
+
+        let outgoing = build_batch(
+            &state,
+            root,
+            &[
+                ".context/plan.md".to_string(),
+                "changed.txt".to_string(),
+                "gone.txt".to_string(),
+                "new.txt".to_string(),
+            ],
+            None,
+        )
+        .expect("builds");
+
+        let base_of = |path: &str| {
+            outgoing
+                .batch
+                .changes
+                .iter()
+                .find(|change| change.path == path)
+                .map(|change| change.base_hash.clone())
+                .unwrap_or_else(|| panic!("{path} is sent"))
+        };
+        assert_eq!(
+            base_of(".context/plan.md").as_deref(),
+            Some("jay-plan-hash")
+        );
+        assert_eq!(base_of("changed.txt"), Some(file_hash(b"one")));
+        assert_eq!(base_of("gone.txt"), Some(file_hash(b"gone")));
+        assert_eq!(base_of("new.txt"), None);
+        let gone = outgoing
+            .batch
+            .changes
+            .iter()
+            .find(|change| change.path == "gone.txt")
+            .expect("sent");
+        assert_eq!(gone.content, None);
+    }
+
+    #[test]
+    fn a_send_during_a_follow_round_is_not_overwritten() {
+        let started_from = copy_state("aaaaaaa", &[("a.md", "a1"), ("b.md", "b1"), ("c.md", "c1")]);
+        let mut round = started_from.clone();
+        round.head_commit = "bbbbbbb".to_string();
+        round.synced.insert("a.md".to_string(), "a2".to_string());
+        round.synced.insert("b.md".to_string(), "b2".to_string());
+        round.synced.remove("c.md");
+        let mut live = started_from.clone();
+        live.synced.insert("b.md".to_string(), "b-sent".to_string());
+        live.synced.insert("d.md".to_string(), "d-sent".to_string());
+
+        let merged = merge_follow_round(&started_from, round, &live);
+
+        assert_eq!(merged.head_commit, "bbbbbbb");
+        assert_eq!(merged.synced.get("a.md").map(String::as_str), Some("a2"));
+        assert_eq!(
+            merged.synced.get("b.md").map(String::as_str),
+            Some("b-sent")
+        );
+        assert_eq!(merged.synced.get("c.md"), None);
+        assert_eq!(
+            merged.synced.get("d.md").map(String::as_str),
+            Some("d-sent")
+        );
     }
 }

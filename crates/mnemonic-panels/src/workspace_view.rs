@@ -4773,6 +4773,18 @@ pub(crate) struct OpenChat {
     pub thread: Option<Entity<acp_thread::AcpThread>>,
 }
 
+/// The window whose host has the workspace open, if any.
+pub(crate) fn find_workspace_window(workspace_id: &str, cx: &App) -> Option<Entity<Workspace>> {
+    open_windows(cx).into_iter().find(|window| {
+        window.read(cx).panes().iter().any(|pane| {
+            pane.read(cx)
+                .items()
+                .filter_map(|item| item.downcast::<WorkspaceHost>())
+                .any(|host| host.read(cx).views.contains_key(workspace_id))
+        })
+    })
+}
+
 /// Finds a loaded chat by its record id, in whichever window holds it.
 pub(crate) fn find_open_chat(record_id: &str, cx: &App) -> Option<OpenChat> {
     open_windows(cx).into_iter().find_map(|window| {
