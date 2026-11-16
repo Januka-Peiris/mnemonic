@@ -94,6 +94,9 @@ pub struct TeamWorkspace {
     pub remote_url: Option<String>,
     #[serde(default)]
     pub base_branch: Option<String>,
+    /// The sharer's skip list for the workspace's files.
+    #[serde(default)]
+    pub skip_patterns: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

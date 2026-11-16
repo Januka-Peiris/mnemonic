@@ -102,6 +102,20 @@ pub fn update_name_and_branch(
     })
 }
 
+pub fn update_base_branch(
+    db: &Database,
+    workspace_id: &str,
+    base_branch: &str,
+) -> Result<(), String> {
+    db.with_connection_mut(|connection| {
+        connection.execute(
+            "UPDATE workspaces SET base_branch = ?1 WHERE id = ?2",
+            params![base_branch, workspace_id],
+        )?;
+        Ok(())
+    })
+}
+
 pub fn update_last_rebase(
     db: &Database,
     workspace_id: &str,

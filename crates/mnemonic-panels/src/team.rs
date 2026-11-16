@@ -28,7 +28,7 @@ use mnemonic_bridge::AgentAttention;
 use mnemonic_core::models::{ChatSessionRecord, WorkspaceSummary};
 use mnemonic_core::repositories::{chat_session_repository, settings_repository};
 use mnemonic_core::services::team_files_service::{
-    self, SkipList, TeamBatchOutcome, normalize_remote_url, scan_workspace,
+    self, HashCache, SkipList, TeamBatchOutcome, normalize_remote_url, scan_workspace_cached,
 };
 use mnemonic_core::services::team_share_server::{
     BundleSource, DiffSource, FileSource, SkipListSource, TeamServerConfig, TeamShareServer,
@@ -782,23 +782,33 @@ impl TeamShare {
     /// when the manifest differs.
     fn watch_files(hub: TeamShareHub, file_roots: FileRoots, cx: &mut Context<Self>) -> Task<()> {
         cx.spawn(async move |_, cx| {
+            let mut hash_caches: HashMap<String, HashCache> = HashMap::new();
             loop {
                 cx.background_executor().timer(PUBLISH_INTERVAL).await;
                 if !hub.has_viewers_within(VIEWER_WINDOW) {
                     continue;
                 }
-                let scans: Vec<_> = lock_file_roots(&file_roots)
+                let roots: Vec<(String, PathBuf, SkipList)> = lock_file_roots(&file_roots)
                     .iter()
-                    .map(|(id, (root, skip_list))| {
-                        let id = id.clone();
-                        let root = root.clone();
-                        let skip_list = skip_list.clone();
-                        let scan =
-                            cx.background_spawn(async move { scan_workspace(&root, &skip_list) });
-                        async move { (id, scan.await) }
+                    .map(|(id, (root, skip_list))| (id.clone(), root.clone(), skip_list.clone()))
+                    .collect();
+                let mut previous_caches = std::mem::take(&mut hash_caches);
+                let scans: Vec<_> = roots
+                    .into_iter()
+                    .map(|(id, root, skip_list)| {
+                        let mut cache = previous_caches.remove(&id).unwrap_or_default();
+                        let scan = cx.background_spawn(async move {
+                            let scanned = scan_workspace_cached(&root, &skip_list, &mut cache);
+                            (scanned, cache)
+                        });
+                        async move {
+                            let (scanned, cache) = scan.await;
+                            (id, scanned, cache)
+                        }
                     })
                     .collect();
-                for (id, scanned) in futures::future::join_all(scans).await {
+                for (id, scanned, cache) in futures::future::join_all(scans).await {
+                    hash_caches.insert(id.clone(), cache);
                     match scanned {
                         Ok(manifest) => {
                             let roots = lock_file_roots(&file_roots);
@@ -1070,6 +1080,12 @@ impl TeamShare {
                 remote_url: self.remote_urls.get(&summary.id).cloned().flatten(),
                 base_branch: Some(summary.branch_health.base_branch.trim().to_string())
                     .filter(|base_branch| !base_branch.is_empty()),
+                skip_patterns: self
+                    .skip_lists
+                    .get(&summary.id)
+                    .cloned()
+                    .unwrap_or_default()
+                    .patterns,
                 id: summary.id,
                 project: summary.repo,
                 name: summary.name,

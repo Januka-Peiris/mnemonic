@@ -769,6 +769,7 @@ mod tests {
             edit_files: false,
             remote_url: None,
             base_branch: None,
+            skip_patterns: Vec::new(),
         }
     }
 

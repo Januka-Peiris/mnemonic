@@ -54,6 +54,7 @@ const PROJECT_SETUP_SCRIPT_KEY: &str = "setup_script";
 const PROJECT_RUN_SCRIPT_KEY: &str = workspace_script_service::PROJECT_RUN_SCRIPT_KEY;
 const PROJECT_INIT_FILES_KEY: &str = "workspace_init_files";
 const WORKSPACE_ORDER_KEY: &str = "panel_workspace_order";
+use mnemonic_core::services::team_files_service::TEAM_COPY_SOURCE;
 use mnemonic_core::services::{
     environment_service, pr_draft_service, repo_scanner_service, workspace_port_service, workspace_script_service,
     workspace_service,
@@ -720,6 +721,16 @@ impl WorkspacePanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // A teammate's copy holds the sharer's teardown commands, which this
+        // machine never runs; it is deleted instead, after warning about
+        // unsent edits.
+        let is_team_copy = self.workspaces.iter().any(|workspace| {
+            workspace.id == ws_id && workspace.workspace_source == TEAM_COPY_SOURCE
+        });
+        if is_team_copy {
+            crate::team_copy::delete_copy(ws_id, window, cx);
+            return;
+        }
         cx.spawn_in(window, async move |this, cx| {
             let Some(state) = mnemonic_bridge::mnemonic_state_cloned() else {
                 return;

@@ -17,7 +17,7 @@ use mnemonic_core::repositories::{
     chat_session_repository, repository_repository, workspace_repository,
 };
 use mnemonic_core::services::team_files_service::{
-    self, CopyState, FollowPlan, SkipList, TEAM_COPY_SOURCE, TeamFileManifest, file_hash,
+    self, CopyState, FollowPlan, TEAM_COPY_SOURCE, TeamFileManifest, file_hash,
 };
 use mnemonic_core::services::team_share_server::MAX_BUNDLE_HAVE;
 use mnemonic_core::services::team_share_service::{
@@ -306,10 +306,21 @@ fn follow(local_workspace_id: String, cx: &mut Context<TeamShare>) -> Task<()> {
                 }
             });
             // A send or discard during the long poll changed the live state.
-            let Ok(Some(state)) = this.read_with(cx, |team, _| {
-                team.copies
-                    .get(&local_workspace_id)
-                    .map(|copy| copy.state.clone())
+            let Ok(Some(state)) = this.update(cx, |team, _| {
+                let skip_patterns = {
+                    let state = &team.copies.get(&local_workspace_id)?.state;
+                    team.peer(&state.host).and_then(|peer| {
+                        peer.workspaces
+                            .iter()
+                            .find(|workspace| workspace.id == state.workspace_id)
+                            .map(|workspace| workspace.skip_patterns.clone())
+                    })
+                };
+                let copy = team.copies.get_mut(&local_workspace_id)?;
+                if let Some(skip_patterns) = skip_patterns.filter(|patterns| !patterns.is_empty()) {
+                    copy.state.skip_patterns = skip_patterns;
+                }
+                Some(copy.state.clone())
             }) else {
                 break;
             };
@@ -559,6 +570,15 @@ fn create_copy(app: &AppState, copy: NewCopy) -> Result<CopyState, String> {
             workspace_source: Some(TEAM_COPY_SOURCE.to_string()),
         },
     )?;
+    // The worktree starts at the sharer's commit, but its changes are
+    // compared with the branch the sharer's are, not that frozen commit.
+    if let Some(base_branch) = shared.base_branch.as_deref() {
+        if let Err(err) =
+            workspace_repository::update_base_branch(&app.db, &detail.summary.id, base_branch)
+        {
+            log::error!("Couldn't set the copy's base branch to {base_branch}: {err}");
+        }
+    }
     let state = CopyState {
         host,
         sharer_name,
@@ -567,6 +587,7 @@ fn create_copy(app: &AppState, copy: NewCopy) -> Result<CopyState, String> {
         base_branch: shared.base_branch.clone(),
         head_commit: manifest.head_commit,
         synced: Default::default(),
+        skip_patterns: shared.skip_patterns.clone(),
     };
     // The follow loop writes the sharer's files, starting from the whole
     // list, and shows its progress above the copy.
@@ -692,7 +713,7 @@ pub(crate) fn open_teammate_copy(
 }
 
 /// Deletes the copy after asking, warning about edits that weren't sent.
-fn delete_copy(local_workspace_id: String, window: &mut Window, cx: &mut App) {
+pub(crate) fn delete_copy(local_workspace_id: String, window: &mut Window, cx: &mut App) {
     let Some(team) = team_share(cx) else {
         return;
     };
@@ -726,7 +747,7 @@ fn delete_copy(local_workspace_id: String, window: &mut Window, cx: &mut App) {
                         let edits = team_files_service::local_edits(
                             &state,
                             Path::new(&root),
-                            &SkipList::default(),
+                            &state.skip_list(),
                         )?;
                         Ok::<_, String>((detail, root, edits))
                     }
@@ -886,7 +907,7 @@ fn refresh_edits(team: &Entity<TeamShare>, local_workspace_id: String, cx: &mut 
             .background_spawn(async move {
                 let root = copy_root(&app, &state.local_workspace_id)?
                     .ok_or_else(|| "The copy no longer exists".to_string())?;
-                team_files_service::local_edit_hashes(&state, &root, &SkipList::default())
+                team_files_service::local_edit_hashes(&state, &root, &state.skip_list())
             })
             .await;
         team.update(cx, |team, cx| {
