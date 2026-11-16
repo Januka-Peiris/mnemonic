@@ -456,6 +456,53 @@ fn finish_remote(host: &str, path: &str) -> String {
     }
 }
 
+#[allow(clippy::disallowed_methods)]
+pub fn bundle_for(root: &Path, have: &[String]) -> Result<Vec<u8>, String> {
+    let output = Command::new("git")
+        .args(["bundle", "create", "-", "HEAD", "--not"])
+        .args(have)
+        .arg("--remotes=origin")
+        .current_dir(root)
+        .output()
+        .map_err(|error| format!("could not run git: {error}"))?;
+    if output.status.success() {
+        return Ok(output.stdout);
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if stderr.contains("empty bundle") {
+        return Ok(Vec::new());
+    }
+    Err(format!("git bundle failed: {}", stderr.trim()))
+}
+
+pub fn fetch_bundle(repo: &Path, bundle: &[u8], head_commit: &str) -> Result<(), String> {
+    if head_commit.starts_with('-') {
+        return Err(format!("{head_commit} isn't a commit id"));
+    }
+    let has_head = |repo: &Path| run_git(repo, &["cat-file", "-e", head_commit]).is_ok();
+    if !bundle.is_empty() {
+        let bundle_path =
+            std::env::temp_dir().join(format!("mnemonic-share-{}.bundle", uuid::Uuid::new_v4()));
+        std::fs::write(&bundle_path, bundle)
+            .map_err(|error| format!("could not save the bundle: {error}"))?;
+        let fetched = run_git(
+            repo,
+            &["fetch", "--quiet", &bundle_path.to_string_lossy(), "HEAD"],
+        );
+        if let Err(error) = std::fs::remove_file(&bundle_path) {
+            log::warn!("Couldn't remove {}: {error}", bundle_path.display());
+        }
+        fetched?;
+    }
+    if has_head(repo) {
+        Ok(())
+    } else {
+        Err(format!(
+            "{head_commit} isn't in your clone or the sharer's bundle"
+        ))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -675,5 +722,54 @@ mod tests {
             serde_json::from_str::<TeamFileChange>(&json).expect("parse"),
             change
         );
+    }
+
+    fn head_of(root: &Path) -> String {
+        String::from_utf8_lossy(&run_git(root, &["rev-parse", "HEAD"]).expect("rev-parse"))
+            .trim()
+            .to_string()
+    }
+
+    #[test]
+    fn an_unpushed_commit_reaches_the_teammate() {
+        let sharer = repo();
+        let origin = tempfile::tempdir().expect("tempdir");
+        git(origin.path(), &["init", "-q", "--bare"]);
+        let origin_path = origin.path().to_string_lossy().to_string();
+        git(sharer.path(), &["remote", "add", "origin", &origin_path]);
+        git(
+            sharer.path(),
+            &["push", "-q", "origin", "HEAD:refs/heads/main"],
+        );
+        git(sharer.path(), &["fetch", "-q", "origin"]);
+        let teammate_parent = tempfile::tempdir().expect("tempdir");
+        let teammate = teammate_parent.path().join("clone");
+        git(
+            teammate_parent.path(),
+            &["clone", "-q", &origin_path, "clone"],
+        );
+
+        write(sharer.path(), "local.txt", "unpushed");
+        git(sharer.path(), &["add", "-A"]);
+        git(sharer.path(), &["commit", "-q", "-m", "unpushed"]);
+        let head = head_of(sharer.path());
+        assert!(run_git(&teammate, &["cat-file", "-e", &head]).is_err());
+
+        let bundle = bundle_for(sharer.path(), &[]).expect("bundle");
+        assert!(!bundle.is_empty());
+        fetch_bundle(&teammate, &bundle, &head).expect("fetch");
+        run_git(&teammate, &["cat-file", "-e", &head]).expect("head present");
+    }
+
+    #[test]
+    fn a_sharer_with_no_origin_still_bundles_head() {
+        let sharer = repo();
+        let head = head_of(sharer.path());
+        let teammate = tempfile::tempdir().expect("tempdir");
+        git(teammate.path(), &["init", "-q"]);
+
+        let bundle = bundle_for(sharer.path(), &[]).expect("bundle");
+        fetch_bundle(teammate.path(), &bundle, &head).expect("fetch");
+        run_git(teammate.path(), &["cat-file", "-e", &head]).expect("head present");
     }
 }

@@ -27,9 +27,11 @@ use gpui::{
 use mnemonic_bridge::AgentAttention;
 use mnemonic_core::models::{ChatSessionRecord, WorkspaceSummary};
 use mnemonic_core::repositories::{chat_session_repository, settings_repository};
-use mnemonic_core::services::team_files_service::{SkipList, normalize_remote_url, scan_workspace};
+use mnemonic_core::services::team_files_service::{
+    self, SkipList, normalize_remote_url, scan_workspace,
+};
 use mnemonic_core::services::team_share_server::{
-    DiffSource, FileSource, SkipListSource, TeamServerConfig, TeamShareServer,
+    BundleSource, DiffSource, FileSource, SkipListSource, TeamServerConfig, TeamShareServer,
 };
 use mnemonic_core::services::team_share_service::{
     ActionHandler, DEFAULT_TEAM_PORT, TailscaleSelf, TailscaleWhois, TeamAction, TeamActionError,
@@ -1311,6 +1313,16 @@ fn start_server(
                 .map(|(root, _)| root.clone())
         }
     });
+    let bundle_source: BundleSource = Arc::new({
+        let file_roots = file_roots.clone();
+        move |workspace_id: &str, have: &[String]| {
+            let root = lock_file_roots(&file_roots)
+                .get(workspace_id)
+                .map(|(root, _)| root.clone())
+                .ok_or_else(|| "That workspace isn't sharing files".to_string())?;
+            team_files_service::bundle_for(&root, have)
+        }
+    });
     let skip_list: SkipListSource = Arc::new(move |workspace_id: &str| {
         lock_file_roots(&file_roots)
             .get(workspace_id)
@@ -1324,7 +1336,7 @@ fn start_server(
             display_name,
             allowed_logins,
             files,
-            bundle_source: Arc::new(|_, _| Err("Not available yet".to_string())),
+            bundle_source,
             skip_list,
             batch_handler: Arc::new(|_| Err(TeamActionError::Failed("Not available yet".into()))),
         },
