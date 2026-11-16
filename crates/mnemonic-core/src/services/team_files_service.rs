@@ -495,6 +495,10 @@ mod tests {
 
         let manifest = scan_workspace(root, &SkipList::default()).expect("scan");
         assert_eq!(paths(&manifest), vec![".context/plan.md"]);
+
+        let skip = SkipList::default();
+        assert!(skip.skips(".Git/config"));
+        assert!(skip.skips(".GIT/hooks/x"));
     }
 
     #[cfg(unix)]
