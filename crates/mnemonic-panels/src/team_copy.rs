@@ -353,7 +353,7 @@ fn apply_manifest(
                 .map_err(|err| format!("Couldn't fetch {path}: {err}"))
         };
         let on_progress = |done: usize, total: usize| {
-            if done == total || done % PROGRESS_STEP == 0 {
+            if done == total || done.is_multiple_of(PROGRESS_STEP) {
                 // The receiver only goes away when following stops.
                 progress.unbounded_send((done, total)).ok();
             }
