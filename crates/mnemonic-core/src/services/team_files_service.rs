@@ -74,7 +74,10 @@ impl SkipList {
             } else if pattern.contains('*') {
                 glob_matches(pattern, final_component)
             } else {
-                components.iter().any(|component| component == pattern)
+                components.iter().any(|component| {
+                    component == pattern
+                        || (pattern == ".git" && component.eq_ignore_ascii_case(".git"))
+                })
             }
         })
     }
@@ -139,8 +142,9 @@ mod optional_base64 {
         serializer: S,
     ) -> Result<S::Ok, S::Error> {
         match value {
-            Some(bytes) => serializer
-                .serialize_some(&base64::engine::general_purpose::STANDARD.encode(bytes)),
+            Some(bytes) => {
+                serializer.serialize_some(&base64::engine::general_purpose::STANDARD.encode(bytes))
+            }
             None => serializer.serialize_none(),
         }
     }
@@ -166,29 +170,26 @@ pub fn needs_approval(path: &str) -> bool {
     let mut components = path.split('/').filter(|component| !component.is_empty());
     match components.next() {
         Some(".mnemonic" | ".claude" | ".zed" | ".vscode") => true,
-        Some(".envrc") => components.next().is_none(),
-        _ => false,
+        _ => path.rsplit('/').next().is_some_and(|name| name == ".envrc"),
     }
 }
 
 pub fn safe_relative_path(root: &Path, path: &str) -> Result<PathBuf, String> {
     let mut resolved = root.to_path_buf();
-    let mut components = Path::new(path).components().peekable();
-    if components.peek().is_none() {
+    let components = Path::new(path).components();
+    if path.is_empty() {
         return Err("path is empty".to_string());
     }
-    while let Some(component) = components.next() {
+    for component in components {
         match component {
             Component::Normal(name) => {
-                if name == ".git" {
+                if name.eq_ignore_ascii_case(".git") {
                     return Err(format!("{path} is inside .git"));
                 }
                 resolved.push(name);
-                let is_last = components.peek().is_none();
-                if !is_last
-                    && std::fs::symlink_metadata(&resolved)
-                        .map(|metadata| metadata.file_type().is_symlink())
-                        .unwrap_or(false)
+                if std::fs::symlink_metadata(&resolved)
+                    .map(|metadata| metadata.file_type().is_symlink())
+                    .unwrap_or(false)
                 {
                     return Err(format!("{path} passes through a symlink"));
                 }
@@ -363,8 +364,8 @@ fn build_entry(
     if !metadata.is_file() {
         return Ok(None);
     }
-    let bytes =
-        std::fs::read(&full_path).map_err(|error| format!("could not read {path}: {error}"))?;
+    let (size, hash) =
+        hash_file(&full_path).map_err(|error| format!("could not read {path}: {error}"))?;
     #[cfg(unix)]
     let executable = {
         use std::os::unix::fs::PermissionsExt;
@@ -375,9 +376,26 @@ fn build_entry(
     Ok(Some(TeamFileEntry {
         path: path.to_string(),
         kind: TeamFileKind::File { executable },
-        size: bytes.len() as u64,
-        hash: file_hash(&bytes),
+        size,
+        hash,
     }))
+}
+
+fn hash_file(path: &Path) -> std::io::Result<(u64, String)> {
+    use std::io::Read;
+    let mut file = std::fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+    let mut size = 0u64;
+    loop {
+        let count = file.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        hasher.update(&buffer[..count]);
+        size += count as u64;
+    }
+    Ok((size, format!("{:x}", hasher.finalize())))
 }
 
 #[cfg(test)]
@@ -410,7 +428,11 @@ mod tests {
         git(root, &["init", "-q"]);
         git(root, &["config", "user.email", "t@example.com"]);
         git(root, &["config", "user.name", "t"]);
-        write(root, ".gitignore", ".context/\ntarget/\nnode_modules/\n.env*\n*.pem\n.claude/settings.local.json\n");
+        write(
+            root,
+            ".gitignore",
+            ".context/\ntarget/\nnode_modules/\n.env*\n*.pem\n.claude/settings.local.json\n",
+        );
         write(root, "kept.txt", "kept");
         write(root, "changed.txt", "one");
         write(root, "gone.txt", "gone");
@@ -420,7 +442,11 @@ mod tests {
     }
 
     fn paths(manifest: &TeamFileManifest) -> Vec<&str> {
-        manifest.entries.iter().map(|entry| entry.path.as_str()).collect()
+        manifest
+            .entries
+            .iter()
+            .map(|entry| entry.path.as_str())
+            .collect()
     }
 
     #[test]
@@ -465,6 +491,7 @@ mod tests {
         write(root, "key.pem", "s");
         write(root, ".claude/settings.local.json", "{}");
         write(root, ".context/plan.md", "plan");
+        write(root, ".context/node_modules/x", "x");
 
         let manifest = scan_workspace(root, &SkipList::default()).expect("scan");
         assert_eq!(paths(&manifest), vec![".context/plan.md"]);
@@ -501,9 +528,22 @@ mod tests {
         let root = directory.path();
         std::fs::create_dir(root.join("real")).expect("mkdir");
         std::os::unix::fs::symlink("real", root.join("link")).expect("link");
+        std::os::unix::fs::symlink("/etc/hosts", root.join("linkfile")).expect("link");
 
-        for bad in ["../x", "/etc/passwd", ".git/config", "a/../../x", "link/file.txt"] {
-            assert!(safe_relative_path(root, bad).is_err(), "{bad} should be refused");
+        for bad in [
+            "../x",
+            "/etc/passwd",
+            ".git/config",
+            "a/../../x",
+            "link/file.txt",
+            ".Git/config",
+            ".GIT/hooks/x",
+            "linkfile",
+        ] {
+            assert!(
+                safe_relative_path(root, bad).is_err(),
+                "{bad} should be refused"
+            );
         }
         assert_eq!(
             safe_relative_path(root, ".context/plan.md"),
@@ -519,6 +559,7 @@ mod tests {
             ".zed/settings.json",
             ".vscode/tasks.json",
             ".envrc",
+            "sub/.envrc",
         ] {
             assert!(needs_approval(path), "{path}");
         }
@@ -534,6 +575,9 @@ mod tests {
         };
         let json = serde_json::to_string(&change).expect("serialize");
         assert!(json.contains("\"AP8H\""));
-        assert_eq!(serde_json::from_str::<TeamFileChange>(&json).expect("parse"), change);
+        assert_eq!(
+            serde_json::from_str::<TeamFileChange>(&json).expect("parse"),
+            change
+        );
     }
 }
