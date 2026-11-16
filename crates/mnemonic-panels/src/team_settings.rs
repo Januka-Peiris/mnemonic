@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use editor::{Editor, EditorEvent};
+use editor::Editor;
 use fs::Fs;
 use gpui::{
     App, AppContext as _, Bounds, ClipboardItem, Context, Entity, FocusHandle, Focusable,
@@ -209,23 +209,6 @@ impl TeamSettingsView {
                 editor.set_text(patterns, window, cx);
                 editor
             });
-            let workspace_id = workspace.id.clone();
-            self._subscriptions.push(cx.subscribe(
-                &editor,
-                move |_, editor, event: &EditorEvent, cx| {
-                    if matches!(event, EditorEvent::BufferEdited) {
-                        let patterns = editor
-                            .read(cx)
-                            .text(cx)
-                            .lines()
-                            .map(str::trim)
-                            .filter(|line| !line.is_empty())
-                            .map(str::to_string)
-                            .collect();
-                        set_workspace_skip_list(&workspace_id, SkipList { patterns }, cx);
-                    }
-                },
-            ));
             self.skip_list_editors.insert(workspace.id.clone(), editor);
         }
     }
@@ -313,6 +296,8 @@ impl TeamSettingsView {
                 .then(|| self.skip_list_editors.get(&workspace.id))
                 .flatten()
                 .map(|editor| {
+                    let editor_for_save = editor.clone();
+                    let workspace_id = workspace_id.clone();
                     v_flex()
                         .w_full()
                         .pl_6()
@@ -332,6 +317,24 @@ impl TeamSettingsView {
                                 .border_color(cx.theme().colors().border)
                                 .bg(cx.theme().colors().editor_background)
                                 .child(editor.clone()),
+                        )
+                        .child(
+                            Button::new(
+                                SharedString::from(format!("team-skip-save-{}", workspace.id)),
+                                "Save",
+                            )
+                            .label_size(LabelSize::Small)
+                            .on_click(move |_, _, cx| {
+                                let patterns = editor_for_save
+                                    .read(cx)
+                                    .text(cx)
+                                    .lines()
+                                    .map(str::trim)
+                                    .filter(|line| !line.is_empty())
+                                    .map(str::to_string)
+                                    .collect();
+                                set_workspace_skip_list(&workspace_id, SkipList { patterns }, cx);
+                            }),
                         )
                 });
             section =

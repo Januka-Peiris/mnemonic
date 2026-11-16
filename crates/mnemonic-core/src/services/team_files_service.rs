@@ -58,6 +58,17 @@ impl Default for SkipList {
     }
 }
 
+/// Always skipped, whatever the editable patterns say, so an edit to the
+/// list can never expose secrets.
+const SECRET_FLOOR: [&str; 6] = [
+    ".git",
+    ".env",
+    ".env.*",
+    "*.pem",
+    "*.key",
+    ".claude/settings.local.json",
+];
+
 impl SkipList {
     pub fn skips(&self, path: &str) -> bool {
         let components: Vec<&str> = path
@@ -68,14 +79,19 @@ impl SkipList {
             return false;
         };
         let normalized = components.join("/");
-        self.patterns.iter().any(|pattern| {
+        let patterns = self
+            .patterns
+            .iter()
+            .map(String::as_str)
+            .chain(SECRET_FLOOR.iter().copied());
+        patterns.into_iter().any(|pattern| {
             if pattern.contains('/') {
-                *pattern == normalized
+                pattern == normalized
             } else if pattern.contains('*') {
                 glob_matches(pattern, final_component)
             } else {
                 components.iter().any(|component| {
-                    component == pattern
+                    *component == pattern
                         || (pattern == ".git" && component.eq_ignore_ascii_case(".git"))
                 })
             }
@@ -443,6 +459,20 @@ fn finish_remote(host: &str, path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_secret_floor_holds_with_no_patterns() {
+        let empty = SkipList { patterns: vec![] };
+        for path in [
+            ".env.local",
+            "key.pem",
+            ".claude/settings.local.json",
+            "a/.GIT/config",
+        ] {
+            assert!(empty.skips(path), "{path}");
+        }
+        assert!(!empty.skips("src/main.rs"));
+    }
 
     #[test]
     fn remotes_compare_equal_whatever_their_spelling() {

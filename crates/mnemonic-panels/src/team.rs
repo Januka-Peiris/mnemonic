@@ -213,6 +213,10 @@ pub(crate) struct TeamShare {
     /// Each file-sharing workspace's normalized `origin`, looked up once.
     remote_urls: HashMap<String, Option<String>>,
     scan_task: Option<Task<()>>,
+    skip_list_save_count: u64,
+    /// The newest skip-list save written, so a slower older write can't
+    /// land after a newer one.
+    skip_list_written: Arc<Mutex<u64>>,
 }
 
 type FileRoots = Arc<Mutex<HashMap<String, (PathBuf, SkipList)>>>;
@@ -295,6 +299,8 @@ impl TeamShare {
             file_roots: Arc::new(Mutex::new(HashMap::new())),
             remote_urls: HashMap::new(),
             scan_task: None,
+            skip_list_save_count: 0,
+            skip_list_written: Arc::new(Mutex::new(0)),
         }
     }
 }
@@ -414,12 +420,24 @@ fn load_skip_lists() -> HashMap<String, SkipList> {
     }
 }
 
-fn save_skip_lists(skip_lists: &HashMap<String, SkipList>, cx: &App) {
+fn save_skip_lists(
+    skip_lists: &HashMap<String, SkipList>,
+    sequence: u64,
+    written: Arc<Mutex<u64>>,
+    cx: &App,
+) {
     let skip_lists = skip_lists.clone();
     cx.background_spawn(async move {
         let Some(state) = mnemonic_bridge::mnemonic_state_cloned() else {
             return;
         };
+        let mut written = written
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if *written >= sequence {
+            return;
+        }
+        *written = sequence;
         let saved = serde_json::to_string(&skip_lists)
             .map_err(|err| err.to_string())
             .and_then(|json| settings_repository::set_value(&state.db, SKIP_LISTS_KEY, &json));
@@ -600,7 +618,13 @@ impl TeamShare {
             *current = skip_list.clone();
         }
         self.skip_lists.insert(workspace_id.to_string(), skip_list);
-        save_skip_lists(&self.skip_lists, cx);
+        self.skip_list_save_count += 1;
+        save_skip_lists(
+            &self.skip_lists,
+            self.skip_list_save_count,
+            self.skip_list_written.clone(),
+            cx,
+        );
         cx.notify();
     }
 
@@ -1008,7 +1032,13 @@ impl TeamShare {
                 branch: summary.branch,
             });
         }
-        *lock_file_roots(&self.file_roots) = file_roots;
+        {
+            let mut roots = lock_file_roots(&self.file_roots);
+            for id in roots.keys().filter(|id| !file_roots.contains_key(*id)) {
+                self.hub.remove_file_manifest(id);
+            }
+            *roots = file_roots;
+        }
         self.hub.set_workspaces(workspaces);
         self.hub.set_step_in_chats(step_in_chats);
         self.watch_chats(open_chats, &closed_chats, cx);
@@ -2434,6 +2464,31 @@ mod tests {
             team.set_workspace_shared("workspace", false, cx);
             assert!(!team.shares_files("workspace"));
             assert!(!team.allows_file_edits("workspace"));
+        });
+    }
+
+    #[gpui::test]
+    async fn dropping_file_sharing_removes_the_snapshot_and_manifest(cx: &mut TestAppContext) {
+        let team = cx.new(|_| TeamShare::new());
+        team.update(cx, |team, cx| {
+            let manifest = || mnemonic_core::services::team_files_service::TeamFileManifest {
+                head_commit: "abc".into(),
+                entries: Vec::new(),
+            };
+            for turn_off in [false, true] {
+                team.set_workspace_shared("workspace", true, cx);
+                team.set_workspace_share_files("workspace", true, cx);
+                lock_file_roots(&team.file_roots)
+                    .insert("workspace".into(), (PathBuf::from("/root"), SkipList::default()));
+                team.hub.set_file_manifest("workspace", manifest());
+                if turn_off {
+                    team.set_workspace_share_files("workspace", false, cx);
+                } else {
+                    team.set_workspace_shared("workspace", false, cx);
+                }
+                assert!(lock_file_roots(&team.file_roots).is_empty());
+                assert!(team.hub.file_manifest("workspace").is_none());
+            }
         });
     }
 }
