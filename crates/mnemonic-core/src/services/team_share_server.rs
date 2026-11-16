@@ -1,5 +1,5 @@
-//! The HTTP side of team sharing. Reads are GETs. The only writes are three
-//! POSTs on a chat (stop, message, permission), each handed to the app's
+//! The HTTP side of team sharing. Reads are GETs. The only writes are two
+//! POSTs on a chat (stop, permission), each handed to the app's
 //! action handler and only for chats the sharer has opened to step-in.
 
 use std::io::Read as _;
@@ -34,7 +34,7 @@ pub struct TeamServerConfig {
 const MAX_ACTIVE_REQUESTS: usize = 64;
 /// Diffs past this are cut, so a vendored directory can't stall a viewer.
 const MAX_DIFF_BYTES: usize = 2 * 1024 * 1024;
-const MAX_MESSAGE_BYTES: usize = 256 * 1024;
+const MAX_ACTION_BODY_BYTES: usize = 16 * 1024;
 
 struct Shared {
     hub: TeamShareHub,
@@ -192,7 +192,7 @@ fn handle(mut request: Request, shared: &Shared) {
     let method = request.method().clone();
     if method == Method::Post {
         let response = match segments.as_slice() {
-            ["v1", "chats", chat_id, action @ ("stop" | "message" | "permission")]
+            ["v1", "chats", chat_id, action @ ("stop" | "permission")]
                 if is_plain_id(chat_id) =>
             {
                 handle_action(&mut request, shared, &caller, chat_id, action)
@@ -320,13 +320,13 @@ fn handle_action(
     let mut body = Vec::new();
     let read = request
         .as_reader()
-        .take(MAX_MESSAGE_BYTES as u64 + 1)
+        .take(MAX_ACTION_BODY_BYTES as u64 + 1)
         .read_to_end(&mut body);
     if let Err(err) = read {
         return text_response(400, &format!("Couldn't read the request: {err}"));
     }
-    if body.len() > MAX_MESSAGE_BYTES {
-        return text_response(413, "The message is too long");
+    if body.len() > MAX_ACTION_BODY_BYTES {
+        return text_response(413, "The request is too long");
     }
     let kind = match parse_action(action, &body) {
         Ok(kind) => kind,
@@ -352,23 +352,12 @@ fn handle_action(
 
 fn parse_action(action: &str, body: &[u8]) -> Result<TeamActionKind, String> {
     #[derive(serde::Deserialize)]
-    struct MessageBody {
-        text: String,
-    }
-    #[derive(serde::Deserialize)]
     struct PermissionBody {
         tool_call_id: String,
         option_id: String,
     }
     let invalid = |err: serde_json::Error| format!("Couldn't read the request: {err}");
     match action {
-        "message" => {
-            let message: MessageBody = serde_json::from_slice(body).map_err(invalid)?;
-            if message.text.trim().is_empty() {
-                return Err("The message is empty".to_string());
-            }
-            Ok(TeamActionKind::Message { text: message.text })
-        }
         "permission" => {
             let answer: PermissionBody = serde_json::from_slice(body).map_err(invalid)?;
             Ok(TeamActionKind::Permission {
@@ -454,7 +443,7 @@ mod tests {
     type Recorded = Arc<Mutex<Vec<TeamAction>>>;
 
     fn start(login: Option<&'static str>, hub: TeamShareHub) -> Result<TeamShareServer, String> {
-        Ok(start_with_handler(login, hub, queued())?.0)
+        Ok(start_with_handler(login, hub, accepted())?.0)
     }
 
     fn start_with_handler(
@@ -488,8 +477,8 @@ mod tests {
         Ok((server, recorded))
     }
 
-    fn queued() -> Result<TeamActionOutcome, TeamActionError> {
-        Ok(TeamActionOutcome { queued: true })
+    fn accepted() -> Result<TeamActionOutcome, TeamActionError> {
+        Ok(TeamActionOutcome {})
     }
 
     fn step_in_hub(on: bool) -> TeamShareHub {
@@ -625,14 +614,13 @@ mod tests {
     }
 
     #[test]
-    fn an_allowed_teammate_can_stop_message_and_answer_when_step_in_is_on() -> Result<(), String> {
+    fn an_allowed_teammate_can_stop_and_answer_when_step_in_is_on() -> Result<(), String> {
         let (server, recorded) =
-            start_with_handler(Some("bob@example.com"), step_in_hub(true), queued())?;
+            start_with_handler(Some("bob@example.com"), step_in_hub(true), accepted())?;
         let client =
             TeamClient::new(&server.address().to_string(), 0).map_err(|err| err.to_string())?;
 
         assert_eq!(client.stop("chat-1"), Ok(()));
-        assert_eq!(client.send_message("chat-1", "hello"), Ok(true));
         assert_eq!(client.answer_permission("chat-1", "call-1", "allow"), Ok(()));
 
         let kinds: Vec<TeamActionKind> = recorded
@@ -649,9 +637,6 @@ mod tests {
             kinds,
             vec![
                 TeamActionKind::Stop,
-                TeamActionKind::Message {
-                    text: "hello".to_string()
-                },
                 TeamActionKind::Permission {
                     tool_call_id: "call-1".to_string(),
                     option_id: "allow".to_string()
@@ -662,16 +647,28 @@ mod tests {
     }
 
     #[test]
+    fn a_message_to_the_owners_agent_is_not_found() -> Result<(), String> {
+        let (server, recorded) =
+            start_with_handler(Some("bob@example.com"), step_in_hub(true), accepted())?;
+        let address = server.address();
+
+        let request = post_hello_message(
+            address,
+            "Content-Type: application/json\r\nX-Mnemonic-Team: 3\r\n",
+        );
+        assert_eq!(raw_status(address, &request)?, 404);
+        assert!(recorded.lock().map_err(|err| err.to_string())?.is_empty());
+        Ok(())
+    }
+
+    #[test]
     fn actions_are_refused_when_step_in_is_off() -> Result<(), String> {
         let (server, recorded) =
-            start_with_handler(Some("bob@example.com"), step_in_hub(false), queued())?;
+            start_with_handler(Some("bob@example.com"), step_in_hub(false), accepted())?;
         let client =
             TeamClient::new(&server.address().to_string(), 0).map_err(|err| err.to_string())?;
 
         assert!(client.stop("chat-1").is_err_and(|err| refused(403)(&err)));
-        assert!(client
-            .send_message("chat-1", "hello")
-            .is_err_and(|err| refused(403)(&err)));
         assert!(client
             .answer_permission("chat-1", "call-1", "allow")
             .is_err_and(|err| refused(403)(&err)));
@@ -682,7 +679,7 @@ mod tests {
     #[test]
     fn actions_are_refused_for_a_login_not_on_the_allow_list() -> Result<(), String> {
         let (server, recorded) =
-            start_with_handler(Some("mallory@example.com"), step_in_hub(true), queued())?;
+            start_with_handler(Some("mallory@example.com"), step_in_hub(true), accepted())?;
         let client =
             TeamClient::new(&server.address().to_string(), 0).map_err(|err| err.to_string())?;
 
@@ -692,26 +689,9 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_or_oversized_message_is_refused() -> Result<(), String> {
-        let (server, recorded) =
-            start_with_handler(Some("bob@example.com"), step_in_hub(true), queued())?;
-        let client =
-            TeamClient::new(&server.address().to_string(), 0).map_err(|err| err.to_string())?;
-
-        assert!(client
-            .send_message("chat-1", "  ")
-            .is_err_and(|err| refused(400)(&err)));
-        assert!(client
-            .send_message("chat-1", &"a".repeat(300 * 1024))
-            .is_err_and(|err| refused(413)(&err)));
-        assert!(recorded.lock().map_err(|err| err.to_string())?.is_empty());
-        Ok(())
-    }
-
-    #[test]
     fn a_browser_style_post_is_refused() -> Result<(), String> {
         let (server, recorded) =
-            start_with_handler(Some("bob@example.com"), step_in_hub(true), queued())?;
+            start_with_handler(Some("bob@example.com"), step_in_hub(true), accepted())?;
         let address = server.address();
 
         let plain_text = post_hello_message(address, "Content-Type: text/plain\r\n");

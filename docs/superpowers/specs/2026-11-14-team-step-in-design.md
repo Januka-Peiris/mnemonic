@@ -15,6 +15,8 @@ in the wrong direction while its owner is away from the desk.
 - From a mirrored chat, send a message to the teammate's agent. It arrives in
   their chat labelled with who sent it and queues if their agent is busy. A
   chat that is not loaded in their app is loaded to receive it.
+  (Removed in step 3: a teammate's messages now always run on their own
+  agent.)
 - From a mirrored chat, answer a permission request their agent is waiting on.
 - Nothing above works unless the sharer switched it on for that workspace.
 - The sharer can see that a teammate acted.

@@ -38,7 +38,6 @@ pub(crate) fn teammate_workspace_key(host: &str, workspace_id: &str) -> String {
 }
 
 /// Hands a message typed in a teammate's chat to their agent.
-type MessageSender = Rc<dyn Fn(String, &mut Window, &mut App)>;
 
 /// One of the teammate's chats as a tab.
 pub(crate) struct TeammateChatItem {
@@ -541,23 +540,6 @@ impl TeammateWorkspaceView {
             }
         }
 
-        for item in &self.chats {
-            let Some(view) = item.read(cx).view.clone() else {
-                continue;
-            };
-            let chat_id = item.read(cx).chat_id.clone();
-            // A chat that isn't loaded on the teammate's machine can still be
-            // messaged: the message loads it there.
-            let chat = live.chats.iter().find(|chat| chat.id == chat_id);
-            let handler = match (chat, client.clone()) {
-                (Some(chat), Some(client)) if live.step_in && chat.open => Some(
-                    self.message_sender(chat_id, chat.live, &peer_name, client, view.downgrade()),
-                ),
-                _ => None,
-            };
-            view.update(cx, |view, cx| view.set_send_handler(handler, cx));
-        }
-
         mnemonic_bridge::TeammateWorkspaceTitles::set(
             &teammate_workspace_key(&self.host, &self.workspace_id),
             mnemonic_bridge::TeammateWorkspaceTitle {
@@ -572,59 +554,6 @@ impl TeammateWorkspaceView {
         );
         self.last_known = Some(live);
         cx.notify();
-    }
-
-    /// Posts each message to the teammate's chat off the main thread, as the
-    /// mirror shows it once the teammate's chat has it. A message that
-    /// couldn't be sent goes back into the editor.
-    fn message_sender(
-        &self,
-        chat_id: String,
-        chat_is_loaded: bool,
-        peer_name: &SharedString,
-        client: TeamClient,
-        view: WeakEntity<ConversationView>,
-    ) -> MessageSender {
-        let workspace = self.workspace.clone();
-        let peer_name = peer_name.clone();
-        Rc::new(move |text, window, cx| {
-            let client = client.clone();
-            let chat_id = chat_id.clone();
-            let peer_name = peer_name.clone();
-            let workspace = workspace.clone();
-            let view = view.clone();
-            let window_handle = window.window_handle();
-            cx.spawn(async move |cx| {
-                let result = cx
-                    .background_spawn({
-                        let text = text.clone();
-                        async move { client.send_message(&chat_id, &text) }
-                    })
-                    .await;
-                let notice = match result {
-                    Ok(true) if chat_is_loaded => {
-                        format!("Queued until {peer_name}'s agent finishes")
-                    }
-                    Ok(true) => format!("Starting {peer_name}'s agent to deliver it"),
-                    Ok(false) => return,
-                    Err(err) => {
-                        // The handler ran inside the chat view's update; this
-                        // runs later, so the view is free to change.
-                        let restored = cx.update_window(window_handle, |_, window, cx| {
-                            view.update(cx, |view, cx| {
-                                view.restore_unsent_message(&text, window, cx)
-                            })
-                        });
-                        if let Err(restore_error) = restored.and_then(|restored| restored) {
-                            log::debug!("Couldn't put an unsent message back: {restore_error}");
-                        }
-                        format!("Couldn't send the message: {err}")
-                    }
-                };
-                cx.update(|cx| show_notice(&workspace, notice, cx));
-            })
-            .detach();
-        })
     }
 
     /// Drops every chat view and the connection they share, so the open

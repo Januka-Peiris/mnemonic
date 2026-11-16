@@ -157,14 +157,11 @@ pub struct TeamAction {
 #[derive(Clone, Debug, PartialEq)]
 pub enum TeamActionKind {
     Stop,
-    Message { text: String },
     Permission { tool_call_id: String, option_id: String },
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct TeamActionOutcome {
-    pub queued: bool,
-}
+pub struct TeamActionOutcome {}
 
 /// Why an action wasn't carried out, mapped to 403, 404, 409 and 500.
 #[derive(Clone, Debug, PartialEq)]
@@ -933,19 +930,6 @@ impl TeamClient {
     pub fn stop(&self, chat_id: &str) -> Result<(), TeamClientError> {
         let path = format!("/v1/chats/{}/stop", path_segment(chat_id)?);
         self.post(&path, serde_json::json!({})).map(|_| ())
-    }
-
-    /// Sends a message into the chat. True when the agent was busy and the
-    /// message was queued behind its current turn.
-    pub fn send_message(&self, chat_id: &str, text: &str) -> Result<bool, TeamClientError> {
-        let path = format!("/v1/chats/{}/message", path_segment(chat_id)?);
-        let response = self.post(&path, serde_json::json!({ "text": text }))?;
-        let bytes = response
-            .bytes()
-            .map_err(|err| TeamClientError::Unreachable(err.to_string()))?;
-        serde_json::from_slice::<TeamActionOutcome>(&bytes)
-            .map(|outcome| outcome.queued)
-            .map_err(|err| TeamClientError::Other(format!("Unexpected answer: {err}")))
     }
 
     pub fn answer_permission(
