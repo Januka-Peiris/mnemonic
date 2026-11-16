@@ -1775,11 +1775,16 @@ pub fn apply_batch(
 }
 
 /// Puts each file of `record` back to what it held before the batch, where
-/// it still holds what the batch wrote, and returns the paths left alone
-/// because they changed since. Files still held are kept as they are.
-/// `record` is updated file by file, so it stays true to the disk when a
-/// write fails part way.
-pub fn undo_batch(root: &Path, record: &mut BatchRecord) -> Result<Vec<String>, String> {
+/// it still holds what the batch wrote and has no unsaved edits in an
+/// editor (`unsaved`, relative to `root`), and returns the paths left
+/// alone. Files still held are kept as they are. `record` is updated file
+/// by file, so it stays true to the disk when a write fails part way.
+pub fn undo_batch(
+    root: &Path,
+    record: &mut BatchRecord,
+    unsaved: &HashSet<String>,
+) -> Result<Vec<String>, String> {
+    let unsaved: HashSet<String> = unsaved.iter().map(|path| fold_case(path)).collect();
     let mut left_alone = Vec::new();
     for file in &mut record.files {
         match file.state {
@@ -1790,10 +1795,24 @@ pub fn undo_batch(root: &Path, record: &mut BatchRecord) -> Result<Vec<String>, 
             }
             BatchFileState::Kept | BatchFileState::Undone => continue,
         }
-        let full_path = safe_relative_path(root, &file.path)?;
-        // A fresh check per file, as putting back an earlier file can add a
-        // name to a folder already listed.
-        SpellingCheck::default().check(root, &file.path)?;
+        if unsaved.contains(&fold_case(&file.path)) {
+            left_alone.push(file.path.clone());
+            continue;
+        }
+        // A fresh spelling check per file, as putting back an earlier file
+        // can add a name to a folder already listed.
+        let checked = safe_relative_path(root, &file.path).and_then(|full_path| {
+            SpellingCheck::default().check(root, &file.path)?;
+            Ok(full_path)
+        });
+        let full_path = match checked {
+            Ok(full_path) => full_path,
+            Err(error) => {
+                log::warn!("Not undoing {}: {error}", file.path);
+                left_alone.push(file.path.clone());
+                continue;
+            }
+        };
         let replaced = replace_if_unchanged(
             root,
             &file.path,
@@ -1852,6 +1871,20 @@ pub fn resolve_held(
             ))
         }
     }
+}
+
+/// The lock held while a batch is applied, undone or resolved in a
+/// workspace, so two of them never interleave on its files.
+pub fn workspace_files_lock(workspace_id: &str) -> std::sync::Arc<std::sync::Mutex<()>> {
+    static LOCKS: std::sync::LazyLock<
+        std::sync::Mutex<HashMap<String, std::sync::Arc<std::sync::Mutex<()>>>>,
+    > = std::sync::LazyLock::new(Default::default);
+    LOCKS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .entry(workspace_id.to_string())
+        .or_default()
+        .clone()
 }
 
 fn batches_dir(data_dir: &Path, workspace_id: &str) -> Result<PathBuf, String> {
@@ -2897,7 +2930,7 @@ mod tests {
         )
         .expect("applies");
 
-        let left_alone = undo_batch(root, &mut record).expect("undoes");
+        let left_alone = undo_batch(root, &mut record, &HashSet::new()).expect("undoes");
 
         assert!(left_alone.is_empty(), "{left_alone:?}");
         assert_eq!(read(root, "changed.txt").as_deref(), Some("one"));
@@ -2925,7 +2958,7 @@ mod tests {
         write(root, "changed.txt", "jay's since");
         std::fs::remove_file(root.join("notes/new.md")).expect("remove");
 
-        let left_alone = undo_batch(root, &mut record).expect("undoes the rest");
+        let left_alone = undo_batch(root, &mut record, &HashSet::new()).expect("undoes the rest");
 
         assert_eq!(left_alone, vec!["changed.txt", "notes/new.md"]);
         assert_eq!(read(root, "changed.txt").as_deref(), Some("jay's since"));
@@ -2989,5 +3022,60 @@ mod tests {
 
         assert_eq!(read(root, "changed.txt").as_deref(), Some("jay's"));
         assert_eq!(state_of(&record, "changed.txt").state, BatchFileState::Kept);
+    }
+
+    #[test]
+    fn undo_leaves_a_file_with_unsaved_edits() {
+        let directory = repo();
+        let root = directory.path();
+        let mut record = apply(
+            root,
+            vec![
+                change("changed.txt", Some("one"), Some("two")),
+                change("kept.txt", Some("kept"), Some("dan's")),
+            ],
+            &[],
+        )
+        .expect("applies");
+
+        let unsaved = HashSet::from(["Changed.TXT".to_string()]);
+        let left_alone = undo_batch(root, &mut record, &unsaved).expect("undoes the rest");
+
+        assert_eq!(left_alone, vec!["changed.txt"]);
+        assert_eq!(read(root, "changed.txt").as_deref(), Some("two"));
+        assert_eq!(read(root, "kept.txt").as_deref(), Some("kept"));
+        assert_eq!(
+            state_of(&record, "changed.txt").state,
+            BatchFileState::Applied
+        );
+    }
+
+    #[test]
+    fn undo_keeps_yours_for_held_files_and_undoes_taken_ones() {
+        let directory = repo();
+        let root = directory.path();
+        write(root, "changed.txt", "jay's");
+        write(root, "kept.txt", "jay's too");
+        let mut record = apply(
+            root,
+            vec![
+                change("changed.txt", Some("one"), Some("dan's")),
+                change("kept.txt", Some("kept"), Some("dan's too")),
+            ],
+            &[],
+        )
+        .expect("holds");
+        resolve_held(root, &mut record, "changed.txt", true).expect("takes");
+
+        let left_alone = undo_batch(root, &mut record, &HashSet::new()).expect("undoes");
+
+        assert!(left_alone.is_empty(), "{left_alone:?}");
+        assert_eq!(read(root, "changed.txt").as_deref(), Some("jay's"));
+        assert_eq!(
+            state_of(&record, "changed.txt").state,
+            BatchFileState::Undone
+        );
+        assert_eq!(read(root, "kept.txt").as_deref(), Some("jay's too"));
+        assert_eq!(state_of(&record, "kept.txt").state, BatchFileState::Kept);
     }
 }

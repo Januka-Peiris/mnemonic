@@ -1487,6 +1487,8 @@ async fn apply_teammate_batch(
         .background_spawn({
             let workspace_id = workspace_id.clone();
             async move {
+                let lock = team_files_service::workspace_files_lock(&workspace_id);
+                let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
                 let record = team_files_service::apply_batch(
                     &root,
                     &skip_list,

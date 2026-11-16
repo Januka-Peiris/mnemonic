@@ -3417,6 +3417,8 @@ impl WorkspaceDetailPanel {
                 .background_spawn({
                     let workspace_id = workspace_id.clone();
                     async move {
+                        let lock = team_files_service::workspace_files_lock(&workspace_id);
+                        let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
                         let mut record = record;
                         let outcome = action(&root, &mut record);
                         let saved = mnemonic_bridge::mnemonic_state_cloned()
@@ -3452,22 +3454,86 @@ impl WorkspaceDetailPanel {
         cx.notify();
     }
 
-    fn undo_teammate_batch(&mut self, batch_id: &str, cx: &mut Context<Self>) {
+    fn undo_teammate_batch(&mut self, batch_id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if self.batch_action_task.is_some() {
+            return;
+        }
+        let Some(record) = self.batches.iter().find(|record| record.id == batch_id) else {
+            return;
+        };
+        let held: Vec<String> = record
+            .files
+            .iter()
+            .filter(|file| matches!(file.state, BatchFileState::Held(_)))
+            .map(|file| file.path.clone())
+            .collect();
+        if held.is_empty() {
+            self.start_undo(batch_id.to_string(), cx);
+            return;
+        }
+        let answer = window.prompt(
+            PromptLevel::Warning,
+            &format!("Undo {}'s changes?", teammate_name(record)),
+            Some(&format!(
+                "These files are still held and will keep your version:\n{}",
+                held.join("\n")
+            )),
+            &["Undo", "Cancel"],
+            cx,
+        );
+        let batch_id = batch_id.to_string();
+        cx.spawn(async move |this, cx| {
+            if answer.await == Ok(0) {
+                this.update(cx, |this, cx| this.start_undo(batch_id, cx))
+                    .log_err();
+            }
+        })
+        .detach();
+    }
+
+    fn start_undo(&mut self, batch_id: String, cx: &mut Context<Self>) {
+        let unsaved = self
+            .summary
+            .as_ref()
+            .and_then(team::workspace_root)
+            .map(|root| team::unsaved_paths(&root, cx))
+            .unwrap_or_default();
         self.run_batch_action(
-            batch_id,
-            |root, record| {
+            &batch_id,
+            move |root, record| {
                 let teammate = teammate_name(record).to_string();
-                match team_files_service::undo_batch(root, record) {
-                    Ok(left_alone) if left_alone.is_empty() => {
-                        Ok(format!("Undid {teammate}'s changes"))
+                let states_before: Vec<BatchFileState> =
+                    record.files.iter().map(|file| file.state).collect();
+                let undone = team_files_service::undo_batch(root, record, &unsaved);
+                let changed_to = |state: BatchFileState| {
+                    record
+                        .files
+                        .iter()
+                        .zip(&states_before)
+                        .filter(|(file, before)| file.state == state && **before != state)
+                        .count()
+                };
+                let files = |count: usize| if count == 1 { "file" } else { "files" };
+                let undone_count = changed_to(BatchFileState::Undone);
+                let kept_count = changed_to(BatchFileState::Kept);
+                let mut message = format!(
+                    "Undid {undone_count} {} of {teammate}'s",
+                    files(undone_count)
+                );
+                if kept_count > 0 {
+                    message.push_str(&format!(", kept yours for {kept_count}"));
+                }
+                match undone {
+                    Ok(left_alone) if left_alone.is_empty() => Ok(message),
+                    Ok(left_alone) => {
+                        message.push_str(&format!(
+                            ", left {} alone: {}",
+                            left_alone.len(),
+                            left_alone.join(", ")
+                        ));
+                        Ok(message)
                     }
-                    Ok(left_alone) => Ok(format!(
-                        "Undid {teammate}'s changes except {}, changed since and left alone",
-                        left_alone.join(", ")
-                    )),
-                    Err(err) => Err(format!(
-                        "Couldn't finish undoing {teammate}'s changes: {err}"
-                    )),
+                    Err(err) => Err(format!("{message}, then stopped: {err}")),
                 }
             },
             cx,
@@ -3594,8 +3660,8 @@ impl WorkspaceDetailPanel {
                                 .tooltip(Tooltip::text(
                                     "Put back each file this batch changed, unless it changed since",
                                 ))
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.undo_teammate_batch(&batch_id, cx);
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.undo_teammate_batch(&batch_id, window, cx);
                                 })),
                         )
                     }),
