@@ -679,10 +679,13 @@ fn mcp_run_tool(
     }
 }
 
+/// `caller_key` identifies one MCP session of one teammate: JSON-RPC ids
+/// restart at 1 in each chat, so a command's cancel key is
+/// `{caller_key}:{request id}`.
 pub fn handle_mcp_message(
     context: &AgentToolContext,
     running: &RunningCommands,
-    caller_login: &str,
+    caller_key: &str,
     body: &[u8],
 ) -> McpReply {
     use serde_json::{Value, json};
@@ -700,10 +703,7 @@ pub fn handle_mcp_message(
     let Some(id) = message.get("id").cloned() else {
         if method == "notifications/cancelled" {
             if let Some(request_id) = message.pointer("/params/requestId") {
-                running.kill(&format!(
-                    "{caller_login}:{}",
-                    mcp_request_id_text(request_id)
-                ));
+                running.kill(&format!("{caller_key}:{}", mcp_request_id_text(request_id)));
             }
         }
         return McpReply::Accepted;
@@ -732,7 +732,7 @@ pub fn handle_mcp_message(
                 return mcp_error_reply(id, -32602, "tools/call requires a tool name");
             };
             let arguments = params.get("arguments").cloned().unwrap_or(json!({}));
-            let call_key = format!("{caller_login}:{}", mcp_request_id_text(&id));
+            let call_key = format!("{caller_key}:{}", mcp_request_id_text(&id));
             let (text, is_error) = match mcp_run_tool(context, running, &call_key, name, &arguments)
             {
                 Ok(text) => (text, false),
@@ -1080,5 +1080,39 @@ mod tests {
         let result = handle.join().expect("thread");
         assert!(started.elapsed() < Duration::from_secs(3));
         assert_eq!(result["result"]["isError"], true);
+    }
+
+    #[test]
+    fn mcp_cancel_only_kills_commands_of_the_same_caller_key() {
+        let root = temp_root("mcp-cancel-key");
+        let context = context(&root);
+        let running = RunningCommands::default();
+        let handle = std::thread::spawn({
+            let context = context.clone();
+            let running = running.clone();
+            move || {
+                let body = serde_json::json!({"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"Bash","arguments":{"command":"sleep 2; echo done"}}});
+                match handle_mcp_message(
+                    &context,
+                    &running,
+                    "alice:session-1",
+                    body.to_string().as_bytes(),
+                ) {
+                    McpReply::Json(text) => {
+                        serde_json::from_str::<serde_json::Value>(&text).expect("json")
+                    }
+                    McpReply::Accepted => panic!("expected a JSON reply"),
+                }
+            }
+        });
+        std::thread::sleep(Duration::from_millis(300));
+        handle_mcp_message(
+            &context,
+            &running,
+            "alice:session-2",
+            br#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":7}}"#,
+        );
+        let result = handle.join().expect("thread");
+        assert_eq!(result["result"]["isError"], false);
     }
 }

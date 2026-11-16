@@ -1093,6 +1093,8 @@ impl TeamShare {
                     .cloned()
                     .unwrap_or_default()
                     .patterns,
+                agents: false,
+                root_path: None,
                 id: summary.id,
                 project: summary.repo,
                 name: summary.name,
@@ -1402,6 +1404,10 @@ fn start_server(
             bundle_source,
             skip_list,
             batch_handler,
+            agent_roots: Arc::new(|_| None),
+            agent_write_check: Arc::new(|_, _| {
+                Err("Teammates' agents aren't set up yet".to_string())
+            }),
         },
         hub,
         Arc::new(TailscaleWhois::default()),

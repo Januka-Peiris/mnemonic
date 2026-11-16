@@ -1,6 +1,9 @@
-//! The HTTP side of team sharing. Reads are GETs. The only writes are two
-//! POSTs on a chat (stop, permission), each handed to the app's
-//! action handler and only for chats the sharer has opened to step-in.
+//! The HTTP side of team sharing. Reads are GETs. Writes are POSTs: stop and
+//! permission on a chat, each handed to the app's action handler and only for
+//! chats the sharer has opened to step-in; a batch of file changes, only for
+//! workspaces that allow editing; and MCP messages from a teammate's agent,
+//! which can write files and run commands in the workspace folder, only for
+//! workspaces whose agents switch is on.
 
 use std::io::Read as _;
 use std::path::PathBuf;
@@ -12,10 +15,13 @@ use std::time::Duration;
 
 use tiny_http::{Header, Method, Request, Response, Server};
 
+use crate::services::team_agent_tools::{
+    AgentToolContext, GitAuthor, McpReply, RunningCommands, handle_mcp_message,
+};
 use crate::services::team_files_service::{SkipList, TeamFileKind, safe_relative_path};
 use crate::services::team_share_service::{
     ActionHandler, BatchHandler, CallerIdentity, MAX_CHAT_WAIT, TEAM_ACP_CRATE_VERSION, TEAM_PROTOCOL_VERSION,
-    TEAM_REQUEST_HEADER, TeamAction, TeamActionError, TeamActionKind, TeamBatchRequest, TeamCaller, TeamHello,
+    TEAM_GIT_AUTHOR_HEADER, TEAM_REQUEST_HEADER, TeamAction, TeamActionError, TeamActionKind, TeamBatchRequest, TeamCaller, TeamHello,
     TeamShareHub, TeamWorkspaceList, is_plain_id, percent_decode,
 };
 
@@ -32,6 +38,12 @@ pub type BundleSource = Arc<dyn Fn(&str, &[String]) -> Result<Vec<u8>, String> +
 /// The files a workspace never serves or accepts.
 pub type SkipListSource = Arc<dyn Fn(&str) -> SkipList + Send + Sync>;
 
+/// A workspace's root, or None unless its agents switch is on.
+pub type AgentRootSource = Arc<dyn Fn(&str) -> Option<PathBuf> + Send + Sync>;
+
+/// Whether a teammate's agent may write the absolute path in the workspace.
+pub type AgentWriteCheck = Arc<dyn Fn(&str, &std::path::Path) -> Result<(), String> + Send + Sync>;
+
 pub struct TeamServerConfig {
     pub bind: IpAddr,
     pub port: u16,
@@ -42,6 +54,8 @@ pub struct TeamServerConfig {
     pub bundle_source: BundleSource,
     pub skip_list: SkipListSource,
     pub batch_handler: BatchHandler,
+    pub agent_roots: AgentRootSource,
+    pub agent_write_check: AgentWriteCheck,
 }
 
 /// Long-polls hold a thread each, so this caps what a misbehaving caller
@@ -50,6 +64,9 @@ const MAX_ACTIVE_REQUESTS: usize = 64;
 /// Diffs past this are cut, so a vendored directory can't stall a viewer.
 const MAX_DIFF_BYTES: usize = 2 * 1024 * 1024;
 const MAX_ACTION_BODY_BYTES: usize = 16 * 1024;
+/// Write carries whole files.
+const MAX_AGENT_BODY_BYTES: usize = MAX_ACTION_BODY_BYTES * 64;
+const MCP_SESSION_HEADER: &str = "Mcp-Session-Id";
 const MAX_BATCH_BODY_BYTES: usize = 512 * 1024 * 1024;
 pub const MAX_BUNDLE_HAVE: usize = 64;
 
@@ -62,6 +79,9 @@ struct Shared {
     bundle_source: BundleSource,
     skip_list: SkipListSource,
     batch_handler: BatchHandler,
+    agent_roots: AgentRootSource,
+    agent_write_check: AgentWriteCheck,
+    running_commands: RunningCommands,
     hello: String,
     allowed_logins: Vec<String>,
     active_requests: AtomicUsize,
@@ -103,6 +123,9 @@ impl TeamShareServer {
             bundle_source: config.bundle_source,
             skip_list: config.skip_list,
             batch_handler: config.batch_handler,
+            agent_roots: config.agent_roots,
+            agent_write_check: config.agent_write_check,
+            running_commands: RunningCommands::default(),
             hello,
             allowed_logins: config
                 .allowed_logins
@@ -225,6 +248,9 @@ fn handle(mut request: Request, shared: &Shared) {
             ["v1", "workspaces", workspace_id, "changes"] if is_plain_id(workspace_id) => {
                 handle_changes(&mut request, shared, &caller, workspace_id)
             }
+            ["v1", "workspaces", workspace_id, "agent"] if is_plain_id(workspace_id) => {
+                handle_agent(&mut request, shared, &caller, workspace_id)
+            }
             _ => text_response(404, "Not found"),
         };
         respond(request, response);
@@ -245,6 +271,9 @@ fn handle(mut request: Request, shared: &Shared) {
                 Err(err) => text_response(500, &err.to_string()),
             }
         }
+        // Claude's streamable HTTP client takes a 405 to mean there is no
+        // server-sent event stream and goes on with plain POSTs.
+        ["v1", "workspaces", _, "agent"] => text_response(405, "Use POST"),
         ["v1", "workspaces", workspace_id, "diff"] if is_plain_id(workspace_id) => {
             if shared.hub.has_workspace(workspace_id) {
                 match (shared.diff_source)(workspace_id) {
@@ -401,6 +430,99 @@ fn handle_action(
         kind,
     });
     outcome_response(outcome)
+}
+
+fn handle_agent(
+    request: &mut Request,
+    shared: &Shared,
+    caller: &TeamCaller,
+    workspace_id: &str,
+) -> Response<std::io::Cursor<Vec<u8>>> {
+    let Some(workspace) = shared
+        .hub
+        .workspaces()
+        .into_iter()
+        .find(|workspace| workspace.id == workspace_id)
+    else {
+        return text_response(404, "No such workspace");
+    };
+    let root = workspace
+        .agents
+        .then(|| (shared.agent_roots)(workspace_id))
+        .flatten();
+    let Some(root) = root else {
+        return text_response(403, "Teammates' agents can't work in this workspace");
+    };
+    let header_value = |name: &'static str| {
+        request
+            .headers()
+            .iter()
+            .find(|header| header.field.equiv(name))
+            .map(|header| header.value.as_str().to_string())
+    };
+    let git_author = header_value(TEAM_GIT_AUTHOR_HEADER)
+        .as_deref()
+        .and_then(parse_git_author);
+    let session = header_value(MCP_SESSION_HEADER).unwrap_or_default();
+    if request
+        .body_length()
+        .is_some_and(|length| length > MAX_AGENT_BODY_BYTES)
+    {
+        return text_response(413, "The request is too long");
+    }
+    let mut body = Vec::new();
+    let read = request
+        .as_reader()
+        .take(MAX_AGENT_BODY_BYTES as u64 + 1)
+        .read_to_end(&mut body);
+    if let Err(err) = read {
+        return text_response(400, &format!("Couldn't read the request: {err}"));
+    }
+    if body.len() > MAX_AGENT_BODY_BYTES {
+        return text_response(413, "The request is too long");
+    }
+
+    let is_initialize = serde_json::from_slice::<serde_json::Value>(&body)
+        .ok()
+        .is_some_and(|message| {
+            message.get("method").and_then(|method| method.as_str()) == Some("initialize")
+        });
+    let session = if is_initialize {
+        uuid::Uuid::new_v4().to_string()
+    } else {
+        session
+    };
+
+    let context = AgentToolContext {
+        root,
+        git_author,
+        can_write: Arc::new({
+            let write_check = shared.agent_write_check.clone();
+            let workspace_id = workspace_id.to_string();
+            move |path| write_check(&workspace_id, path)
+        }),
+    };
+    let caller_key = format!("{}:{session}", caller.login);
+    let mut response =
+        match handle_mcp_message(&context, &shared.running_commands, &caller_key, &body) {
+            McpReply::Json(text) => json_response(200, text),
+            McpReply::Accepted => Response::from_string("").with_status_code(202),
+        };
+    if is_initialize {
+        if let Some(header) = header(MCP_SESSION_HEADER, &session) {
+            response.add_header(header);
+        }
+    }
+    response
+}
+
+fn parse_git_author(value: &str) -> Option<GitAuthor> {
+    let (name, email) = value.trim().strip_suffix('>')?.split_once('<')?;
+    let (name, email) = (name.trim(), email.trim());
+    (!name.is_empty() && !email.is_empty()).then(|| GitAuthor {
+        name: name.to_string(),
+        email: email.to_string(),
+    })
 }
 
 fn outcome_response<T: serde::Serialize>(
@@ -639,6 +761,7 @@ fn respond<R: std::io::Read>(request: Request, response: Response<R>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::services::team_agent_tools::AGENT_MCP_SERVER_NAME;
     use agent_client_protocol::schema as acp;
     use crate::services::team_share_service::{
         TeamActionOutcome, TeamCaller, TeamClient, TeamClientError, TeamEntry, TeamWorkspace,
@@ -694,6 +817,8 @@ mod tests {
                 bundle_source: Arc::new(|_, _| Err("No bundles".to_string())),
                 skip_list: Arc::new(|_| SkipList::default()),
                 batch_handler: Arc::new(|_| Err(TeamActionError::Failed("Unused".to_string()))),
+                agent_roots: Arc::new(|_| None),
+                agent_write_check: Arc::new(|_, _| Ok(())),
             },
             hub,
             Arc::new(FixedLogin(login)),
@@ -770,6 +895,8 @@ mod tests {
             remote_url: None,
             base_branch: None,
             skip_patterns: Vec::new(),
+            agents: false,
+            root_path: None,
         }
     }
 
@@ -794,12 +921,276 @@ mod tests {
                 bundle_source: Arc::new(|_, _| Ok(b"bundle".to_vec())),
                 skip_list: Arc::new(|_| SkipList::default()),
                 batch_handler: Arc::new(|_| Err(TeamActionError::Failed("Unused".to_string()))),
+                agent_roots: Arc::new(|_| None),
+                agent_write_check: Arc::new(|_, _| Ok(())),
             },
             hub,
             Arc::new(FixedLogin(Some("bob@example.com"))),
             Arc::new(|_: &str| Ok(String::new())),
             Arc::new(|_| Ok(TeamActionOutcome {})),
         )
+    }
+
+    fn start_agents(
+        root: PathBuf,
+        agents: bool,
+        login: &'static str,
+        write_check: AgentWriteCheck,
+    ) -> Result<TeamShareServer, String> {
+        let hub = TeamShareHub::new();
+        hub.set_workspaces(vec![TeamWorkspace {
+            agents,
+            root_path: agents.then(|| root.to_string_lossy().into_owned()),
+            ..workspace("ws-1")
+        }]);
+        TeamShareServer::start(
+            TeamServerConfig {
+                bind: IpAddr::V4(Ipv4Addr::LOCALHOST),
+                port: 0,
+                display_name: "Alice".to_string(),
+                allowed_logins: vec!["bob@example.com".to_string()],
+                files: Arc::new(|_| None),
+                bundle_source: Arc::new(|_, _| Err("No bundles".to_string())),
+                skip_list: Arc::new(|_| SkipList::default()),
+                batch_handler: Arc::new(|_| Err(TeamActionError::Failed("Unused".to_string()))),
+                agent_roots: Arc::new(move |_| Some(root.clone())),
+                agent_write_check: write_check,
+            },
+            hub,
+            Arc::new(FixedLogin(Some(login))),
+            Arc::new(|_: &str| Ok(String::new())),
+            Arc::new(|_| Ok(TeamActionOutcome {})),
+        )
+    }
+
+    /// Posts `body` to the agent endpoint and returns the status and the
+    /// whole answer, headers included.
+    fn raw_agent_post(
+        address: SocketAddr,
+        extra_headers: &str,
+        body: &str,
+    ) -> Result<(u16, String), String> {
+        let request = format!(
+            "POST /v1/workspaces/ws-1/agent HTTP/1.1\r\nHost: {address}\r\n\
+             Content-Type: application/json\r\n{extra_headers}\
+             Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let mut stream = TcpStream::connect(address).map_err(|err| err.to_string())?;
+        stream
+            .set_read_timeout(Some(Duration::from_secs(20)))
+            .map_err(|err| err.to_string())?;
+        stream
+            .write_all(request.as_bytes())
+            .map_err(|err| err.to_string())?;
+        let mut answer = String::new();
+        stream
+            .read_to_string(&mut answer)
+            .map_err(|err| err.to_string())?;
+        let status = answer
+            .split_whitespace()
+            .nth(1)
+            .and_then(|code| code.parse().ok())
+            .ok_or_else(|| format!("No status in {answer:?}"))?;
+        Ok((status, answer))
+    }
+
+    const TEAM_HEADER: &str = "X-Mnemonic-Team: 5\r\n";
+
+    fn call_body(id: u32, name: &str, arguments: serde_json::Value) -> String {
+        serde_json::json!({"jsonrpc":"2.0","id":id,"method":"tools/call","params":{"name":name,"arguments":arguments}}).to_string()
+    }
+
+    #[test]
+    fn agent_endpoint_answers_mcp_when_agents_are_on() -> Result<(), String> {
+        let root = tempfile::tempdir().map_err(|err| err.to_string())?;
+        let server = start_agents(
+            root.path().to_path_buf(),
+            true,
+            "bob@example.com",
+            Arc::new(|_, _| Ok(())),
+        )?;
+        let body = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26"}}"#;
+
+        let (status, answer) = raw_agent_post(server.address(), TEAM_HEADER, body)?;
+
+        assert_eq!(status, 200);
+        assert!(answer.contains(AGENT_MCP_SERVER_NAME), "{answer}");
+        assert!(
+            answer.to_lowercase().contains("mcp-session-id:"),
+            "{answer}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn agent_endpoint_refuses_when_agents_are_off() -> Result<(), String> {
+        let root = tempfile::tempdir().map_err(|err| err.to_string())?;
+        let server = start_agents(
+            root.path().to_path_buf(),
+            false,
+            "bob@example.com",
+            Arc::new(|_, _| Ok(())),
+        )?;
+
+        let (status, _) = raw_agent_post(
+            server.address(),
+            TEAM_HEADER,
+            &call_body(1, "Bash", serde_json::json!({"command": "echo hi"})),
+        )?;
+
+        assert_eq!(status, 403);
+        Ok(())
+    }
+
+    #[test]
+    fn agent_endpoint_refuses_browser_requests() -> Result<(), String> {
+        let root = tempfile::tempdir().map_err(|err| err.to_string())?;
+        let server = start_agents(
+            root.path().to_path_buf(),
+            true,
+            "bob@example.com",
+            Arc::new(|_, _| Ok(())),
+        )?;
+        let body = call_body(1, "Bash", serde_json::json!({"command": "echo hi"}));
+
+        let (with_origin, _) = raw_agent_post(
+            server.address(),
+            &format!("{TEAM_HEADER}Origin: https://evil.example\r\n"),
+            &body,
+        )?;
+        let (without_header, _) = raw_agent_post(server.address(), "", &body)?;
+
+        assert_eq!(with_origin, 403);
+        assert_eq!(without_header, 400);
+        Ok(())
+    }
+
+    #[test]
+    fn agent_endpoint_refuses_callers_off_the_allow_list() -> Result<(), String> {
+        let root = tempfile::tempdir().map_err(|err| err.to_string())?;
+        let server = start_agents(
+            root.path().to_path_buf(),
+            true,
+            "stranger",
+            Arc::new(|_, _| Ok(())),
+        )?;
+
+        let (status, _) = raw_agent_post(
+            server.address(),
+            TEAM_HEADER,
+            &call_body(1, "Bash", serde_json::json!({"command": "echo hi"})),
+        )?;
+
+        assert_eq!(status, 403);
+        Ok(())
+    }
+
+    #[test]
+    fn agent_writes_ask_the_write_check() -> Result<(), String> {
+        let root = tempfile::tempdir().map_err(|err| err.to_string())?;
+        let server = start_agents(
+            root.path().to_path_buf(),
+            true,
+            "bob@example.com",
+            Arc::new(|_, _| Err("unsaved".to_string())),
+        )?;
+        let target = root.path().join("new.txt");
+        let body = call_body(
+            1,
+            "Write",
+            serde_json::json!({"file_path": target.to_string_lossy(), "content": "x"}),
+        );
+
+        let (status, answer) = raw_agent_post(server.address(), TEAM_HEADER, &body)?;
+
+        assert_eq!(status, 200);
+        assert!(answer.contains(r#""isError":true"#), "{answer}");
+        assert!(answer.contains("unsaved"), "{answer}");
+        assert!(!target.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn agent_get_is_405_and_commands_of_two_sessions_do_not_cancel_each_other() -> Result<(), String>
+    {
+        let root = tempfile::tempdir().map_err(|err| err.to_string())?;
+        let server = start_agents(
+            root.path().to_path_buf(),
+            true,
+            "bob@example.com",
+            Arc::new(|_, _| Ok(())),
+        )?;
+        let address = server.address();
+        let get = format!(
+            "GET /v1/workspaces/ws-1/agent HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n"
+        );
+        assert_eq!(raw_status(address, &get)?, 405);
+
+        let running = std::thread::spawn(move || {
+            raw_agent_post(
+                address,
+                &format!("{TEAM_HEADER}Mcp-Session-Id: one\r\n"),
+                &call_body(
+                    7,
+                    "Bash",
+                    serde_json::json!({"command": "sleep 2; echo finished"}),
+                ),
+            )
+        });
+        std::thread::sleep(Duration::from_millis(500));
+        let cancel =
+            r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":7}}"#;
+        let (status, _) = raw_agent_post(
+            address,
+            &format!("{TEAM_HEADER}Mcp-Session-Id: two\r\n"),
+            cancel,
+        )?;
+        assert_eq!(status, 202);
+
+        let (_, answer) = running
+            .join()
+            .map_err(|_| "thread panicked".to_string())??;
+        assert!(answer.contains(r#""isError":false"#), "{answer}");
+        assert!(answer.contains("finished"), "{answer}");
+        Ok(())
+    }
+
+    #[test]
+    fn agent_read_maps_a_missing_file_to_none() -> Result<(), String> {
+        let root = tempfile::tempdir().map_err(|err| err.to_string())?;
+        std::fs::write(root.path().join("a.txt"), "hello\n").map_err(|err| err.to_string())?;
+        let server = start_agents(
+            root.path().to_path_buf(),
+            true,
+            "bob@example.com",
+            Arc::new(|_, _| Ok(())),
+        )?;
+        let client =
+            TeamClient::new(&server.address().to_string(), 0).map_err(|err| err.to_string())?;
+        let present = root.path().join("a.txt");
+        let missing = root.path().join("missing.txt");
+
+        let text = client
+            .agent_read("ws-1", &present.to_string_lossy())
+            .map_err(|err| err.to_string())?
+            .ok_or("file should exist")?;
+        assert!(text.contains("hello"));
+        assert_eq!(
+            client.agent_read("ws-1", &missing.to_string_lossy()),
+            Ok(None)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn git_author_header_is_parsed() {
+        let author = parse_git_author("Bob Smith <bob@example.com>").expect("author");
+        assert_eq!(
+            (author.name.as_str(), author.email.as_str()),
+            ("Bob Smith", "bob@example.com")
+        );
+        assert!(parse_git_author("nobody").is_none());
     }
 
     fn manifest_of(path: &str, bytes: &[u8]) -> TeamFileManifest {
@@ -826,15 +1217,21 @@ mod tests {
         let client =
             TeamClient::new(&server.address().to_string(), 0).map_err(|err| err.to_string())?;
 
-        assert!(client
-            .files("ws-1", None, Duration::ZERO)
-            .is_err_and(|err| err == TeamClientError::Forbidden));
-        assert!(client
-            .file("ws-1", "a.txt")
-            .is_err_and(|err| refused(403)(&err)));
-        assert!(client
-            .bundle("ws-1", &[])
-            .is_err_and(|err| refused(403)(&err)));
+        assert!(
+            client
+                .files("ws-1", None, Duration::ZERO)
+                .is_err_and(|err| err == TeamClientError::Forbidden)
+        );
+        assert!(
+            client
+                .file("ws-1", "a.txt")
+                .is_err_and(|err| refused(403)(&err))
+        );
+        assert!(
+            client
+                .bundle("ws-1", &[])
+                .is_err_and(|err| refused(403)(&err))
+        );
         Ok(())
     }
 
@@ -925,9 +1322,11 @@ mod tests {
             changes: Vec::new(),
         };
 
-        assert!(client
-            .send_changes("ws-1", &batch)
-            .is_err_and(|err| refused(403)(&err)));
+        assert!(
+            client
+                .send_changes("ws-1", &batch)
+                .is_err_and(|err| refused(403)(&err))
+        );
         Ok(())
     }
 
@@ -1058,9 +1457,11 @@ mod tests {
             TeamClient::new(&server.address().to_string(), 0).map_err(|err| err.to_string())?;
 
         assert!(client.stop("chat-1").is_err_and(|err| refused(403)(&err)));
-        assert!(client
-            .answer_permission("chat-1", "call-1", "allow")
-            .is_err_and(|err| refused(403)(&err)));
+        assert!(
+            client
+                .answer_permission("chat-1", "call-1", "allow")
+                .is_err_and(|err| refused(403)(&err))
+        );
         assert!(recorded.lock().map_err(|err| err.to_string())?.is_empty());
         Ok(())
     }
