@@ -1467,8 +1467,9 @@ async fn apply_teammate_batch(
         login: request.login.clone(),
         name: request.from.clone(),
     };
+    let actor = actor_name(&request.from, &request.login);
     let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
-    let record = cx
+    let applied = cx
         .background_spawn({
             let workspace_id = workspace_id.clone();
             async move {
@@ -1481,32 +1482,46 @@ async fn apply_teammate_batch(
                     &now,
                 )
                 .map_err(TeamActionError::Invalid)?;
-                match mnemonic_bridge::mnemonic_state_cloned() {
-                    Some(app) => {
-                        if let Err(err) = team_files_service::save_batch_record(
-                            &app.data_dir,
-                            &workspace_id,
-                            &record,
-                        ) {
-                            log::error!("Couldn't save a teammate's batch {}: {err}", record.id);
-                        }
-                    }
-                    None => log::error!(
-                        "Couldn't save a teammate's batch {}: Mnemonic isn't ready",
-                        record.id
-                    ),
+                let saved = mnemonic_bridge::mnemonic_state_cloned()
+                    .ok_or_else(|| "Mnemonic isn't ready".to_string())
+                    .and_then(|app| {
+                        team_files_service::save_batch_record(&app.data_dir, &workspace_id, &record)
+                    });
+                if let Err(err) = &saved {
+                    log::error!("Couldn't save a teammate's batch {}: {err}", record.id);
                 }
-                Ok(record)
+                Ok((record, saved.err()))
             }
         })
-        .await?;
-    let outcome = record.outcome();
-    let message = batch_notice(
-        &actor_name(&record.name, &record.login),
-        outcome.applied.len(),
-        outcome.held.len(),
-        &workspace_name,
-    );
+        .await;
+    let (outcome, message) = match applied {
+        Ok((record, save_error)) => {
+            let outcome = record.outcome();
+            let mut message = batch_notice(
+                &actor,
+                outcome.applied.len(),
+                outcome.held.len(),
+                &workspace_name,
+            );
+            if let Some(err) = save_error {
+                message.push_str(&format!(" (couldn't record it: {err})"));
+            }
+            (Ok(outcome), message)
+        }
+        Err(err) => {
+            let reason = match &err {
+                TeamActionError::Invalid(reason)
+                | TeamActionError::NotAllowed(reason)
+                | TeamActionError::NothingToDo(reason)
+                | TeamActionError::Failed(reason) => reason.clone(),
+                TeamActionError::NotLoaded => "the workspace isn't open".to_string(),
+            };
+            (
+                Err(err),
+                format!("{actor}'s changes to {workspace_name} weren't applied: {reason}"),
+            )
+        }
+    };
     cx.update(|cx| {
         if let Some(window) =
             find_workspace_window(&workspace_id, cx).or_else(|| open_windows(cx).into_iter().next())
@@ -1514,12 +1529,21 @@ async fn apply_teammate_batch(
             show_step_in_notice(&window, message, cx);
         }
     });
-    Ok(outcome)
+    outcome
 }
 
 fn batch_notice(actor: &str, applied: usize, held: usize, workspace_name: &str) -> String {
-    let files = if applied == 1 { "file" } else { "files" };
-    let mut message = format!("{actor} changed {applied} {files} in {workspace_name}");
+    let files = |count: usize| if count == 1 { "file" } else { "files" };
+    if applied == 0 && held > 0 {
+        return format!(
+            "{actor} sent {held} {} in {workspace_name}, all held for you",
+            files(held)
+        );
+    }
+    let mut message = format!(
+        "{actor} changed {applied} {} in {workspace_name}",
+        files(applied)
+    );
     if held > 0 {
         message.push_str(&format!(", {held} held for you"));
     }

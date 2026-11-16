@@ -73,7 +73,10 @@ const SECRET_FLOOR: [&str; 6] = [
 ];
 
 impl SkipList {
+    /// Compared without regard to ASCII case, as on a case-insensitive
+    /// disk `.ENV` is the same file as `.env`.
     pub fn skips(&self, path: &str) -> bool {
+        let path = path.to_ascii_lowercase();
         let components: Vec<&str> = path
             .split('/')
             .filter(|component| !component.is_empty())
@@ -88,15 +91,13 @@ impl SkipList {
             .map(String::as_str)
             .chain(SECRET_FLOOR.iter().copied());
         patterns.into_iter().any(|pattern| {
+            let pattern = pattern.to_ascii_lowercase();
             if pattern.contains('/') {
                 pattern == normalized
             } else if pattern.contains('*') {
-                glob_matches(pattern, final_component)
+                glob_matches(&pattern, final_component)
             } else {
-                components.iter().any(|component| {
-                    *component == pattern
-                        || (pattern == ".git" && component.eq_ignore_ascii_case(".git"))
-                })
+                components.iter().any(|component| *component == pattern)
             }
         })
     }
@@ -246,7 +247,9 @@ pub fn file_hash(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
+/// Compared without regard to ASCII case, like `SkipList::skips`.
 pub fn needs_approval(path: &str) -> bool {
+    let path = path.to_ascii_lowercase();
     let mut components = path.split('/').filter(|component| !component.is_empty());
     match components.next() {
         Some(".mnemonic" | ".claude" | ".zed" | ".vscode") => true,
@@ -1387,7 +1390,7 @@ pub fn merge_follow_round(
 /// A batch ready to send, and the edits that can't be sent in one.
 pub struct OutgoingBatch {
     pub batch: TeamChangeBatch,
-    /// Links and folders, which a batch can't carry.
+    /// Why each edit that can't be sent was left out, one line per path.
     pub left_out: Vec<String>,
 }
 
@@ -1409,7 +1412,7 @@ pub fn build_batch(
             Ok(full_path) => full_path,
             Err(reason) => {
                 log::warn!("Not sending {path}: {reason}");
-                left_out.push(path.clone());
+                left_out.push(reason);
                 continue;
             }
         };
@@ -1419,7 +1422,9 @@ pub fn build_batch(
                     .map_err(|error| format!("could not read {path}: {error}"))?,
             ),
             Ok(_) => {
-                left_out.push(path.clone());
+                left_out.push(format!(
+                    "{path} is a link or folder, and only files can be sent"
+                ));
                 continue;
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
@@ -1520,21 +1525,22 @@ fn read_existing(path: &str, full_path: &Path) -> Result<Option<Vec<u8>>, String
     }
 }
 
-/// Writes `content` at `full_path`, or removes it when None, keeping an
-/// existing file's permissions.
-fn write_batch_file(full_path: &Path, content: Option<&[u8]>) -> Result<(), String> {
+/// Writes `content` at `full_path` with `permissions`, or removes it when
+/// None.
+fn write_batch_file(
+    full_path: &Path,
+    content: Option<&[u8]>,
+    permissions: Option<&std::fs::Permissions>,
+) -> Result<(), String> {
     let Some(bytes) = content else {
         return remove_if_present(full_path);
     };
-    let permissions = std::fs::symlink_metadata(full_path)
-        .ok()
-        .map(|metadata| metadata.permissions());
     replace_atomically(full_path, |temp_path| {
         std::fs::write(temp_path, bytes)
             .map_err(|error| format!("could not write {}: {error}", full_path.display()))?;
         match permissions {
             Some(permissions) => {
-                std::fs::set_permissions(temp_path, permissions).map_err(|error| {
+                std::fs::set_permissions(temp_path, permissions.clone()).map_err(|error| {
                     format!(
                         "could not set permissions on {}: {error}",
                         full_path.display()
@@ -1544,6 +1550,36 @@ fn write_batch_file(full_path: &Path, content: Option<&[u8]>) -> Result<(), Stri
             None => Ok(()),
         }
     })
+}
+
+/// Writes one file of a batch, unless the sharer's file changed since the
+/// batch was checked, in which case it is held with what is there now.
+/// Returns the permissions the file had when it was written, so it can be
+/// put back.
+fn write_checked_file(
+    root: &Path,
+    file: &mut BatchFile,
+    full_path: &Path,
+) -> Result<Option<Option<std::fs::Permissions>>, String> {
+    // Checked again just before writing, in case a link appeared on the way
+    // or the sharer's side wrote the file since the batch was checked.
+    safe_relative_path(root, &file.path)?;
+    let permissions = std::fs::symlink_metadata(full_path)
+        .ok()
+        .map(|metadata| metadata.permissions());
+    let now = read_existing(&file.path, full_path)?;
+    if now != file.before {
+        let already_there = now.as_deref().map(file_hash) == file.after.as_deref().map(file_hash);
+        file.state = if already_there {
+            BatchFileState::Applied
+        } else {
+            BatchFileState::Held(HeldReason::ChangedSinceYourCopy)
+        };
+        file.before = now;
+        return Ok(None);
+    }
+    write_batch_file(full_path, file.after.as_deref(), permissions.as_ref())?;
+    Ok(Some(permissions))
 }
 
 /// Applies a teammate's batch to the workspace at `root`. Every path is
@@ -1561,11 +1597,17 @@ pub fn apply_batch(
     caller: &TeamCaller,
     now: &str,
 ) -> Result<BatchRecord, String> {
+    // Paths are compared without regard to case, as on a case-insensitive
+    // disk two spellings name one file.
+    let unsaved: HashSet<String> = unsaved
+        .iter()
+        .map(|path| path.to_ascii_lowercase())
+        .collect();
     let mut seen = HashSet::new();
     let mut checked = Vec::with_capacity(batch.changes.len());
     for change in &batch.changes {
         let path = change.path.as_str();
-        if !seen.insert(path) {
+        if !seen.insert(path.to_ascii_lowercase()) {
             return Err(format!("{path} is in the batch twice"));
         }
         if skip.skips(path) {
@@ -1584,14 +1626,14 @@ pub fn apply_batch(
         let already_there = current_hash == change.content.as_deref().map(file_hash);
         let state = if already_there {
             BatchFileState::Applied
-        } else if unsaved.contains(path) {
+        } else if unsaved.contains(&path.to_ascii_lowercase()) {
             BatchFileState::Held(HeldReason::UnsavedInEditor)
         } else if current_hash != change.base_hash {
             BatchFileState::Held(HeldReason::ChangedSinceYourCopy)
         } else if needs_approval(path) {
             BatchFileState::Held(HeldReason::NeedsApproval)
         } else {
-            to_write.push((path, full_path, files.len()));
+            to_write.push((full_path, files.len()));
             BatchFileState::Applied
         };
         files.push(BatchFile {
@@ -1602,27 +1644,29 @@ pub fn apply_batch(
         });
     }
 
-    let mut written: Vec<(&Path, Option<&[u8]>)> = Vec::new();
-    for (path, full_path, index) in &to_write {
-        let Some(file) = files.get(*index) else {
+    let mut written: Vec<(&Path, usize, Option<std::fs::Permissions>)> = Vec::new();
+    for (full_path, index) in &to_write {
+        let Some(file) = files.get_mut(*index) else {
             continue;
         };
-        // Checked again just before writing, in case a link appeared on the
-        // way since the batch was checked.
-        let result = safe_relative_path(root, path)
-            .and_then(|_| write_batch_file(full_path, file.after.as_deref()));
-        if let Err(error) = result {
-            for (written_path, before) in written.into_iter().rev() {
-                if let Err(undo_error) = write_batch_file(written_path, before) {
-                    log::error!(
-                        "Couldn't put back {} after a failed batch: {undo_error}",
-                        written_path.display()
-                    );
+        match write_checked_file(root, file, full_path) {
+            Ok(Some(permissions)) => written.push((full_path.as_path(), *index, permissions)),
+            Ok(None) => {}
+            Err(error) => {
+                for (written_path, index, permissions) in written.into_iter().rev() {
+                    let before = files.get(index).and_then(|file| file.before.as_deref());
+                    if let Err(undo_error) =
+                        write_batch_file(written_path, before, permissions.as_ref())
+                    {
+                        log::error!(
+                            "Couldn't put back {} after a failed batch: {undo_error}",
+                            written_path.display()
+                        );
+                    }
                 }
+                return Err(error);
             }
-            return Err(error);
         }
-        written.push((full_path.as_path(), file.before.as_deref()));
     }
 
     Ok(BatchRecord {
@@ -2360,6 +2404,8 @@ mod tests {
             vec![
                 change(".claude/settings.json", None, Some("{\"hooks\":{}}")),
                 change(".envrc", None, Some("export X=1")),
+                change(".Claude/settings.local2.json", None, Some("{}")),
+                change("sub/.ENVRC", None, Some("export X=1")),
             ],
             &[],
         )
@@ -2367,6 +2413,8 @@ mod tests {
 
         assert_eq!(read(root, ".claude/settings.json"), None);
         assert_eq!(read(root, ".envrc"), None);
+        assert_eq!(read(root, ".Claude/settings.local2.json"), None);
+        assert_eq!(read(root, "sub/.ENVRC"), None);
         for file in &record.files {
             assert_eq!(
                 file.state,
@@ -2406,9 +2454,12 @@ mod tests {
 
         let mut bad_paths = vec![
             ".env",
+            ".ENV",
             "config/.env.local",
             "server.pem",
+            "X.PEM",
             "node_modules/x.js",
+            "NODE_MODULES/x.js",
             ".git/config",
             "../outside.txt",
             "/tmp/outside.txt",
@@ -2451,6 +2502,55 @@ mod tests {
         );
         assert!(twice.is_err(), "a path named twice rejects the batch");
         assert_eq!(read(root, "kept.txt").as_deref(), Some("kept"));
+
+        let two_spellings = apply(
+            root,
+            vec![
+                change("a.txt", None, Some("first")),
+                change("A.txt", None, Some("second")),
+            ],
+            &[],
+        );
+        assert!(
+            two_spellings.is_err(),
+            "two spellings of one path reject the batch"
+        );
+        assert_eq!(read(root, "a.txt"), None);
+    }
+
+    #[test]
+    fn a_failed_write_puts_back_what_was_written() {
+        let directory = repo();
+        let root = directory.path();
+        write(root, "tool.sh", "#!/bin/sh");
+        #[cfg(unix)]
+        set_executable(&root.join("tool.sh"), true).expect("chmod");
+
+        // "blocker" is written as a file first, so its folder can't be made.
+        let result = apply(
+            root,
+            vec![
+                change("tool.sh", Some("#!/bin/sh"), None),
+                change("kept.txt", Some("kept"), Some("dan's")),
+                change("blocker", None, Some("a file")),
+                change("blocker/inside.txt", None, Some("inside")),
+            ],
+            &[],
+        );
+
+        assert!(result.is_err());
+        assert_eq!(read(root, "tool.sh").as_deref(), Some("#!/bin/sh"));
+        assert_eq!(read(root, "kept.txt").as_deref(), Some("kept"));
+        assert!(!root.join("blocker").exists());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(root.join("tool.sh"))
+                .expect("stat")
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o755, "kept its mode");
+        }
     }
 
     #[test]

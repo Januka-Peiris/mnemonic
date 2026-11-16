@@ -908,16 +908,24 @@ fn refresh_edits(team: &Entity<TeamShare>, local_workspace_id: String, cx: &mut 
     .detach();
 }
 
+/// The unsent edits worth sending: all but files the sharer held that
+/// haven't changed since they were sent, as sending them again would only
+/// be held again.
+fn sendable_paths(copy: &CopyFollow, edits: &BTreeMap<String, String>) -> Vec<String> {
+    edits
+        .iter()
+        .filter(|(path, hash)| copy.held.get(*path) != Some(*hash))
+        .map(|(path, _)| path.clone())
+        .collect()
+}
+
 fn sent_message(sharer_name: &str, applied: usize, held: usize, left_out: &[String]) -> String {
     let mut message = format!("Sent to {sharer_name}: {applied} applied");
     if held > 0 {
         message.push_str(&format!(", {held} held by {sharer_name}"));
     }
     if !left_out.is_empty() {
-        message.push_str(&format!(
-            ". Links and folders can't be sent: {}",
-            left_out.join(", ")
-        ));
+        message.push_str(&format!(". Not sent: {}", left_out.join("; ")));
     }
     message
 }
@@ -934,7 +942,7 @@ fn send_changes(local_workspace_id: String, window: &mut Window, cx: &mut App) {
         let team = team.read(cx);
         team.copies.get(&local_workspace_id).and_then(|copy| {
             let panel = copy.send.as_ref().filter(|panel| !panel.busy)?;
-            let paths: Vec<String> = panel.edits.as_ref()?.keys().cloned().collect();
+            let paths = sendable_paths(copy, panel.edits.as_ref()?);
             let client = team
                 .peer(&copy.state.host)
                 .and_then(|peer| peer.client.clone());
@@ -1133,7 +1141,10 @@ fn render_send_panel(
     cx: &App,
 ) -> AnyElement {
     let name = &copy.state.sharer_name;
-    let count = panel.edits.as_ref().map_or(0, BTreeMap::len);
+    let count = panel
+        .edits
+        .as_ref()
+        .map_or(0, |edits| sendable_paths(copy, edits).len());
     let list = match &panel.edits {
         None => Label::new("Looking for your changes...")
             .size(LabelSize::Small)

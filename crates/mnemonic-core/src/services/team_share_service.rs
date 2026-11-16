@@ -922,7 +922,9 @@ impl std::fmt::Display for TeamClientError {
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(4);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 const FILE_TIMEOUT: Duration = Duration::from_secs(300);
-const BATCH_TIMEOUT: Duration = Duration::from_secs(120);
+/// Longer than the sharer waits for its app to take the batch (120 s), so
+/// a batch taken just before then isn't reported failed after applying.
+const BATCH_TIMEOUT: Duration = Duration::from_secs(150);
 /// The longest a chat request waits for changes, shared by both ends.
 pub const MAX_CHAT_WAIT: Duration = Duration::from_secs(25);
 
