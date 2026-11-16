@@ -1614,6 +1614,38 @@ impl SpellingCheck {
     }
 }
 
+/// What `replace_if_unchanged` found.
+enum Replaced {
+    /// Written, with the permissions the file had, so it can be put back.
+    Written(Option<std::fs::Permissions>),
+    /// Left alone, as the file no longer held what was expected; this is
+    /// what it holds instead.
+    Changed(Option<Vec<u8>>),
+}
+
+/// Writes `content` at `path` with the file's permissions, or removes it
+/// when None, only while the file holds `expected` (None: nothing there).
+fn replace_if_unchanged(
+    root: &Path,
+    path: &str,
+    full_path: &Path,
+    expected: Option<&[u8]>,
+    content: Option<&[u8]>,
+) -> Result<Replaced, String> {
+    // Checked again just before writing, in case a link appeared on the way
+    // or the sharer's side wrote the file since it was last read.
+    safe_relative_path(root, path)?;
+    let permissions = std::fs::symlink_metadata(full_path)
+        .ok()
+        .map(|metadata| metadata.permissions());
+    let now = read_existing(path, full_path)?;
+    if now.as_deref() != expected {
+        return Ok(Replaced::Changed(now));
+    }
+    write_batch_file(full_path, content, permissions.as_ref())?;
+    Ok(Replaced::Written(permissions))
+}
+
 /// Writes one file of a batch, unless the sharer's file changed since the
 /// batch was checked, in which case it is held with what is there now.
 /// Returns the permissions the file had when it was written, so it can be
@@ -1623,25 +1655,27 @@ fn write_checked_file(
     file: &mut BatchFile,
     full_path: &Path,
 ) -> Result<Option<Option<std::fs::Permissions>>, String> {
-    // Checked again just before writing, in case a link appeared on the way
-    // or the sharer's side wrote the file since the batch was checked.
-    safe_relative_path(root, &file.path)?;
-    let permissions = std::fs::symlink_metadata(full_path)
-        .ok()
-        .map(|metadata| metadata.permissions());
-    let now = read_existing(&file.path, full_path)?;
-    if now != file.before {
-        let already_there = now.as_deref().map(file_hash) == file.after.as_deref().map(file_hash);
-        file.state = if already_there {
-            BatchFileState::Applied
-        } else {
-            BatchFileState::Held(HeldReason::ChangedSinceYourCopy)
-        };
-        file.before = now;
-        return Ok(None);
+    let replaced = replace_if_unchanged(
+        root,
+        &file.path,
+        full_path,
+        file.before.as_deref(),
+        file.after.as_deref(),
+    )?;
+    match replaced {
+        Replaced::Written(permissions) => Ok(Some(permissions)),
+        Replaced::Changed(now) => {
+            let already_there =
+                now.as_deref().map(file_hash) == file.after.as_deref().map(file_hash);
+            file.state = if already_there {
+                BatchFileState::Applied
+            } else {
+                BatchFileState::Held(HeldReason::ChangedSinceYourCopy)
+            };
+            file.before = now;
+            Ok(None)
+        }
     }
-    write_batch_file(full_path, file.after.as_deref(), permissions.as_ref())?;
-    Ok(Some(permissions))
 }
 
 /// Applies a teammate's batch to the workspace at `root`. Every path is
@@ -1738,6 +1772,86 @@ pub fn apply_batch(
         note: batch.note.clone(),
         files,
     })
+}
+
+/// Puts each file of `record` back to what it held before the batch, where
+/// it still holds what the batch wrote, and returns the paths left alone
+/// because they changed since. Files still held are kept as they are.
+/// `record` is updated file by file, so it stays true to the disk when a
+/// write fails part way.
+pub fn undo_batch(root: &Path, record: &mut BatchRecord) -> Result<Vec<String>, String> {
+    let mut left_alone = Vec::new();
+    for file in &mut record.files {
+        match file.state {
+            BatchFileState::Applied | BatchFileState::Taken => {}
+            BatchFileState::Held(_) => {
+                file.state = BatchFileState::Kept;
+                continue;
+            }
+            BatchFileState::Kept | BatchFileState::Undone => continue,
+        }
+        let full_path = safe_relative_path(root, &file.path)?;
+        // A fresh check per file, as putting back an earlier file can add a
+        // name to a folder already listed.
+        SpellingCheck::default().check(root, &file.path)?;
+        let replaced = replace_if_unchanged(
+            root,
+            &file.path,
+            &full_path,
+            file.after.as_deref(),
+            file.before.as_deref(),
+        )?;
+        match replaced {
+            Replaced::Written(_) => file.state = BatchFileState::Undone,
+            Replaced::Changed(_) => left_alone.push(file.path.clone()),
+        }
+    }
+    Ok(left_alone)
+}
+
+/// Settles a held file of `record`: keeps the owner's version, or writes
+/// the teammate's when the file still holds what it did when it was held.
+/// A file changed since stays held, now showing what it holds, and is left
+/// alone.
+pub fn resolve_held(
+    root: &Path,
+    record: &mut BatchRecord,
+    path: &str,
+    take_teammates: bool,
+) -> Result<(), String> {
+    let file = record
+        .files
+        .iter_mut()
+        .find(|file| file.path == path)
+        .ok_or_else(|| format!("{path} isn't in this batch"))?;
+    if !matches!(file.state, BatchFileState::Held(_)) {
+        return Err(format!("{path} isn't held"));
+    }
+    if !take_teammates {
+        file.state = BatchFileState::Kept;
+        return Ok(());
+    }
+    let full_path = safe_relative_path(root, path)?;
+    SpellingCheck::default().check(root, path)?;
+    let replaced = replace_if_unchanged(
+        root,
+        path,
+        &full_path,
+        file.before.as_deref(),
+        file.after.as_deref(),
+    )?;
+    match replaced {
+        Replaced::Written(_) => {
+            file.state = BatchFileState::Taken;
+            Ok(())
+        }
+        Replaced::Changed(now) => {
+            file.before = now;
+            Err(format!(
+                "{path} changed again since it was held, so it was left alone"
+            ))
+        }
+    }
 }
 
 fn batches_dir(data_dir: &Path, workspace_id: &str) -> Result<PathBuf, String> {
@@ -2766,5 +2880,114 @@ mod tests {
             merged.synced.get("d.md").map(String::as_str),
             Some("d-sent")
         );
+    }
+
+    #[test]
+    fn undo_restores_files_that_still_hold_the_batch() {
+        let directory = repo();
+        let root = directory.path();
+        let mut record = apply(
+            root,
+            vec![
+                change("changed.txt", Some("one"), Some("two")),
+                change("notes/new.md", None, Some("hello")),
+                change("gone.txt", Some("gone"), None),
+            ],
+            &[],
+        )
+        .expect("applies");
+
+        let left_alone = undo_batch(root, &mut record).expect("undoes");
+
+        assert!(left_alone.is_empty(), "{left_alone:?}");
+        assert_eq!(read(root, "changed.txt").as_deref(), Some("one"));
+        assert_eq!(read(root, "notes/new.md"), None);
+        assert_eq!(read(root, "gone.txt").as_deref(), Some("gone"));
+        for file in &record.files {
+            assert_eq!(file.state, BatchFileState::Undone, "{}", file.path);
+        }
+    }
+
+    #[test]
+    fn undo_leaves_a_file_changed_since() {
+        let directory = repo();
+        let root = directory.path();
+        let mut record = apply(
+            root,
+            vec![
+                change("changed.txt", Some("one"), Some("two")),
+                change("kept.txt", Some("kept"), Some("dan's")),
+                change("notes/new.md", None, Some("hello")),
+            ],
+            &[],
+        )
+        .expect("applies");
+        write(root, "changed.txt", "jay's since");
+        std::fs::remove_file(root.join("notes/new.md")).expect("remove");
+
+        let left_alone = undo_batch(root, &mut record).expect("undoes the rest");
+
+        assert_eq!(left_alone, vec!["changed.txt", "notes/new.md"]);
+        assert_eq!(read(root, "changed.txt").as_deref(), Some("jay's since"));
+        assert_eq!(read(root, "notes/new.md"), None);
+        assert_eq!(read(root, "kept.txt").as_deref(), Some("kept"));
+        assert_eq!(
+            state_of(&record, "changed.txt").state,
+            BatchFileState::Applied
+        );
+        assert_eq!(state_of(&record, "kept.txt").state, BatchFileState::Undone);
+    }
+
+    #[test]
+    fn taking_a_held_file_writes_the_teammates_version() {
+        let directory = repo();
+        let root = directory.path();
+        write(root, "changed.txt", "jay's");
+        write(root, "kept.txt", "jay's too");
+        let mut record = apply(
+            root,
+            vec![
+                change("changed.txt", Some("one"), Some("dan's")),
+                change("kept.txt", Some("kept"), Some("dan's too")),
+            ],
+            &[],
+        )
+        .expect("holds");
+
+        resolve_held(root, &mut record, "changed.txt", true).expect("takes");
+
+        assert_eq!(read(root, "changed.txt").as_deref(), Some("dan's"));
+        assert_eq!(
+            state_of(&record, "changed.txt").state,
+            BatchFileState::Taken
+        );
+
+        // Jay's side wrote it again after it was held: taking it now would
+        // overwrite that, so it is left alone and still held.
+        write(root, "kept.txt", "jay's again");
+        assert!(resolve_held(root, &mut record, "kept.txt", true).is_err());
+        assert_eq!(read(root, "kept.txt").as_deref(), Some("jay's again"));
+        assert_eq!(
+            state_of(&record, "kept.txt").state,
+            BatchFileState::Held(HeldReason::ChangedSinceYourCopy)
+        );
+    }
+
+    #[test]
+    fn keeping_a_held_file_changes_nothing() {
+        let directory = repo();
+        let root = directory.path();
+        write(root, "changed.txt", "jay's");
+        let mut record = apply(
+            root,
+            vec![change("changed.txt", Some("one"), Some("dan's"))],
+            &[],
+        )
+        .expect("holds");
+
+        resolve_held(root, &mut record, "changed.txt", false).expect("keeps");
+
+        assert_eq!(read(root, "changed.txt").as_deref(), Some("jay's"));
+        assert_eq!(state_of(&record, "changed.txt").state, BatchFileState::Kept);
     }
 }

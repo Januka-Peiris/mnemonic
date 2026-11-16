@@ -233,6 +233,9 @@ pub(crate) struct TeamShare {
     skip_list_save_count: u64,
     /// This machine's copies of teammates' workspaces, by local workspace id.
     pub copies: HashMap<String, CopyFollow>,
+    /// Bumped each time a teammate's batch is recorded, so views listing
+    /// batches know to reload them.
+    pub batch_generation: u64,
     /// The newest skip-list save written, so a slower older write can't
     /// land after a newer one.
     skip_list_written: Arc<Mutex<u64>>,
@@ -322,6 +325,7 @@ impl TeamShare {
             scan_task: None,
             skip_list_save_count: 0,
             copies: HashMap::new(),
+            batch_generation: 0,
             skip_list_written: Arc::new(Mutex::new(0)),
         }
     }
@@ -1409,7 +1413,7 @@ fn wait_for_reply<T>(
 
 /// The paths, relative to `root`, of files with unsaved edits in any open
 /// editor.
-fn unsaved_paths(root: &Path, cx: &App) -> HashSet<String> {
+pub(crate) fn unsaved_paths(root: &Path, cx: &App) -> HashSet<String> {
     let mut unsaved = HashSet::new();
     for window in open_windows(cx) {
         let project = window.read(cx).project().read(cx);
@@ -1506,6 +1510,12 @@ async fn apply_teammate_batch(
         .await;
     let (outcome, message) = match applied {
         Ok((record, save_error)) => {
+            if let Err(err) = team.update(cx, |team, cx| {
+                team.batch_generation += 1;
+                cx.notify();
+            }) {
+                log::warn!("Couldn't announce a teammate's batch: {err}");
+            }
             let outcome = record.outcome();
             let mut message = batch_notice(
                 &actor,
@@ -1765,7 +1775,7 @@ fn answer_permission(
     Ok((title, chosen))
 }
 
-fn workspace_root(summary: &WorkspaceSummary) -> Option<PathBuf> {
+pub(crate) fn workspace_root(summary: &WorkspaceSummary) -> Option<PathBuf> {
     summary
         .workspace_root_path
         .as_deref()

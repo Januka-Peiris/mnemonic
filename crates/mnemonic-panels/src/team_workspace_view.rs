@@ -105,9 +105,33 @@ impl Render for TeammateChatItem {
 }
 
 /// One changed file's diff as a read-only tab.
-struct TeammateDiffItem {
+pub(crate) struct TeammateDiffItem {
     title: SharedString,
     editor: Entity<Editor>,
+}
+
+impl TeammateDiffItem {
+    /// A read-only tab showing `text`, a unified diff, with `language` (the
+    /// Diff language) for highlighting.
+    pub(crate) fn new(
+        title: SharedString,
+        text: String,
+        language: Option<Arc<language::Language>>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Entity<Self> {
+        let buffer = cx.new(|cx| {
+            let mut buffer = Buffer::local(text, cx);
+            buffer.set_language(language, cx);
+            buffer
+        });
+        let editor = cx.new(|cx| {
+            let mut editor = Editor::for_buffer(buffer, None, window, cx);
+            editor.set_read_only(true);
+            editor
+        });
+        cx.new(|_| Self { title, editor })
+    }
 }
 
 impl EventEmitter<ItemEvent> for TeammateDiffItem {}
@@ -373,17 +397,7 @@ impl TeammateWorkspaceView {
                 if this.diff_items.iter().any(|(open, _)| *open == path) {
                     return;
                 }
-                let buffer = cx.new(|cx| {
-                    let mut buffer = Buffer::local(text, cx);
-                    buffer.set_language(language, cx);
-                    buffer
-                });
-                let editor = cx.new(|cx| {
-                    let mut editor = Editor::for_buffer(buffer, None, window, cx);
-                    editor.set_read_only(true);
-                    editor
-                });
-                let item = cx.new(|_| TeammateDiffItem { title, editor });
+                let item = TeammateDiffItem::new(title, text, language, window, cx);
                 this.pane.update(cx, |pane, cx| {
                     pane.add_item(Box::new(item.clone()), true, true, None, window, cx);
                 });
