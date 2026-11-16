@@ -14,6 +14,10 @@ const DEFAULT_READ_LIMIT: usize = 2000;
 const GLOB_RESULT_LIMIT: usize = 100;
 const BASH_OUTPUT_LIMIT: usize = 30000;
 const BASH_DEFAULT_TIMEOUT: Duration = Duration::from_secs(120);
+const BASH_MAX_TIMEOUT: Duration = Duration::from_secs(600);
+const BASH_DRAIN_GRACE: Duration = Duration::from_secs(2);
+const READ_LINE_LIMIT: usize = 2000;
+const BASH_STREAM_BYTE_LIMIT: usize = BASH_OUTPUT_LIMIT * 4;
 
 #[derive(Clone, Debug)]
 pub struct GitAuthor {
@@ -150,7 +154,10 @@ pub fn read(
         .enumerate()
         .skip(start - 1)
         .take(limit)
-        .map(|(index, line)| format!("{}\t{line}", index + 1))
+        .map(|(index, line)| {
+            let line: String = line.chars().take(READ_LINE_LIMIT).collect();
+            format!("{}\t{line}", index + 1)
+        })
         .collect();
     Ok(lines.join("\n"))
 }
@@ -327,12 +334,35 @@ pub fn grep(context: &AgentToolContext, request: &GrepRequest) -> Result<String,
     Ok(lines.join("\n"))
 }
 
-fn drain<R: std::io::Read + Send + 'static>(mut stream: R) -> std::thread::JoinHandle<Vec<u8>> {
+struct StreamOutput {
+    index: usize,
+    bytes: Vec<u8>,
+    cut: bool,
+}
+
+fn drain<R: std::io::Read + Send + 'static>(
+    mut stream: R,
+    index: usize,
+    sender: std::sync::mpsc::Sender<StreamOutput>,
+) {
     std::thread::spawn(move || {
-        let mut buffer = Vec::new();
-        stream.read_to_end(&mut buffer).ok();
-        buffer
-    })
+        let mut bytes = Vec::new();
+        let mut cut = false;
+        let mut chunk = [0u8; 8192];
+        loop {
+            match stream.read(&mut chunk) {
+                Ok(0) | Err(_) => break,
+                Ok(count) => {
+                    let room = BASH_STREAM_BYTE_LIMIT.saturating_sub(bytes.len());
+                    if count > room {
+                        cut = true;
+                    }
+                    bytes.extend_from_slice(&chunk[..count.min(room)]);
+                }
+            }
+        }
+        sender.send(StreamOutput { index, bytes, cut }).ok();
+    });
 }
 
 #[allow(clippy::disallowed_methods)]
@@ -345,7 +375,9 @@ pub fn bash(
 ) -> Result<String, String> {
     use std::os::unix::process::CommandExt as _;
 
-    let timeout = timeout.unwrap_or(BASH_DEFAULT_TIMEOUT);
+    let timeout = timeout
+        .unwrap_or(BASH_DEFAULT_TIMEOUT)
+        .min(BASH_MAX_TIMEOUT);
     let shell = std::env::var("SHELL")
         .ok()
         .filter(|shell| !shell.is_empty())
@@ -361,9 +393,7 @@ pub fn bash(
     if let Some(author) = &context.git_author {
         process
             .env("GIT_AUTHOR_NAME", &author.name)
-            .env("GIT_AUTHOR_EMAIL", &author.email)
-            .env("GIT_COMMITTER_NAME", &author.name)
-            .env("GIT_COMMITTER_EMAIL", &author.email);
+            .env("GIT_AUTHOR_EMAIL", &author.email);
     }
     let mut child = process
         .spawn()
@@ -371,8 +401,17 @@ pub fn bash(
     let process_group = child.id() as i32;
     running.register(call_key, process_group);
 
-    let stdout = child.stdout.take().map(drain);
-    let stderr = child.stderr.take().map(drain);
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let mut expected_streams = 0;
+    if let Some(stdout) = child.stdout.take() {
+        drain(stdout, 0, sender.clone());
+        expected_streams += 1;
+    }
+    if let Some(stderr) = child.stderr.take() {
+        drain(stderr, 1, sender.clone());
+        expected_streams += 1;
+    }
+    drop(sender);
 
     let started = Instant::now();
     let outcome = loop {
@@ -397,11 +436,22 @@ pub fn bash(
     kill_process_group(process_group);
 
     let status = outcome?;
-    let mut output = Vec::new();
-    for handle in [stdout, stderr].into_iter().flatten() {
-        if let Ok(bytes) = handle.join() {
-            output.extend(bytes);
+    // A daemonized grandchild outside the process group can keep a pipe open, so wait only briefly.
+    let deadline = Instant::now() + BASH_DRAIN_GRACE;
+    let mut streams = Vec::new();
+    while streams.len() < expected_streams {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        match receiver.recv_timeout(remaining) {
+            Ok(stream) => streams.push(stream),
+            Err(_) => break,
         }
+    }
+    streams.sort_by_key(|stream| stream.index);
+    let mut output = Vec::new();
+    let mut output_cut = streams.len() < expected_streams;
+    for stream in streams {
+        output_cut |= stream.cut;
+        output.extend(stream.bytes);
     }
     let output = String::from_utf8_lossy(&output).into_owned();
 
@@ -411,7 +461,7 @@ pub fn bash(
     }
     let code = status.code().unwrap_or(-1);
     let mut result = format!("exit {code}\n{output}");
-    if result.chars().count() > BASH_OUTPUT_LIMIT {
+    if output_cut || result.chars().count() > BASH_OUTPUT_LIMIT {
         result = result.chars().take(BASH_OUTPUT_LIMIT).collect();
         result.push_str("\n[output truncated]");
     }
@@ -474,6 +524,31 @@ mod tests {
             read(&context, "f.txt", None, None).expect("read"),
             "1\tone\n2\ttwo\n3\tthree"
         );
+    }
+
+    #[test]
+    fn read_cuts_long_lines() {
+        let root = temp_root("long-line");
+        std::fs::write(root.join("f.txt"), "x".repeat(5000)).expect("write");
+        let output = read(&context(&root), "f.txt", None, None).expect("read");
+        assert_eq!(output.chars().count(), "1\t".len() + READ_LINE_LIMIT);
+    }
+
+    #[test]
+    fn bash_caps_output_and_does_not_hang_on_a_detached_holder() {
+        let root = temp_root("big-output");
+        let started = Instant::now();
+        let output = bash(
+            &context(&root),
+            "head -c 3000000 /dev/zero | tr '\\0' a; perl -e 'use POSIX; fork and exit; POSIX::setsid(); sleep 30'; true",
+            None,
+            &RunningCommands::default(),
+            "k",
+        )
+        .expect("bash");
+        assert!(output.ends_with("[output truncated]"), "{}", output.len());
+        assert!(output.chars().count() < BASH_OUTPUT_LIMIT + 100);
+        assert!(started.elapsed() < Duration::from_secs(8));
     }
 
     #[test]
