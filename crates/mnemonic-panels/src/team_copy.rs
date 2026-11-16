@@ -756,14 +756,21 @@ pub(crate) fn delete_copy(local_workspace_id: String, window: &mut Window, cx: &
 }
 
 /// Refuses unless the workspace is a teammate's copy inside Mnemonic's own
-/// workspaces folder, as deleting it force-removes that folder.
+/// workspaces folder, as deleting it force-removes that folder. Returns
+/// whether the folder still exists; a copy whose folder is gone has nothing
+/// left to remove but its record.
 fn check_is_managed_copy(
     app: &AppState,
     detail: &WorkspaceDetail,
     root: &str,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     if detail.summary.workspace_source != TEAM_COPY_SOURCE {
         return Err(format!("{} isn't a teammate's copy", detail.summary.name));
+    }
+    match std::fs::symlink_metadata(root) {
+        Ok(_) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => return Err(format!("Couldn't read the copy's folder {root}: {err}")),
     }
     let managed_root = settings_repository::get_managed_workspaces_root(&app.db)?;
     let managed_root = std::fs::canonicalize(&managed_root)
@@ -777,7 +784,7 @@ fn check_is_managed_copy(
             managed_root.display()
         ));
     }
-    Ok(())
+    Ok(true)
 }
 
 /// Asks, then removes the copy's workspace, worktree and saved state.
@@ -805,21 +812,24 @@ async fn delete_copy_files(
                     .workspace_root_path
                     .clone()
                     .unwrap_or_else(|| detail.worktree_path.clone());
-                check_is_managed_copy(&app, &detail, &root)?;
+                let folder_exists = check_is_managed_copy(&app, &detail, &root)?;
                 let edits = match &state {
-                    Some(state) => Some(team_files_service::local_edits(
+                    Some(state) if folder_exists => Some(team_files_service::local_edits(
                         state,
                         Path::new(&root),
                         &state.skip_list(),
                     )?),
-                    None => None,
+                    _ => None,
                 };
-                Ok::<_, String>((detail, root, edits))
+                Ok::<_, String>((detail, root, folder_exists, edits))
             }
         })
         .await;
-    let (detail, root, edits) = found.map_err(|err| anyhow!(err))?;
+    let (detail, root, folder_exists, edits) = found.map_err(|err| anyhow!(err))?;
     let message = match edits.map(|edits| edits.len()) {
+        _ if !folder_exists => {
+            "The copy's folder is already gone. This removes it from Mnemonic.".to_string()
+        }
         Some(0) => "This removes the copy's folder from this Mac.".to_string(),
         Some(1) => "You have 1 edit you haven't sent. It will be lost.".to_string(),
         Some(count) => format!("You have {count} edits you haven't sent. They will be lost."),
@@ -850,7 +860,11 @@ async fn delete_copy_files(
             // The worktree goes first, so a failed removal leaves the
             // workspace listed to try again.
             if let Some(repository_path) = detail.summary.repository_path.as_deref() {
-                git_worktree_service::remove_mnemonic_worktree(repository_path, &root)?;
+                if folder_exists {
+                    git_worktree_service::remove_mnemonic_worktree(repository_path, &root)?;
+                } else {
+                    git_worktree_service::prune_worktrees(Path::new(repository_path))?;
+                }
             }
             workspace_service::delete_workspace(&app, &local_workspace_id)?;
             if let Err(err) =
