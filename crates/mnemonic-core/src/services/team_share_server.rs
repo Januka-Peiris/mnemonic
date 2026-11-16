@@ -1159,7 +1159,7 @@ mod tests {
     #[test]
     fn agent_read_maps_a_missing_file_to_none() -> Result<(), String> {
         let root = tempfile::tempdir().map_err(|err| err.to_string())?;
-        std::fs::write(root.path().join("a.txt"), "hello\n").map_err(|err| err.to_string())?;
+        std::fs::write(root.path().join("a.txt"), "first\n\tsecond\n").map_err(|err| err.to_string())?;
         let server = start_agents(
             root.path().to_path_buf(),
             true,
@@ -1175,7 +1175,7 @@ mod tests {
             .agent_read("ws-1", &present.to_string_lossy())
             .map_err(|err| err.to_string())?
             .ok_or("file should exist")?;
-        assert!(text.contains("hello"));
+        assert_eq!(text, "first\n\tsecond");
         assert_eq!(
             client.agent_read("ws-1", &missing.to_string_lossy()),
             Ok(None)
@@ -1217,21 +1217,15 @@ mod tests {
         let client =
             TeamClient::new(&server.address().to_string(), 0).map_err(|err| err.to_string())?;
 
-        assert!(
-            client
-                .files("ws-1", None, Duration::ZERO)
-                .is_err_and(|err| err == TeamClientError::Forbidden)
-        );
-        assert!(
-            client
-                .file("ws-1", "a.txt")
-                .is_err_and(|err| refused(403)(&err))
-        );
-        assert!(
-            client
-                .bundle("ws-1", &[])
-                .is_err_and(|err| refused(403)(&err))
-        );
+        assert!(client
+            .files("ws-1", None, Duration::ZERO)
+            .is_err_and(|err| err == TeamClientError::Forbidden));
+        assert!(client
+            .file("ws-1", "a.txt")
+            .is_err_and(|err| refused(403)(&err)));
+        assert!(client
+            .bundle("ws-1", &[])
+            .is_err_and(|err| refused(403)(&err)));
         Ok(())
     }
 
@@ -1322,11 +1316,9 @@ mod tests {
             changes: Vec::new(),
         };
 
-        assert!(
-            client
-                .send_changes("ws-1", &batch)
-                .is_err_and(|err| refused(403)(&err))
-        );
+        assert!(client
+            .send_changes("ws-1", &batch)
+            .is_err_and(|err| refused(403)(&err)));
         Ok(())
     }
 
@@ -1457,11 +1449,9 @@ mod tests {
             TeamClient::new(&server.address().to_string(), 0).map_err(|err| err.to_string())?;
 
         assert!(client.stop("chat-1").is_err_and(|err| refused(403)(&err)));
-        assert!(
-            client
-                .answer_permission("chat-1", "call-1", "allow")
-                .is_err_and(|err| refused(403)(&err))
-        );
+        assert!(client
+            .answer_permission("chat-1", "call-1", "allow")
+            .is_err_and(|err| refused(403)(&err)));
         assert!(recorded.lock().map_err(|err| err.to_string())?.is_empty());
         Ok(())
     }

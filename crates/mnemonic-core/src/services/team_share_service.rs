@@ -1189,8 +1189,9 @@ impl TeamClient {
             .map_err(|err| TeamClientError::Other(format!("Unexpected answer: {err}")))
     }
 
-    /// Reads one file through the workspace's agent endpoint. None when the
-    /// file doesn't exist.
+    /// Reads one file through the workspace's agent endpoint, as the raw
+    /// text of at most its first 2000 lines, each cut at 2000 characters.
+    /// A trailing newline is not kept. None when the file doesn't exist.
     pub fn agent_read(
         &self,
         workspace_id: &str,
@@ -1218,19 +1219,22 @@ impl TeamClient {
         let text = reply
             .pointer("/result/content/0/text")
             .and_then(|text| text.as_str())
-            .unwrap_or_default()
-            .to_string();
+            .unwrap_or_default();
         if reply
             .pointer("/result/isError")
             .and_then(|flag| flag.as_bool())
             == Some(true)
         {
-            if text.contains("No such file") {
+            if text == format!("{absolute_path} doesn't exist") {
                 return Ok(None);
             }
-            return Err(TeamClientError::Other(text));
+            return Err(TeamClientError::Other(text.to_string()));
         }
-        Ok(Some(text))
+        let lines: Vec<&str> = text
+            .lines()
+            .map(|line| line.split_once('\t').map_or(line, |(_, content)| content))
+            .collect();
+        Ok(Some(lines.join("\n")))
     }
 
     /// Waits up to `wait` for the chat to change after `cursor`. None when

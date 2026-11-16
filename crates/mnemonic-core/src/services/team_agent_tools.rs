@@ -127,7 +127,13 @@ pub fn resolve_agent_path(root: &Path, path: &str, for_write: bool) -> Result<Pa
     let canonical = canonical_root
         .join(&relative)
         .canonicalize()
-        .map_err(|error| format!("could not find {path}: {error}"))?;
+        .map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                format!("{path} doesn't exist")
+            } else {
+                format!("could not find {path}: {error}")
+            }
+        })?;
     if !canonical.starts_with(&canonical_root) {
         return Err(format!("{path} is outside the workspace"));
     }
@@ -141,8 +147,13 @@ pub fn read(
     limit: Option<usize>,
 ) -> Result<String, String> {
     let resolved = resolve_agent_path(&context.root, file_path, false)?;
-    let bytes =
-        std::fs::read(&resolved).map_err(|error| format!("could not read {file_path}: {error}"))?;
+    let bytes = std::fs::read(&resolved).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            format!("{file_path} doesn't exist")
+        } else {
+            format!("could not read {file_path}: {error}")
+        }
+    })?;
     if bytes.contains(&0) {
         return Err(format!("{file_path} is a binary file"));
     }
