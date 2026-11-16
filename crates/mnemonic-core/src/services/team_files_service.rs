@@ -457,44 +457,77 @@ fn finish_remote(host: &str, path: &str) -> String {
 }
 
 #[allow(clippy::disallowed_methods)]
-pub fn bundle_for(root: &Path, have: &[String]) -> Result<Vec<u8>, String> {
+fn run_git_locale_free(root: &Path, args: &[&str], have: &[String]) -> Result<Vec<u8>, String> {
     let output = Command::new("git")
-        .args(["bundle", "create", "-", "HEAD", "--not"])
+        .env("LC_ALL", "C")
+        .args(args)
         .args(have)
         .arg("--remotes=origin")
         .current_dir(root)
         .output()
         .map_err(|error| format!("could not run git: {error}"))?;
-    if output.status.success() {
-        return Ok(output.stdout);
+    if !output.status.success() {
+        return Err(format!(
+            "git {} failed: {}",
+            args[0],
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
     }
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    if stderr.contains("empty bundle") {
+    Ok(output.stdout)
+}
+
+pub fn bundle_for(root: &Path, have: &[String]) -> Result<Vec<u8>, String> {
+    let missing = run_git_locale_free(root, &["rev-list", "-n1", "HEAD", "--not"], have)?;
+    if missing.iter().all(u8::is_ascii_whitespace) {
         return Ok(Vec::new());
     }
-    Err(format!("git bundle failed: {}", stderr.trim()))
+    run_git_locale_free(root, &["bundle", "create", "-", "HEAD", "--not"], have)
+}
+
+struct TempBundle(PathBuf);
+
+impl Drop for TempBundle {
+    fn drop(&mut self) {
+        if let Err(error) = std::fs::remove_file(&self.0) {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                log::warn!("Couldn't remove {}: {error}", self.0.display());
+            }
+        }
+    }
+}
+
+fn write_temp_bundle(bundle: &[u8]) -> Result<TempBundle, String> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let path = std::env::temp_dir().join(format!("mnemonic-share-{}.bundle", uuid::Uuid::new_v4()));
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&path)
+        .map_err(|error| format!("could not save the bundle: {error}"))?;
+    let guard = TempBundle(path);
+    file.write_all(bundle)
+        .map_err(|error| format!("could not save the bundle: {error}"))?;
+    Ok(guard)
 }
 
 pub fn fetch_bundle(repo: &Path, bundle: &[u8], head_commit: &str) -> Result<(), String> {
-    if head_commit.starts_with('-') {
+    let is_commit_id = (7..=64).contains(&head_commit.len())
+        && head_commit
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
+    if !is_commit_id {
         return Err(format!("{head_commit} isn't a commit id"));
     }
-    let has_head = |repo: &Path| run_git(repo, &["cat-file", "-e", head_commit]).is_ok();
     if !bundle.is_empty() {
-        let bundle_path =
-            std::env::temp_dir().join(format!("mnemonic-share-{}.bundle", uuid::Uuid::new_v4()));
-        std::fs::write(&bundle_path, bundle)
-            .map_err(|error| format!("could not save the bundle: {error}"))?;
-        let fetched = run_git(
+        let bundle_file = write_temp_bundle(bundle)?;
+        run_git(
             repo,
-            &["fetch", "--quiet", &bundle_path.to_string_lossy(), "HEAD"],
-        );
-        if let Err(error) = std::fs::remove_file(&bundle_path) {
-            log::warn!("Couldn't remove {}: {error}", bundle_path.display());
-        }
-        fetched?;
+            &["fetch", "--quiet", &bundle_file.0.to_string_lossy(), "HEAD"],
+        )?;
     }
-    if has_head(repo) {
+    if run_git(repo, &["cat-file", "-e", head_commit]).is_ok() {
         Ok(())
     } else {
         Err(format!(
@@ -771,5 +804,14 @@ mod tests {
         let bundle = bundle_for(sharer.path(), &[]).expect("bundle");
         fetch_bundle(teammate.path(), &bundle, &head).expect("fetch");
         run_git(teammate.path(), &["cat-file", "-e", &head]).expect("head present");
+    }
+
+    #[test]
+    fn a_teammate_who_has_the_head_gets_an_empty_bundle() {
+        let sharer = repo();
+        let head = head_of(sharer.path());
+        let bundle = bundle_for(sharer.path(), &[head.clone()]).expect("bundle");
+        assert!(bundle.is_empty());
+        fetch_bundle(sharer.path(), &bundle, &head).expect("already present");
     }
 }
