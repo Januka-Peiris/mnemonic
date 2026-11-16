@@ -1437,22 +1437,10 @@ async fn apply_teammate_batch(
     cx: &mut gpui::AsyncApp,
 ) -> Result<TeamBatchOutcome, TeamActionError> {
     let workspace_id = request.workspace_id.clone();
-    let (root, skip_list, workspace_name, unsaved) = cx.update(|cx| {
-        let team = team
-            .upgrade()
-            .ok_or_else(|| TeamActionError::Failed("Sharing stopped".into()))?;
+    let actor = actor_name(&request.from, &request.login);
+    let checked = cx.update(|cx| {
+        let team = team.upgrade()?;
         let team = team.read(cx);
-        if !team.allows_file_edits(&workspace_id) {
-            return Err(TeamActionError::NotAllowed(
-                "Editing files is off for this workspace".into(),
-            ));
-        }
-        let (root, skip_list) = lock_file_roots(&team.file_roots)
-            .get(&workspace_id)
-            .cloned()
-            .ok_or_else(|| {
-                TeamActionError::NotAllowed("Sharing files is off for this workspace".into())
-            })?;
         let workspace_name = team
             .hub
             .workspaces()
@@ -1460,14 +1448,36 @@ async fn apply_teammate_batch(
             .find(|workspace| workspace.id == workspace_id)
             .map(|workspace| workspace.name)
             .unwrap_or_else(|| workspace_id.clone());
-        let unsaved = unsaved_paths(&root, cx);
-        Ok((root, skip_list, workspace_name, unsaved))
-    })?;
+        let allowed = if !team.allows_file_edits(&workspace_id) {
+            Err(TeamActionError::NotAllowed(
+                "Editing files is off for this workspace".into(),
+            ))
+        } else {
+            lock_file_roots(&team.file_roots)
+                .get(&workspace_id)
+                .cloned()
+                .ok_or_else(|| {
+                    TeamActionError::NotAllowed("Sharing files is off for this workspace".into())
+                })
+        };
+        let allowed =
+            allowed.map(|(root, skip_list)| (unsaved_paths(&root, cx), root, skip_list));
+        Some((workspace_name, allowed))
+    });
+    let Some((workspace_name, allowed)) = checked else {
+        return Err(TeamActionError::Failed("Sharing stopped".into()));
+    };
+    let (unsaved, root, skip_list) = match allowed {
+        Ok(allowed) => allowed,
+        Err(err) => {
+            show_batch_notice(&workspace_id, batch_refused(&actor, &workspace_name, &err), cx);
+            return Err(err);
+        }
+    };
     let caller = TeamCaller {
         login: request.login.clone(),
         name: request.from.clone(),
     };
-    let actor = actor_name(&request.from, &request.login);
     let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
     let applied = cx
         .background_spawn({
@@ -1509,27 +1519,33 @@ async fn apply_teammate_batch(
             (Ok(outcome), message)
         }
         Err(err) => {
-            let reason = match &err {
-                TeamActionError::Invalid(reason)
-                | TeamActionError::NotAllowed(reason)
-                | TeamActionError::NothingToDo(reason)
-                | TeamActionError::Failed(reason) => reason.clone(),
-                TeamActionError::NotLoaded => "the workspace isn't open".to_string(),
-            };
-            (
-                Err(err),
-                format!("{actor}'s changes to {workspace_name} weren't applied: {reason}"),
-            )
+            let message = batch_refused(&actor, &workspace_name, &err);
+            (Err(err), message)
         }
     };
+    show_batch_notice(&workspace_id, message, cx);
+    outcome
+}
+
+fn batch_refused(actor: &str, workspace_name: &str, err: &TeamActionError) -> String {
+    let reason = match err {
+        TeamActionError::Invalid(reason)
+        | TeamActionError::NotAllowed(reason)
+        | TeamActionError::NothingToDo(reason)
+        | TeamActionError::Failed(reason) => reason.clone(),
+        TeamActionError::NotLoaded => "the workspace isn't open".to_string(),
+    };
+    format!("{actor}'s changes to {workspace_name} weren't applied: {reason}")
+}
+
+fn show_batch_notice(workspace_id: &str, message: String, cx: &mut gpui::AsyncApp) {
     cx.update(|cx| {
         if let Some(window) =
-            find_workspace_window(&workspace_id, cx).or_else(|| open_windows(cx).into_iter().next())
+            find_workspace_window(workspace_id, cx).or_else(|| open_windows(cx).into_iter().next())
         {
             show_step_in_notice(&window, message, cx);
         }
     });
-    outcome
 }
 
 fn batch_notice(actor: &str, applied: usize, held: usize, workspace_name: &str) -> String {

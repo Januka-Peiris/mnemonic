@@ -72,34 +72,53 @@ const SECRET_FLOOR: [&str; 6] = [
     ".claude/settings.local.json",
 ];
 
+/// `text` folded the way a case-insensitive disk compares names, so that
+/// `ſ` (long s) matches `s` and the Kelvin sign matches `k`.
+pub fn fold_case(text: &str) -> String {
+    text.to_uppercase().to_lowercase()
+}
+
+fn matches_pattern(pattern: &str, path: &str) -> bool {
+    let components: Vec<&str> = path
+        .split('/')
+        .filter(|component| !component.is_empty())
+        .collect();
+    let Some(final_component) = components.last() else {
+        return false;
+    };
+    if pattern.contains('/') {
+        pattern == components.join("/")
+    } else if pattern.contains('*') {
+        glob_matches(pattern, final_component)
+    } else {
+        components.iter().any(|component| *component == pattern)
+    }
+}
+
 impl SkipList {
-    /// Compared without regard to ASCII case, as on a case-insensitive
-    /// disk `.ENV` is the same file as `.env`.
+    /// The secret floor is matched in any case spelling, as on a
+    /// case-insensitive disk `.ENV` is `.env`; the editable patterns match
+    /// exactly, so a `BUILD` file or `Dist/` folder is still shared.
     pub fn skips(&self, path: &str) -> bool {
-        let path = path.to_ascii_lowercase();
-        let components: Vec<&str> = path
-            .split('/')
-            .filter(|component| !component.is_empty())
-            .collect();
-        let Some(final_component) = components.last() else {
-            return false;
-        };
-        let normalized = components.join("/");
-        let patterns = self
-            .patterns
+        let folded = fold_case(path);
+        SECRET_FLOOR
             .iter()
-            .map(String::as_str)
-            .chain(SECRET_FLOOR.iter().copied());
-        patterns.into_iter().any(|pattern| {
-            let pattern = pattern.to_ascii_lowercase();
-            if pattern.contains('/') {
-                pattern == normalized
-            } else if pattern.contains('*') {
-                glob_matches(&pattern, final_component)
-            } else {
-                components.iter().any(|component| *component == pattern)
-            }
-        })
+            .any(|pattern| matches_pattern(pattern, &folded))
+            || self
+                .patterns
+                .iter()
+                .any(|pattern| matches_pattern(pattern, path))
+    }
+
+    /// Whether a teammate's batch may not write `path`: every pattern in
+    /// any case spelling, as refusing more there is safe.
+    pub fn refuses(&self, path: &str) -> bool {
+        let folded = fold_case(path);
+        SECRET_FLOOR
+            .iter()
+            .map(|pattern| pattern.to_string())
+            .chain(self.patterns.iter().map(|pattern| fold_case(pattern)))
+            .any(|pattern| matches_pattern(&pattern, &folded))
     }
 }
 
@@ -247,9 +266,9 @@ pub fn file_hash(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
-/// Compared without regard to ASCII case, like `SkipList::skips`.
+/// Compared in any case spelling, as a case-insensitive disk would.
 pub fn needs_approval(path: &str) -> bool {
-    let path = path.to_ascii_lowercase();
+    let path = fold_case(path);
     let mut components = path.split('/').filter(|component| !component.is_empty());
     match components.next() {
         Some(".mnemonic" | ".claude" | ".zed" | ".vscode") => true,
@@ -1552,6 +1571,49 @@ fn write_batch_file(
     })
 }
 
+/// Checks that a batch path names what is on disk byte for byte. A
+/// case-insensitive disk opens `.Vscode` or a differently normalized name
+/// as the existing entry, which would slip past the checks on the name.
+#[derive(Default)]
+struct SpellingCheck {
+    /// Names in each folder seen so far.
+    folders: HashMap<PathBuf, HashSet<std::ffi::OsString>>,
+}
+
+impl SpellingCheck {
+    fn check(&mut self, root: &Path, path: &str) -> Result<(), String> {
+        let mut folder = root.to_path_buf();
+        for component in path.split('/') {
+            let next = folder.join(component);
+            match std::fs::symlink_metadata(&next) {
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                Err(error) => return Err(format!("could not stat {path}: {error}")),
+            }
+            let names = match self.folders.entry(folder.clone()) {
+                std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    let mut names = HashSet::new();
+                    let read_dir = std::fs::read_dir(&folder)
+                        .map_err(|error| format!("could not read {}: {error}", folder.display()))?;
+                    for name in read_dir {
+                        let name = name.map_err(|error| {
+                            format!("could not read {}: {error}", folder.display())
+                        })?;
+                        names.insert(name.file_name());
+                    }
+                    entry.insert(names)
+                }
+            };
+            if !names.contains(std::ffi::OsStr::new(component)) {
+                return Err(format!("{path} is spelled differently on disk"));
+            }
+            folder = next;
+        }
+        Ok(())
+    }
+}
+
 /// Writes one file of a batch, unless the sharer's file changed since the
 /// batch was checked, in which case it is held with what is there now.
 /// Returns the permissions the file had when it was written, so it can be
@@ -1599,21 +1661,20 @@ pub fn apply_batch(
 ) -> Result<BatchRecord, String> {
     // Paths are compared without regard to case, as on a case-insensitive
     // disk two spellings name one file.
-    let unsaved: HashSet<String> = unsaved
-        .iter()
-        .map(|path| path.to_ascii_lowercase())
-        .collect();
+    let unsaved: HashSet<String> = unsaved.iter().map(|path| fold_case(path)).collect();
+    let mut spelling = SpellingCheck::default();
     let mut seen = HashSet::new();
     let mut checked = Vec::with_capacity(batch.changes.len());
     for change in &batch.changes {
         let path = change.path.as_str();
-        if !seen.insert(path.to_ascii_lowercase()) {
+        if !seen.insert(fold_case(path)) {
             return Err(format!("{path} is in the batch twice"));
         }
-        if skip.skips(path) {
+        if skip.refuses(path) {
             return Err(format!("{path} can't be changed by teammates"));
         }
         let full_path = safe_relative_path(root, path)?;
+        spelling.check(root, path)?;
         let before = read_existing(path, &full_path)?;
         checked.push((change, full_path, before));
     }
@@ -1626,7 +1687,7 @@ pub fn apply_batch(
         let already_there = current_hash == change.content.as_deref().map(file_hash);
         let state = if already_there {
             BatchFileState::Applied
-        } else if unsaved.contains(&path.to_ascii_lowercase()) {
+        } else if unsaved.contains(&fold_case(path)) {
             BatchFileState::Held(HeldReason::UnsavedInEditor)
         } else if current_hash != change.base_hash {
             BatchFileState::Held(HeldReason::ChangedSinceYourCopy)
@@ -1865,6 +1926,21 @@ mod tests {
         let skip = SkipList::default();
         assert!(skip.skips(".Git/config"));
         assert!(skip.skips(".GIT/hooks/x"));
+    }
+
+    #[test]
+    fn scan_skips_secrets_in_any_spelling_but_keeps_capitalised_build_files() {
+        let directory = repo();
+        let root = directory.path();
+        write(root, "BUILD", "bazel");
+        write(root, "Dist/x", "x");
+        write(root, ".ENV", "s");
+        write(root, "x.\u{212A}ey", "s");
+
+        let manifest = scan_workspace(root, &SkipList::default()).expect("scan");
+        let mut scanned = paths(&manifest);
+        scanned.sort_unstable();
+        assert_eq!(scanned, vec!["BUILD", "Dist/x"]);
     }
 
     #[cfg(unix)]
@@ -2460,6 +2536,9 @@ mod tests {
             "X.PEM",
             "node_modules/x.js",
             "NODE_MODULES/x.js",
+            "node_module\u{17F}/x.js",
+            "x.\u{212A}ey",
+            ".claude/\u{17F}ettings.local.json",
             ".git/config",
             "../outside.txt",
             "/tmp/outside.txt",
@@ -2516,6 +2595,44 @@ mod tests {
             "two spellings of one path reject the batch"
         );
         assert_eq!(read(root, "a.txt"), None);
+    }
+
+    #[test]
+    fn a_differently_spelled_existing_path_is_refused_or_held() {
+        let directory = repo();
+        let root = directory.path();
+        write(root, ".vscode/tasks.json", "{}");
+
+        let case_insensitive_disk = root.join("KEPT.TXT").exists();
+
+        let result = apply(
+            root,
+            vec![change("Kept.txt", Some("kept"), Some("evil"))],
+            &[],
+        );
+        assert_eq!(result.is_err(), case_insensitive_disk);
+        assert_eq!(read(root, "kept.txt").as_deref(), Some("kept"));
+
+        for spelling in [".v\u{17F}code/tasks.json", ".VSCode/tasks.json"] {
+            let result = apply(root, vec![change(spelling, Some("{}"), Some("evil"))], &[]);
+            // A case-insensitive disk opens the real file under this
+            // spelling, so it is refused; elsewhere it is a new file that
+            // still needs approval.
+            if case_insensitive_disk {
+                assert!(result.is_err(), "{spelling}");
+            } else if let Ok(record) = result {
+                assert_eq!(
+                    state_of(&record, spelling).state,
+                    BatchFileState::Held(HeldReason::NeedsApproval),
+                    "{spelling}"
+                );
+            }
+            assert_eq!(
+                read(root, ".vscode/tasks.json").as_deref(),
+                Some("{}"),
+                "{spelling}"
+            );
+        }
     }
 
     #[test]
