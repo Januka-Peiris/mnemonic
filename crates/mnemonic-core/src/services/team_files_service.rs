@@ -91,7 +91,7 @@ fn matches_pattern(pattern: &str, path: &str) -> bool {
     } else if pattern.contains('*') {
         glob_matches(pattern, final_component)
     } else {
-        components.iter().any(|component| *component == pattern)
+        components.contains(&pattern)
     }
 }
 
@@ -2397,7 +2397,7 @@ mod tests {
     fn a_teammate_who_has_the_head_gets_an_empty_bundle() {
         let sharer = repo();
         let head = head_of(sharer.path());
-        let bundle = bundle_for(sharer.path(), &[head.clone()]).expect("bundle");
+        let bundle = bundle_for(sharer.path(), std::slice::from_ref(&head)).expect("bundle");
         assert!(bundle.is_empty());
         fetch_bundle(sharer.path(), &bundle, &head).expect("already present");
     }

@@ -610,7 +610,7 @@ impl TeammateWorkspaceView {
         let shared = live.clone();
         let workspace = self.workspace.clone();
         let in_flight = self.copy_in_flight.clone();
-        let on_click: Rc<dyn Fn(&mut Window, &mut App)> = Rc::new(move |window, cx| {
+        let on_click = Rc::new(move |window: &mut Window, cx: &mut App| {
             work_in_copy(
                 host.clone(),
                 shared.clone(),
