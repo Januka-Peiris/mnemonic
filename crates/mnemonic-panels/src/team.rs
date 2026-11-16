@@ -223,6 +223,8 @@ pub(crate) struct TeamShare {
     share_files_workspaces: HashSet<String>,
     /// Workspaces with Share files on whose files teammates may also change.
     edit_files_workspaces: HashSet<String>,
+    /// Skip lists by repo name, so every workspace of a repo skips the same
+    /// files.
     skip_lists: HashMap<String, SkipList>,
     /// What the share server's request threads read to find a workspace's
     /// files: only workspaces with Share files on, as (root, skip list).
@@ -258,8 +260,8 @@ const SHARED_WORKSPACES_KEY: &str = "team_shared_workspaces";
 const STEP_IN_WORKSPACES_KEY: &str = "team_step_in_workspaces";
 const SHARE_FILES_WORKSPACES_KEY: &str = "team_share_files_workspaces";
 const EDIT_FILES_WORKSPACES_KEY: &str = "team_edit_files_workspaces";
-/// The core settings key holding each workspace's skip list, as a JSON map.
-const SKIP_LISTS_KEY: &str = "team_skip_lists";
+/// The core settings key holding each repo's skip list, as a JSON map.
+const SKIP_LISTS_KEY: &str = "team_repo_skip_lists";
 
 struct GlobalTeamShare(Entity<TeamShare>);
 
@@ -415,17 +417,15 @@ pub(crate) fn set_workspace_file_edits(workspace_id: &str, allowed: bool, cx: &m
     }
 }
 
-pub(crate) fn workspace_skip_list(workspace_id: &str, cx: &App) -> SkipList {
+pub(crate) fn repo_skip_list(repo: &str, cx: &App) -> SkipList {
     team_share(cx)
-        .and_then(|team| team.read(cx).skip_lists.get(workspace_id).cloned())
+        .and_then(|team| team.read(cx).skip_lists.get(repo).cloned())
         .unwrap_or_default()
 }
 
-pub(crate) fn set_workspace_skip_list(workspace_id: &str, skip_list: SkipList, cx: &mut App) {
+pub(crate) fn set_repo_skip_list(repo: &str, skip_list: SkipList, cx: &mut App) {
     if let Some(team) = team_share(cx) {
-        team.update(cx, |team, cx| {
-            team.set_workspace_skip_list(workspace_id, skip_list, cx)
-        });
+        team.update(cx, |team, cx| team.set_repo_skip_list(repo, skip_list, cx));
     }
 }
 
@@ -539,10 +539,20 @@ impl TeamShare {
             return;
         }
         save_workspace_ids(SHARED_WORKSPACES_KEY, &self.shared_workspaces, cx);
-        if !shared && self.step_in_workspaces.remove(workspace_id) {
-            save_workspace_ids(STEP_IN_WORKSPACES_KEY, &self.step_in_workspaces, cx);
-        }
-        if !shared {
+        if shared {
+            for (ids, key) in [
+                (&mut self.step_in_workspaces, STEP_IN_WORKSPACES_KEY),
+                (&mut self.share_files_workspaces, SHARE_FILES_WORKSPACES_KEY),
+                (&mut self.edit_files_workspaces, EDIT_FILES_WORKSPACES_KEY),
+            ] {
+                if ids.insert(workspace_id.to_string()) {
+                    save_workspace_ids(key, ids, cx);
+                }
+            }
+        } else {
+            if self.step_in_workspaces.remove(workspace_id) {
+                save_workspace_ids(STEP_IN_WORKSPACES_KEY, &self.step_in_workspaces, cx);
+            }
             self.stop_sharing_files(workspace_id, cx);
         }
         self.update_sharing(cx);
@@ -631,19 +641,11 @@ impl TeamShare {
         cx.notify();
     }
 
-    fn set_workspace_skip_list(
-        &mut self,
-        workspace_id: &str,
-        skip_list: SkipList,
-        cx: &mut Context<Self>,
-    ) {
-        if self.skip_lists.get(workspace_id) == Some(&skip_list) {
+    fn set_repo_skip_list(&mut self, repo: &str, skip_list: SkipList, cx: &mut Context<Self>) {
+        if self.skip_lists.get(repo) == Some(&skip_list) {
             return;
         }
-        if let Some((_, current)) = lock_file_roots(&self.file_roots).get_mut(workspace_id) {
-            *current = skip_list.clone();
-        }
-        self.skip_lists.insert(workspace_id.to_string(), skip_list);
+        self.skip_lists.insert(repo.to_string(), skip_list);
         self.skip_list_save_count += 1;
         save_skip_lists(
             &self.skip_lists,
@@ -651,6 +653,11 @@ impl TeamShare {
             self.skip_list_written.clone(),
             cx,
         );
+        // Publishing rebuilds the file roots, which carry each workspace's
+        // skip list, from the repo's list.
+        if self.server.is_some() {
+            self.start_publishing(cx);
+        }
         cx.notify();
     }
 
@@ -1011,7 +1018,7 @@ impl TeamShare {
                         (
                             root,
                             self.skip_lists
-                                .get(&summary.id)
+                                .get(&summary.repo)
                                 .cloned()
                                 .unwrap_or_default(),
                         ),
@@ -1082,7 +1089,7 @@ impl TeamShare {
                     .filter(|base_branch| !base_branch.is_empty()),
                 skip_patterns: self
                     .skip_lists
-                    .get(&summary.id)
+                    .get(&summary.repo)
                     .cloned()
                     .unwrap_or_default()
                     .patterns,
@@ -2705,6 +2712,17 @@ mod tests {
             "discard gave {answered:?}"
         );
         assert!(is_waiting(&dirty_buffer, cx));
+    }
+
+    #[gpui::test]
+    async fn sharing_turns_on_step_in_files_and_edits(cx: &mut TestAppContext) {
+        let team = cx.new(|_| TeamShare::new());
+        team.update(cx, |team, cx| {
+            team.set_workspace_shared("workspace", true, cx);
+            assert!(team.allows_step_in("workspace"));
+            assert!(team.shares_files("workspace"));
+            assert!(team.allows_file_edits("workspace"));
+        });
     }
 
     #[gpui::test]
