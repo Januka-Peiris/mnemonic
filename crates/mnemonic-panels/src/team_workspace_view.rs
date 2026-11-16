@@ -37,8 +37,6 @@ pub(crate) fn teammate_workspace_key(host: &str, workspace_id: &str) -> String {
     )
 }
 
-/// Hands a message typed in a teammate's chat to their agent.
-
 /// One of the teammate's chats as a tab.
 pub(crate) struct TeammateChatItem {
     chat_id: String,
@@ -538,6 +536,19 @@ impl TeammateWorkspaceView {
                     cx.notify();
                 });
             }
+        }
+
+        for item in &self.chats {
+            let Some(view) = item.read(cx).view.clone() else {
+                continue;
+            };
+            let chat_id = item.read(cx).chat_id.clone();
+            let can_stop = live.step_in
+                && live
+                    .chats
+                    .iter()
+                    .any(|chat| chat.id == chat_id && chat.open);
+            view.update(cx, |view, cx| view.set_read_only_can_stop(can_stop, cx));
         }
 
         mnemonic_bridge::TeammateWorkspaceTitles::set(

@@ -568,6 +568,7 @@ pub struct ConversationView {
     notifications_suppressed: bool,
     fork_enabled: bool,
     read_only: Option<SharedString>,
+    read_only_can_stop: bool,
     auth_task: Option<Task<()>>,
     loading_status: Option<SharedString>,
     /// When settings change, use this to see if the theme has changed (which
@@ -651,6 +652,15 @@ impl ConversationView {
         self.sync_read_only_to_thread_views(cx);
     }
 
+    /// Whether a read-only view offers a Stop button while its thread is
+    /// generating, for mirrors whose owner allows stopping their agent.
+    pub fn set_read_only_can_stop(&mut self, can_stop: bool, cx: &mut Context<Self>) {
+        if self.read_only_can_stop != can_stop {
+            self.read_only_can_stop = can_stop;
+            self.sync_read_only_to_thread_views(cx);
+        }
+    }
+
     pub fn read_only(&self) -> Option<SharedString> {
         self.read_only.clone()
     }
@@ -661,8 +671,9 @@ impl ConversationView {
         };
         for thread_view in connected.threads.values() {
             let notice = self.read_only.clone();
+            let can_stop = self.read_only_can_stop;
             thread_view.update(cx, |thread_view, cx| {
-                thread_view.set_read_only(notice, cx)
+                thread_view.set_read_only(notice, can_stop, cx)
             });
         }
     }
@@ -886,6 +897,7 @@ impl ConversationView {
             notifications_suppressed: false,
             fork_enabled: false,
             read_only: None,
+            read_only_can_stop: false,
             auth_task: None,
             loading_status: None,
             last_theme_id: Some(cx.theme().id.clone()),
@@ -1351,6 +1363,7 @@ impl ConversationView {
                 self.thread_store.clone(),
                 initial_content,
                 self.read_only.clone(),
+                self.read_only_can_stop,
                 subscriptions,
                 window,
                 cx,

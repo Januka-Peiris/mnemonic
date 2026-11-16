@@ -640,6 +640,7 @@ pub struct ThreadView {
     // `cancel_generation` run while it is being updated, where reading it
     // panics.
     read_only_notice: Option<SharedString>,
+    read_only_can_stop: bool,
     pub skill_loading_issues: Vec<SkillLoadingIssue>,
     /// Issues the user has explicitly dismissed. Each entry is matched against
     /// emitted issues by full equality; when an issue no longer appears in the
@@ -846,6 +847,7 @@ impl ThreadView {
         thread_store: Option<Entity<ThreadStore>>,
         initial_content: Option<AgentInitialContent>,
         read_only_notice: Option<SharedString>,
+        read_only_can_stop: bool,
         mut subscriptions: Vec<Subscription>,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -1093,6 +1095,7 @@ impl ThreadView {
             multi_root_callout_dismissed: false,
             generating_indicator_in_list: false,
             read_only_notice,
+            read_only_can_stop,
             skill_loading_issues: Vec::new(),
             dismissed_skill_loading_issues: HashSet::default(),
         };
@@ -1989,8 +1992,8 @@ impl ThreadView {
     }
 
     pub fn cancel_generation(&mut self, cx: &mut Context<Self>) {
-        // A mirrored thread that only shows its notice offers no Stop, so
-        // Escape must not stop the agent it mirrors either.
+        // Escape must not stop the agent a mirrored thread shows; only its
+        // Stop button does.
         if self.read_only_notice().is_some() {
             return;
         }
@@ -1999,6 +2002,11 @@ impl ThreadView {
         self.user_interrupted_generation = true;
         self._cancel_task = Some(self.thread.update(cx, |thread, cx| thread.cancel(cx)));
         self.sync_generating_indicator(cx);
+        cx.notify();
+    }
+
+    fn stop_mirrored_agent(&mut self, cx: &mut Context<Self>) {
+        self._cancel_task = Some(self.thread.update(cx, |thread, cx| thread.cancel(cx)));
         cx.notify();
     }
 
@@ -4155,9 +4163,11 @@ impl ThreadView {
     pub(crate) fn set_read_only(
         &mut self,
         notice: Option<SharedString>,
+        can_stop: bool,
         cx: &mut Context<Self>,
     ) {
         self.read_only_notice = notice;
+        self.read_only_can_stop = can_stop;
         cx.notify();
     }
 
@@ -4176,10 +4186,23 @@ impl ThreadView {
         }
 
         if let Some(notice) = self.read_only_notice() {
-            return div()
+            let can_stop = self.read_only_can_stop
+                && self.thread.read(cx).status() != ThreadStatus::Idle;
+            return h_flex()
                 .w_full()
                 .p_2()
+                .gap_2()
+                .justify_between()
                 .child(Label::new(notice).color(Color::Muted))
+                .when(can_stop, |this| {
+                    this.child(
+                        IconButton::new("stop-mirrored-agent", IconName::Stop)
+                            .icon_size(IconSize::Small)
+                            .icon_color(Color::Error)
+                            .tooltip(Tooltip::text("Stop Their Agent"))
+                            .on_click(cx.listener(|this, _, _, cx| this.stop_mirrored_agent(cx))),
+                    )
+                })
                 .into_any_element();
         }
 
