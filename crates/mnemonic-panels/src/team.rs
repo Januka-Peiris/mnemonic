@@ -1899,7 +1899,7 @@ pub(crate) fn show_step_in_notice(window: &Entity<Workspace>, message: String, c
 /// The options a teammate may pick from: only once-only answers, as an
 /// "always" answer leaves a standing rule in the owner's agent, which is
 /// theirs to make.
-fn once_only_options(options: &PermissionOptions) -> Vec<acp::PermissionOption> {
+pub(crate) fn once_only_options(options: &PermissionOptions) -> Vec<acp::PermissionOption> {
     let (candidates, from_dropdown): (Vec<&acp::PermissionOption>, bool) = match options {
         PermissionOptions::Flat(options) => (options.iter().collect(), false),
         PermissionOptions::Dropdown(choices)
