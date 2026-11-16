@@ -213,13 +213,37 @@ pub(crate) fn live_session_extras(
     })
 }
 
+/// Creates the chats' working directory and builds their session extras,
+/// reading the sharer's instruction files and this Mac's git identity. None
+/// when the sharer doesn't let agents work in the workspace. Blocking.
+pub(crate) fn prepare_live_session(
+    data_dir: &Path,
+    host: &str,
+    client: &TeamClient,
+    shared: &TeamWorkspace,
+    sharer_name: &str,
+) -> Result<Option<(PathBuf, SessionExtras)>, String> {
+    let Some(root_path) = shared.root_path.as_deref().filter(|_| shared.agents) else {
+        return Ok(None);
+    };
+    let dir = live_chat_dir(data_dir, host, &shared.id);
+    std::fs::create_dir_all(&dir)
+        .map_err(|err| format!("Couldn't create {}: {err}", dir.display()))?;
+    let instructions = fetch_project_instructions(client, &shared.id, root_path);
+    let git_author = global_git_author();
+    Ok(live_session_extras(
+        shared,
+        sharer_name,
+        client.base_url(),
+        git_author.as_ref(),
+        &instructions,
+    )
+    .map(|extras| (dir, extras)))
+}
+
 /// The sharer's project instruction files, read through the share server.
 /// A file that is missing or can't be read is left out. Blocking.
-pub(crate) fn fetch_project_instructions(
-    client: &TeamClient,
-    workspace_id: &str,
-    root_path: &str,
-) -> String {
+fn fetch_project_instructions(client: &TeamClient, workspace_id: &str, root_path: &str) -> String {
     let root = root_path.trim_end_matches('/');
     let mut sections = Vec::new();
     for name in PROJECT_INSTRUCTION_FILES {
@@ -237,7 +261,7 @@ pub(crate) fn fetch_project_instructions(
 
 /// This Mac's git identity, sent so commits the agent makes on the sharer's
 /// Mac name this teammate. Blocking.
-pub(crate) fn global_git_author() -> Option<GitAuthor> {
+fn global_git_author() -> Option<GitAuthor> {
     let name = global_git_config("user.name")?;
     let email = global_git_config("user.email")?;
     Some(GitAuthor { name, email })
