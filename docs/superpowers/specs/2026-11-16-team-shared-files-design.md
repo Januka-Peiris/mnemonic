@@ -164,14 +164,21 @@ Jay picked A. Jay also picked sending edits back as a batch rather than live
 
 ## Left to the builder
 
-- The wire format: routes for the file list (long-poll), file contents, and
-  posting a batch; how large files are streamed; a body size limit for
-  batches that does not get in the way of real `.context/` data.
-- The fingerprint (content hash) and how Jay's side notices file changes
-  (file watcher or periodic scan), as long as it runs off the foreground
-  thread and does not slow Jay's app.
-- How the copy is registered as a workspace in Dan's Mnemonic and how it is
-  marked as a teammate's copy in the sidebar.
-- Where the batch history and held-back conflicts appear in Jay's UI
-  (likely the right panel beside Changes) and how the two versions are
-  shown.
+What was chosen:
+
+- Wire routes: `GET /v1/workspaces/{id}/files` (long-poll file list),
+  `GET /file?path=` (streamed contents), `GET /bundle?have=` (git bundle
+  without commits the copy has), `POST /changes` (a batch, 512 MB body limit
+  so large `.context/` data fits).
+- Fingerprints are sha256, hashed in a stream off the foreground thread; the
+  shared state is rescanned every 2 s (`PUBLISH_INTERVAL` in `team.rs`).
+- The copy is registered as a workspace with `workspace_source` `team_copy`
+  on branch `team/<peer-slug>/<branch>`.
+- Batch history and held-back conflicts appear as a "Teammate changes"
+  section in the workspace right panel, with Keep mine, Take <Name>'s,
+  Approve and Undo.
+- Rulings: the secret floor is skipped in any case spelling; batches refuse
+  paths spelled differently from disk; `.claude/settings.local.json` is
+  withheld while the committed `.claude/settings.json` arrives through git;
+  messaging the sharer's agent is removed, while Stop and permission answers
+  stay.
