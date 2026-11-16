@@ -204,7 +204,8 @@ pub type BatchHandler =
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct TeamFileUpdate {
     pub cursor: String,
-    pub manifest: TeamFileManifest,
+    /// None when the wait ended with the viewer's cursor still current.
+    pub manifest: Option<TeamFileManifest>,
 }
 
 /// Where to reach a teammate: a Tailscale machine name or address, with an
@@ -361,8 +362,8 @@ impl TeamShareHub {
             let now = Instant::now();
             if !unchanged || now >= deadline {
                 return Some(TeamFileUpdate {
+                    manifest: (!unchanged).then(|| manifest.clone()),
                     cursor: current,
-                    manifest: manifest.clone(),
                 });
             }
             state = self
@@ -1109,7 +1110,9 @@ impl TeamClient {
     }
 
     /// Waits up to `wait` for the workspace's file manifest to change from
-    /// `cursor`. None when the workspace isn't sharing files.
+    /// `cursor`. None when there is no manifest yet or the workspace is
+    /// unknown; sharing being off is `Err(Forbidden)`. The update's manifest
+    /// is None when the cursor was still current.
     pub fn files(
         &self,
         workspace_id: &str,

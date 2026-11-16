@@ -483,7 +483,14 @@ fn serve_file(
     if !in_manifest && !is_git_tracked(&root, &path) {
         return Err(not_found());
     }
-    let file = std::fs::File::open(&resolved).map_err(|_| not_found())?;
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let file = options.open(&resolved).map_err(|_| not_found())?;
     if !file.metadata().is_ok_and(|metadata| metadata.is_file()) {
         return Err(not_found());
     }
@@ -531,6 +538,12 @@ fn handle_changes(
 ) -> Response<std::io::Cursor<Vec<u8>>> {
     if let Err(refusal) = shared_root(shared, workspace_id, true) {
         return refusal;
+    }
+    if request
+        .body_length()
+        .is_some_and(|length| length > MAX_BATCH_BODY_BYTES)
+    {
+        return text_response(413, "The request is too long");
     }
     let mut body = Vec::new();
     let read = request
@@ -838,7 +851,7 @@ mod tests {
             .files("ws-1", None, Duration::ZERO)
             .map_err(|err| err.to_string())?
             .ok_or("manifest should be served")?;
-        assert_eq!(update.manifest, manifest);
+        assert_eq!(update.manifest, Some(manifest));
         assert_eq!(client.file("ws-1", "a.txt"), Ok(b"hello".to_vec()));
         assert_eq!(client.bundle("ws-1", &[]), Ok(b"bundle".to_vec()));
 
@@ -855,8 +868,15 @@ mod tests {
             .map_err(|_| "poller panicked")?
             .map_err(|err| err.to_string())?
             .ok_or("manifest should be served")?;
-        assert_eq!(next.manifest, newer);
+        assert_eq!(next.manifest, Some(newer));
         assert_ne!(next.cursor, update.cursor);
+
+        let unchanged = client
+            .files("ws-1", Some(&next.cursor), Duration::ZERO)
+            .map_err(|err| err.to_string())?
+            .ok_or("manifest should be served")?;
+        assert_eq!(unchanged.manifest, None);
+        assert_eq!(unchanged.cursor, next.cursor);
         Ok(())
     }
 
@@ -865,6 +885,9 @@ mod tests {
         let root = tempfile::tempdir().map_err(|err| err.to_string())?;
         std::fs::write(root.path().join(".env"), b"SECRET=1").map_err(|err| err.to_string())?;
         std::fs::write(root.path().join("unlisted.txt"), b"x").map_err(|err| err.to_string())?;
+        std::fs::create_dir(root.path().join(".claude")).map_err(|err| err.to_string())?;
+        std::fs::write(root.path().join(".claude/settings.local.json"), b"{}")
+            .map_err(|err| err.to_string())?;
         let hub = TeamShareHub::new();
         hub.set_file_manifest("ws-1", manifest_of(".env", b"SECRET=1"));
         let server = start_sharing_files(root.path().to_path_buf(), true, false, hub)?;
@@ -877,6 +900,9 @@ mod tests {
             .is_err_and(|err| refused(404)(&err)));
         assert!(client
             .file("ws-1", "../x")
+            .is_err_and(|err| refused(400)(&err)));
+        assert!(client
+            .file("ws-1", ".claude/./settings.local.json")
             .is_err_and(|err| refused(400)(&err)));
         Ok(())
     }

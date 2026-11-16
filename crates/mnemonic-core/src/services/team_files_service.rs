@@ -180,6 +180,12 @@ pub fn safe_relative_path(root: &Path, path: &str) -> Result<PathBuf, String> {
     if path.is_empty() {
         return Err("path is empty".to_string());
     }
+    if path
+        .split('/')
+        .any(|part| part.is_empty() || part == "." || part == "..")
+    {
+        return Err(format!("{path} is not a plain relative path"));
+    }
     for component in components {
         match component {
             Component::Normal(name) => {
@@ -543,6 +549,9 @@ mod tests {
             ".Git/config",
             ".GIT/hooks/x",
             "linkfile",
+            "a/./b",
+            "a//b",
+            "a/",
         ] {
             assert!(
                 safe_relative_path(root, bad).is_err(),
