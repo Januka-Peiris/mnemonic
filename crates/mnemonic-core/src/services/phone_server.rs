@@ -17,6 +17,7 @@ use crate::services::team_share_server::{
 use crate::services::team_share_service::{
     CallerIdentity, TeamActionError, TeamShareHub, TeamWorkspaceList, TlsFiles, is_plain_id,
 };
+use crate::services::web_push_service::PushSubscription;
 
 /// Sent by the page on every POST. A page on another site can't add it
 /// without a CORS preflight, which this server never answers.
@@ -143,6 +144,9 @@ pub struct PhoneSources {
     /// Most recently used first.
     pub repositories: PhoneRepositorySource,
     pub pr_status: PhonePrStatusSource,
+    /// The public VAPID key, base64url, that browsers subscribe with.
+    pub push_key: Arc<dyn Fn() -> Result<String, String> + Send + Sync>,
+    pub save_push_subscription: Arc<dyn Fn(PushSubscription) -> Result<(), String> + Send + Sync>,
 }
 
 struct Shared {
@@ -306,6 +310,10 @@ fn handle(mut request: Request, shared: &Shared) {
                 Err(err) => text_response(500, &err.to_string()),
             }
         }
+        ["v1", "push", "key"] => match (shared.sources.push_key)() {
+            Ok(key) => json_response(200, serde_json::json!({ "key": key }).to_string()),
+            Err(err) => text_response(500, &err),
+        },
         ["v1", "repositories"] => match (shared.sources.repositories)() {
             Ok(repositories) => {
                 match serde_json::to_string(&PhoneRepositoryList { repositories }) {
@@ -488,6 +496,15 @@ fn handle_action(
     if body.len() > MAX_ACTION_BODY_BYTES {
         return text_response(413, "The request is too long");
     }
+    if let ["v1", "push", "subscriptions"] = segments {
+        return match parse_push_subscription(&body) {
+            Ok(subscription) => match (shared.sources.save_push_subscription)(subscription) {
+                Ok(()) => json_response(200, "{}".to_string()),
+                Err(err) => text_response(500, &err),
+            },
+            Err(reason) => text_response(400, &reason),
+        };
+    }
     let action = match parse_action(segments, &body) {
         Ok(action) => action,
         Err((status, reason)) => return text_response(status, &reason),
@@ -505,6 +522,30 @@ fn handle_action(
         Err(TeamActionError::NothingToDo(reason)) => text_response(409, &reason),
         Err(TeamActionError::Failed(reason)) => text_response(500, &reason),
     }
+}
+
+/// Browsers nest the keys, as `PushSubscription.toJSON()` writes them.
+fn parse_push_subscription(body: &[u8]) -> Result<PushSubscription, String> {
+    #[derive(serde::Deserialize)]
+    struct Keys {
+        p256dh: String,
+        auth: String,
+    }
+    #[derive(serde::Deserialize)]
+    struct Browser {
+        endpoint: String,
+        keys: Keys,
+    }
+    let browser: Browser =
+        serde_json::from_slice(body).map_err(|err| format!("Couldn't read the request: {err}"))?;
+    if !browser.endpoint.starts_with("https://") {
+        return Err("The push endpoint must be an https address".to_string());
+    }
+    Ok(PushSubscription {
+        endpoint: browser.endpoint,
+        p256dh: browser.keys.p256dh,
+        auth: browser.keys.auth,
+    })
 }
 
 fn parse_action(segments: &[&str], body: &[u8]) -> Result<PhoneAction, (u16, String)> {
@@ -684,6 +725,8 @@ mod tests {
                     ])
                 }),
                 pr_status: Arc::new(|_| Ok(PhonePrStatus::default())),
+                push_key: Arc::new(|| Ok("key".to_string())),
+                save_push_subscription: Arc::new(|_| Ok(())),
             },
             handler,
         )?;
@@ -811,6 +854,21 @@ mod tests {
                 text: "hi".to_string(),
             }]
         );
+        Ok(())
+    }
+
+    #[test]
+    fn refuses_a_non_https_push_endpoint() -> Result<(), String> {
+        let (server, _recorded) = start("jay@example.com", Vec::new(), TeamShareHub::new())?;
+        let address = server.address();
+        let body = r#"{"endpoint":"http://push.example/x","keys":{"p256dh":"a","auth":"b"}}"#;
+        let request = format!(
+            "POST /v1/push/subscriptions HTTP/1.1\r\nHost: {address}\r\n\
+             Origin: http://{address}\r\nContent-Type: application/json\r\n\
+             {PHONE_REQUEST_HEADER}: 1\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        assert_eq!(raw_status(address, &request)?, 400);
         Ok(())
     }
 

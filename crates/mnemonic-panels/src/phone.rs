@@ -16,9 +16,12 @@ use futures::channel::{mpsc, oneshot};
 use futures::future::{self, Either};
 use gpui::{AnyWindowHandle, App, AppContext as _, Context, Entity, Global, Subscription, Task};
 use mnemonic_core::models::{DiscoveredRepository, WorkspaceDetail, WorkspacePrStatus};
-use mnemonic_core::repositories::{repository_repository, workspace_repository};
+use mnemonic_core::repositories::{
+    push_subscription_repository, repository_repository, workspace_repository,
+};
 use mnemonic_core::services::ntfy_service::{
-    self, Notice, NoticeKind, NtfyRequest, mac_idle_seconds, ntfy_request, should_notify,
+    self, Notice, NoticeKind, NtfyRequest, mac_idle_seconds, notice_body, ntfy_request,
+    should_notify,
 };
 use mnemonic_core::services::phone_server::{
     PhoneAction, PhoneActionHandler, PhoneActionOutcome, PhoneAgent, PhonePrStatus,
@@ -29,13 +32,16 @@ use mnemonic_core::services::team_share_service::{
     DEFAULT_TEAM_PORT, TailscaleSelf, TailscaleWhois, TeamActionError, TeamShareHub, TlsFiles,
     tailscale_cert, tailscale_self,
 };
+use mnemonic_core::services::web_push_service::{
+    self, PushOutcome, PushSubscription, load_or_create_vapid_keys,
+};
 use settings::{RegisterSetting, Settings, SettingsStore};
 use workspace::Workspace;
 
 use crate::WorkspacePanel;
 use crate::chat_feed::{
-    ChatFeed, ChatFeedEvent, PermissionScope, SharedRecords, TranscriptToRead, WorkspaceFlags,
-    load_records, read_saved_transcripts,
+    ChatFeed, ChatFeedEvent, PermissionScope, QuickAnswers, SharedRecords, TranscriptToRead,
+    WorkspaceFlags, load_records, read_saved_transcripts,
 };
 use crate::team::{answer_permission, show_step_in_notice, wait_for_reply, workspace_diff_source};
 use crate::workspace_detail_panel::request_pr;
@@ -203,27 +209,33 @@ impl PhoneShare {
     /// been left alone long enough that nobody is watching it.
     fn notify_idle_phone(&mut self, event: &ChatFeedEvent, cx: &mut Context<Self>) {
         let settings = PhoneSettings::get_global(cx);
-        if settings.ntfy_url.is_empty() {
-            return;
-        }
         let Some(page_url) = self.page_url.clone() else {
             return;
         };
+        let mut permission = None;
         let (workspace_id, notice, stop_reason) = match event {
             ChatFeedEvent::PermissionRequested {
                 workspace_id,
                 chat_id,
                 tool_kind,
-            } => (
-                workspace_id,
+                tool_call_id,
+                quick_answers,
+            } => {
+                permission = quick_answers.as_ref().map(|answers| PushPermission {
+                    tool_call_id: tool_call_id.clone(),
+                    answers: answers.clone(),
+                });
                 (
-                    NoticeKind::Permission,
-                    chat_id,
-                    String::new(),
-                    Some(*tool_kind),
-                ),
-                None,
-            ),
+                    workspace_id,
+                    (
+                        NoticeKind::Permission,
+                        chat_id,
+                        String::new(),
+                        Some(*tool_kind),
+                    ),
+                    None,
+                )
+            }
             ChatFeedEvent::TurnEnded {
                 workspace_id,
                 chat_id,
@@ -245,15 +257,20 @@ impl PhoneShare {
             ),
         };
         let (kind, chat_id, chat_title, tool_kind) = notice;
-        let workspace_name = self
+        let (push_title, workspace_name) = self
             .feed
             .read(cx)
             .hub()
             .workspaces()
             .into_iter()
             .find(|workspace| &workspace.id == workspace_id)
-            .map(|workspace| workspace.name)
-            .unwrap_or_else(|| workspace_id.clone());
+            .map(|workspace| {
+                (
+                    format!("{} / {}", workspace.project, workspace.name),
+                    workspace.name,
+                )
+            })
+            .unwrap_or_else(|| (workspace_id.clone(), workspace_id.clone()));
         let notice = Notice {
             kind,
             workspace_name,
@@ -261,7 +278,7 @@ impl PhoneShare {
             chat_title,
             tool_kind,
         };
-        let ntfy_url = settings.ntfy_url.clone();
+        let ntfy_url = Some(settings.ntfy_url.clone()).filter(|url| !url.is_empty());
         let token = settings.ntfy_token.clone();
         let threshold_minutes = settings.notify_after_idle_minutes;
         cx.spawn(async move |this, cx| {
@@ -288,14 +305,18 @@ impl PhoneShare {
             if collapsed {
                 return;
             }
-            let request: NtfyRequest =
-                ntfy_request(&ntfy_url, token.as_deref(), &page_url, &notice);
-            let sent = cx
-                .background_spawn(async move { ntfy_service::send(&request) })
-                .await;
-            if let Err(err) = sent {
-                log::warn!("Couldn't send the phone alert: {err}");
-            }
+            let payload = push_payload(&push_title, &notice, &page_url, permission.as_ref());
+            let request: Option<NtfyRequest> = ntfy_url
+                .map(|ntfy_url| ntfy_request(&ntfy_url, token.as_deref(), &page_url, &notice));
+            cx.background_spawn(async move {
+                if let Some(request) = request {
+                    if let Err(err) = ntfy_service::send(&request) {
+                        log::warn!("Couldn't send the phone alert: {err}");
+                    }
+                }
+                send_web_push(&payload);
+            })
+            .await;
         })
         .detach();
     }
@@ -630,6 +651,8 @@ fn start_server(
                 }),
                 repositories: Arc::new(phone_repositories),
                 pr_status: Arc::new(phone_pr_status),
+                push_key: Arc::new(phone_push_key),
+                save_push_subscription: Arc::new(save_push_subscription),
             },
             action_handler.clone(),
         )
@@ -654,6 +677,71 @@ fn start_server(
         certificate,
         https_error,
     })
+}
+
+struct PushPermission {
+    tool_call_id: String,
+    answers: QuickAnswers,
+}
+
+/// Like the ntfy alert, never carries a command, tool input, message or
+/// diff: only what kind of thing happened and where.
+fn push_payload(
+    title: &str,
+    notice: &Notice,
+    page_url: &str,
+    permission: Option<&PushPermission>,
+) -> String {
+    serde_json::json!({
+        "title": title,
+        "body": notice_body(notice),
+        "chat_id": notice.chat_id,
+        "url": format!("{page_url}#chat={}", notice.chat_id),
+        "permission": permission.map(|permission| serde_json::json!({
+            "tool_call_id": permission.tool_call_id,
+            "allow_option_id": permission.answers.allow_option_id,
+            "deny_option_id": permission.answers.deny_option_id,
+        })),
+    })
+    .to_string()
+}
+
+fn send_web_push(payload: &str) {
+    if let Err(err) = try_send_web_push(payload) {
+        log::warn!("Couldn't send the phone's web push: {err}");
+    }
+}
+
+fn try_send_web_push(payload: &str) -> Result<(), String> {
+    let state = mnemonic_bridge::mnemonic_state_cloned()
+        .ok_or_else(|| "Mnemonic isn't ready".to_string())?;
+    let subscriptions = push_subscription_repository::list(&state.db)?;
+    if subscriptions.is_empty() {
+        return Ok(());
+    }
+    let keys = load_or_create_vapid_keys(&state.data_dir.join("phone"))?;
+    for subscription in subscriptions {
+        match web_push_service::send(&subscription, payload.as_bytes(), &keys) {
+            Ok(PushOutcome::Delivered) => {}
+            Ok(PushOutcome::Gone) => {
+                push_subscription_repository::delete(&state.db, &subscription.endpoint)?;
+            }
+            Err(err) => log::warn!("Couldn't send a web push: {err}"),
+        }
+    }
+    Ok(())
+}
+
+fn phone_push_key() -> Result<String, String> {
+    let state = mnemonic_bridge::mnemonic_state_cloned()
+        .ok_or_else(|| "Mnemonic isn't ready".to_string())?;
+    Ok(load_or_create_vapid_keys(&state.data_dir.join("phone"))?.public_key_base64url())
+}
+
+fn save_push_subscription(subscription: PushSubscription) -> Result<(), String> {
+    let state = mnemonic_bridge::mnemonic_state_cloned()
+        .ok_or_else(|| "Mnemonic isn't ready".to_string())?;
+    push_subscription_repository::upsert(&state.db, &subscription)
 }
 
 /// The repositories, those with the newest workspace first. Workspaces carry

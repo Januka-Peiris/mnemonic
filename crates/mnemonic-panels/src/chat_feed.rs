@@ -59,11 +59,35 @@ pub(crate) struct TranscriptToRead {
     pub modified: SystemTime,
 }
 
+/// The options a one-tap answer from a notification uses.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct QuickAnswers {
+    pub allow_option_id: String,
+    pub deny_option_id: String,
+}
+
+/// The first allow-once and the first reject-once among `options`, None
+/// unless both exist, since a notification can't offer a lone button.
+pub(crate) fn quick_answers(options: &[acp::PermissionOption]) -> Option<QuickAnswers> {
+    let first = |wanted| {
+        options
+            .iter()
+            .find(|option| option.kind == wanted)
+            .map(|option| option.option_id.0.to_string())
+    };
+    Some(QuickAnswers {
+        allow_option_id: first(acp::PermissionOptionKind::AllowOnce)?,
+        deny_option_id: first(acp::PermissionOptionKind::RejectOnce)?,
+    })
+}
+
 pub(crate) enum ChatFeedEvent {
     PermissionRequested {
         workspace_id: String,
         chat_id: String,
         tool_kind: acp::ToolKind,
+        tool_call_id: String,
+        quick_answers: Option<QuickAnswers>,
     },
     TurnEnded {
         workspace_id: String,
@@ -391,10 +415,17 @@ impl ChatFeed {
         match event {
             AcpThreadEvent::ToolAuthorizationRequested(tool_call_id) => {
                 let (_, tool_call) = thread.tool_call(tool_call_id)?;
+                let tool_call_id = tool_call_id.0.to_string();
+                let quick_answers = thread_permissions(thread, self.scope)
+                    .into_iter()
+                    .find(|request| request.tool_call_id == tool_call_id)
+                    .and_then(|request| quick_answers(&request.options));
                 Some(ChatFeedEvent::PermissionRequested {
                     workspace_id,
                     chat_id,
                     tool_kind: tool_call.kind,
+                    tool_call_id,
+                    quick_answers,
                 })
             }
             AcpThreadEvent::Stopped(stop_reason) => Some(ChatFeedEvent::TurnEnded {
@@ -598,6 +629,27 @@ mod tests {
     use std::cell::RefCell;
     use std::rc::Rc;
 
+    #[test]
+    fn quick_answers_need_both_once_options() {
+        let option = |id: &'static str, kind| acp::PermissionOption::new(id, id, kind);
+        let both = quick_answers(&[
+            option("always", acp::PermissionOptionKind::AllowAlways),
+            option("yes", acp::PermissionOptionKind::AllowOnce),
+            option("no", acp::PermissionOptionKind::RejectOnce),
+        ]);
+        assert_eq!(
+            both.map(|answers| (answers.allow_option_id, answers.deny_option_id)),
+            Some(("yes".to_string(), "no".to_string()))
+        );
+        assert!(
+            quick_answers(&[
+                option("always", acp::PermissionOptionKind::AllowAlways),
+                option("no", acp::PermissionOptionKind::RejectOnce),
+            ])
+            .is_none()
+        );
+    }
+
     fn published_option_kinds(
         scope: PermissionScope,
         thread: &Entity<AcpThread>,
@@ -669,6 +721,7 @@ mod tests {
                         workspace_id,
                         chat_id,
                         tool_kind,
+                        ..
                     } = event
                     {
                         announced.borrow_mut().push((
