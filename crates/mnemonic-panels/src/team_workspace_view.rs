@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
 
-use acp_thread::AcpThreadEvent;
+use acp_thread::{AcpThreadEvent, ThreadStatus};
 use agent_client_protocol::schema as acp;
 use agent_servers::{AgentServer, set_session_extras};
 use agent_ui::{
@@ -126,6 +126,12 @@ pub(crate) struct LiveChatItem {
     /// None until the session setup is ready, which needs the teammate
     /// online.
     view: Option<Entity<ConversationView>>,
+    /// The view's session started while the share server's tools were out
+    /// of reach, so Claude gave up on them for the session and it is
+    /// reloaded once they are back.
+    started_without_tools: bool,
+    /// The view was dropped to reload its session, which is still closing.
+    reloading: bool,
     observed_thread: Option<EntityId>,
     focus_handle: FocusHandle,
     _view_subscription: Option<Subscription>,
@@ -133,6 +139,16 @@ pub(crate) struct LiveChatItem {
 }
 
 impl LiveChatItem {
+    fn drop_view_for_reload(&mut self, cx: &mut Context<Self>) {
+        self.view = None;
+        self.reloading = true;
+        self.started_without_tools = false;
+        self.observed_thread = None;
+        self._view_subscription = None;
+        self._thread_subscription = None;
+        cx.notify();
+    }
+
     fn set_view(&mut self, view: Entity<ConversationView>, cx: &mut Context<Self>) {
         self._view_subscription = Some(cx.observe(&view, |this, _, cx| {
             this.handle_view_changed(cx);
@@ -357,6 +373,10 @@ pub(crate) struct TeammateWorkspaceView {
     /// The live chats' working directory, set once their session extras
     /// are in place.
     live_dir: Option<PathBuf>,
+    /// The session extras were built while the sharer was unreachable, so
+    /// they lack the sharer's instruction files and are built again once
+    /// the sharer is back.
+    live_setup_offline: bool,
     live_setup_task: Option<Task<()>>,
     files: Vec<TeamFileDiff>,
     diff_state: TeammateDiffState,
@@ -398,6 +418,7 @@ impl TeammateWorkspaceView {
             live_chats: Vec::new(),
             live_connection_store: None,
             live_dir: None,
+            live_setup_offline: false,
             live_setup_task: None,
             files: Vec::new(),
             diff_state: TeammateDiffState::Loading,
@@ -874,6 +895,8 @@ impl TeammateWorkspaceView {
             record,
             peer_name,
             view: None,
+            started_without_tools: false,
+            reloading: false,
             observed_thread: None,
             focus_handle: cx.focus_handle(),
             _view_subscription: None,
@@ -909,26 +932,52 @@ impl TeammateWorkspaceView {
         self.start_live_chats(window, cx);
     }
 
-    /// Puts the session extras in place once, then builds a view for every
-    /// live chat still waiting for one.
+    /// Whether a session starting now would reach the share server's tools.
+    fn live_tools_reachable(&self) -> bool {
+        self.available
+            && self
+                .last_known
+                .as_ref()
+                .is_some_and(|shared| shared.agents && shared.root_path.is_some())
+    }
+
+    /// Puts the session extras in place, again once the sharer is back if
+    /// they were built while the sharer was away, then builds a view for
+    /// every live chat waiting for one and reloads the sessions that started
+    /// without the tools.
     fn start_live_chats(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let waiting: Vec<Entity<LiveChatItem>> = self
             .live_chats
             .iter()
-            .filter(|item| item.read(cx).view.is_none())
+            .filter(|item| {
+                let item = item.read(cx);
+                item.view.is_none() && !item.reloading
+            })
             .cloned()
             .collect();
-        if waiting.is_empty() {
-            return;
+        let needs_setup = (self.live_dir.is_none() && !waiting.is_empty())
+            || (self.live_setup_offline && self.live_tools_reachable());
+        if needs_setup {
+            self.set_up_live_session(window, cx);
         }
-        if let Some(dir) = self.live_dir.clone() {
-            for item in waiting {
-                let record = item.read(cx).record.clone();
-                let view = self.build_live_chat_view(&record, &dir, window, cx);
-                item.update(cx, |item, cx| item.set_view(view, cx));
-            }
+        let Some(dir) = self.live_dir.clone() else {
             return;
+        };
+        let started_without_tools = self.live_setup_offline || !self.live_tools_reachable();
+        for item in waiting {
+            let record = item.read(cx).record.clone();
+            let view = self.build_live_chat_view(&record, &dir, window, cx);
+            item.update(cx, |item, cx| {
+                item.started_without_tools = started_without_tools;
+                item.set_view(view, cx);
+            });
         }
+        if !started_without_tools {
+            self.reload_live_chats_started_without_tools(window, cx);
+        }
+    }
+
+    fn set_up_live_session(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.live_setup_task.is_some() {
             return;
         }
@@ -975,6 +1024,7 @@ impl TeammateWorkspaceView {
                     Ok(Some((dir, extras))) => {
                         set_session_extras(dir.clone(), extras, cx);
                         this.live_dir = Some(dir);
+                        this.live_setup_offline = !sharer_reachable;
                         this.start_live_chats(window, cx);
                     }
                     Ok(None) => {}
@@ -983,6 +1033,52 @@ impl TeammateWorkspaceView {
             })
             .log_err();
         }));
+    }
+
+    /// Claude gives up on an MCP server it can't reach when a session
+    /// starts, so those sessions are closed and loaded again. A chat in the
+    /// middle of a turn is left for a later sync.
+    fn reload_live_chats_started_without_tools(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        for item in self.live_chats.clone() {
+            let Some(view) = item
+                .read(cx)
+                .view
+                .clone()
+                .filter(|_| item.read(cx).started_without_tools)
+            else {
+                continue;
+            };
+            let busy = view.read(cx).is_loading()
+                || view
+                    .read(cx)
+                    .root_thread(cx)
+                    .is_some_and(|thread| thread.read(cx).status() == ThreadStatus::Generating);
+            if busy {
+                continue;
+            }
+            let close_task = view.update(cx, |view, cx| {
+                view.as_connected()
+                    .map(|connected| connected.close_all_sessions(cx))
+            });
+            item.update(cx, |item, cx| item.drop_view_for_reload(cx));
+            cx.spawn_in(window, async move |this, cx| {
+                if let Some(close_task) = close_task {
+                    close_task.await;
+                }
+                this.update_in(cx, |this, window, cx| {
+                    item.update(cx, |item, _| item.reloading = false);
+                    if this.live_chats.contains(&item) {
+                        this.start_live_chats(window, cx);
+                    }
+                })
+                .log_err();
+            })
+            .detach();
+        }
     }
 
     fn build_live_chat_view(
