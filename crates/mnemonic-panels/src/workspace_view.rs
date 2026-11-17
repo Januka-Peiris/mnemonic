@@ -5980,7 +5980,6 @@ mod tests {
     #[test]
     fn composer_text_goes_to_the_cli_tab_being_viewed() {
         let sessions = [chat(ChatAgent::Claude, false), terminal("claude-2")];
-
         assert_eq!(
             pick_dispatch_target(DispatchOrigin::Composer, &sessions, 1),
             Some(DispatchTarget::Terminal(1))

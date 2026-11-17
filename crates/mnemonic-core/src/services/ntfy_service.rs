@@ -64,20 +64,38 @@ pub fn ntfy_request(
     }
 }
 
+/// Published as JSON because header values can't carry non-ASCII workspace
+/// names.
+fn build_request(
+    client: &reqwest::blocking::Client,
+    request: &NtfyRequest,
+) -> Result<reqwest::blocking::RequestBuilder, String> {
+    let (server, topic) = request
+        .url
+        .trim_end_matches('/')
+        .rsplit_once('/')
+        .filter(|(server, topic)| !topic.is_empty() && !server.ends_with('/'))
+        .ok_or_else(|| {
+            "The ntfy address needs a topic, like https://ntfy.sh/my-topic".to_string()
+        })?;
+    let mut builder = client.post(server).json(&serde_json::json!({
+        "topic": topic,
+        "title": request.title,
+        "message": request.body,
+        "click": request.click,
+    }));
+    if let Some(token) = &request.token {
+        builder = builder.header("Authorization", format!("Bearer {token}"));
+    }
+    Ok(builder)
+}
+
 pub fn send(request: &NtfyRequest) -> Result<(), String> {
     let client = reqwest::blocking::Client::builder()
         .timeout(SEND_TIMEOUT)
         .build()
         .map_err(|err| format!("Couldn't set up the ntfy request: {err}"))?;
-    let mut builder = client
-        .post(&request.url)
-        .header("Title", &request.title)
-        .header("Click", &request.click)
-        .body(request.body.clone());
-    if let Some(token) = &request.token {
-        builder = builder.header("Authorization", format!("Bearer {token}"));
-    }
-    let response = builder
+    let response = build_request(&client, request)?
         .send()
         .map_err(|err| format!("Couldn't reach ntfy: {err}"))?;
     if !response.status().is_success() {
@@ -171,6 +189,26 @@ mod tests {
             parse_hid_idle_seconds("    |   \"HIDIdleTime\" = 312000000000\n"),
             Some(312)
         );
+    }
+
+    #[test]
+    fn non_ascii_workspace_name_can_be_published() {
+        let request = NtfyRequest {
+            url: "https://ntfy.sh/topic".into(),
+            title: "caf\u{e9} \u{1f680}".into(),
+            body: "finished: Deploy".into(),
+            click: "http://mac.ts.net:47232/#chat=chat-1".into(),
+            token: Some("tk".into()),
+        };
+        let client = reqwest::blocking::Client::new();
+        let built = build_request(&client, &request).unwrap().build().unwrap();
+        assert_eq!(built.url().as_str(), "https://ntfy.sh/");
+        let body: serde_json::Value =
+            serde_json::from_slice(built.body().unwrap().as_bytes().unwrap()).unwrap();
+        assert_eq!(body["topic"], "topic");
+        assert_eq!(body["title"], "caf\u{e9} \u{1f680}");
+        assert_eq!(body["message"], "finished: Deploy");
+        assert_eq!(body["click"], "http://mac.ts.net:47232/#chat=chat-1");
     }
 
     #[test]

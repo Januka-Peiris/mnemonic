@@ -17,7 +17,7 @@ use settings::{Settings as _, SettingsStore, TeamPeerContent, update_settings_fi
 use ui::{Checkbox, Headline, HeadlineSize, Switch, ToggleState, Tooltip, prelude::*};
 use util::ResultExt as _;
 
-use crate::phone::{phone_page_url, phone_share};
+use crate::phone::{phone_page_url, phone_share, phone_start_error};
 use crate::team::{
     SharingStatus, TeamPeer, TeamSettings, is_workspace_shared, set_workspace_shared, team_share,
 };
@@ -188,6 +188,13 @@ impl TeamSettingsView {
         card("This computer", None, cx)
             .child(address)
             .child(Label::new(status).size(LabelSize::Small).color(color))
+            .when_some(phone_start_error(cx), |card, err| {
+                card.child(
+                    Label::new(format!("Phone page couldn't start: {err}"))
+                        .size(LabelSize::Small)
+                        .color(Color::Warning),
+                )
+            })
             .when_some(phone_page_url(cx), |card, url| {
                 card.child(
                     h_flex()

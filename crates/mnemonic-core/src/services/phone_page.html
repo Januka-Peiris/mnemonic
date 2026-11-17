@@ -899,7 +899,7 @@ async function chooseAgent(workspaceId) {
   list.replaceChildren(make("div", "muted", "Loading..."));
   element("agent-sheet").classList.remove("hidden");
   try {
-    if (!app.agents) {
+    if (!app.agents || !app.agents.length) {
       app.agents = (await getJson("/v1/agents")).agents || [];
     }
   } catch (error) {

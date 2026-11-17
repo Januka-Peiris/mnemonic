@@ -8552,7 +8552,7 @@ fn workspaces_page() -> SettingsPage {
             }),
             SettingsPageItem::SettingItem(SettingItem {
                 title: "Notify After Idle Minutes",
-                description: "How many minutes a chat must wait for you before a notification is sent.",
+                description: "Minutes without keyboard or mouse input on this Mac before alerts are sent.",
                 field: Box::new(SettingField {
                     organization_override: None,
                     json_path: Some("phone.notify_after_idle_minutes"),

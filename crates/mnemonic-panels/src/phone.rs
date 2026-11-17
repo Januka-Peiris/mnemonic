@@ -91,6 +91,8 @@ pub(crate) struct PhoneShare {
     server: Option<PhoneServer>,
     /// The page's address, once the server is running.
     page_url: Option<String>,
+    /// Why the server last failed to start, until it starts or is turned off.
+    start_error: Option<String>,
     /// Publishes every workspace and its chats into the hub the server
     /// serves. Kept for as long as the app runs, so its events can be
     /// followed across restarts of the server.
@@ -142,6 +144,11 @@ pub(crate) fn phone_page_url(cx: &App) -> Option<String> {
     phone_share(cx)?.read(cx).page_url.clone()
 }
 
+/// Why the phone server couldn't start, while it is still trying.
+pub(crate) fn phone_start_error(cx: &App) -> Option<String> {
+    phone_share(cx)?.read(cx).start_error.clone()
+}
+
 impl PhoneShare {
     fn new(cx: &mut Context<Self>) -> Self {
         let feed = cx.new(|_| ChatFeed::new(TeamShareHub::new(), PermissionScope::All));
@@ -152,6 +159,7 @@ impl PhoneShare {
             port: None,
             server: None,
             page_url: None,
+            start_error: None,
             feed,
             start_task: None,
             publish_task: None,
@@ -319,6 +327,7 @@ impl PhoneShare {
                     let started = match attempt {
                         Ok((server, started_as)) => {
                             this.page_url = Some(page_url(&started_as, server.address().port()));
+                            this.start_error = None;
                             this.server = Some(server);
                             this.start_publishing(cx);
                             this.tailscale_watch =
@@ -327,6 +336,7 @@ impl PhoneShare {
                         }
                         Err(err) => {
                             log::warn!("Couldn't start the phone server: {err}");
+                            this.start_error = Some(err.to_string());
                             false
                         }
                     };
@@ -378,6 +388,7 @@ impl PhoneShare {
         self.server = None;
         self.port = None;
         self.page_url = None;
+        self.start_error = None;
         self.feed.update(cx, |feed, _| feed.clear());
     }
 

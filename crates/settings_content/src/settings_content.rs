@@ -1061,8 +1061,7 @@ pub struct PhoneSettingsContent {
     ///
     /// Default: ""
     pub ntfy_token: Option<String>,
-    /// How many minutes a chat must wait for you before a notification is
-    /// sent.
+    /// Minutes without keyboard or mouse input on this Mac before alerts are sent.
     ///
     /// Default: 5
     pub notify_after_idle_minutes: Option<u32>,
