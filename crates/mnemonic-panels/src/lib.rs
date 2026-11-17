@@ -1,3 +1,4 @@
+mod agent_hub;
 mod command_approval_panel;
 mod team;
 mod team_connection;
@@ -27,6 +28,7 @@ pub use workspaces_settings::WorkspacesSettings;
 pub fn init(cx: &mut gpui::App) {
     workspaces_settings::init(cx);
     team::init(cx);
+    agent_hub::init(cx);
 }
 
 pub use mnemonic_bridge::ActiveWorkspace;

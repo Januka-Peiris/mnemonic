@@ -2182,7 +2182,7 @@ const NAME_ANIMALS: &[&str] = &[
 /// Conductor-style two-word workspace names ("patient-cipher"), seeded from
 /// the clock so no rand dependency is needed. Falls back to a numeric suffix
 /// in the unlikely case the random picks keep colliding.
-fn generate_workspace_name(existing: &[String]) -> String {
+pub(crate) fn generate_workspace_name(existing: &[String]) -> String {
     let mut seed = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_nanos() as u64)
@@ -2461,7 +2461,7 @@ fn issue_seed(id: &str, title: &str, kind: &str, url: &str, body: &str) -> Works
 }
 
 /// `name`, or `name-2`, `name-3`... when a workspace already uses it.
-fn unique_workspace_name(name: &str, existing: &[String]) -> String {
+pub(crate) fn unique_workspace_name(name: &str, existing: &[String]) -> String {
     let taken = |candidate: &str| existing.iter().any(|existing| existing == candidate);
     if !taken(name) {
         return name.to_string();

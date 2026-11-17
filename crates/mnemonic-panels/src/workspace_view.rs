@@ -204,7 +204,6 @@ impl ChatAgent {
         }
     }
 
-    #[expect(dead_code, reason = "the agent hub tools call it")]
     pub(crate) fn from_choice(choice: ChatAgentChoice) -> Self {
         match choice {
             ChatAgentChoice::Claude => Self::Claude,
@@ -2858,6 +2857,10 @@ impl WorkspaceView {
         record: &ChatSessionRecord,
         cx: &App,
     ) -> Option<Rc<dyn agent_servers::AgentServer>> {
+        #[cfg(test)]
+        if let Some(server) = cx.try_global::<tests::TestChatServer>() {
+            return Some(server.0.clone());
+        }
         let project = self.project.upgrade()?;
         let agent = Agent::Custom {
             id: AgentId(SharedString::from(record.agent.clone())),
@@ -4851,6 +4854,14 @@ pub(crate) fn register_window(
     windows.0.push((workspace, window));
 }
 
+/// The OS window showing this Mnemonic window's workspace.
+pub(crate) fn window_handle_of(workspace: &Entity<Workspace>, cx: &App) -> Option<AnyWindowHandle> {
+    open_window_handles(cx)
+        .into_iter()
+        .find(|(open, _)| open == workspace)
+        .map(|(_, window)| window)
+}
+
 pub(crate) fn open_windows(cx: &App) -> Vec<Entity<Workspace>> {
     open_window_handles(cx)
         .into_iter()
@@ -4918,7 +4929,6 @@ pub(crate) fn find_open_chat(record_id: &str, cx: &App) -> Option<OpenChat> {
 }
 
 /// What a chat's agent is doing, for the agent hub.
-#[cfg_attr(not(test), expect(dead_code, reason = "the agent hub tools call it"))]
 pub(crate) fn chat_state(record_id: &str, cx: &App) -> ChatState {
     let Some(open_chat) = find_open_chat(record_id, cx) else {
         return ChatState::Closed;
@@ -4956,7 +4966,6 @@ pub(crate) fn chat_state(record_id: &str, cx: &App) -> ChatState {
 }
 
 /// The agent's text since the last user message, without its thinking.
-#[cfg_attr(not(test), expect(dead_code, reason = "the agent hub tools call it"))]
 pub(crate) fn latest_reply(record_id: &str, cx: &App) -> Option<String> {
     let thread = find_open_chat(record_id, cx)?.thread?;
     let thread = thread.read(cx);
@@ -4989,7 +4998,6 @@ fn replies_since_last_user_message(
 /// Takes the messages the user typed into a chat while its agent was busy
 /// off the chat's queue, so they aren't also sent when its turn ends.
 /// Messages with no text, such as a lone image, stay queued.
-#[expect(dead_code, reason = "the agent hub tools call it")]
 pub(crate) fn take_typed_messages(record_id: &str, cx: &mut App) -> Vec<String> {
     let Some(thread_view) = find_open_chat(record_id, cx).and_then(|chat| {
         chat.view
@@ -5024,7 +5032,6 @@ pub(crate) fn take_typed_messages(record_id: &str, cx: &mut App) -> Vec<String> 
 }
 
 /// Sends a message to a chat, queued until it is connected and idle.
-#[expect(dead_code, reason = "the agent hub tools call it")]
 pub(crate) fn send_to_chat(record_id: &str, text: String, cx: &mut App) -> Result<(), String> {
     let chat = find_open_chat(record_id, cx).ok_or_else(|| "That chat isn't open.".to_string())?;
     chat.view
@@ -5032,7 +5039,6 @@ pub(crate) fn send_to_chat(record_id: &str, text: String, cx: &mut App) -> Resul
 }
 
 /// The open chat whose agent session has this id.
-#[expect(dead_code, reason = "the agent hub tools call it")]
 pub(crate) fn chat_record_for_session(session_id: &str, cx: &App) -> Option<String> {
     open_windows(cx).into_iter().find_map(|window| {
         let host = window.read(cx).panes().iter().find_map(|pane| {
@@ -5142,7 +5148,7 @@ fn agent_chat_title(thread: &acp_thread::AcpThread, agent_label: &str) -> Option
     clean_chat_title(&thread.title()?, agent_label)
 }
 
-fn clean_chat_title(title: &str, agent_label: &str) -> Option<String> {
+pub(crate) fn clean_chat_title(title: &str, agent_label: &str) -> Option<String> {
     let title = title.split_whitespace().collect::<Vec<_>>().join(" ");
     let title = title
         .trim_matches(|character: char| matches!(character, '"' | '\'' | '.' | ':'))
@@ -5976,7 +5982,6 @@ impl WorkspaceHost {
     /// Creates the workspace's view if needed (via `ensure_view`, without
     /// activating it) and opens a new chat tab in it without activating the
     /// tab. Returns the new chat record id.
-    #[cfg_attr(not(test), expect(dead_code, reason = "the agent hub tools call it"))]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn open_chat_in_background(
         workspace: &mut Workspace,
@@ -6175,7 +6180,7 @@ impl Render for WorkspaceHost {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[test]
@@ -6414,7 +6419,12 @@ mod tests {
         })
     }
 
-    struct StubServer(acp_thread::StubAgentConnection);
+    pub(crate) struct StubServer(pub(crate) acp_thread::StubAgentConnection);
+
+    /// Makes every chat opened from now on run on this server.
+    pub(crate) struct TestChatServer(pub(crate) Rc<dyn agent_servers::AgentServer>);
+
+    impl gpui::Global for TestChatServer {}
 
     impl agent_servers::AgentServer for StubServer {
         fn logo(&self) -> IconName {
@@ -6441,7 +6451,7 @@ mod tests {
 
     /// A window showing chat-first workspace A, with chat-first workspace B
     /// saved but not opened. Their chats' agents never connect.
-    async fn window_showing_workspace_a(
+    pub(crate) async fn window_showing_workspace_a(
         cx: &mut gpui::TestAppContext,
     ) -> (
         Entity<Workspace>,
