@@ -816,6 +816,33 @@ fn typed_text(blocks: &[acp::ContentBlock]) -> String {
         .join(" ")
 }
 
+/// A queued message as text, with its mentions as `[@name](uri)` links. None
+/// when it holds an image or anything else text can't stand in for.
+fn queued_message_text(blocks: &[acp::ContentBlock]) -> Option<String> {
+    let mut text = String::new();
+    for block in blocks {
+        match block {
+            acp::ContentBlock::Text(content) => text.push_str(&content.text),
+            acp::ContentBlock::ResourceLink(link) => {
+                text.push_str(&format!("[@{}]({})", link.name, link.uri));
+            }
+            acp::ContentBlock::Resource(acp::EmbeddedResource { resource, .. }) => {
+                let uri = match resource {
+                    acp::EmbeddedResourceResource::TextResourceContents(contents) => &contents.uri,
+                    acp::EmbeddedResourceResource::BlobResourceContents(contents) => &contents.uri,
+                    _ => return None,
+                };
+                let link = acp_thread::MentionUri::parse(uri, util::paths::PathStyle::local())
+                    .map(|mention| mention.as_link().to_string())
+                    .unwrap_or_else(|_| format!("[@{uri}]({uri})"));
+                text.push_str(&link);
+            }
+            _ => return None,
+        }
+    }
+    Some(text)
+}
+
 /// Workspaces created chat-first have a primary chat; every other workspace
 /// keeps starting its main claude CLI, even after chats are added to it.
 pub(crate) fn should_start_main_cli(records: &[ChatSessionRecord]) -> bool {
@@ -4995,9 +5022,38 @@ fn replies_since_last_user_message(
     })
 }
 
+/// Which turn a chat's agent is on: how many user messages its thread has,
+/// and whether the latest turn is still running.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct ChatTurn {
+    pub user_messages: usize,
+    pub running: bool,
+}
+
+pub(crate) fn chat_turn(record_id: &str, cx: &App) -> Option<ChatTurn> {
+    let thread = find_open_chat(record_id, cx)?.thread?;
+    let thread = thread.read(cx);
+    Some(ChatTurn {
+        user_messages: thread
+            .entries()
+            .iter()
+            .filter(|entry| matches!(entry, acp_thread::AgentThreadEntry::UserMessage(_)))
+            .count(),
+        running: thread.status() == acp_thread::ThreadStatus::Generating,
+    })
+}
+
+/// The agent a loaded chat runs.
+pub(crate) fn chat_agent(record_id: &str, cx: &App) -> Option<ChatAgent> {
+    let open_chat = find_open_chat(record_id, cx)?;
+    let agent = open_chat.view.read(cx).chat_by_record(record_id)?.agent;
+    Some(agent)
+}
+
 /// Takes the messages the user typed into a chat while its agent was busy
 /// off the chat's queue, so they aren't also sent when its turn ends.
-/// Messages with no text, such as a lone image, stay queued.
+/// Messages holding an image, or with no text at all, stay queued and are
+/// sent as usual when the turn ends.
 pub(crate) fn take_typed_messages(record_id: &str, cx: &mut App) -> Vec<String> {
     let Some(thread_view) = find_open_chat(record_id, cx).and_then(|chat| {
         chat.view
@@ -5013,11 +5069,12 @@ pub(crate) fn take_typed_messages(record_id: &str, cx: &mut App) -> Vec<String> 
         let mut typed = Vec::new();
         let mut index = 0;
         while let Some(queued) = thread_view.local_queued_messages.get(index) {
-            let text = typed_text(&queued.content);
-            if text.trim().is_empty() {
+            let Some(text) =
+                queued_message_text(&queued.content).filter(|text| !text.trim().is_empty())
+            else {
                 index += 1;
                 continue;
-            }
+            };
             // Removing through the thread view keeps its queued flag right.
             if thread_view.remove_from_queue(index, cx).is_none() {
                 break;
@@ -5983,24 +6040,25 @@ impl WorkspaceHost {
     /// activating it) and opens a new chat tab in it without activating the
     /// tab. A `primary` chat is saved before a new view is built, so the
     /// view opens it in place of the main CLI, as for a workspace made in
-    /// the sidebar. Returns the new chat record id.
+    /// the sidebar. The chat record gets `record_id`, chosen by the caller so
+    /// it can record who started the chat before the tab reads that.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn open_chat_in_background(
         workspace: &mut Workspace,
         workspace_id: &str,
+        record_id: String,
         agent: ChatAgent,
         title: String,
         prompt: String,
-        started_by: Option<String>,
         primary: bool,
         window: &mut Window,
         cx: &mut Context<Workspace>,
-    ) -> Result<String, String> {
+    ) -> Result<(), String> {
         let state = mnemonic_bridge::mnemonic_state(cx);
         let host = Self::host_for_background_view(workspace, workspace_id, cx)?;
         let saved_primary = if primary && !host.read(cx).views.contains_key(workspace_id) {
             let record = ChatSessionRecord {
-                id: uuid::Uuid::new_v4().to_string(),
+                id: record_id.clone(),
                 workspace_id: workspace_id.to_string(),
                 agent: agent.agent_id().to_string(),
                 title: title.clone(),
@@ -6015,47 +6073,26 @@ impl WorkspaceHost {
             None
         };
         let view = Self::ensure_background_view(workspace, workspace_id, window, cx)?;
-        view.update(cx, |view, cx| {
-            let record_id = match saved_primary {
-                // The view opened the saved chat, without a prompt.
-                Some(record_id) => {
-                    view.queue_agent_message(&record_id, prompt, cx)?;
-                    record_id
+        view.update(cx, |view, cx| match saved_primary {
+            // The view opened the saved chat, without a prompt.
+            Some(record_id) => view.queue_agent_message(&record_id, prompt, cx),
+            None => {
+                let record = ChatSessionRecord {
+                    id: record_id,
+                    workspace_id: view.workspace_id.clone(),
+                    agent: agent.agent_id().to_string(),
+                    title,
+                    acp_session_id: None,
+                    is_review: false,
+                    is_primary: false,
+                    position: view.next_chat_position(cx),
+                };
+                chat_session_repository::insert(&state.db, &record)?;
+                if !view.open_chat(record, Some(prompt), false, window, cx) {
+                    return Err("Couldn't start the chat.".to_string());
                 }
-                None => {
-                    let record = ChatSessionRecord {
-                        id: uuid::Uuid::new_v4().to_string(),
-                        workspace_id: view.workspace_id.clone(),
-                        agent: agent.agent_id().to_string(),
-                        title,
-                        acp_session_id: None,
-                        is_review: false,
-                        is_primary: false,
-                        position: view.next_chat_position(cx),
-                    };
-                    chat_session_repository::insert(&state.db, &record)?;
-                    let record_id = record.id.clone();
-                    if !view.open_chat(record, Some(prompt), false, window, cx) {
-                        return Err("Couldn't start the chat.".to_string());
-                    }
-                    record_id
-                }
-            };
-            // The hub records the starter only after this returns, so the
-            // read when the tab opened found nothing.
-            let item = view
-                .sessions
-                .iter()
-                .find(|session| {
-                    session
-                        .chat()
-                        .is_some_and(|chat| chat.record_id == record_id)
-                })
-                .map(|session| session.item.clone());
-            if let (Some(item), Some(started_by)) = (item, started_by) {
-                item.update(cx, |item, _| item.starter_record_id = Some(started_by));
+                Ok(())
             }
-            Ok(record_id)
         })
     }
 
@@ -6520,6 +6557,40 @@ pub(crate) mod tests {
 
     /// A window showing chat-first workspace A, with chat-first workspace B
     /// saved but not opened. Their chats' agents never connect.
+    /// Queues a message in a chat as the user typing it during a turn does.
+    pub(crate) fn queue_typed_message(
+        record_id: &str,
+        content: Vec<acp::ContentBlock>,
+        cx: &mut App,
+    ) {
+        let thread_view = find_open_chat(record_id, cx)
+            .and_then(|chat| {
+                chat.view
+                    .read(cx)
+                    .chat_by_record(record_id)?
+                    .view
+                    .read(cx)
+                    .root_thread_view()
+            })
+            .expect("the chat is connected");
+        thread_view.update(cx, |thread_view, cx| {
+            thread_view.add_to_queue(content, Vec::new(), cx)
+        });
+    }
+
+    pub(crate) fn queued_message_count(record_id: &str, cx: &App) -> usize {
+        find_open_chat(record_id, cx)
+            .and_then(|chat| {
+                chat.view
+                    .read(cx)
+                    .chat_by_record(record_id)?
+                    .view
+                    .read(cx)
+                    .root_thread_view()
+            })
+            .map_or(0, |thread_view| thread_view.read(cx).local_queued_messages.len())
+    }
+
     pub(crate) async fn window_showing_workspace_a(
         cx: &mut gpui::TestAppContext,
     ) -> (
@@ -6582,15 +6653,26 @@ pub(crate) mod tests {
         });
         assert!(starts_focused, "workspace A's chat tab starts out focused");
 
-        let chat_in_a = workspace
+        let chat_in_a = "helper-in-a".to_string();
+        agent_started_chat_repository::insert(
+            &state.db,
+            &mnemonic_core::models::AgentStartedChat {
+                chat_id: chat_in_a.clone(),
+                started_by_chat_id: "ws-a-primary".to_string(),
+                workspace_id: "ws-a".to_string(),
+                made_workspace: false,
+            },
+        )
+        .expect("the starter is recorded");
+        workspace
             .update_in(cx, |workspace, window, cx| {
                 WorkspaceHost::open_chat_in_background(
                     workspace,
                     "ws-a",
+                    chat_in_a.clone(),
                     ChatAgent::Claude,
                     "Helper".to_string(),
                     "Look at the tests".to_string(),
-                    Some("ws-a-primary".to_string()),
                     false,
                     window,
                     cx,
@@ -6640,10 +6722,10 @@ pub(crate) mod tests {
                 WorkspaceHost::open_chat_in_background(
                     workspace,
                     "ws-b",
+                    "helper-in-b".to_string(),
                     ChatAgent::Codex,
                     "Helper".to_string(),
                     "Look at the docs".to_string(),
-                    None,
                     false,
                     window,
                     cx,

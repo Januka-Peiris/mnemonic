@@ -39,8 +39,8 @@ use crate::workspace_panel::{
     unique_workspace_name,
 };
 use crate::workspace_view::{
-    ChatAgent, WorkspaceHost, chat_agent_label, chat_record_for_session, chat_state,
-    clean_chat_title, find_open_chat, find_workspace_window, latest_reply, open_windows,
+    ChatAgent, WorkspaceHost, chat_agent, chat_agent_label, chat_record_for_session, chat_state,
+    chat_turn, clean_chat_title, find_open_chat, find_workspace_window, latest_reply, open_windows,
     send_to_chat, take_typed_messages, window_handle_of,
 };
 
@@ -55,6 +55,11 @@ const MAX_CHECK_INTERVAL: Duration = Duration::from_secs(5);
 /// How often a wait notices that its call was cancelled or that the user
 /// wrote to the waiting chat.
 const CANCEL_CHECK_INTERVAL: Duration = Duration::from_millis(500);
+/// Codex gives up on an MCP tool call after 60 seconds by default, and
+/// codex-acp passes only a server's url and headers to Codex, so its timeout
+/// can't be raised from here. A Codex chat's wait returns before that and
+/// the agent is told to call it again.
+const CODEX_WAIT_LIMIT: Duration = Duration::from_secs(50);
 
 struct AgentHub {
     _server: AgentHubServer,
@@ -275,7 +280,7 @@ async fn run_tool(
         .ok_or_else(|| "This chat isn't open in Mnemonic.".to_string())?;
     match tool.as_str() {
         "start_chat" => start_chat(&hub, &caller_chat, &arguments, cx).await,
-        "send" => cx.update(|cx| send(&arguments, cx)),
+        "send" => cx.update(|cx| send(&caller_chat, &arguments, cx)),
         "wait" => wait(&caller_chat, &arguments, &cancelled, cx).await,
         "list" => cx.update(|cx| list(&caller_chat, cx)),
         "stop_chat" => cx.update(|cx| stop_chat(&arguments, cx)),
@@ -288,6 +293,7 @@ async fn run_tool(
 #[derive(Clone)]
 struct KnownChat {
     id: String,
+    workspace_id: String,
     title: String,
     agent: &'static str,
     workspace_path: Option<String>,
@@ -310,6 +316,7 @@ fn known_chats(cx: &App) -> Result<Vec<KnownChat>, String> {
                 .unwrap_or(record.title);
             chats.push(KnownChat {
                 id: record.id,
+                workspace_id: workspace.id.clone(),
                 title,
                 agent: chat_agent_label(&record.agent),
                 workspace_path: workspace_path(&workspace),
@@ -428,7 +435,20 @@ async fn start_new_chat(
                 )
             })
             .count();
-        check_can_start(&state.db, caller_chat, busy_children)?;
+        // A start making a workspace has no chat yet while git runs, so it
+        // is counted from here; the entry for this very start is left out.
+        let other_starts_in_flight = hub
+            .starts_in_flight
+            .borrow()
+            .iter()
+            .filter(|start| start.caller_chat == caller_chat)
+            .count()
+            .saturating_sub(1);
+        check_can_start(
+            &state.db,
+            caller_chat,
+            busy_children + other_starts_in_flight,
+        )?;
         let window = find_open_chat(caller_chat, cx)
             .map(|chat| chat.window)
             .ok_or_else(|| "This chat isn't open in Mnemonic.".to_string())?;
@@ -455,31 +475,46 @@ async fn start_new_chat(
         agent.label(),
     )
     .unwrap_or_else(|| agent.label().to_string());
-    let chat_id = cx
-        .update_window(window_handle, |_, window, cx| {
+    let chat_id = uuid::Uuid::new_v4().to_string();
+    // Recorded before the chat opens: a chat missing this record would escape
+    // the depth and stop rules, and a workspace made above must stay
+    // archivable by the agent even if its chat then fails to open.
+    let recorded = agent_started_chat_repository::insert(
+        &state.db,
+        &AgentStartedChat {
+            chat_id: chat_id.clone(),
+            started_by_chat_id: caller_chat.to_string(),
+            workspace_id: workspace_id.clone(),
+            made_workspace,
+        },
+    );
+    let opened = recorded.and_then(|()| {
+        cx.update_window(window_handle, |_, window, cx| {
             caller_window.update(cx, |workspace, cx| {
                 WorkspaceHost::open_chat_in_background(
                     workspace,
                     &workspace_id,
+                    chat_id.clone(),
                     agent,
                     title,
                     request.task.clone(),
-                    Some(caller_chat.to_string()),
                     made_workspace,
                     window,
                     cx,
                 )
             })
         })
-        .map_err(|_| "This chat's window is closed.".to_string())??;
-    let link = AgentStartedChat {
-        chat_id: chat_id.clone(),
-        started_by_chat_id: caller_chat.to_string(),
-        workspace_id: workspace_id.clone(),
-        made_workspace,
-    };
-    if let Err(err) = agent_started_chat_repository::insert(&state.db, &link) {
-        log::error!("Failed to record that chat {caller_chat} started {chat_id}: {err}");
+        .map_err(|_| "This chat's window is closed.".to_string())
+        .and_then(|opened| opened)
+    });
+    if let Err(err) = opened {
+        return Err(if made_workspace {
+            format!(
+                "{err} The workspace {workspace_id} was made for it; archive it with `archive_workspace` if it isn't needed."
+            )
+        } else {
+            err
+        });
     }
     hub.recent_starts
         .borrow_mut()
@@ -560,7 +595,30 @@ fn describe_started(state: &AppState, chat_id: &str) -> Result<String, String> {
     ))
 }
 
-fn send(arguments: &serde_json::Value, cx: &mut App) -> Result<String, String> {
+/// Loads the chat's workspace in the background if this session hasn't yet,
+/// so a chat the user hasn't opened since Mnemonic started can be reached.
+fn ensure_chat_loaded(chat: &KnownChat, caller_chat: &str, cx: &mut App) -> Result<(), String> {
+    if find_open_chat(&chat.id, cx).is_some() {
+        return Ok(());
+    }
+    let window = find_workspace_window(&chat.workspace_id, cx)
+        .or_else(|| find_open_chat(caller_chat, cx).map(|chat| chat.window))
+        .ok_or_else(|| "This chat isn't open in Mnemonic.".to_string())?;
+    let handle =
+        window_handle_of(&window, cx).ok_or_else(|| "This chat's window is closed.".to_string())?;
+    cx.update_window(handle, |_, window_context, cx| {
+        window.update(cx, |workspace, cx| {
+            WorkspaceHost::ensure_background_view(workspace, &chat.workspace_id, window_context, cx)
+        })
+    })
+    .map_err(|_| "This chat's window is closed.".to_string())??;
+    if find_open_chat(&chat.id, cx).is_none() {
+        return Err(format!("Chat {} couldn't be opened.", chat.id));
+    }
+    Ok(())
+}
+
+fn send(caller_chat: &str, arguments: &serde_json::Value, cx: &mut App) -> Result<String, String> {
     let chat_text = required_str(arguments, "chat")?;
     let text = required_str(arguments, "text")?;
     if text.trim().is_empty() {
@@ -568,6 +626,7 @@ fn send(arguments: &serde_json::Value, cx: &mut App) -> Result<String, String> {
     }
     let chats = known_chats(cx)?;
     let chat = resolve_chat(&chats, chat_text)?;
+    ensure_chat_loaded(chat, caller_chat, cx)?;
     send_to_chat(&chat.id, text.to_string(), cx)?;
     Ok(format!(
         "Sent to chat {} \"{}\". Collect the reply with `wait`.",
@@ -593,15 +652,27 @@ async fn wait(
     cancelled: &AtomicBool,
     cx: &mut AsyncApp,
 ) -> Result<String, String> {
-    let request = parse_wait(arguments)?;
-    let targets = cx.update(|cx| {
+    let mut request = parse_wait(arguments)?;
+    let (targets, caller_turn, caller_agent) = cx.update(|cx| {
         let chats = known_chats(cx)?;
-        request
+        let targets = request
             .chats
             .iter()
             .map(|text| resolve_chat(&chats, text).cloned())
-            .collect::<Result<Vec<_>, String>>()
+            .collect::<Result<Vec<_>, String>>()?;
+        for target in &targets {
+            // A chat that can't be loaded is reported as closed.
+            if let Err(err) = ensure_chat_loaded(target, caller_chat, cx) {
+                log::warn!("Wait couldn't load chat {}: {err}", target.id);
+            }
+        }
+        let caller_turn = chat_turn(caller_chat, cx)
+            .ok_or_else(|| "This chat isn't open in Mnemonic.".to_string())?;
+        Ok::<_, String>((targets, caller_turn, chat_agent(caller_chat, cx)))
     })?;
+    if caller_agent == Some(ChatAgent::Codex) {
+        request.timeout = request.timeout.min(CODEX_WAIT_LIMIT);
+    }
     let finished = |report: &ChatReport| {
         matches!(
             report.state,
@@ -618,7 +689,17 @@ async fn wait(
         if cancelled.load(Ordering::SeqCst) {
             return Err("The wait was cancelled.".to_string());
         }
-        let typed = cx.update(|cx| take_typed_messages(caller_chat, cx));
+        // A wait whose turn is over has no one to answer it, so it must not
+        // take messages the user typed after that off the chat's queue.
+        let typed = cx.update(|cx| {
+            let still_in_turn = chat_turn(caller_chat, cx).is_some_and(|turn| {
+                turn.running && turn.user_messages == caller_turn.user_messages
+            });
+            still_in_turn.then(|| take_typed_messages(caller_chat, cx))
+        });
+        let Some(typed) = typed else {
+            return Ok("The wait ended because this chat's turn is over.".to_string());
+        };
         if !typed.is_empty() || waited >= next_check {
             let reports: Vec<ChatReport> =
                 cx.update(|cx| targets.iter().map(|chat| report(chat, cx)).collect());
@@ -773,12 +854,14 @@ async fn archive_workspace(
 mod tests {
     use super::*;
     use crate::workspace_view::tests::{
-        StubServer, TestChatServer, terminal_tabs, window_showing_workspace_a,
+        StubServer, TestChatServer, queue_typed_message, queued_message_count, terminal_tabs,
+        window_showing_workspace_a,
     };
     use acp_thread::{PermissionOptions, StubAgentConnection};
     use gpui::{Entity, VisualTestContext};
     use mnemonic_core::models::DiscoveredRepository;
     use mnemonic_core::repositories::settings_repository;
+    use mnemonic_core::services::agent_hub_service::MAX_BUSY_CHILDREN;
     use serde_json::json;
     use workspace::Workspace;
 
@@ -849,15 +932,16 @@ mod tests {
         cx.update(|_, cx| {
             cx.set_global(TestChatServer(Rc::new(StubServer(connection.clone()))));
         });
-        let caller_chat = workspace
+        let caller_chat = "lead".to_string();
+        workspace
             .update_in(cx, |workspace, window, cx| {
                 WorkspaceHost::open_chat_in_background(
                     workspace,
                     "ws-a",
+                    caller_chat.clone(),
                     ChatAgent::Claude,
                     "Lead".to_string(),
                     "Split the work".to_string(),
-                    None,
                     false,
                     window,
                     cx,
@@ -1022,6 +1106,240 @@ mod tests {
             "{report}"
         );
         assert!(!report.contains("Timed out."), "{report}");
+    }
+
+    /// Starts a chat whose turn the stub holds open, so it stays replying.
+    async fn start_busy_chat(fixture: &Hub, title: &str, cx: &mut VisualTestContext) -> String {
+        call(
+            &fixture.hub,
+            &fixture.caller,
+            "start_chat",
+            json!({"task": format!("Work on {title}"), "workspace": "ws-b", "title": title}),
+            cx,
+        )
+        .await
+        .expect("the chat starts");
+        agent_started_chat_repository::started_by(&fixture.state.db, &fixture.caller_chat)
+            .expect("started chats are listed")
+            .pop()
+            .expect("the chat records who started it")
+            .chat_id
+    }
+
+    #[gpui::test]
+    async fn typed_message_ends_the_wait_with_its_mentions_and_images_stay_queued(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (fixture, cx) = hub_with_caller(cx).await;
+        let helper = start_busy_chat(&fixture, "Helper", cx).await;
+        let waiting = spawn_call(
+            &fixture.hub,
+            &fixture.caller,
+            "wait",
+            json!({"chats": [helper]}),
+            cx,
+        );
+        cx.run_until_parked();
+
+        cx.update(|_, cx| {
+            queue_typed_message(
+                &fixture.caller_chat,
+                vec![
+                    "Look at this".into(),
+                    acp::ContentBlock::Image(acp::ImageContent::new("aGVsbG8=", "image/png")),
+                ],
+                cx,
+            );
+            queue_typed_message(
+                &fixture.caller_chat,
+                vec![
+                    "Check ".into(),
+                    acp::ContentBlock::ResourceLink(acp::ResourceLink::new(
+                        "main.rs",
+                        "file:///a/main.rs",
+                    )),
+                    " first".into(),
+                ],
+                cx,
+            );
+        });
+        cx.executor().advance_clock(Duration::from_secs(1));
+        cx.run_until_parked();
+
+        let report = waiting.await.expect("the wait returns");
+        assert!(
+            report.contains("Check [@main.rs](file:///a/main.rs) first"),
+            "{report}"
+        );
+        assert!(!report.contains("Look at this"), "{report}");
+        let queued = cx.read(|cx| queued_message_count(&fixture.caller_chat, cx));
+        assert_eq!(
+            queued, 1,
+            "the message with an image is sent after the turn"
+        );
+    }
+
+    #[gpui::test]
+    async fn wait_outliving_its_turn_leaves_later_messages_queued(cx: &mut gpui::TestAppContext) {
+        let (fixture, cx) = hub_with_caller(cx).await;
+        let helper = start_busy_chat(&fixture, "Helper", cx).await;
+        let waiting = spawn_call(
+            &fixture.hub,
+            &fixture.caller,
+            "wait",
+            json!({"chats": [helper]}),
+            cx,
+        );
+        cx.run_until_parked();
+
+        // The user stops the waiting turn and starts another, which they
+        // then write to while it runs.
+        cx.update(|_, cx| {
+            let thread = find_open_chat(&fixture.caller_chat, cx)
+                .and_then(|chat| chat.thread)
+                .expect("the calling chat is connected");
+            thread.update(cx, |thread, cx| thread.cancel(cx)).detach();
+        });
+        cx.run_until_parked();
+        cx.update(|_, cx| send_to_chat(&fixture.caller_chat, "Next thing".to_string(), cx))
+            .expect("the next message is sent");
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            queue_typed_message(&fixture.caller_chat, vec!["Also this".into()], cx);
+        });
+        cx.executor().advance_clock(Duration::from_secs(1));
+        cx.run_until_parked();
+
+        let report = waiting.await.expect("the wait returns");
+        assert!(report.contains("turn is over"), "{report}");
+        let queued = cx.read(|cx| queued_message_count(&fixture.caller_chat, cx));
+        assert_eq!(queued, 1, "the stale wait left the message queued");
+    }
+
+    #[gpui::test]
+    async fn starts_still_making_workspaces_count_toward_the_busy_limit(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (fixture, cx) = hub_with_caller(cx).await;
+        // This many starts already running, plus the one about to be made,
+        // reach the limit.
+        for index in 0..MAX_BUSY_CHILDREN {
+            fixture
+                .hub
+                .starts_in_flight
+                .borrow_mut()
+                .push(StartInFlight {
+                    caller_chat: fixture.caller_chat.clone(),
+                    request: parse_start_chat(
+                        &json!({"task": format!("Task {index}"), "repo": "demo"}),
+                    )
+                    .expect("the request parses"),
+                    waiters: Vec::new(),
+                });
+        }
+
+        let refused = call(
+            &fixture.hub,
+            &fixture.caller,
+            "start_chat",
+            json!({"task": "One more", "workspace": "ws-b"}),
+            cx,
+        )
+        .await
+        .expect_err("the start is refused");
+        assert!(refused.contains("limit"), "{refused}");
+    }
+
+    #[gpui::test]
+    async fn send_reaches_a_chat_whose_workspace_is_not_loaded(cx: &mut gpui::TestAppContext) {
+        let (fixture, cx) = hub_with_caller(cx).await;
+        assert!(
+            cx.read(|cx| find_open_chat("ws-b-primary", cx).is_none()),
+            "workspace B isn't loaded yet"
+        );
+
+        fixture.connection.set_next_prompt_updates(echo("hello"));
+        call(
+            &fixture.hub,
+            &fixture.caller,
+            "send",
+            json!({"chat": "ws-b-primary", "text": "hello"}),
+            cx,
+        )
+        .await
+        .expect("the message is sent");
+        let report = call(
+            &fixture.hub,
+            &fixture.caller,
+            "wait",
+            json!({"chats": ["ws-b-primary"]}),
+            cx,
+        )
+        .await
+        .expect("the wait returns");
+        assert!(report.contains("echo: hello"), "{report}");
+    }
+
+    #[gpui::test]
+    async fn codex_chat_wait_returns_before_codex_gives_up(cx: &mut gpui::TestAppContext) {
+        let (fixture, cx) = hub_with_caller(cx).await;
+        let helper = start_busy_chat(&fixture, "Helper", cx).await;
+        let codex_chat = "codex-lead".to_string();
+        fixture
+            .workspace
+            .update_in(cx, |workspace, window, cx| {
+                WorkspaceHost::open_chat_in_background(
+                    workspace,
+                    "ws-a",
+                    codex_chat.clone(),
+                    ChatAgent::Codex,
+                    "Codex lead".to_string(),
+                    "Split the work".to_string(),
+                    false,
+                    window,
+                    cx,
+                )
+            })
+            .expect("the Codex chat opens");
+        cx.run_until_parked();
+        let codex_caller = cx
+            .read(|cx| {
+                let thread = find_open_chat(&codex_chat, cx)?.thread?;
+                Some(HubCaller {
+                    session_id: thread.read(cx).session_id().0.to_string(),
+                })
+            })
+            .expect("the Codex chat is connected");
+
+        let waiting = spawn_call(
+            &fixture.hub,
+            &codex_caller,
+            "wait",
+            json!({"chats": [helper], "timeout_seconds": 600}),
+            cx,
+        );
+        // Awaiting the call would run the clock on to whenever it ends, so
+        // the outcome is collected without waiting on it.
+        let outcome = Rc::new(RefCell::new(None));
+        cx.cx
+            .spawn({
+                let outcome = outcome.clone();
+                async move |_| {
+                    let report = waiting.await;
+                    *outcome.borrow_mut() = Some(report);
+                }
+            })
+            .detach();
+        cx.run_until_parked();
+        cx.executor().advance_clock(CODEX_WAIT_LIMIT);
+        cx.run_until_parked();
+
+        let report = outcome
+            .borrow_mut()
+            .take()
+            .expect("the wait returned within the Codex limit")
+            .expect("the wait returns");
+        assert!(report.contains("Timed out."), "{report}");
     }
 
     #[expect(

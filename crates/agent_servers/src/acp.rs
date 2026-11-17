@@ -1542,8 +1542,12 @@ struct SessionTools {
     key: String,
 }
 
-fn session_tools_for_cwd(cwd: &Path, cx: &App) -> Option<SessionTools> {
-    if requires_session_extras(cwd, cx) {
+fn session_tools_for_cwd(
+    agent_capabilities: &acp::AgentCapabilities,
+    cwd: &Path,
+    cx: &App,
+) -> Option<SessionTools> {
+    if !agent_capabilities.mcp_capabilities.http || requires_session_extras(cwd, cx) {
         return None;
     }
     let provider = cx.try_global::<SessionToolProviderGlobal>()?.0.clone()?;
@@ -1794,7 +1798,7 @@ impl AgentConnection for AcpConnection {
             Err(error) => return Task::ready(Err(error)),
         };
         let name = self.id.0.clone();
-        let tools = session_tools_for_cwd(&directories.cwd, cx);
+        let tools = session_tools_for_cwd(&self.agent_capabilities, &directories.cwd, cx);
         let mcp_servers = with_session_tools(mcp_servers_for_project(&project, cx), tools.as_ref());
 
         cx.spawn(async move |cx| {
@@ -1942,7 +1946,7 @@ impl AgentConnection for AcpConnection {
         let tools = work_dirs
             .ordered_paths()
             .next()
-            .and_then(|cwd| session_tools_for_cwd(cwd, cx));
+            .and_then(|cwd| session_tools_for_cwd(&self.agent_capabilities, cwd, cx));
         let mcp_servers = with_session_tools(mcp_servers_for_project(&project, cx), tools.as_ref());
         self.open_or_create_session(
             session_id,
@@ -1999,7 +2003,7 @@ impl AgentConnection for AcpConnection {
         let tools = work_dirs
             .ordered_paths()
             .next()
-            .and_then(|cwd| session_tools_for_cwd(cwd, cx));
+            .and_then(|cwd| session_tools_for_cwd(&self.agent_capabilities, cwd, cx));
         let mcp_servers = with_session_tools(mcp_servers_for_project(&project, cx), tools.as_ref());
         self.open_or_create_session(
             session_id,
@@ -2060,7 +2064,7 @@ impl AgentConnection for AcpConnection {
             .and_then(|session| session.thread.upgrade())
             .map(|thread| mcp_servers_for_project(thread.read(cx).project(), cx))
             .unwrap_or_default();
-        let tools = session_tools_for_cwd(&directories.cwd, cx);
+        let tools = session_tools_for_cwd(&self.agent_capabilities, &directories.cwd, cx);
         let mcp_servers = with_session_tools(mcp_servers, tools.as_ref());
         let request = directories.into_fork_session_request(session_id, mcp_servers, extras);
         let connection = self.connection.clone();
@@ -3545,6 +3549,11 @@ mod tests {
                 .session_capabilities;
             capabilities.resume = Some(acp::SessionResumeCapabilities::new());
             capabilities.fork = Some(acp::SessionForkCapabilities::new());
+            Rc::get_mut(&mut harness.connection)
+                .expect("test harness should own the only ACP connection handle")
+                .agent_capabilities
+                .mcp_capabilities
+                .http = true;
             let provider = Rc::new(RecordingToolProvider {
                 binds: RefCell::new(Vec::new()),
             });
@@ -3618,6 +3627,30 @@ mod tests {
                 *provider.binds.borrow(),
                 vec![("chat-key".to_string(), acp::SessionId::new("original-fork"))]
             );
+        }
+
+        #[gpui::test]
+        async fn agent_without_http_mcp_gets_no_tools(cx: &mut gpui::TestAppContext) {
+            let (mut harness, project, provider) = session_tool_harness(cx).await;
+            Rc::get_mut(&mut harness.connection)
+                .expect("test harness should own the only ACP connection handle")
+                .agent_capabilities
+                .mcp_capabilities
+                .http = false;
+            let connection = harness.connection.clone();
+            cx.update(|cx| {
+                connection.new_session(
+                    project,
+                    PathList::new(&[std::path::PathBuf::from("/a")]),
+                    cx,
+                )
+            })
+            .await
+            .expect("new session starts");
+
+            let requests = harness.received_requests.lock().expect("lock").clone();
+            assert!(server_names(&requests[0]).is_empty());
+            assert!(provider.binds.borrow().is_empty());
         }
 
         #[gpui::test]

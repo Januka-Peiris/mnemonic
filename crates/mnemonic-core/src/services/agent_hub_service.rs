@@ -347,7 +347,7 @@ pub fn tool_definitions(can_start: bool) -> serde_json::Value {
     }));
     tools.push(serde_json::json!({
         "name": "wait",
-        "description": "Wait for replies from chats. Returns when all of them have replied, or when any has if `any` is true, or when the timeout passes. It returns early when the user writes to you; answer them, then wait again.",
+        "description": "Wait for replies from chats. Returns when all of them have replied, or when any has if `any` is true, or when the timeout passes. It returns early when the user writes to you; answer them, then wait again. A long wait may also return before its timeout; if chats are still replying, call `wait` again.",
         "inputSchema": {
             "type": "object",
             "properties": {
