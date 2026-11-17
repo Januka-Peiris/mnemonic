@@ -4,6 +4,9 @@ version = "0.1.0"
 edition = "2021"
 publish.workspace = true
 
+[features]
+test-support = []
+
 [dependencies]
 mnemonic-core.workspace = true
 gpui.workspace = true
