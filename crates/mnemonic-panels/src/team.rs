@@ -2980,6 +2980,24 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn agents_off_and_unsharing_take_the_folder_from_the_server(cx: &mut TestAppContext) {
+        let team = cx.new(|_| TeamShare::new());
+        team.update(cx, |team, cx| {
+            team.set_workspace_shared("workspace", true, cx);
+            let has_root =
+                |team: &TeamShare| lock_agent_roots(&team.agent_roots).contains_key("workspace");
+            lock_agent_roots(&team.agent_roots).insert("workspace".into(), "/work".into());
+            team.set_workspace_agents("workspace", false, cx);
+            assert!(!has_root(team));
+
+            team.set_workspace_agents("workspace", true, cx);
+            lock_agent_roots(&team.agent_roots).insert("workspace".into(), "/work".into());
+            team.set_workspace_shared("workspace", false, cx);
+            assert!(!has_root(team));
+        });
+    }
+
+    #[gpui::test]
     fn agent_writes_outside_the_root_or_not_utf8_are_refused(cx: &mut TestAppContext) {
         use std::os::unix::ffi::OsStrExt as _;
         let root = Path::new("/work/root");
