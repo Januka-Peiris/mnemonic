@@ -5,11 +5,14 @@ edition = "2021"
 publish.workspace = true
 
 [dependencies]
+aes-gcm.workspace = true
 agent-client-protocol.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 base64.workspace = true
+hkdf.workspace = true
+p256 = { workspace = true, features = ["ecdh"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 portable-pty.workspace = true
 log.workspace = true
@@ -24,7 +27,7 @@ streaming-iterator.workspace = true
 reqwest = { workspace = true, features = ["blocking", "json"] }
 uuid.workspace = true
 tungstenite = "0.24"
-tiny_http.workspace = true
+tiny_http = { workspace = true, features = ["ssl-rustls"] }
 libc.workspace = true
 rand.workspace = true
 ignore.workspace = true
@@ -32,4 +35,5 @@ globset.workspace = true
 regex.workspace = true
 
 [dev-dependencies]
+jsonwebtoken = { workspace = true, features = ["aws_lc_rs"] }
 tempfile.workspace = true

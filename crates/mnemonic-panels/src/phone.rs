@@ -4,33 +4,51 @@
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use acp_thread::ThreadStatus;
 use agent_client_protocol::schema as acp;
 use futures::StreamExt as _;
-use futures::channel::mpsc;
-use gpui::{App, AppContext as _, Context, Entity, Global, Subscription, Task};
+use futures::channel::{mpsc, oneshot};
+use futures::future::{self, Either};
+use gpui::{AnyWindowHandle, App, AppContext as _, Context, Entity, Global, Subscription, Task};
+use mnemonic_core::models::{DiscoveredRepository, WorkspaceDetail, WorkspacePrStatus};
+use mnemonic_core::repositories::{
+    push_subscription_repository, repository_repository, workspace_repository,
+};
 use mnemonic_core::services::ntfy_service::{
-    self, Notice, NoticeKind, NtfyRequest, mac_idle_seconds, ntfy_request, should_notify,
+    self, Notice, NoticeKind, NtfyRequest, mac_idle_seconds, notice_body, ntfy_request,
+    should_notify,
 };
 use mnemonic_core::services::phone_server::{
-    PhoneAction, PhoneActionHandler, PhoneActionOutcome, PhoneAgent, PhoneServer, PhoneServerConfig,
+    PhoneAction, PhoneActionHandler, PhoneActionOutcome, PhoneAgent, PhonePrStatus,
+    PhoneRepository, PhoneServer, PhoneServerConfig, PhoneSources,
 };
+use mnemonic_core::services::pr_draft_service;
 use mnemonic_core::services::team_share_service::{
-    DEFAULT_TEAM_PORT, TailscaleSelf, TailscaleWhois, TeamActionError, TeamShareHub, tailscale_self,
+    DEFAULT_TEAM_PORT, TailscaleSelf, TailscaleWhois, TeamActionError, TeamShareHub, TlsFiles,
+    tailscale_cert, tailscale_self,
+};
+use mnemonic_core::services::web_push_service::{
+    self, PushOutcome, PushSubscription, load_or_create_vapid_keys,
 };
 use settings::{RegisterSetting, Settings, SettingsStore};
 use workspace::Workspace;
 
+use crate::WorkspacePanel;
 use crate::chat_feed::{
-    ChatFeed, ChatFeedEvent, PermissionScope, SharedRecords, TranscriptToRead, WorkspaceFlags,
-    load_records, read_saved_transcripts,
+    ChatFeed, ChatFeedEvent, PermissionScope, QuickAnswers, SharedRecords, TranscriptToRead,
+    WorkspaceFlags, load_records, read_saved_transcripts,
 };
 use crate::team::{answer_permission, show_step_in_notice, wait_for_reply, workspace_diff_source};
-use crate::workspace_view::{ChatAgent, WorkspaceHost, find_open_chat, find_workspace_window};
+use crate::workspace_detail_panel::request_pr;
+use crate::workspace_view::{
+    ChatAgent, WorkspaceHost, WorkspaceView, find_open_chat, find_workspace_window,
+    open_window_handles,
+};
 
 const DEFAULT_NOTIFY_AFTER_IDLE_MINUTES: u32 = 5;
 /// How often what the phone sees is refreshed.
@@ -41,10 +59,17 @@ const RETRY_START_AFTER: Duration = Duration::from_secs(30);
 /// How often the running server checks Tailscale is still on the address
 /// and account it started with.
 const CHECK_TAILSCALE_EVERY: Duration = Duration::from_secs(15);
-/// A chat's repeated alert of one kind within this long is sent once.
+/// How often the running server re-runs `tailscale cert`, which renews the
+/// certificate by itself once it nears expiry.
+const CHECK_CERTIFICATE_EVERY: Duration = Duration::from_secs(24 * 60 * 60);
+/// An alert repeated within this long is sent once. See `AlertKey`.
 const NOTIFY_COLLAPSE_WITHIN: Duration = Duration::from_secs(30);
 /// How long the phone's request waits for the app to carry out its action.
 const ACTION_TIMEOUT: Duration = Duration::from_secs(10);
+/// The same for starting a task, which makes a worktree, and merging, which
+/// waits on GitHub.
+const LONG_ACTION_TIMEOUT: Duration = Duration::from_secs(60);
+const NO_WINDOW: &str = "Open Mnemonic on the Mac first";
 
 /// The `phone` section of the settings file.
 #[derive(Clone, Debug, PartialEq, RegisterSetting)]
@@ -93,6 +118,8 @@ pub(crate) struct PhoneShare {
     page_url: Option<String>,
     /// Why the server last failed to start, until it starts or is turned off.
     start_error: Option<String>,
+    /// Why the running server serves plain HTTP rather than HTTPS.
+    https_error: Option<String>,
     /// Publishes every workspace and its chats into the hub the server
     /// serves. Kept for as long as the app runs, so its events can be
     /// followed across restarts of the server.
@@ -100,12 +127,13 @@ pub(crate) struct PhoneShare {
     start_task: Option<Task<()>>,
     publish_task: Option<Task<()>>,
     /// Restarts the server when this Mac's Tailscale address or account
-    /// changes, since it stays bound to the address it started on.
+    /// changes, since it stays bound to the address it started on, or when
+    /// its HTTPS certificate is renewed.
     tailscale_watch: Option<Task<()>>,
     /// Carries out the phone's actions on the main thread.
     action_task: Option<Task<()>>,
-    /// When each chat's last alert of each kind went out.
-    last_notified: HashMap<(String, NoticeKind), Instant>,
+    /// When each alert last went out.
+    last_notified: HashMap<AlertKey, Instant>,
     /// The agents new chats may use, kept here for the server's request
     /// threads, which can't read the settings.
     enabled_agents: Arc<Mutex<Vec<PhoneAgent>>>,
@@ -120,8 +148,8 @@ pub(crate) fn init(cx: &mut App) {
     let phone = cx.new(|cx| {
         let mut phone = PhoneShare::new(cx);
         phone.apply_settings(cx);
-        cx.on_app_quit(|phone, cx| {
-            phone.stop(cx);
+        cx.on_app_quit(|phone, _| {
+            phone.stop();
             async {}
         })
         .detach();
@@ -149,6 +177,11 @@ pub(crate) fn phone_start_error(cx: &App) -> Option<String> {
     phone_share(cx)?.read(cx).start_error.clone()
 }
 
+/// Why the running phone server couldn't get an HTTPS certificate.
+pub(crate) fn phone_https_error(cx: &App) -> Option<String> {
+    phone_share(cx)?.read(cx).https_error.clone()
+}
+
 impl PhoneShare {
     fn new(cx: &mut Context<Self>) -> Self {
         let feed = cx.new(|_| ChatFeed::new(TeamShareHub::new(), PermissionScope::All));
@@ -160,6 +193,7 @@ impl PhoneShare {
             server: None,
             page_url: None,
             start_error: None,
+            https_error: None,
             feed,
             start_task: None,
             publish_task: None,
@@ -175,27 +209,33 @@ impl PhoneShare {
     /// been left alone long enough that nobody is watching it.
     fn notify_idle_phone(&mut self, event: &ChatFeedEvent, cx: &mut Context<Self>) {
         let settings = PhoneSettings::get_global(cx);
-        if settings.ntfy_url.is_empty() {
-            return;
-        }
         let Some(page_url) = self.page_url.clone() else {
             return;
         };
+        let mut permission = None;
         let (workspace_id, notice, stop_reason) = match event {
             ChatFeedEvent::PermissionRequested {
                 workspace_id,
                 chat_id,
                 tool_kind,
-            } => (
-                workspace_id,
+                tool_call_id,
+                quick_answers,
+            } => {
+                permission = quick_answers.as_ref().map(|answers| PushPermission {
+                    tool_call_id: tool_call_id.clone(),
+                    answers: answers.clone(),
+                });
                 (
-                    NoticeKind::Permission,
-                    chat_id,
-                    String::new(),
-                    Some(*tool_kind),
-                ),
-                None,
-            ),
+                    workspace_id,
+                    (
+                        NoticeKind::Permission,
+                        chat_id,
+                        String::new(),
+                        Some(*tool_kind),
+                    ),
+                    None,
+                )
+            }
             ChatFeedEvent::TurnEnded {
                 workspace_id,
                 chat_id,
@@ -217,15 +257,20 @@ impl PhoneShare {
             ),
         };
         let (kind, chat_id, chat_title, tool_kind) = notice;
-        let workspace_name = self
+        let (push_title, workspace_name) = self
             .feed
             .read(cx)
             .hub()
             .workspaces()
             .into_iter()
             .find(|workspace| &workspace.id == workspace_id)
-            .map(|workspace| workspace.name)
-            .unwrap_or_else(|| workspace_id.clone());
+            .map(|workspace| {
+                (
+                    format!("{} / {}", workspace.project, workspace.name),
+                    workspace.name,
+                )
+            })
+            .unwrap_or_else(|| (workspace_id.clone(), workspace_id.clone()));
         let notice = Notice {
             kind,
             workspace_name,
@@ -233,7 +278,8 @@ impl PhoneShare {
             chat_title,
             tool_kind,
         };
-        let ntfy_url = settings.ntfy_url.clone();
+        let key = alert_key(event);
+        let ntfy_url = Some(settings.ntfy_url.clone()).filter(|url| !url.is_empty());
         let token = settings.ntfy_token.clone();
         let threshold_minutes = settings.notify_after_idle_minutes;
         cx.spawn(async move |this, cx| {
@@ -242,32 +288,25 @@ impl PhoneShare {
                 return;
             }
             let Ok(collapsed) = this.update(cx, |this, _| {
-                let now = Instant::now();
-                let key = (notice.chat_id.clone(), notice.kind);
-                let collapsed = this
-                    .last_notified
-                    .get(&key)
-                    .is_some_and(|sent| now.duration_since(*sent) < NOTIFY_COLLAPSE_WITHIN);
-                if !collapsed {
-                    this.last_notified
-                        .retain(|_, sent| now.duration_since(*sent) < NOTIFY_COLLAPSE_WITHIN);
-                    this.last_notified.insert(key, now);
-                }
-                collapsed
+                collapse_repeat(&mut this.last_notified, key, Instant::now())
             }) else {
                 return;
             };
             if collapsed {
                 return;
             }
-            let request: NtfyRequest =
-                ntfy_request(&ntfy_url, token.as_deref(), &page_url, &notice);
-            let sent = cx
-                .background_spawn(async move { ntfy_service::send(&request) })
-                .await;
-            if let Err(err) = sent {
-                log::warn!("Couldn't send the phone alert: {err}");
-            }
+            let payload = push_payload(&push_title, &notice, &page_url, permission.as_ref());
+            let request: Option<NtfyRequest> = ntfy_url
+                .map(|ntfy_url| ntfy_request(&ntfy_url, token.as_deref(), &page_url, &notice));
+            cx.background_spawn(async move {
+                if let Some(request) = request {
+                    if let Err(err) = ntfy_service::send(&request) {
+                        log::warn!("Couldn't send the phone alert: {err}");
+                    }
+                }
+                send_web_push(&payload);
+            })
+            .await;
         })
         .detach();
     }
@@ -280,7 +319,10 @@ impl PhoneShare {
         }
         match port {
             Some(port) => self.start(port, cx),
-            None => self.stop(cx),
+            None => {
+                self.stop();
+                self.feed.update(cx, |feed, _| feed.clear());
+            }
         }
         cx.notify();
     }
@@ -292,7 +334,7 @@ impl PhoneShare {
     }
 
     fn start(&mut self, port: u16, cx: &mut Context<Self>) {
-        self.stop(cx);
+        self.stop();
         self.port = Some(port);
         let hub = self.feed.read(cx).hub().clone();
         let enabled_agents = self.enabled_agents.clone();
@@ -304,10 +346,19 @@ impl PhoneShare {
                     continue;
                 }
                 let PendingPhoneAction { action, reply, .. } = pending;
-                let outcome = cx.update(|cx| run_phone_action(action, cx));
-                if reply.send(outcome).is_err() {
-                    log::warn!("A phone action finished after its request gave up");
-                }
+                let timeout = action_timeout(&action);
+                let on_timeout = timed_out(&action);
+                let outcome = cx.update(|cx| {
+                    within_timeout(run_phone_action(action, cx), timeout, on_timeout, cx)
+                });
+                // Awaited on its own, so a task being started or a merge
+                // doesn't hold up a Stop or a permission answer behind it.
+                cx.spawn(async move |_| {
+                    if reply.send(outcome.await).is_err() {
+                        log::warn!("A phone action finished after its request gave up");
+                    }
+                })
+                .detach();
             }
         }));
         self.start_task = Some(cx.spawn(async move |this, cx| {
@@ -325,13 +376,23 @@ impl PhoneShare {
                         return true;
                     }
                     let started = match attempt {
-                        Ok((server, started_as)) => {
-                            this.page_url = Some(page_url(&started_as, server.address().port()));
+                        Ok(StartedServer {
+                            server,
+                            started_as,
+                            certificate,
+                            https_error,
+                        }) => {
+                            this.page_url = Some(page_url(
+                                &started_as,
+                                server.address().port(),
+                                certificate.is_some(),
+                            ));
                             this.start_error = None;
+                            this.https_error = https_error;
                             this.server = Some(server);
                             this.start_publishing(cx);
                             this.tailscale_watch =
-                                Some(Self::watch_tailscale(port, started_as, cx));
+                                Some(Self::watch_tailscale(port, started_as, certificate, cx));
                             true
                         }
                         Err(err) => {
@@ -352,8 +413,14 @@ impl PhoneShare {
         }));
     }
 
-    fn watch_tailscale(port: u16, started_as: TailscaleSelf, cx: &mut Context<Self>) -> Task<()> {
+    fn watch_tailscale(
+        port: u16,
+        started_as: TailscaleSelf,
+        certificate: Option<Vec<u8>>,
+        cx: &mut Context<Self>,
+    ) -> Task<()> {
         cx.spawn(async move |this, cx| {
+            let mut certificate_checked = SystemTime::now();
             loop {
                 cx.background_executor().timer(CHECK_TAILSCALE_EVERY).await;
                 let now = cx.background_spawn(async move { tailscale_self() }).await;
@@ -361,13 +428,36 @@ impl PhoneShare {
                     Ok(now) => Self::needs_restart(&started_as, now),
                     Err(_) => true,
                 };
-                if !moved {
+                // Wall-clock time, since a Mac asleep overnight doesn't count
+                // that time on a monotonic clock.
+                let certificate_due = certificate_checked
+                    .elapsed()
+                    .map_or(true, |elapsed| elapsed >= CHECK_CERTIFICATE_EVERY);
+                let reason = if moved {
+                    "Tailscale changed"
+                } else if certificate_due {
+                    certificate_checked = SystemTime::now();
+                    let me = started_as.clone();
+                    let fetched = cx
+                        .background_spawn(async move {
+                            https_certificate(
+                                &me,
+                                certificate_directory().as_deref(),
+                                tailscale_cert,
+                            )
+                        })
+                        .await;
+                    if !certificate_changed(certificate.as_deref(), &fetched) {
+                        continue;
+                    }
+                    "The HTTPS certificate changed"
+                } else {
                     continue;
-                }
+                };
                 this.update(cx, |this, cx| {
                     if this.port == Some(port) {
                         log::info!(
-                            "Tailscale changed since the phone server started on {}; restarting it",
+                            "{reason} since the phone server started on {}; restarting it",
                             started_as.ip
                         );
                         this.start(port, cx);
@@ -380,7 +470,9 @@ impl PhoneShare {
         })
     }
 
-    fn stop(&mut self, cx: &mut Context<Self>) {
+    /// Keeps the feed, so a restart for a renewed certificate or a Tailscale
+    /// change doesn't lose which turns ended and when.
+    fn stop(&mut self) {
         self.start_task = None;
         self.publish_task = None;
         self.tailscale_watch = None;
@@ -389,7 +481,7 @@ impl PhoneShare {
         self.port = None;
         self.page_url = None;
         self.start_error = None;
-        self.feed.update(cx, |feed, _| feed.clear());
+        self.https_error = None;
     }
 
     fn start_publishing(&mut self, cx: &mut Context<Self>) {
@@ -451,13 +543,52 @@ impl PhoneShare {
     }
 }
 
-fn page_url(me: &TailscaleSelf, port: u16) -> String {
+fn page_url(me: &TailscaleSelf, port: u16, https: bool) -> String {
     let host = if me.dns_name.is_empty() {
         me.ip.to_string()
     } else {
         me.dns_name.clone()
     };
-    format!("http://{host}:{port}/")
+    let scheme = if https { "https" } else { "http" };
+    format!("{scheme}://{host}:{port}/")
+}
+
+fn certificate_directory() -> Option<PathBuf> {
+    mnemonic_bridge::mnemonic_state_cloned().map(|state| state.data_dir.join("phone"))
+}
+
+/// The certificate to serve the page over HTTPS with, or why it can't be.
+fn https_certificate(
+    me: &TailscaleSelf,
+    directory: Option<&Path>,
+    fetch: impl FnOnce(&str, &Path) -> Result<TlsFiles, String>,
+) -> Result<TlsFiles, String> {
+    if me.dns_name.is_empty() {
+        return Err("MagicDNS is off in this tailnet, so there's no name to certify".into());
+    }
+    let directory = directory.ok_or_else(|| "Mnemonic's data folder isn't ready".to_string())?;
+    fetch(&me.dns_name, directory)
+}
+
+/// Whether a renewal check found a certificate other than the one being
+/// served. A failed check keeps what is running.
+fn certificate_changed(running: Option<&[u8]>, fetched: &Result<TlsFiles, String>) -> bool {
+    match fetched {
+        Ok(files) => running != Some(files.certificate.as_slice()),
+        Err(err) => {
+            log::warn!("Couldn't renew the phone page's HTTPS certificate: {err}");
+            false
+        }
+    }
+}
+
+struct StartedServer {
+    server: PhoneServer,
+    started_as: TailscaleSelf,
+    /// The certificate served, None when serving plain HTTP.
+    certificate: Option<Vec<u8>>,
+    /// Why plain HTTP.
+    https_error: Option<String>,
 }
 
 fn start_server(
@@ -465,7 +596,7 @@ fn start_server(
     hub: TeamShareHub,
     enabled_agents: Arc<Mutex<Vec<PhoneAgent>>>,
     action_sender: mpsc::UnboundedSender<PendingPhoneAction>,
-) -> Result<(PhoneServer, TailscaleSelf), String> {
+) -> Result<StartedServer, String> {
     let me = tailscale_self()?;
     if me.login.trim().is_empty() {
         return Err(
@@ -477,6 +608,7 @@ fn start_server(
     // Runs on a request thread, which waits here while the main thread
     // carries the action out.
     let action_handler: PhoneActionHandler = Arc::new(move |action| {
+        let timeout = action_timeout(&action);
         let (reply_sender, reply_receiver) = std::sync::mpsc::channel();
         let claimed = Arc::new(AtomicBool::new(false));
         let pending = PendingPhoneAction {
@@ -487,31 +619,289 @@ fn start_server(
         if action_sender.unbounded_send(pending).is_err() {
             return Err(TeamActionError::Failed("The phone server stopped".into()));
         }
-        wait_for_reply(&reply_receiver, &claimed, ACTION_TIMEOUT)
+        wait_for_reply(&reply_receiver, &claimed, timeout)
     });
-    PhoneServer::start(
-        PhoneServerConfig {
-            bind: IpAddr::V4(me.ip),
-            port,
-            owner_login: me.login.clone(),
-            own_addresses: vec![
-                IpAddr::V4(me.ip),
-                IpAddr::V4(Ipv4Addr::LOCALHOST),
-                IpAddr::V6(Ipv6Addr::LOCALHOST),
-            ],
+    let start = |tls: Option<TlsFiles>| {
+        let enabled_agents = enabled_agents.clone();
+        PhoneServer::start(
+            PhoneServerConfig {
+                bind: IpAddr::V4(me.ip),
+                port,
+                owner_login: me.login.clone(),
+                own_addresses: vec![
+                    IpAddr::V4(me.ip),
+                    IpAddr::V4(Ipv4Addr::LOCALHOST),
+                    IpAddr::V6(Ipv6Addr::LOCALHOST),
+                ],
+                tls,
+            },
+            hub.clone(),
+            Arc::new(TailscaleWhois::default()),
+            PhoneSources {
+                diff: workspace_diff_source(),
+                agents: Arc::new(move || {
+                    enabled_agents
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .clone()
+                }),
+                repositories: Arc::new(phone_repositories),
+                pr_status: Arc::new(phone_pr_status),
+                push_key: Arc::new(phone_push_key),
+                save_push_subscription: Arc::new(save_push_subscription),
+            },
+            action_handler.clone(),
+        )
+    };
+    let served_over_https =
+        https_certificate(&me, certificate_directory().as_deref(), tailscale_cert).and_then(
+            |tls| {
+                let certificate = tls.certificate.clone();
+                start(Some(tls)).map(|server| (server, certificate))
+            },
+        );
+    let (server, certificate, https_error) = match served_over_https {
+        Ok((server, certificate)) => (server, Some(certificate), None),
+        Err(err) => {
+            log::warn!("Serving the phone page over plain HTTP: {err}");
+            (start(None)?, None, Some(err))
+        }
+    };
+    Ok(StartedServer {
+        server,
+        started_as: me,
+        certificate,
+        https_error,
+    })
+}
+
+/// What a repeated alert is matched on. Permission prompts match by their
+/// tool call, so the agent's next prompt after one answered from the
+/// notification still alerts; a chat's finishes and errors match by kind.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct AlertKey {
+    chat_id: String,
+    kind: NoticeKind,
+    tool_call_id: Option<String>,
+}
+
+fn alert_key(event: &ChatFeedEvent) -> AlertKey {
+    match event {
+        ChatFeedEvent::PermissionRequested {
+            chat_id,
+            tool_call_id,
+            ..
+        } => AlertKey {
+            chat_id: chat_id.clone(),
+            kind: NoticeKind::Permission,
+            tool_call_id: Some(tool_call_id.clone()),
         },
-        hub,
-        Arc::new(TailscaleWhois::default()),
-        workspace_diff_source(),
-        Arc::new(move || {
-            enabled_agents
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .clone()
-        }),
-        action_handler,
-    )
-    .map(|server| (server, me))
+        ChatFeedEvent::TurnEnded { chat_id, .. } => AlertKey {
+            chat_id: chat_id.clone(),
+            kind: NoticeKind::Finished,
+            tool_call_id: None,
+        },
+        ChatFeedEvent::Errored { chat_id, .. } => AlertKey {
+            chat_id: chat_id.clone(),
+            kind: NoticeKind::Error,
+            tool_call_id: None,
+        },
+    }
+}
+
+/// Whether an alert matching `key` went out within `NOTIFY_COLLAPSE_WITHIN`
+/// of `now`. When it didn't, records it as going out now.
+fn collapse_repeat(
+    last_notified: &mut HashMap<AlertKey, Instant>,
+    key: AlertKey,
+    now: Instant,
+) -> bool {
+    let collapsed = last_notified
+        .get(&key)
+        .is_some_and(|sent| now.duration_since(*sent) < NOTIFY_COLLAPSE_WITHIN);
+    if !collapsed {
+        last_notified.retain(|_, sent| now.duration_since(*sent) < NOTIFY_COLLAPSE_WITHIN);
+        last_notified.insert(key, now);
+    }
+    collapsed
+}
+
+struct PushPermission {
+    tool_call_id: String,
+    answers: QuickAnswers,
+}
+
+/// Like the ntfy alert, never carries a command, tool input, message or
+/// diff: only what kind of thing happened and where.
+fn push_payload(
+    title: &str,
+    notice: &Notice,
+    page_url: &str,
+    permission: Option<&PushPermission>,
+) -> String {
+    serde_json::json!({
+        "title": title,
+        "body": notice_body(notice),
+        "chat_id": notice.chat_id,
+        "url": format!("{page_url}#chat={}", notice.chat_id),
+        "permission": permission.map(|permission| serde_json::json!({
+            "tool_call_id": permission.tool_call_id,
+            "allow_option_id": permission.answers.allow_option_id,
+            "deny_option_id": permission.answers.deny_option_id,
+        })),
+    })
+    .to_string()
+}
+
+fn send_web_push(payload: &str) {
+    if let Err(err) = try_send_web_push(payload) {
+        log::warn!("Couldn't send the phone's web push: {err}");
+    }
+}
+
+fn try_send_web_push(payload: &str) -> Result<(), String> {
+    let state = mnemonic_bridge::mnemonic_state_cloned()
+        .ok_or_else(|| "Mnemonic isn't ready".to_string())?;
+    let subscriptions = push_subscription_repository::list(&state.db)?;
+    if subscriptions.is_empty() {
+        return Ok(());
+    }
+    let keys = load_or_create_vapid_keys(&state.data_dir.join("phone"))?;
+    for subscription in subscriptions {
+        match web_push_service::send(&subscription, payload.as_bytes(), &keys) {
+            Ok(PushOutcome::Delivered) => {}
+            Ok(PushOutcome::Gone) => {
+                if let Err(err) =
+                    push_subscription_repository::delete(&state.db, &subscription.endpoint)
+                {
+                    log::warn!("Couldn't forget a push subscription the browser dropped: {err}");
+                }
+            }
+            Err(err) => log::warn!("Couldn't send a web push: {err}"),
+        }
+    }
+    Ok(())
+}
+
+fn phone_push_key() -> Result<String, String> {
+    let state = mnemonic_bridge::mnemonic_state_cloned()
+        .ok_or_else(|| "Mnemonic isn't ready".to_string())?;
+    Ok(load_or_create_vapid_keys(&state.data_dir.join("phone"))?.public_key_base64url())
+}
+
+fn save_push_subscription(subscription: PushSubscription) -> Result<(), String> {
+    let state = mnemonic_bridge::mnemonic_state_cloned()
+        .ok_or_else(|| "Mnemonic isn't ready".to_string())?;
+    push_subscription_repository::upsert(&state.db, &subscription)
+}
+
+/// The repositories, those with the newest workspace first. Workspaces carry
+/// no creation date, so their newest-first listing order stands in for it.
+fn phone_repositories() -> Result<Vec<PhoneRepository>, String> {
+    let state = mnemonic_bridge::mnemonic_state_cloned()
+        .ok_or_else(|| "Mnemonic isn't ready".to_string())?;
+    let repositories = repository_repository::list(&state.db)?;
+    let workspaces = workspace_repository::list(&state.db)?;
+    let recency = |repository: &DiscoveredRepository| {
+        workspaces.iter().position(|workspace| {
+            workspace.repository_id.as_deref() == Some(repository.id.as_str())
+        })
+    };
+    let mut ranked: Vec<(Option<usize>, DiscoveredRepository)> = repositories
+        .into_iter()
+        .map(|repository| (recency(&repository), repository))
+        .collect();
+    ranked.sort_by(|(left_rank, left), (right_rank, right)| {
+        match (left_rank, right_rank) {
+            (Some(left_rank), Some(right_rank)) => left_rank.cmp(right_rank),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => std::cmp::Ordering::Equal,
+        }
+        .then_with(|| left.name.cmp(&right.name))
+    });
+    Ok(ranked
+        .into_iter()
+        .map(|(_, repository)| PhoneRepository {
+            id: repository.id,
+            name: repository.name,
+        })
+        .collect())
+}
+
+fn phone_pr_status(workspace_id: &str) -> Result<PhonePrStatus, String> {
+    let state = mnemonic_bridge::mnemonic_state_cloned()
+        .ok_or_else(|| "Mnemonic isn't ready".to_string())?;
+    let status = pr_draft_service::get_workspace_pr_status(&state, workspace_id)?;
+    Ok(PhonePrStatus {
+        can_merge: status.can_merge(),
+        found: status.found,
+        number: status.number,
+        title: status.title,
+        url: status.url,
+        state: status.state,
+        is_draft: status.is_draft,
+        merge_state_status: status.merge_state_status,
+        head_ref_oid: status.head_ref_oid,
+        checks_summary: status.checks_summary,
+        merge_method: pr_draft_service::configured_merge_method(&state),
+    })
+}
+
+fn action_timeout(action: &PhoneAction) -> Duration {
+    match action {
+        PhoneAction::StartTask { .. } | PhoneAction::Merge { .. } => LONG_ACTION_TIMEOUT,
+        _ => ACTION_TIMEOUT,
+    }
+}
+
+/// What the phone hears when an action outlasts its timeout. A task or a
+/// merge is usually still going, so calling it a failure would invite the
+/// owner to start a second one.
+fn timed_out(action: &PhoneAction) -> Result<PhoneActionOutcome, TeamActionError> {
+    let still_running = |message: &str| {
+        Ok(PhoneActionOutcome {
+            message: Some(message.to_string()),
+            ..PhoneActionOutcome::default()
+        })
+    };
+    match action {
+        PhoneAction::StartTask { .. } => {
+            still_running("Still starting on the Mac; it will appear in the list shortly")
+        }
+        PhoneAction::Merge { .. } => {
+            still_running("Still merging on the Mac; check the PR in a moment")
+        }
+        _ => Err(TeamActionError::Failed("Timed out".to_string())),
+    }
+}
+
+/// The action's outcome, or `on_timeout` once it has run for `timeout`, so
+/// a hung `git` or `gh` can't hold the phone's request open forever. The
+/// action itself carries on, so a half-made workspace isn't abandoned.
+fn within_timeout(
+    action: Task<Result<PhoneActionOutcome, TeamActionError>>,
+    timeout: Duration,
+    on_timeout: Result<PhoneActionOutcome, TeamActionError>,
+    cx: &mut App,
+) -> Task<Result<PhoneActionOutcome, TeamActionError>> {
+    let (outcome_sender, outcome_receiver) = oneshot::channel();
+    cx.spawn(async move |_| {
+        if outcome_sender.send(action.await).is_err() {
+            log::info!("A phone action finished after it timed out");
+        }
+    })
+    .detach();
+    let timer = cx.background_executor().timer(timeout);
+    cx.background_spawn(async move {
+        match future::select(outcome_receiver, timer).await {
+            Either::Left((Ok(outcome), _)) => outcome,
+            Either::Left((Err(oneshot::Canceled), _)) => Err(TeamActionError::Failed(
+                "The action stopped before it finished".to_string(),
+            )),
+            Either::Right(_) => on_timeout,
+        }
+    })
 }
 
 /// The agent the phone named, by its label or its id.
@@ -522,103 +912,377 @@ fn chat_agent(name: &str) -> Option<ChatAgent> {
         .find(|agent| agent.label().eq_ignore_ascii_case(name) || agent.agent_id() == name)
 }
 
+fn enabled_agent(name: &str, enabled: &[ChatAgent]) -> Result<ChatAgent, TeamActionError> {
+    let agent = chat_agent(name)
+        .ok_or_else(|| TeamActionError::Invalid(format!("Unknown agent {name}")))?;
+    if !enabled.contains(&agent) {
+        return Err(TeamActionError::Invalid(format!(
+            "{} isn't enabled on this Mac",
+            agent.label()
+        )));
+    }
+    Ok(agent)
+}
+
+/// The repository and agent a task from the phone starts with.
+fn task_to_start(
+    repositories: &[DiscoveredRepository],
+    enabled: &[ChatAgent],
+    repository_id: &str,
+    agent: &str,
+) -> Result<(DiscoveredRepository, ChatAgent), TeamActionError> {
+    let repository = repositories
+        .iter()
+        .find(|repository| repository.id == repository_id)
+        .cloned()
+        .ok_or_else(|| TeamActionError::Invalid(format!("Unknown repository {repository_id}")))?;
+    Ok((repository, enabled_agent(agent, enabled)?))
+}
+
+/// The PR's number when it may be merged at `head`, the commit the phone
+/// saw.
+fn check_merge(status: &WorkspacePrStatus, head: &str) -> Result<i64, TeamActionError> {
+    let cannot_merge =
+        || TeamActionError::NothingToDo("This PR can't be merged right now".to_string());
+    if !status.can_merge() {
+        return Err(cannot_merge());
+    }
+    if status.head_ref_oid.as_deref() != Some(head) {
+        return Err(TeamActionError::NothingToDo(
+            "The PR changed since you looked. Refresh and try again.".to_string(),
+        ));
+    }
+    status.number.ok_or_else(cannot_merge)
+}
+
+fn no_window() -> TeamActionError {
+    TeamActionError::NothingToDo(NO_WINDOW.to_string())
+}
+
+fn not_ready() -> TeamActionError {
+    TeamActionError::Failed("Mnemonic isn't ready".to_string())
+}
+
+/// The frontmost Mnemonic window, or any open one when none is in front.
+fn front_window(cx: &App) -> Option<Entity<Workspace>> {
+    let windows = open_window_handles(cx);
+    let in_front = cx
+        .window_stack()
+        .unwrap_or_default()
+        .into_iter()
+        .find_map(|handle| {
+            windows
+                .iter()
+                .find(|(_, window)| window.window_id() == handle.window_id())
+                .map(|(workspace, _)| workspace.clone())
+        });
+    in_front.or_else(|| windows.into_iter().next().map(|(workspace, _)| workspace))
+}
+
+fn window_handle_of(workspace: &Entity<Workspace>, cx: &App) -> Option<AnyWindowHandle> {
+    open_window_handles(cx)
+        .into_iter()
+        .find(|(open, _)| open.entity_id() == workspace.entity_id())
+        .map(|(_, window)| window)
+}
+
+/// The workspace holding a chat, as last published to the phone.
+fn saved_chat_workspace(chat_id: &str, cx: &App) -> Option<String> {
+    phone_share(cx)?
+        .read(cx)
+        .feed
+        .read(cx)
+        .hub()
+        .workspaces()
+        .into_iter()
+        .find(|workspace| workspace.chats.iter().any(|chat| chat.id == chat_id))
+        .map(|workspace| workspace.id)
+}
+
+/// The workspace's loaded view, opening it in the frontmost window the way
+/// selecting it in the workspace list does when no window has it loaded.
+fn open_workspace_for_phone(
+    workspace_id: &str,
+    cx: &mut App,
+) -> Result<(Entity<Workspace>, Entity<WorkspaceView>), TeamActionError> {
+    let loaded = find_workspace_window(workspace_id, cx).and_then(|window| {
+        let view = WorkspaceHost::view_in(window.read(cx), workspace_id, cx)?;
+        Some((window, view))
+    });
+    if let Some(loaded) = loaded {
+        return Ok(loaded);
+    }
+    let window = front_window(cx).ok_or_else(no_window)?;
+    let window_handle = window_handle_of(&window, cx).ok_or_else(no_window)?;
+    let panel = window
+        .read(cx)
+        .panel::<WorkspacePanel>(cx)
+        .ok_or_else(no_window)?;
+    window_handle
+        .update(cx, |_, window, cx| {
+            panel.update(cx, |panel, cx| {
+                // A workspace made moments ago may not be listed yet.
+                panel.refresh(cx);
+                panel.select_workspace(workspace_id.to_string(), window, cx);
+            })
+        })
+        .map_err(|err| TeamActionError::Failed(format!("Couldn't open the workspace: {err}")))?;
+    let view = WorkspaceHost::view_in(window.read(cx), workspace_id, cx).ok_or_else(|| {
+        TeamActionError::NothingToDo("This workspace isn't on the Mac any more".to_string())
+    })?;
+    Ok((window, view))
+}
+
 /// Carries out the phone's action. Unlike a teammate's, it needs no
-/// step-in switch and may give any answer the agent offers.
+/// step-in switch and may give any answer the agent offers. A workspace not
+/// loaded on the Mac is opened first, except to merge its PR.
 fn run_phone_action(
     action: PhoneAction,
     cx: &mut App,
-) -> Result<PhoneActionOutcome, TeamActionError> {
+) -> Task<Result<PhoneActionOutcome, TeamActionError>> {
     match action {
-        PhoneAction::Stop { chat_id } => {
-            let chat = find_open_chat(&chat_id, cx).ok_or(TeamActionError::NotLoaded)?;
-            // None while the chat's agent is still connecting.
-            let Some(thread) = &chat.thread else {
-                return Err(TeamActionError::NotLoaded);
-            };
-            if thread.read(cx).status() == ThreadStatus::Idle {
-                return Err(TeamActionError::NothingToDo(
-                    "The agent isn't running".into(),
-                ));
-            }
-            chat.view
-                .update(cx, |view, cx| view.stop_chat(&chat_id, cx));
-            show_phone_notice(
-                &chat.window,
-                format!("stopped the agent in {}", chat.title),
-                cx,
-            );
-            Ok(PhoneActionOutcome::default())
-        }
+        PhoneAction::Stop { chat_id } => Task::ready(stop_chat(chat_id, cx)),
         PhoneAction::Permission {
             chat_id,
             tool_call_id,
             option_id,
-        } => {
-            let chat = find_open_chat(&chat_id, cx).ok_or(TeamActionError::NotLoaded)?;
-            let Some(thread) = &chat.thread else {
-                return Err(TeamActionError::NotLoaded);
-            };
-            let (tool_title, chosen) =
-                answer_permission(thread, &tool_call_id, &option_id, PermissionScope::All, cx)?;
-            let answer = match chosen {
-                acp::PermissionOptionKind::RejectOnce | acp::PermissionOptionKind::RejectAlways => {
-                    "rejected"
-                }
-                _ => "allowed",
-            };
-            show_phone_notice(
-                &chat.window,
-                format!("{answer} {tool_title} in {}", chat.title),
-                cx,
-            );
-            Ok(PhoneActionOutcome::default())
-        }
-        PhoneAction::Message { chat_id, text } => {
-            let chat = find_open_chat(&chat_id, cx).ok_or(TeamActionError::NotLoaded)?;
-            let sent = chat
-                .view
-                .update(cx, |view, cx| view.send_to_chat(&chat_id, text, cx));
-            if !sent {
-                return Err(TeamActionError::NotLoaded);
-            }
-            show_phone_notice(
-                &chat.window,
-                format!("sent a message to {}", chat.title),
-                cx,
-            );
-            Ok(PhoneActionOutcome::default())
-        }
+        } => Task::ready(answer_chat_permission(chat_id, tool_call_id, option_id, cx)),
+        PhoneAction::Message { chat_id, text } => Task::ready(send_message(chat_id, text, cx)),
         PhoneAction::NewChat {
             workspace_id,
             agent,
-        } => {
-            let agent = chat_agent(&agent)
-                .ok_or_else(|| TeamActionError::Invalid(format!("Unknown agent {agent}")))?;
-            if !ChatAgent::enabled(cx).contains(&agent) {
-                return Err(TeamActionError::Invalid(format!(
-                    "{} isn't enabled on this Mac",
-                    agent.label()
-                )));
+        } => Task::ready(start_new_chat(workspace_id, agent, cx)),
+        PhoneAction::CreatePr { workspace_id } => Task::ready(ask_for_pr(workspace_id, cx)),
+        PhoneAction::StartTask {
+            repository_id,
+            agent,
+            text,
+        } => start_task(repository_id, agent, text, cx),
+        PhoneAction::Merge { workspace_id, head } => merge_pr(workspace_id, head, cx),
+    }
+}
+
+fn stop_chat(chat_id: String, cx: &mut App) -> Result<PhoneActionOutcome, TeamActionError> {
+    let not_running = || TeamActionError::NothingToDo("The agent isn't running".to_string());
+    let chat = find_open_chat(&chat_id, cx).ok_or_else(not_running)?;
+    // None while the chat's agent is still connecting.
+    let Some(thread) = &chat.thread else {
+        return Err(not_running());
+    };
+    if thread.read(cx).status() == ThreadStatus::Idle {
+        return Err(not_running());
+    }
+    chat.view
+        .update(cx, |view, cx| view.stop_chat(&chat_id, cx));
+    show_phone_notice(
+        &chat.window,
+        format!("stopped the agent in {}", chat.title),
+        cx,
+    );
+    Ok(PhoneActionOutcome::default())
+}
+
+/// A chat that isn't loaded has no prompt waiting: whatever the phone saw
+/// was answered before the chat was closed.
+fn answer_chat_permission(
+    chat_id: String,
+    tool_call_id: String,
+    option_id: String,
+    cx: &mut App,
+) -> Result<PhoneActionOutcome, TeamActionError> {
+    let already_answered = || TeamActionError::NothingToDo("Already answered".to_string());
+    let chat = find_open_chat(&chat_id, cx).ok_or_else(already_answered)?;
+    let Some(thread) = &chat.thread else {
+        return Err(already_answered());
+    };
+    let (tool_title, chosen) =
+        answer_permission(thread, &tool_call_id, &option_id, PermissionScope::All, cx)?;
+    let answer = match chosen {
+        acp::PermissionOptionKind::RejectOnce | acp::PermissionOptionKind::RejectAlways => {
+            "rejected"
+        }
+        _ => "allowed",
+    };
+    show_phone_notice(
+        &chat.window,
+        format!("{answer} {tool_title} in {}", chat.title),
+        cx,
+    );
+    Ok(PhoneActionOutcome::default())
+}
+
+fn send_message(
+    chat_id: String,
+    text: String,
+    cx: &mut App,
+) -> Result<PhoneActionOutcome, TeamActionError> {
+    let closed = || TeamActionError::NothingToDo("This chat was closed on the Mac".to_string());
+    if find_open_chat(&chat_id, cx).is_none() {
+        let workspace_id = saved_chat_workspace(&chat_id, cx).ok_or_else(closed)?;
+        open_workspace_for_phone(&workspace_id, cx)?;
+    }
+    let chat = find_open_chat(&chat_id, cx).ok_or_else(closed)?;
+    let sent = chat
+        .view
+        .update(cx, |view, cx| view.send_to_chat(&chat_id, text, cx));
+    if !sent {
+        return Err(closed());
+    }
+    show_phone_notice(
+        &chat.window,
+        format!("sent a message to {}", chat.title),
+        cx,
+    );
+    Ok(PhoneActionOutcome::default())
+}
+
+fn start_new_chat(
+    workspace_id: String,
+    agent: String,
+    cx: &mut App,
+) -> Result<PhoneActionOutcome, TeamActionError> {
+    let agent = enabled_agent(&agent, &ChatAgent::enabled(cx))?;
+    let (window, view) = open_workspace_for_phone(&workspace_id, cx)?;
+    let chat_id = view
+        .read(cx)
+        .window_handle()
+        .update(cx, |_, window, cx| {
+            view.update(cx, |view, cx| view.start_chat(agent, window, cx))
+        })
+        .map_err(|err| TeamActionError::Failed(format!("Couldn't start the chat: {err}")))?;
+    show_phone_notice(&window, format!("started a {} chat", agent.label()), cx);
+    Ok(PhoneActionOutcome {
+        chat_id: Some(chat_id),
+        ..PhoneActionOutcome::default()
+    })
+}
+
+fn ask_for_pr(workspace_id: String, cx: &mut App) -> Result<PhoneActionOutcome, TeamActionError> {
+    let (window, _view) = open_workspace_for_phone(&workspace_id, cx)?;
+    let state = mnemonic_bridge::mnemonic_state_cloned().ok_or_else(not_ready)?;
+    let summary =
+        workspace_repository::get(&state.db, &workspace_id).map_err(TeamActionError::Failed)?;
+    let sent = window.update(cx, |workspace, cx| {
+        request_pr(workspace, &workspace_id, &summary.branch, cx)
+    });
+    if !sent {
+        return Err(TeamActionError::Failed(
+            "Couldn't send the PR instruction".to_string(),
+        ));
+    }
+    show_phone_notice(&window, format!("asked for a PR in {}", summary.name), cx);
+    Ok(PhoneActionOutcome::default())
+}
+
+/// Resolves to the new workspace and its primary chat's record id.
+type WorkspaceCreation = Task<Result<(WorkspaceDetail, String), String>>;
+
+/// Starts creating the task's workspace in the frontmost window, returning
+/// the creation and the repository's name.
+fn create_task_workspace(
+    repository_id: &str,
+    agent: &str,
+    cx: &mut App,
+) -> Result<(WorkspaceCreation, String), TeamActionError> {
+    let window = front_window(cx).ok_or_else(no_window)?;
+    let state = mnemonic_bridge::mnemonic_state_cloned().ok_or_else(not_ready)?;
+    let repositories = repository_repository::list(&state.db).map_err(TeamActionError::Failed)?;
+    let (repository, agent) =
+        task_to_start(&repositories, &ChatAgent::enabled(cx), repository_id, agent)?;
+    let window_handle = window_handle_of(&window, cx).ok_or_else(no_window)?;
+    let panel = window
+        .read(cx)
+        .panel::<WorkspacePanel>(cx)
+        .ok_or_else(no_window)?;
+    let repository_name = repository.name.clone();
+    let created = window_handle
+        .update(cx, |_, window, cx| {
+            panel.update(cx, |panel, cx| {
+                panel.create_project_workspace(repository, agent, window, cx)
+            })
+        })
+        .map_err(|err| TeamActionError::Failed(format!("Couldn't start the task: {err}")))?;
+    Ok((created, repository_name))
+}
+
+/// Creates a workspace for the task, then sends `text` to its chat as the
+/// user's own first message, so the workspace is named from it as when
+/// typed on the Mac. The message waits in the chat while its agent connects.
+fn start_task(
+    repository_id: String,
+    agent: String,
+    text: String,
+    cx: &mut App,
+) -> Task<Result<PhoneActionOutcome, TeamActionError>> {
+    let (created, repository_name) = match create_task_workspace(&repository_id, &agent, cx) {
+        Ok(creating) => creating,
+        Err(err) => return Task::ready(Err(err)),
+    };
+    cx.spawn(async move |cx| {
+        let (detail, chat_id) = created.await.map_err(TeamActionError::Failed)?;
+        let workspace_id = detail.summary.id;
+        cx.update(|cx| {
+            let (window, view) = open_workspace_for_phone(&workspace_id, cx)?;
+            let sent = view.update(cx, |view, cx| view.send_to_chat(&chat_id, text, cx));
+            if !sent {
+                return Err(TeamActionError::Failed(
+                    "The new workspace's chat didn't open".to_string(),
+                ));
             }
-            let window =
-                find_workspace_window(&workspace_id, cx).ok_or(TeamActionError::NotLoaded)?;
-            let view = WorkspaceHost::view_in(window.read(cx), &workspace_id, cx)
-                .ok_or(TeamActionError::NotLoaded)?;
-            let chat_id = view
-                .read(cx)
-                .window_handle()
-                .update(cx, |_, window, cx| {
-                    view.update(cx, |view, cx| view.start_chat(agent, window, cx))
-                })
-                .map_err(|err| {
-                    TeamActionError::Failed(format!("Couldn't start the chat: {err}"))
-                })?;
-            show_phone_notice(&window, format!("started a {} chat", agent.label()), cx);
+            show_phone_notice(&window, format!("started a task in {repository_name}"), cx);
             Ok(PhoneActionOutcome {
                 chat_id: Some(chat_id),
+                workspace_id: Some(workspace_id),
+                message: None,
             })
-        }
-    }
+        })
+    })
+}
+
+/// Merges without opening the workspace. GitHub refuses the merge if the
+/// PR's head moved past `head` since the status was read here.
+fn merge_pr(
+    workspace_id: String,
+    head: String,
+    cx: &mut App,
+) -> Task<Result<PhoneActionOutcome, TeamActionError>> {
+    let Some(state) = mnemonic_bridge::mnemonic_state_cloned() else {
+        return Task::ready(Err(not_ready()));
+    };
+    cx.spawn(async move |cx| {
+        let (number, message) = cx
+            .background_spawn({
+                let workspace_id = workspace_id.clone();
+                async move {
+                    let status = pr_draft_service::get_workspace_pr_status(&state, &workspace_id)
+                        .map_err(TeamActionError::Failed)?;
+                    let number = check_merge(&status, &head)?;
+                    let method = pr_draft_service::configured_merge_method(&state);
+                    let message = pr_draft_service::merge_workspace_pr(
+                        &state,
+                        &workspace_id,
+                        number,
+                        status.url.as_deref(),
+                        &head,
+                        &method,
+                    )
+                    .map_err(TeamActionError::Failed)?;
+                    Ok::<_, TeamActionError>((number, message))
+                }
+            })
+            .await?;
+        cx.update(|cx| {
+            let window = find_workspace_window(&workspace_id, cx).or_else(|| front_window(cx));
+            if let Some(window) = window {
+                show_phone_notice(&window, format!("merged PR #{number}"), cx);
+            }
+        });
+        Ok(PhoneActionOutcome {
+            workspace_id: Some(workspace_id),
+            message: Some(message),
+            ..PhoneActionOutcome::default()
+        })
+    })
 }
 
 fn show_phone_notice(window: &Entity<Workspace>, what: String, cx: &mut App) {
@@ -636,6 +1300,8 @@ mod tests {
         SelectedPermissionOutcome,
     };
     use gpui::TestAppContext;
+    use mnemonic_core::models::WorkspacePrStatus;
+    use mnemonic_core::services::team_share_service::TeamWorkspace;
 
     #[gpui::test]
     async fn phone_can_answer_with_an_always_option(cx: &mut TestAppContext) {
@@ -758,6 +1424,249 @@ mod tests {
         );
     }
 
+    fn saved_workspace(workspace_id: &str, chat_id: &str) -> TeamWorkspace {
+        serde_json::from_value(serde_json::json!({
+            "id": workspace_id,
+            "project": "mnemonic",
+            "name": "fix-login",
+            "branch": "jay/fix-login",
+            "chats": [{ "id": chat_id, "title": "Claude", "agent": "claude-acp", "open": true }],
+        }))
+        .unwrap_or_else(|err| panic!("the test workspace didn't parse: {err}"))
+    }
+
+    #[gpui::test]
+    async fn no_window_says_open_mnemonic(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let settings_store = SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            let phone = cx.new(PhoneShare::new);
+            phone
+                .read(cx)
+                .feed
+                .read(cx)
+                .hub()
+                .set_workspaces(vec![saved_workspace("ws-1", "chat-1")]);
+            cx.set_global(GlobalPhoneShare(phone));
+        });
+
+        let open_mnemonic = || {
+            Err(TeamActionError::NothingToDo(
+                "Open Mnemonic on the Mac first".to_string(),
+            ))
+        };
+        let needs_a_window = [
+            PhoneAction::Message {
+                chat_id: "chat-1".to_string(),
+                text: "Carry on".to_string(),
+            },
+            PhoneAction::NewChat {
+                workspace_id: "ws-1".to_string(),
+                agent: "claude".to_string(),
+            },
+            PhoneAction::CreatePr {
+                workspace_id: "ws-1".to_string(),
+            },
+            PhoneAction::StartTask {
+                repository_id: "repo-1".to_string(),
+                agent: "claude".to_string(),
+                text: "Fix the login page".to_string(),
+            },
+        ];
+        for action in needs_a_window {
+            let outcome = cx.update(|cx| run_phone_action(action.clone(), cx)).await;
+            assert_eq!(outcome, open_mnemonic(), "{action:?}");
+        }
+
+        let stopped = cx
+            .update(|cx| {
+                run_phone_action(
+                    PhoneAction::Stop {
+                        chat_id: "chat-1".to_string(),
+                    },
+                    cx,
+                )
+            })
+            .await;
+        assert_eq!(
+            stopped,
+            Err(TeamActionError::NothingToDo(
+                "The agent isn't running".to_string()
+            ))
+        );
+        let answered = cx
+            .update(|cx| {
+                run_phone_action(
+                    PhoneAction::Permission {
+                        chat_id: "chat-1".to_string(),
+                        tool_call_id: "run-tests".to_string(),
+                        option_id: "allow".to_string(),
+                    },
+                    cx,
+                )
+            })
+            .await;
+        assert_eq!(
+            answered,
+            Err(TeamActionError::NothingToDo("Already answered".to_string()))
+        );
+    }
+
+    fn repository(id: &str, name: &str) -> DiscoveredRepository {
+        DiscoveredRepository {
+            id: id.to_string(),
+            name: name.to_string(),
+            path: format!("/code/{name}"),
+            current_branch: Some("main".to_string()),
+            head: None,
+            is_dirty: false,
+            worktrees: Vec::new(),
+            last_scanned_at: String::new(),
+        }
+    }
+
+    #[test]
+    fn start_task_refuses_an_unknown_repository() {
+        let repositories = vec![repository("repo-1", "mnemonic")];
+        let enabled = [ChatAgent::Claude];
+
+        assert!(matches!(
+            task_to_start(&repositories, &enabled, "repo-2", "claude"),
+            Err(TeamActionError::Invalid(_))
+        ));
+        assert!(matches!(
+            task_to_start(&repositories, &enabled, "repo-1", "codex"),
+            Err(TeamActionError::Invalid(_))
+        ));
+        let started = task_to_start(&repositories, &enabled, "repo-1", "Claude")
+            .map(|(repository, agent)| (repository.id, agent));
+        assert_eq!(started, Ok(("repo-1".to_string(), ChatAgent::Claude)));
+    }
+
+    fn mergeable_pr(head: &str) -> WorkspacePrStatus {
+        WorkspacePrStatus {
+            workspace_id: "ws-1".to_string(),
+            found: true,
+            number: Some(212),
+            title: Some("Fix the login page".to_string()),
+            url: Some("https://github.com/example/mnemonic/pull/212".to_string()),
+            state: Some("OPEN".to_string()),
+            is_draft: false,
+            review_decision: None,
+            mergeable: Some("MERGEABLE".to_string()),
+            merge_state_status: Some("CLEAN".to_string()),
+            head_ref_oid: Some(head.to_string()),
+            checks_summary: String::new(),
+            checks: Vec::new(),
+            warning: None,
+        }
+    }
+
+    #[test]
+    fn merge_refuses_a_moved_head() {
+        let status = mergeable_pr("0123abc");
+
+        assert_eq!(check_merge(&status, "0123abc"), Ok(212));
+        assert_eq!(
+            check_merge(&status, "9999fff"),
+            Err(TeamActionError::NothingToDo(
+                "The PR changed since you looked. Refresh and try again.".to_string()
+            ))
+        );
+        let draft = WorkspacePrStatus {
+            is_draft: true,
+            ..status
+        };
+        assert_eq!(
+            check_merge(&draft, "0123abc"),
+            Err(TeamActionError::NothingToDo(
+                "This PR can't be merged right now".to_string()
+            ))
+        );
+    }
+
+    #[gpui::test]
+    async fn a_hung_action_times_out(cx: &mut TestAppContext) {
+        let hung: Task<Result<PhoneActionOutcome, TeamActionError>> =
+            cx.update(|cx| cx.spawn(async move |_| futures::future::pending().await));
+        let reply = cx.update(|cx| {
+            within_timeout(
+                hung,
+                LONG_ACTION_TIMEOUT,
+                Err(TeamActionError::Failed("Timed out".to_string())),
+                cx,
+            )
+        });
+        cx.executor().advance_clock(LONG_ACTION_TIMEOUT);
+
+        assert_eq!(
+            reply.await,
+            Err(TeamActionError::Failed("Timed out".to_string()))
+        );
+
+        let quick = cx.update(|cx| {
+            within_timeout(
+                Task::ready(Ok(PhoneActionOutcome::default())),
+                ACTION_TIMEOUT,
+                Err(TeamActionError::Failed("Timed out".to_string())),
+                cx,
+            )
+        });
+        assert_eq!(quick.await, Ok(PhoneActionOutcome::default()));
+    }
+
+    #[test]
+    fn each_permission_prompt_alerts_once_while_finishes_collapse() {
+        let prompt = |tool_call_id: &str| ChatFeedEvent::PermissionRequested {
+            workspace_id: "ws-1".to_string(),
+            chat_id: "chat-1".to_string(),
+            tool_kind: acp::ToolKind::Execute,
+            tool_call_id: tool_call_id.to_string(),
+            quick_answers: None,
+        };
+        let finished = ChatFeedEvent::TurnEnded {
+            workspace_id: "ws-1".to_string(),
+            chat_id: "chat-1".to_string(),
+            chat_title: "Claude".to_string(),
+            stop_reason: acp::StopReason::EndTurn,
+        };
+        let start = Instant::now();
+        let after = |seconds: u64| start + Duration::from_secs(seconds);
+        let mut last_notified = HashMap::new();
+
+        assert!(!collapse_repeat(
+            &mut last_notified,
+            alert_key(&prompt("run-tests")),
+            start
+        ));
+        assert!(!collapse_repeat(
+            &mut last_notified,
+            alert_key(&prompt("push")),
+            after(5)
+        ));
+        assert!(collapse_repeat(
+            &mut last_notified,
+            alert_key(&prompt("push")),
+            after(10)
+        ));
+
+        assert!(!collapse_repeat(
+            &mut last_notified,
+            alert_key(&finished),
+            after(10)
+        ));
+        assert!(collapse_repeat(
+            &mut last_notified,
+            alert_key(&finished),
+            after(20)
+        ));
+        assert!(!collapse_repeat(
+            &mut last_notified,
+            alert_key(&finished),
+            after(41)
+        ));
+    }
+
     #[test]
     fn new_chat_names_pick_their_agent() {
         assert_eq!(chat_agent("claude"), Some(ChatAgent::Claude));
@@ -786,5 +1695,58 @@ mod tests {
             ..running.clone()
         };
         assert!(PhoneShare::needs_restart(&running, &switched_account));
+    }
+
+    #[test]
+    fn a_failed_certificate_serves_http_and_says_why() {
+        let me = TailscaleSelf {
+            ip: Ipv4Addr::new(100, 64, 0, 1),
+            login: "jay@example.com".into(),
+            display_name: "Jay".into(),
+            dns_name: "jay-mbp.tail1234.ts.net".into(),
+        };
+        let directory = Path::new("/data/phone");
+        let failed = https_certificate(&me, Some(directory), |dns_name, directory| {
+            assert_eq!(
+                (dns_name, directory),
+                ("jay-mbp.tail1234.ts.net", Path::new("/data/phone"))
+            );
+            Err("HTTPS is not enabled for this tailnet".to_string())
+        });
+        assert!(failed.is_err_and(|err| err == "HTTPS is not enabled for this tailnet"));
+        assert_eq!(
+            page_url(&me, 47232, false),
+            "http://jay-mbp.tail1234.ts.net:47232/"
+        );
+        assert_eq!(
+            page_url(&me, 47232, true),
+            "https://jay-mbp.tail1234.ts.net:47232/"
+        );
+
+        let without_magic_dns = TailscaleSelf {
+            dns_name: String::new(),
+            ..me
+        };
+        let skipped = https_certificate(&without_magic_dns, Some(directory), |_, _| {
+            Err("tailscale cert ran without a name".to_string())
+        });
+        assert!(skipped.is_err_and(|err| err.contains("MagicDNS")));
+    }
+
+    #[test]
+    fn renewal_restarts_only_for_a_new_certificate() {
+        let files = |certificate: &[u8]| -> Result<TlsFiles, String> {
+            Ok(TlsFiles {
+                certificate: certificate.to_vec(),
+                private_key: b"key".to_vec(),
+            })
+        };
+        assert!(!certificate_changed(Some(b"old"), &files(b"old")));
+        assert!(certificate_changed(Some(b"old"), &files(b"new")));
+        assert!(certificate_changed(None, &files(b"new")));
+        assert!(!certificate_changed(
+            Some(b"old"),
+            &Err("tailscale is offline".to_string())
+        ));
     }
 }

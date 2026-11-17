@@ -507,6 +507,7 @@ accesskit = "0.24.0"
 accesskit_macos = "0.26.0"
 accesskit_unix = "0.21.0"
 accesskit_windows = "0.32.1"
+aes-gcm = "0.10"
 agent-client-protocol = { version = "=0.14.0", features = ["unstable"] }
 aho-corasick = "1.1"
 alacritty_terminal = { git = "https://github.com/zed-industries/alacritty", rev = "fcf32feacb367b75ec84dd40f041e4fd411d3cc1" }
@@ -606,6 +607,7 @@ heck = "0.5"
 hdrhistogram = "7"
 heed = { version = "0.21.0", features = ["read-txn-no-tls"] }
 hex = "0.4.3"
+hkdf = "0.12"
 human_bytes = "0.4.1"
 html5ever = "0.27.0"
 http = "1.1"
@@ -674,6 +676,7 @@ parking_lot = "0.12.1"
 partial-json-fixer = "0.5.3"
 parse_int = "0.9"
 pciid-parser = "0.8.0"
+p256 = "0.11"
 pathdiff = "0.2"
 percent-encoding = "2.3.2"
 pet = { git = "https://github.com/microsoft/python-environment-tools.git", rev = "9e61a22af989fe54937bf07c9f9cff1bc53d9056" }

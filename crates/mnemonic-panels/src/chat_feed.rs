@@ -59,11 +59,35 @@ pub(crate) struct TranscriptToRead {
     pub modified: SystemTime,
 }
 
+/// The options a one-tap answer from a notification uses.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct QuickAnswers {
+    pub allow_option_id: String,
+    pub deny_option_id: String,
+}
+
+/// The first allow-once and the first reject-once among `options`, None
+/// unless both exist, since a notification can't offer a lone button.
+pub(crate) fn quick_answers(options: &[acp::PermissionOption]) -> Option<QuickAnswers> {
+    let first = |wanted| {
+        options
+            .iter()
+            .find(|option| option.kind == wanted)
+            .map(|option| option.option_id.0.to_string())
+    };
+    Some(QuickAnswers {
+        allow_option_id: first(acp::PermissionOptionKind::AllowOnce)?,
+        deny_option_id: first(acp::PermissionOptionKind::RejectOnce)?,
+    })
+}
+
 pub(crate) enum ChatFeedEvent {
     PermissionRequested {
         workspace_id: String,
         chat_id: String,
         tool_kind: acp::ToolKind,
+        tool_call_id: String,
+        quick_answers: Option<QuickAnswers>,
     },
     TurnEnded {
         workspace_id: String,
@@ -99,6 +123,9 @@ pub(crate) struct ChatFeed {
     /// Chats shared from their saved transcript, as they aren't loaded in
     /// this app, with when that transcript was written.
     saved_chats: HashMap<String, SystemTime>,
+    /// When each chat's last turn ended (unix ms) and whether it errored,
+    /// for the phone feed. Lost on restart.
+    turn_ends: HashMap<String, (u64, bool)>,
 }
 
 impl EventEmitter<ChatFeedEvent> for ChatFeed {}
@@ -110,6 +137,7 @@ impl ChatFeed {
             scope,
             chat_watches: HashMap::new(),
             saved_chats: HashMap::new(),
+            turn_ends: HashMap::new(),
         }
     }
 
@@ -121,6 +149,7 @@ impl ChatFeed {
     pub fn clear(&mut self) {
         self.chat_watches.clear();
         self.saved_chats.clear();
+        self.turn_ends.clear();
         // Wakes any viewer waiting on a chat, so it hears the chat is gone
         // instead of waiting out its long-poll.
         self.hub.retain_chats(|_| false);
@@ -160,13 +189,19 @@ impl ChatFeed {
                 let title = live_chat
                     .map(|chat| chat.title.to_string())
                     .unwrap_or(record.title);
-                chats.push(TeamChat {
-                    id: record.id.clone(),
-                    title: title.clone(),
-                    agent: chat_agent_label(&record.agent).to_string(),
-                    open: thread.is_some() || self.hub.has_chat(&record.id),
-                    live: thread.is_some(),
-                });
+                chats.push(self.with_turn_info(
+                    TeamChat {
+                        id: record.id.clone(),
+                        title: title.clone(),
+                        agent: chat_agent_label(&record.agent).to_string(),
+                        open: thread.is_some() || self.hub.has_chat(&record.id),
+                        live: thread.is_some(),
+                        last_turn_ended_at: None,
+                        last_turn_errored: false,
+                        waiting: false,
+                    },
+                    thread.as_ref().map(|thread| thread.read(cx)),
+                ));
                 if flags.step_in {
                     step_in_chats.insert(record.id.clone());
                 }
@@ -247,6 +282,8 @@ impl ChatFeed {
             open_chats.iter().map(|chat| chat.chat_id.clone()).collect();
         self.chat_watches.retain(|id, _| open_ids.contains(id));
         self.saved_chats.retain(|id, _| closed_chats.contains(id));
+        self.turn_ends
+            .retain(|id, _| open_ids.contains(id) || closed_chats.contains(id));
         self.hub
             .retain_chats(|id| open_ids.contains(id) || closed_chats.contains(id));
         for chat_id in closed_chats.difference(&open_ids) {
@@ -292,6 +329,28 @@ impl ChatFeed {
         }
     }
 
+    /// Fills in the turn info the phone shows. A team feed leaves it unset.
+    fn with_turn_info(&self, mut chat: TeamChat, thread: Option<&AcpThread>) -> TeamChat {
+        if self.scope != PermissionScope::All {
+            return chat;
+        }
+        if let Some((ended_at, errored)) = self.turn_ends.get(&chat.id) {
+            chat.last_turn_ended_at = Some(*ended_at);
+            chat.last_turn_errored = *errored;
+        }
+        chat.waiting =
+            thread.is_some_and(|thread| !thread_permissions(thread, self.scope).is_empty());
+        chat
+    }
+
+    fn record_turn_end(&mut self, chat_id: &str, errored: bool) {
+        let ended_at = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_millis() as u64);
+        self.turn_ends
+            .insert(chat_id.to_string(), (ended_at, errored));
+    }
+
     fn publish_thread_event(
         &mut self,
         chat_id: &str,
@@ -300,6 +359,11 @@ impl ChatFeed {
         cx: &mut Context<Self>,
     ) {
         let feed_event = self.feed_event(chat_id, thread.read(cx), event);
+        match feed_event {
+            Some(ChatFeedEvent::TurnEnded { .. }) => self.record_turn_end(chat_id, false),
+            Some(ChatFeedEvent::Errored { .. }) => self.record_turn_end(chat_id, true),
+            _ => {}
+        }
         let thread = thread.read(cx);
         let entries = thread.entries();
         let published = match event {
@@ -351,10 +415,17 @@ impl ChatFeed {
         match event {
             AcpThreadEvent::ToolAuthorizationRequested(tool_call_id) => {
                 let (_, tool_call) = thread.tool_call(tool_call_id)?;
+                let tool_call_id = tool_call_id.0.to_string();
+                let quick_answers = thread_permissions(thread, self.scope)
+                    .into_iter()
+                    .find(|request| request.tool_call_id == tool_call_id)
+                    .and_then(|request| quick_answers(&request.options));
                 Some(ChatFeedEvent::PermissionRequested {
                     workspace_id,
                     chat_id,
                     tool_kind: tool_call.kind,
+                    tool_call_id,
+                    quick_answers,
                 })
             }
             AcpThreadEvent::Stopped(stop_reason) => Some(ChatFeedEvent::TurnEnded {
@@ -558,6 +629,27 @@ mod tests {
     use std::cell::RefCell;
     use std::rc::Rc;
 
+    #[test]
+    fn quick_answers_need_both_once_options() {
+        let option = |id: &'static str, kind| acp::PermissionOption::new(id, id, kind);
+        let both = quick_answers(&[
+            option("always", acp::PermissionOptionKind::AllowAlways),
+            option("yes", acp::PermissionOptionKind::AllowOnce),
+            option("no", acp::PermissionOptionKind::RejectOnce),
+        ]);
+        assert_eq!(
+            both.map(|answers| (answers.allow_option_id, answers.deny_option_id)),
+            Some(("yes".to_string(), "no".to_string()))
+        );
+        assert!(
+            quick_answers(&[
+                option("always", acp::PermissionOptionKind::AllowAlways),
+                option("no", acp::PermissionOptionKind::RejectOnce),
+            ])
+            .is_none()
+        );
+    }
+
     fn published_option_kinds(
         scope: PermissionScope,
         thread: &Entity<AcpThread>,
@@ -629,6 +721,7 @@ mod tests {
                         workspace_id,
                         chat_id,
                         tool_kind,
+                        ..
                     } = event
                     {
                         announced.borrow_mut().push((
@@ -690,5 +783,86 @@ mod tests {
 
         let all = published_option_kinds(PermissionScope::All, &thread, cx);
         assert!(all.is_empty());
+    }
+
+    fn plain_chat() -> TeamChat {
+        TeamChat {
+            id: "chat".into(),
+            title: "Run the tests".into(),
+            agent: "Claude".into(),
+            open: true,
+            live: true,
+            last_turn_ended_at: None,
+            last_turn_errored: false,
+            waiting: false,
+        }
+    }
+
+    async fn feed_after_turn_ends(
+        scope: PermissionScope,
+        event: AcpThreadEvent,
+        cx: &mut TestAppContext,
+    ) -> (Entity<ChatFeed>, Entity<AcpThread>) {
+        cx.update(|cx| {
+            let settings_store = SettingsStore::test(cx);
+            cx.set_global(settings_store);
+        });
+        let thread = new_thread(cx).await;
+        let feed = cx.new(|_| ChatFeed::new(TeamShareHub::new(), scope));
+        feed.update(cx, |feed, cx| {
+            feed.watch_chats(
+                vec![OpenChat {
+                    chat_id: "chat".into(),
+                    workspace_id: "workspace".into(),
+                    title: "Run the tests".into(),
+                    thread: thread.clone(),
+                }],
+                &HashSet::new(),
+                cx,
+            )
+        });
+        thread.update(cx, |_, cx| cx.emit(event));
+        cx.run_until_parked();
+        (feed, thread)
+    }
+
+    #[gpui::test]
+    async fn team_feed_leaves_turn_info_unset(cx: &mut TestAppContext) {
+        let (feed, thread) = feed_after_turn_ends(
+            PermissionScope::StepInOnceOnly,
+            AcpThreadEvent::Stopped(acp::StopReason::EndTurn),
+            cx,
+        )
+        .await;
+
+        let chat = feed.read_with(cx, |feed, cx| {
+            feed.with_turn_info(plain_chat(), Some(thread.read(cx)))
+        });
+        let json = serde_json::to_value(&chat).expect("a chat serializes");
+        for key in ["last_turn_ended_at", "last_turn_errored", "waiting"] {
+            assert!(json.get(key).is_none(), "the team wire carries {key}");
+        }
+    }
+
+    #[gpui::test]
+    async fn phone_feed_records_a_turn_end(cx: &mut TestAppContext) {
+        let (feed, thread) = feed_after_turn_ends(
+            PermissionScope::All,
+            AcpThreadEvent::Stopped(acp::StopReason::EndTurn),
+            cx,
+        )
+        .await;
+        let chat = feed.read_with(cx, |feed, cx| {
+            feed.with_turn_info(plain_chat(), Some(thread.read(cx)))
+        });
+        assert!(chat.last_turn_ended_at.is_some());
+        assert!(!chat.last_turn_errored);
+
+        thread.update(cx, |_, cx| cx.emit(AcpThreadEvent::Error));
+        cx.run_until_parked();
+        let chat = feed.read_with(cx, |feed, cx| {
+            feed.with_turn_info(plain_chat(), Some(thread.read(cx)))
+        });
+        assert!(chat.last_turn_errored);
     }
 }

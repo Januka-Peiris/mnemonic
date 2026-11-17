@@ -565,15 +565,6 @@ impl WorkspaceDetailPanel {
         }));
     }
 
-    fn can_merge(status: &WorkspacePrStatus) -> bool {
-        status.found
-            && status.state.as_deref() == Some("OPEN")
-            && !status.is_draft
-            && status.merge_state_status.as_deref() == Some("CLEAN")
-            && status.number.is_some()
-            && status.head_ref_oid.is_some()
-    }
-
     /// Confirms, then merges the PR pinned to the head commit the panel last
     /// saw, so a push after the user looked makes GitHub refuse the merge.
     fn merge_pr(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -586,7 +577,7 @@ impl WorkspaceDetailPanel {
         let Some(status) = self
             .pr_status
             .as_ref()
-            .filter(|status| status.workspace_id == workspace_id && Self::can_merge(status))
+            .filter(|status| status.workspace_id == workspace_id && status.can_merge())
         else {
             return;
         };
@@ -932,16 +923,9 @@ impl WorkspaceDetailPanel {
             return;
         };
 
-        let prompt = format!(
-            "Create a pull request for this workspace. Review what changed, commit any \
-             uncommitted work with a sensible message, push the branch ({branch}) to origin, \
-             and open a PR against the default branch using `gh pr create` with a clear title \
-             and a summary body describing the changes. Report the PR URL when done.",
-            branch = summary.branch,
-        );
-
+        let prompt = pr_instruction(&summary.branch);
         let workspace_id = summary.id.clone();
-        self.dispatch_instruction(&workspace_id, prompt, "PR instruction", cx);
+        self.dispatch_instruction(&workspace_id, prompt, PR_INSTRUCTION_LABEL, cx);
     }
 
     /// Routes an instruction to the workspace's agent terminal, surfaces the
@@ -966,19 +950,25 @@ impl WorkspaceDetailPanel {
             let sent = workspace.update(cx, |workspace, cx| {
                 WorkspaceHost::dispatch_to_workspace_agent(workspace, &workspace_id, prompt, cx)
             });
-            let _ = this_handle.update(cx, |this, cx| {
-                this.dispatch_note = Some(if sent {
-                    this.poll_fast_until = Some(Instant::now() + PR_POLL_BOOST);
-                    this.schedule_next_poll(cx);
-                    SharedString::from(format!("Sent {label} to claude ✓"))
-                } else {
-                    SharedString::from(format!(
-                        "Couldn't send {label}: open the workspace first (click its worktree)"
-                    ))
-                });
-                cx.notify();
-            });
+            this_handle
+                .update(cx, |this, cx| this.note_dispatch(sent, &label, cx))
+                .log_err();
         });
+    }
+
+    /// Says in the panel whether an instruction reached the agent, and polls
+    /// GitHub more often to catch what it does.
+    fn note_dispatch(&mut self, sent: bool, label: &str, cx: &mut Context<Self>) {
+        self.dispatch_note = Some(if sent {
+            self.poll_fast_until = Some(Instant::now() + PR_POLL_BOOST);
+            self.schedule_next_poll(cx);
+            SharedString::from(format!("Sent {label} to claude ✓"))
+        } else {
+            SharedString::from(format!(
+                "Couldn't send {label}: open the workspace first (click its worktree)"
+            ))
+        });
+        cx.notify();
     }
 
     /// Asks the workspace's agent to merge the latest base branch in. The
@@ -1194,28 +1184,40 @@ impl WorkspaceDetailPanel {
     /// Creates the PR, also starting the CI watch when the `keep_ci_green`
     /// setting is on.
     pub fn create_pr_per_settings(&mut self, cx: &mut Context<Self>) {
-        if WorkspacesSettings::get_global(cx).keep_ci_green {
-            self.create_pr_with_auto_fix(cx);
-        } else {
-            self.create_pr(cx);
-        }
+        self.send_pr_request(false, cx);
     }
 
     /// Create PR and immediately arm the CI auto-fix loop, so the whole
-    /// create → watch checks → fix → push cycle runs hands-off.
+    /// create, watch checks, fix, push cycle runs hands-off.
     pub fn create_pr_with_auto_fix(&mut self, cx: &mut Context<Self>) {
-        self.create_pr(cx);
-        let Some(workspace_id) = self.summary.as_ref().map(|summary| summary.id.clone()) else {
+        self.send_pr_request(true, cx);
+    }
+
+    /// Asks the agent for the PR as the phone does. `auto_fix` arms the CI
+    /// auto-fix even when `keep_ci_green` is off.
+    fn send_pr_request(&mut self, auto_fix: bool, cx: &mut Context<Self>) {
+        let (Some(summary), Some(workspace)) = (&self.summary, self.workspace.upgrade()) else {
             return;
         };
-        if let Some(workspace) = self.workspace.upgrade() {
-            let workspace_id = workspace_id.clone();
-            cx.defer(move |cx| {
-                workspace.update(cx, |workspace, cx| {
+        let workspace_id = summary.id.clone();
+        let branch = summary.branch.clone();
+        let this_handle = cx.weak_entity();
+        // Deferred like `dispatch_instruction`, as this may run inside an
+        // update of the workspace.
+        cx.defer(move |cx| {
+            let sent = workspace.update(cx, |workspace, cx| {
+                let sent = request_pr(workspace, &workspace_id, &branch, cx);
+                if sent && auto_fix {
                     WorkspaceHost::enable_auto_fix_for_workspace(workspace, &workspace_id, cx);
-                });
+                }
+                sent
             });
-        }
+            this_handle
+                .update(cx, |this, cx| {
+                    this.note_dispatch(sent, PR_INSTRUCTION_LABEL, cx)
+                })
+                .log_err();
+        });
     }
 
     fn render_header(&self, ws: &WorkspaceSummary, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1265,7 +1267,7 @@ impl WorkspaceDetailPanel {
                             .child(self.render_pr_button(cx))
                             .when(
                                 self.pr_status.as_ref().is_some_and(|status| {
-                                    status.workspace_id == ws.id && Self::can_merge(status)
+                                    status.workspace_id == ws.id && status.can_merge()
                                 }),
                                 |el| {
                                     el.child(
@@ -4054,6 +4056,38 @@ impl Render for WorkspaceDetailPanel {
             None => content.child(self.render_empty()),
         }
     }
+}
+
+const PR_INSTRUCTION_LABEL: &str = "PR instruction";
+
+fn pr_instruction(branch: &str) -> String {
+    format!(
+        "Create a pull request for this workspace. Review what changed, commit any \
+         uncommitted work with a sensible message, push the branch ({branch}) to origin, \
+         and open a PR against the default branch using `gh pr create` with a clear title \
+         and a summary body describing the changes. Report the PR URL when done."
+    )
+}
+
+/// Asks the workspace's agent to create the PR, and arms the CI auto-fix
+/// when `keep_ci_green` is on. False when the workspace isn't open in this
+/// window.
+pub(crate) fn request_pr(
+    workspace: &mut Workspace,
+    workspace_id: &str,
+    branch: &str,
+    cx: &mut Context<Workspace>,
+) -> bool {
+    let sent = WorkspaceHost::dispatch_to_workspace_agent(
+        workspace,
+        workspace_id,
+        pr_instruction(branch),
+        cx,
+    );
+    if sent && WorkspacesSettings::get_global(cx).keep_ci_green {
+        WorkspaceHost::enable_auto_fix_for_workspace(workspace, workspace_id, cx);
+    }
+    sent
 }
 
 #[cfg(test)]

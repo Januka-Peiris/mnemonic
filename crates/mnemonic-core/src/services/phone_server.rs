@@ -8,21 +8,25 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 
-use tiny_http::{Header, Method, Request, Response, Server};
+use tiny_http::{Header, Method, Request, Response, Server, SslConfig};
 
 use crate::services::team_share_server::{
     DiffSource, accept_requests, chat_update_response, has_json_body, header_value,
     is_allowed_host, json_response, respond, text_response, truncate_diff,
 };
 use crate::services::team_share_service::{
-    CallerIdentity, TeamActionError, TeamShareHub, TeamWorkspaceList, is_plain_id,
+    CallerIdentity, TeamActionError, TeamShareHub, TeamWorkspaceList, TlsFiles, is_plain_id,
 };
+use crate::services::web_push_service::PushSubscription;
 
 /// Sent by the page on every POST. A page on another site can't add it
 /// without a CORS preflight, which this server never answers.
 pub const PHONE_REQUEST_HEADER: &str = "X-Mnemonic-Phone";
 
 const PAGE: &str = include_str!("phone_page.html");
+const SERVICE_WORKER: &str = include_str!("phone_sw.js");
+const MANIFEST: &str = include_str!("phone_manifest.json");
+const ICON: &[u8] = include_bytes!("../../../zed/resources/app-icon@2x.png");
 
 const MAX_MESSAGE_BYTES: usize = 16 * 1024;
 /// Room for a message of `MAX_MESSAGE_BYTES` whose characters JSON escapes.
@@ -36,6 +40,8 @@ pub struct PhoneServerConfig {
     /// Requests from these are refused, so a program on the Mac (an agent's
     /// shell command included) can't pass as the phone.
     pub own_addresses: Vec<IpAddr>,
+    /// Serves HTTPS only when set, plain HTTP otherwise.
+    pub tls: Option<TlsFiles>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -56,12 +62,33 @@ pub enum PhoneAction {
         workspace_id: String,
         agent: String,
     },
+    /// Creates a workspace in the repository and sends `text` to its chat
+    /// as the user's first message.
+    StartTask {
+        repository_id: String,
+        agent: String,
+        text: String,
+    },
+    CreatePr {
+        workspace_id: String,
+    },
+    /// Merges the workspace's PR at `head`, the commit the phone saw.
+    Merge {
+        workspace_id: String,
+        head: String,
+    },
 }
 
 #[derive(Clone, Debug, Default, PartialEq, serde::Serialize)]
 pub struct PhoneActionOutcome {
-    /// The new chat's id, for `PhoneAction::NewChat`.
+    /// The new chat's id, for `PhoneAction::NewChat` and
+    /// `PhoneAction::StartTask`.
     pub chat_id: Option<String>,
+    /// The new workspace's id, for `PhoneAction::StartTask`.
+    pub workspace_id: Option<String>,
+    /// What GitHub said, for `PhoneAction::Merge`, or, for a task or merge
+    /// that outlasted its timeout, that it is still going on the Mac.
+    pub message: Option<String>,
 }
 
 pub type PhoneActionHandler =
@@ -82,14 +109,58 @@ pub struct PhoneAgentList {
 
 pub type PhoneAgentSource = Arc<dyn Fn() -> Vec<PhoneAgent> + Send + Sync>;
 
+/// A repository a new workspace can be started in.
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+pub struct PhoneRepository {
+    pub id: String,
+    pub name: String,
+}
+
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+pub struct PhoneRepositoryList {
+    pub repositories: Vec<PhoneRepository>,
+}
+
+/// A workspace's pull request as the phone shows it.
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize)]
+pub struct PhonePrStatus {
+    pub found: bool,
+    pub number: Option<i64>,
+    pub title: Option<String>,
+    pub url: Option<String>,
+    pub state: Option<String>,
+    pub is_draft: bool,
+    pub merge_state_status: Option<String>,
+    pub head_ref_oid: Option<String>,
+    pub checks_summary: String,
+    pub can_merge: bool,
+    pub merge_method: String,
+}
+
+pub type PhoneRepositorySource =
+    Arc<dyn Fn() -> Result<Vec<PhoneRepository>, String> + Send + Sync>;
+pub type PhonePrStatusSource = Arc<dyn Fn(&str) -> Result<PhonePrStatus, String> + Send + Sync>;
+
+/// What the Mac reads for the phone beyond the hub's workspaces and chats.
+pub struct PhoneSources {
+    pub diff: DiffSource,
+    pub agents: PhoneAgentSource,
+    /// Most recently used first.
+    pub repositories: PhoneRepositorySource,
+    pub pr_status: PhonePrStatusSource,
+    /// The public VAPID key, base64url, that browsers subscribe with.
+    pub push_key: Arc<dyn Fn() -> Result<String, String> + Send + Sync>,
+    pub save_push_subscription: Arc<dyn Fn(PushSubscription) -> Result<(), String> + Send + Sync>,
+}
+
 struct Shared {
     hub: TeamShareHub,
     identity: Arc<dyn CallerIdentity>,
-    diff_source: DiffSource,
-    agent_source: PhoneAgentSource,
+    sources: PhoneSources,
     action_handler: PhoneActionHandler,
     owner_login: String,
     own_addresses: Vec<IpAddr>,
+    https: bool,
 }
 
 /// A running phone server. Dropping it stops the server.
@@ -104,12 +175,21 @@ impl PhoneServer {
         config: PhoneServerConfig,
         hub: TeamShareHub,
         identity: Arc<dyn CallerIdentity>,
-        diff_source: DiffSource,
-        agent_source: PhoneAgentSource,
+        sources: PhoneSources,
         action_handler: PhoneActionHandler,
     ) -> Result<Self, String> {
-        let server = Server::http((config.bind, config.port))
-            .map_err(|err| format!("Couldn't listen on {}:{}: {err}", config.bind, config.port))?;
+        let https = config.tls.is_some();
+        let server = match config.tls {
+            Some(tls) => Server::https(
+                (config.bind, config.port),
+                SslConfig {
+                    certificate: tls.certificate,
+                    private_key: pkcs8_private_key(&tls.private_key)?,
+                },
+            ),
+            None => Server::http((config.bind, config.port)),
+        }
+        .map_err(|err| format!("Couldn't listen on {}:{}: {err}", config.bind, config.port))?;
         let address = server
             .server_addr()
             .to_ip()
@@ -117,8 +197,7 @@ impl PhoneServer {
         let shared = Arc::new(Shared {
             hub,
             identity,
-            diff_source,
-            agent_source,
+            sources,
             action_handler,
             owner_login: config.owner_login.trim().to_lowercase(),
             own_addresses: config
@@ -126,6 +205,7 @@ impl PhoneServer {
                 .iter()
                 .map(IpAddr::to_canonical)
                 .collect(),
+            https,
         });
         let server = Arc::new(server);
         let accept_thread = std::thread::Builder::new()
@@ -161,7 +241,7 @@ impl Drop for PhoneServer {
 }
 
 fn handle(mut request: Request, shared: &Shared) {
-    if let Err((status, reason)) = check_request(&request) {
+    if let Err((status, reason)) = check_request(&request, shared.https) {
         respond(request, text_response(status, reason));
         return;
     }
@@ -225,15 +305,39 @@ fn handle(mut request: Request, shared: &Shared) {
     }
     let response = match segments.as_slice() {
         [""] => page_response(),
+        ["manifest.webmanifest"] => static_response(
+            MANIFEST.as_bytes().to_vec(),
+            "application/manifest+json",
+            "no-cache",
+        ),
+        ["sw.js"] => static_response(
+            SERVICE_WORKER.as_bytes().to_vec(),
+            "text/javascript",
+            "no-store",
+        ),
+        ["icon.png"] => static_response(ICON.to_vec(), "image/png", "max-age=86400"),
         ["v1", "agents"] => {
             let list = PhoneAgentList {
-                agents: (shared.agent_source)(),
+                agents: (shared.sources.agents)(),
             };
             match serde_json::to_string(&list) {
                 Ok(body) => json_response(200, body),
                 Err(err) => text_response(500, &err.to_string()),
             }
         }
+        ["v1", "push", "key"] => match (shared.sources.push_key)() {
+            Ok(key) => json_response(200, serde_json::json!({ "key": key }).to_string()),
+            Err(err) => text_response(500, &err),
+        },
+        ["v1", "repositories"] => match (shared.sources.repositories)() {
+            Ok(repositories) => {
+                match serde_json::to_string(&PhoneRepositoryList { repositories }) {
+                    Ok(body) => json_response(200, body),
+                    Err(err) => text_response(500, &err.to_string()),
+                }
+            }
+            Err(err) => text_response(500, &err),
+        },
         ["v1", "workspaces"] => {
             let list = TeamWorkspaceList {
                 workspaces: shared.hub.workspaces(),
@@ -245,8 +349,21 @@ fn handle(mut request: Request, shared: &Shared) {
         }
         ["v1", "workspaces", workspace_id, "diff"] if is_plain_id(workspace_id) => {
             if shared.hub.has_workspace(workspace_id) {
-                match (shared.diff_source)(workspace_id) {
+                match (shared.sources.diff)(workspace_id) {
                     Ok(diff) => text_response(200, &truncate_diff(diff)),
+                    Err(err) => text_response(500, &err),
+                }
+            } else {
+                text_response(404, "No such workspace")
+            }
+        }
+        ["v1", "workspaces", workspace_id, "pr"] if is_plain_id(workspace_id) => {
+            if shared.hub.has_workspace(workspace_id) {
+                match (shared.sources.pr_status)(workspace_id) {
+                    Ok(status) => match serde_json::to_string(&status) {
+                        Ok(body) => json_response(200, body),
+                        Err(err) => text_response(500, &err.to_string()),
+                    },
                     Err(err) => text_response(500, &err),
                 }
             } else {
@@ -271,7 +388,8 @@ const PAGE_HEADERS: [(&str, &str); 4] = [
     (
         "Content-Security-Policy",
         "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; \
-         connect-src 'self'; frame-ancestors 'none'",
+         connect-src 'self'; img-src 'self'; manifest-src 'self'; \
+         worker-src 'self'; frame-ancestors 'none'",
     ),
 ];
 
@@ -289,19 +407,36 @@ fn page_response() -> Response<std::io::Cursor<Vec<u8>>> {
     response
 }
 
+fn static_response(
+    body: Vec<u8>,
+    content_type: &str,
+    cache_control: &str,
+) -> Response<std::io::Cursor<Vec<u8>>> {
+    let mut response = Response::from_data(body);
+    for (name, value) in [
+        ("Content-Type", content_type),
+        ("Cache-Control", cache_control),
+    ] {
+        match Header::from_bytes(name.as_bytes(), value.as_bytes()) {
+            Ok(header) => response.add_header(header),
+            Err(()) => return text_response(500, "The file couldn't be served"),
+        }
+    }
+    response
+}
+
 /// The page is served by this server, so its requests are same-origin.
 /// These refuse what another page can send: a foreign `Host` means DNS
 /// rebinding, a foreign `Origin` means another site, and a POST must carry
 /// a JSON body and the phone header, which make a browser ask first with a
 /// CORS preflight that this server never answers.
-fn check_request(request: &Request) -> Result<(), (u16, &'static str)> {
+fn check_request(request: &Request, https: bool) -> Result<(), (u16, &'static str)> {
     let Some(host) = header_value(request, "Host").filter(|host| is_allowed_host(host)) else {
         return Err((403, "Unexpected host name"));
     };
-    let is_same_origin = |origin: &str| origin == format!("http://{host}");
     let is_post = *request.method() == Method::Post;
     match header_value(request, "Origin") {
-        Some(origin) if !is_same_origin(origin) => {
+        Some(origin) if !is_same_origin(origin, host, https) => {
             return Err((403, "Requests from other web pages are refused"));
         }
         None if is_post => return Err((403, "Requests from other web pages are refused")),
@@ -316,6 +451,67 @@ fn check_request(request: &Request) -> Result<(), (u16, &'static str)> {
         }
     }
     Ok(())
+}
+
+/// The 'id-ecPublicKey with prime256v1' algorithm, DER encoded: the only
+/// kind of key `tailscale cert` makes.
+const P256_KEY_ALGORITHM: &[u8] = &[
+    0x30, 0x13, 0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01, 0x06, 0x08, 0x2a, 0x86, 0x48,
+    0xce, 0x3d, 0x03, 0x01, 0x07,
+];
+
+/// The private key as a PKCS#8 PEM block. tiny_http's TLS reads only PKCS#8
+/// and RSA keys, and panics on anything else, while `tailscale cert` writes
+/// a SEC1 "EC PRIVATE KEY". Re-encoding it here also means tiny_http never
+/// sees a PEM block it could fail to parse.
+fn pkcs8_private_key(pem: &[u8]) -> Result<Vec<u8>, String> {
+    use base64::Engine as _;
+    let unreadable = || "The HTTPS private key couldn't be read".to_string();
+    let text = std::str::from_utf8(pem).map_err(|_| unreadable())?;
+    let (_, block) = text.split_once("-----BEGIN ").ok_or_else(unreadable)?;
+    let (label, block) = block.split_once("-----").ok_or_else(unreadable)?;
+    let (body, _) = block
+        .split_once(&format!("-----END {label}-----"))
+        .ok_or_else(unreadable)?;
+    let der = base64::engine::general_purpose::STANDARD
+        .decode(body.split_whitespace().collect::<String>())
+        .map_err(|_| unreadable())?;
+    let pkcs8 = match label {
+        "PRIVATE KEY" => der,
+        "EC PRIVATE KEY" => {
+            let mut info = vec![0x02, 0x01, 0x00];
+            info.extend_from_slice(P256_KEY_ALGORITHM);
+            info.extend(der_element(0x04, &der)?);
+            der_element(0x30, &info)?
+        }
+        _ => return Err(format!("The HTTPS private key is an unsupported {label}")),
+    };
+    Ok(format!(
+        "-----BEGIN PRIVATE KEY-----\n{}\n-----END PRIVATE KEY-----\n",
+        base64::engine::general_purpose::STANDARD.encode(pkcs8)
+    )
+    .into_bytes())
+}
+
+fn der_element(tag: u8, contents: &[u8]) -> Result<Vec<u8>, String> {
+    let mut element = vec![tag];
+    match u8::try_from(contents.len()) {
+        Ok(length) if length < 0x80 => element.push(length),
+        Ok(length) => element.extend_from_slice(&[0x81, length]),
+        Err(_) => {
+            let length = u16::try_from(contents.len())
+                .map_err(|_| "The HTTPS private key is too long".to_string())?;
+            element.push(0x82);
+            element.extend_from_slice(&length.to_be_bytes());
+        }
+    }
+    element.extend_from_slice(contents);
+    Ok(element)
+}
+
+fn is_same_origin(origin: &str, host: &str, https: bool) -> bool {
+    let scheme = if https { "https" } else { "http" };
+    origin == format!("{scheme}://{host}")
 }
 
 fn handle_action(
@@ -333,6 +529,15 @@ fn handle_action(
     }
     if body.len() > MAX_ACTION_BODY_BYTES {
         return text_response(413, "The request is too long");
+    }
+    if let ["v1", "push", "subscriptions"] = segments {
+        return match parse_push_subscription(&body) {
+            Ok(subscription) => match (shared.sources.save_push_subscription)(subscription) {
+                Ok(()) => json_response(200, "{}".to_string()),
+                Err(err) => text_response(500, &err),
+            },
+            Err(reason) => text_response(400, &reason),
+        };
     }
     let action = match parse_action(segments, &body) {
         Ok(action) => action,
@@ -353,6 +558,32 @@ fn handle_action(
     }
 }
 
+/// Browsers nest the keys, as `PushSubscription.toJSON()` writes them.
+fn parse_push_subscription(body: &[u8]) -> Result<PushSubscription, String> {
+    #[derive(serde::Deserialize)]
+    struct Keys {
+        p256dh: String,
+        auth: String,
+    }
+    #[derive(serde::Deserialize)]
+    struct Browser {
+        endpoint: String,
+        keys: Keys,
+    }
+    let browser: Browser =
+        serde_json::from_slice(body).map_err(|err| format!("Couldn't read the request: {err}"))?;
+    if !browser.endpoint.starts_with("https://") {
+        return Err("The push endpoint must be an https address".to_string());
+    }
+    let subscription = PushSubscription {
+        endpoint: browser.endpoint,
+        p256dh: browser.keys.p256dh,
+        auth: browser.keys.auth,
+    };
+    subscription.check_keys()?;
+    Ok(subscription)
+}
+
 fn parse_action(segments: &[&str], body: &[u8]) -> Result<PhoneAction, (u16, String)> {
     #[derive(serde::Deserialize)]
     struct PermissionBody {
@@ -366,6 +597,25 @@ fn parse_action(segments: &[&str], body: &[u8]) -> Result<PhoneAction, (u16, Str
     #[derive(serde::Deserialize)]
     struct NewChatBody {
         agent: String,
+    }
+    #[derive(serde::Deserialize)]
+    struct TaskBody {
+        repository_id: String,
+        agent: String,
+        text: String,
+    }
+    #[derive(serde::Deserialize)]
+    struct MergeBody {
+        head: String,
+    }
+    fn check_message(text: &str) -> Result<(), (u16, String)> {
+        if text.trim().is_empty() {
+            return Err((400, "The message is empty".to_string()));
+        }
+        if text.len() > MAX_MESSAGE_BYTES {
+            return Err((413, "The message is too long".to_string()));
+        }
+        Ok(())
     }
     fn read<T: serde::de::DeserializeOwned>(body: &[u8]) -> Result<T, (u16, String)> {
         serde_json::from_slice(body)
@@ -385,12 +635,7 @@ fn parse_action(segments: &[&str], body: &[u8]) -> Result<PhoneAction, (u16, Str
         }
         ["v1", "chats", chat_id, "message"] if is_plain_id(chat_id) => {
             let message: MessageBody = read(body)?;
-            if message.text.trim().is_empty() {
-                return Err((400, "The message is empty".to_string()));
-            }
-            if message.text.len() > MAX_MESSAGE_BYTES {
-                return Err((413, "The message is too long".to_string()));
-            }
+            check_message(&message.text)?;
             Ok(PhoneAction::Message {
                 chat_id: chat_id.to_string(),
                 text: message.text,
@@ -405,6 +650,38 @@ fn parse_action(segments: &[&str], body: &[u8]) -> Result<PhoneAction, (u16, Str
             Ok(PhoneAction::NewChat {
                 workspace_id: workspace_id.to_string(),
                 agent: agent.to_string(),
+            })
+        }
+        ["v1", "tasks"] => {
+            let task: TaskBody = read(body)?;
+            if !is_plain_id(&task.repository_id) {
+                return Err((400, "No repository given".to_string()));
+            }
+            let agent = task.agent.trim();
+            if agent.is_empty() {
+                return Err((400, "No agent given".to_string()));
+            }
+            check_message(&task.text)?;
+            Ok(PhoneAction::StartTask {
+                repository_id: task.repository_id,
+                agent: agent.to_string(),
+                text: task.text,
+            })
+        }
+        ["v1", "workspaces", workspace_id, "pr"] if is_plain_id(workspace_id) => {
+            Ok(PhoneAction::CreatePr {
+                workspace_id: workspace_id.to_string(),
+            })
+        }
+        ["v1", "workspaces", workspace_id, "merge"] if is_plain_id(workspace_id) => {
+            let merge: MergeBody = read(body)?;
+            let head = merge.head.trim();
+            if head.is_empty() {
+                return Err((400, "No head commit given".to_string()));
+            }
+            Ok(PhoneAction::Merge {
+                workspace_id: workspace_id.to_string(),
+                head: head.to_string(),
             })
         }
         _ => Err((404, "Not found".to_string())),
@@ -438,6 +715,15 @@ mod tests {
         own_addresses: Vec<IpAddr>,
         hub: TeamShareHub,
     ) -> Result<(PhoneServer, Recorded), String> {
+        start_with_tls(login, own_addresses, hub, None)
+    }
+
+    fn start_with_tls(
+        login: &'static str,
+        own_addresses: Vec<IpAddr>,
+        hub: TeamShareHub,
+        tls: Option<TlsFiles>,
+    ) -> Result<(PhoneServer, Recorded), String> {
         let recorded = Recorded::default();
         let handler: PhoneActionHandler = Arc::new({
             let recorded = recorded.clone();
@@ -446,7 +732,7 @@ mod tests {
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
                     .push(action);
-                Ok(PhoneActionOutcome { chat_id: None })
+                Ok(PhoneActionOutcome::default())
             }
         });
         let server = PhoneServer::start(
@@ -455,11 +741,29 @@ mod tests {
                 port: 0,
                 owner_login: "Jay@Example.com".to_string(),
                 own_addresses,
+                tls,
             },
             hub,
             Arc::new(FixedLogin(login)),
-            Arc::new(|workspace_id: &str| Ok(format!("diff of {workspace_id}"))),
-            Arc::new(Vec::new),
+            PhoneSources {
+                diff: Arc::new(|workspace_id: &str| Ok(format!("diff of {workspace_id}"))),
+                agents: Arc::new(Vec::new),
+                repositories: Arc::new(|| {
+                    Ok(vec![
+                        PhoneRepository {
+                            id: "repo-1".to_string(),
+                            name: "alpha-repo".to_string(),
+                        },
+                        PhoneRepository {
+                            id: "repo-2".to_string(),
+                            name: "beta-repo".to_string(),
+                        },
+                    ])
+                }),
+                pr_status: Arc::new(|_| Ok(PhonePrStatus::default())),
+                push_key: Arc::new(|| Ok("key".to_string())),
+                save_push_subscription: Arc::new(|_| Ok(())),
+            },
             handler,
         )?;
         Ok((server, recorded))
@@ -590,6 +894,54 @@ mod tests {
     }
 
     #[test]
+    fn refuses_a_non_https_push_endpoint() -> Result<(), String> {
+        let (server, _recorded) = start("jay@example.com", Vec::new(), TeamShareHub::new())?;
+        let address = server.address();
+        let body = r#"{"endpoint":"http://push.example/x","keys":{"p256dh":"a","auth":"b"}}"#;
+        let request = format!(
+            "POST /v1/push/subscriptions HTTP/1.1\r\nHost: {address}\r\n\
+             Origin: http://{address}\r\nContent-Type: application/json\r\n\
+             {PHONE_REQUEST_HEADER}: 1\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        assert_eq!(raw_status(address, &request)?, 400);
+        Ok(())
+    }
+
+    #[test]
+    fn refuses_malformed_push_keys() -> Result<(), String> {
+        let (server, _recorded) = start("jay@example.com", Vec::new(), TeamShareHub::new())?;
+        let address = server.address();
+        let subscribe = |p256dh: &str, auth: &str| {
+            let body = format!(
+                r#"{{"endpoint":"https://push.example/x","keys":{{"p256dh":"{p256dh}","auth":"{auth}"}}}}"#
+            );
+            raw_status(
+                address,
+                &format!(
+                    "POST /v1/push/subscriptions HTTP/1.1\r\nHost: {address}\r\n\
+                     Origin: http://{address}\r\nContent-Type: application/json\r\n\
+                     {PHONE_REQUEST_HEADER}: 1\r\nContent-Length: {}\r\n\
+                     Connection: close\r\n\r\n{body}",
+                    body.len()
+                ),
+            )
+        };
+        let p256dh = concat!(
+            "BCVxsr7N_eNgVRqvHtD0zTZsEc6-VV-JvLexhqUzORcx",
+            "aOzi6-AYWXvTBHm4bjyPjs7Vd8pZGH6SRpkNtoIAiw4"
+        );
+        let compressed = "AiVxsr7N_eNgVRqvHtD0zTZsEc6-VV-JvLexhqUzORcx";
+        let auth = "BTBZMqHH6r4Tts7J_aSIgg";
+
+        assert_eq!(subscribe(p256dh, auth)?, 200);
+        assert_eq!(subscribe("not a key", auth)?, 400);
+        assert_eq!(subscribe(compressed, auth)?, 400);
+        assert_eq!(subscribe(p256dh, "BTBZMqHH6r4Tts7J_aSI")?, 400);
+        Ok(())
+    }
+
+    #[test]
     fn serves_the_page() -> Result<(), String> {
         let (server, _recorded) = start("jay@example.com", Vec::new(), TeamShareHub::new())?;
         let address = server.address();
@@ -618,6 +970,31 @@ mod tests {
     }
 
     #[test]
+    fn serves_the_service_worker_as_javascript() -> Result<(), String> {
+        let (server, _recorded) = start("jay@example.com", Vec::new(), TeamShareHub::new())?;
+        let address = server.address();
+
+        let mut stream = TcpStream::connect(address).map_err(|err| err.to_string())?;
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .map_err(|err| err.to_string())?;
+        stream
+            .write_all(get(address, "/sw.js").as_bytes())
+            .map_err(|err| err.to_string())?;
+        let mut response = String::new();
+        std::io::Read::read_to_string(&mut stream, &mut response).map_err(|err| err.to_string())?;
+        let head = response.to_ascii_lowercase();
+
+        assert!(head.starts_with("http/1.1 200"), "answered {head}");
+        assert!(
+            head.contains("content-type: text/javascript"),
+            "answered {head}"
+        );
+        assert!(head.contains("cache-control: no-store"), "answered {head}");
+        Ok(())
+    }
+
+    #[test]
     fn unknown_workspace_diff_is_404() -> Result<(), String> {
         let (server, _recorded) = start("jay@example.com", Vec::new(), TeamShareHub::new())?;
         let address = server.address();
@@ -627,5 +1004,175 @@ mod tests {
             404
         );
         Ok(())
+    }
+
+    #[test]
+    fn lists_repositories() -> Result<(), String> {
+        let (server, _recorded) = start("jay@example.com", Vec::new(), TeamShareHub::new())?;
+        let address = server.address();
+
+        let mut stream = TcpStream::connect(address).map_err(|err| err.to_string())?;
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .map_err(|err| err.to_string())?;
+        stream
+            .write_all(get(address, "/v1/repositories").as_bytes())
+            .map_err(|err| err.to_string())?;
+        let mut response = String::new();
+        std::io::Read::read_to_string(&mut stream, &mut response).map_err(|err| err.to_string())?;
+
+        assert!(response.starts_with("HTTP/1.1 200"), "answered {response}");
+        assert!(response.contains("alpha-repo"), "answered {response}");
+        assert!(response.contains("beta-repo"), "answered {response}");
+        Ok(())
+    }
+
+    #[test]
+    fn refuses_a_task_from_another_origin() -> Result<(), String> {
+        let (server, recorded) = start("jay@example.com", Vec::new(), TeamShareHub::new())?;
+        let address = server.address();
+
+        let body = r#"{"repository_id":"repo-1","agent":"claude","text":"Fix the login page"}"#;
+        let request = format!(
+            "POST /v1/tasks HTTP/1.1\r\nHost: {address}\r\nOrigin: http://evil.example\r\n\
+             Content-Type: application/json\r\n{PHONE_REQUEST_HEADER}: 1\r\n\
+             Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        assert_eq!(raw_status(address, &request)?, 403);
+        assert!(recorded.lock().map_err(|err| err.to_string())?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn parses_new_actions() {
+        assert_eq!(
+            parse_action(
+                &["v1", "tasks"],
+                br#"{"repository_id":"repo-1","agent":"codex","text":"Fix the login page"}"#
+            ),
+            Ok(PhoneAction::StartTask {
+                repository_id: "repo-1".to_string(),
+                agent: "codex".to_string(),
+                text: "Fix the login page".to_string(),
+            })
+        );
+        assert_eq!(
+            parse_action(&["v1", "workspaces", "ws-1", "pr"], b"{}"),
+            Ok(PhoneAction::CreatePr {
+                workspace_id: "ws-1".to_string(),
+            })
+        );
+        assert_eq!(
+            parse_action(
+                &["v1", "workspaces", "ws-1", "merge"],
+                br#"{"head":"0123abc"}"#
+            ),
+            Ok(PhoneAction::Merge {
+                workspace_id: "ws-1".to_string(),
+                head: "0123abc".to_string(),
+            })
+        );
+        let status = |segments: &[&str], body: &[u8]| {
+            parse_action(segments, body).map_err(|(status, _reason)| status)
+        };
+        assert_eq!(
+            status(
+                &["v1", "tasks"],
+                br#"{"repository_id":"repo-1","agent":"codex","text":"  "}"#
+            ),
+            Err(400)
+        );
+        assert_eq!(
+            status(&["v1", "workspaces", "ws-1", "merge"], br#"{"head":""}"#),
+            Err(400)
+        );
+    }
+
+    #[test]
+    fn unknown_workspace_pr_is_404() -> Result<(), String> {
+        let (server, _recorded) = start("jay@example.com", Vec::new(), TeamShareHub::new())?;
+        let address = server.address();
+
+        assert_eq!(
+            raw_status(address, &get(address, "/v1/workspaces/ws-x/pr"))?,
+            404
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn origin_must_match_the_scheme() {
+        let host = "mac.example.ts.net:47232";
+        assert!(is_same_origin(
+            "https://mac.example.ts.net:47232",
+            host,
+            true
+        ));
+        assert!(!is_same_origin(
+            "http://mac.example.ts.net:47232",
+            host,
+            true
+        ));
+        assert!(is_same_origin(
+            "http://mac.example.ts.net:47232",
+            host,
+            false
+        ));
+        assert!(!is_same_origin(
+            "https://mac.example.ts.net:47232",
+            host,
+            false
+        ));
+    }
+
+    const TEST_ONLY_CERTIFICATE: &str = "-----BEGIN CERTIFICATE-----
+MIIBcDCCARagAwIBAgIUQ6yTV6qISGnc9CH+UfTTsP7fChcwCgYIKoZIzj0EAwIw
+HTEbMBkGA1UEAwwSbWFjLmV4YW1wbGUudHMubmV0MCAXDTI2MTExNzIyMTQzOFoY
+DzIxMjYxMDI0MjIxNDM4WjAdMRswGQYDVQQDDBJtYWMuZXhhbXBsZS50cy5uZXQw
+WTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAAR1/rdlSJPyi502yA5RhYs8hzUSjh9F
+vqKM1y3nIqhcH3hj5xb1yHWIE0YZjV/rQPaX+8VoZgjy2w44B62B4nytozIwMDAd
+BgNVHQ4EFgQUpMNeRtP7OS7eCjHcLPQOvjWSHLcwDwYDVR0TAQH/BAUwAwEB/zAK
+BggqhkjOPQQDAgNIADBFAiEAiYqmwDSyNeHydMvTvePsYRpwS4mutHnOFhYwi9SE
+m8QCIDzNuasX+UoiDg6f2Ye75bRYtCXUav2z0T9pivbEFjlG
+-----END CERTIFICATE-----
+";
+
+    /// In the SEC1 "EC PRIVATE KEY" form `tailscale cert` writes.
+    const TEST_ONLY_PRIVATE_KEY: &str = "-----BEGIN EC PRIVATE KEY-----
+MHcCAQEEIDhUdshKgImfYeIMfnGOJ5ZYEuR5P7ghCqyMM14rwsHEoAoGCCqGSM49
+AwEHoUQDQgAEdf63ZUiT8oudNsgOUYWLPIc1Eo4fRb6ijNct5yKoXB94Y+cW9ch1
+iBNGGY1f60D2l/vFaGYI8tsOOAetgeJ8rQ==
+-----END EC PRIVATE KEY-----
+";
+
+    #[test]
+    fn serves_https_with_a_tailscale_key() -> Result<(), String> {
+        let (server, _recorded) = start_with_tls(
+            "jay@example.com",
+            Vec::new(),
+            TeamShareHub::new(),
+            Some(TlsFiles {
+                certificate: TEST_ONLY_CERTIFICATE.as_bytes().to_vec(),
+                private_key: TEST_ONLY_PRIVATE_KEY.as_bytes().to_vec(),
+            }),
+        )?;
+        assert_ne!(server.address().port(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn refuses_a_key_it_cannot_read() {
+        let started = start_with_tls(
+            "jay@example.com",
+            Vec::new(),
+            TeamShareHub::new(),
+            Some(TlsFiles {
+                certificate: TEST_ONLY_CERTIFICATE.as_bytes().to_vec(),
+                private_key:
+                    b"-----BEGIN EC PRIVATE KEY-----\nAAAA\n-----END EC PRIVATE KEY-----\n".to_vec(),
+            }),
+        );
+        assert!(started.is_err());
     }
 }

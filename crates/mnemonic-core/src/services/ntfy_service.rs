@@ -31,15 +31,9 @@ pub struct NtfyRequest {
     pub token: Option<String>,
 }
 
-/// The alert's words never include what the agent said or ran, only what
-/// kind of thing happened, since ntfy topics may be on a public server.
-pub fn ntfy_request(
-    ntfy_url: &str,
-    token: Option<&str>,
-    page_url: &str,
-    notice: &Notice,
-) -> NtfyRequest {
-    let body = match notice.kind {
+/// The alert's generic line, shared by every way an alert is sent.
+pub fn notice_body(notice: &Notice) -> String {
+    match notice.kind {
         NoticeKind::Permission => {
             let action = match notice.tool_kind {
                 Some(acp::ToolKind::Execute) => "run a command",
@@ -54,7 +48,18 @@ pub fn ntfy_request(
         }
         NoticeKind::Finished => format!("finished: {}", notice.chat_title),
         NoticeKind::Error => format!("hit an error in {}", notice.chat_title),
-    };
+    }
+}
+
+/// The alert's words never include what the agent said or ran, only what
+/// kind of thing happened, since ntfy topics may be on a public server.
+pub fn ntfy_request(
+    ntfy_url: &str,
+    token: Option<&str>,
+    page_url: &str,
+    notice: &Notice,
+) -> NtfyRequest {
+    let body = notice_body(notice);
     NtfyRequest {
         url: ntfy_url.to_string(),
         title: notice.workspace_name.clone(),

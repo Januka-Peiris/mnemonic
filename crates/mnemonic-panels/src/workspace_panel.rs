@@ -10,7 +10,7 @@ use gpui::{
 };
 use mnemonic_bridge::AgentAttention;
 use mnemonic_core::models::{
-    ActivityItem, ArchivedWorkspace, ChatSessionRecord, DiscoveredRepository,
+    ActivityItem, ArchivedWorkspace, ChatSessionRecord, DiscoveredRepository, WorkspaceDetail,
     WorkspaceSummary,
 };
 use mnemonic_core::repositories::{
@@ -69,7 +69,7 @@ use workspace::dock::{DockPosition, PanelEvent};
 use workspace::notifications::NotificationId;
 use workspace::{ModalView, Panel, Toast, Workspace};
 
-use crate::workspace_view::WorkspaceHost;
+use crate::workspace_view::{ChatAgent, WorkspaceHost};
 use crate::workspaces_settings::WorkspacesSettings;
 
 actions!(
@@ -964,108 +964,135 @@ impl WorkspacePanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let repo = self
+        let Some(repo) = self
             .repositories
             .iter()
             .find(|r| r.name == project_name)
-            .cloned();
+            .cloned()
+        else {
+            log::error!("Repository not found for project: {project_name}");
+            return;
+        };
+        let existing_names = self.workspace_names();
+        let (workspace_name, first_message) = match seed {
+            Some(seed) => (
+                unique_workspace_name(&seed.name, &existing_names),
+                Some(seed.message),
+            ),
+            None => (generate_workspace_name(&existing_names), None),
+        };
+        let created = self.create_named_workspace(
+            repo,
+            workspace_name,
+            ChatAgent::default_agent(cx),
+            window,
+            cx,
+        );
 
-        let existing_names: Vec<String> = self.workspaces.iter().map(|ws| ws.name.clone()).collect();
-        let first_agent = crate::workspace_view::ChatAgent::default_agent(cx);
-
-        cx.spawn_in(window, async move |this, cx| {
-            let Some(repo) = repo else {
-                log::error!("Repository not found for project: {project_name}");
-                return;
-            };
-
-            let (workspace_name, first_message) = match seed {
-                Some(seed) => (
-                    unique_workspace_name(&seed.name, &existing_names),
-                    Some(seed.message),
-                ),
-                None => (generate_workspace_name(&existing_names), None),
-            };
-
-            let Some(state) = mnemonic_bridge::mnemonic_state_cloned() else {
-                return;
-            };
-            // Making the worktree and rescanning the repository run git, so
-            // this stays off the UI thread or the whole window freezes.
-            let result = cx.background_spawn(async move {
-                let input = workspace_service::new_workspace_input(
-                    &state,
-                    &repo,
-                    workspace_name,
-                    None,
-                    None,
-                )?;
-                workspace_service::create_workspace(&state, input)
-            })
-            .await;
-
-            match result {
-                Ok(detail) => {
-                    log::info!("Created workspace: {}", detail.summary.id);
-                    // New workspaces are chat-first: the saved chat session
-                    // makes the workspace view open a chat with the default
-                    // agent instead of the claude CLI.
-                    if let Some(state) = mnemonic_bridge::mnemonic_state_cloned() {
-                        let record = ChatSessionRecord {
-                            id: uuid::Uuid::new_v4().to_string(),
-                            workspace_id: detail.summary.id.clone(),
-                            agent: first_agent.agent_id().to_string(),
-                            title: first_agent.label().to_string(),
-                            acp_session_id: None,
-                            is_review: false,
-                            is_primary: true,
-                            position: 0,
-                        };
-                        if let Err(err) = chat_session_repository::insert(&state.db, &record) {
-                            log::error!("Failed to save initial chat session: {err}");
-                        }
+        cx.spawn_in(window, async move |this, cx| match created.await {
+            Ok((detail, _primary_chat_id)) => {
+                log::info!("Created workspace: {}", detail.summary.id);
+                this.update_in(cx, |this, window, cx| {
+                    this.select_workspace(detail.summary.id.clone(), window, cx);
+                    let (Some(message), Some(workspace)) =
+                        (first_message, this.workspace.upgrade())
+                    else {
+                        return;
+                    };
+                    let dispatched = workspace.update(cx, |workspace, cx| {
+                        WorkspaceHost::dispatch_to_workspace_agent(
+                            workspace,
+                            &detail.summary.id,
+                            message,
+                            cx,
+                        )
+                    });
+                    if !dispatched {
+                        log::error!("No chat received the issue for {}", detail.summary.id);
                     }
-
-                    this.update_in(cx, |this, window, cx| {
-                        this.refresh(cx);
-                        this.select_workspace(detail.summary.id.clone(), window, cx);
-                        let (Some(message), Some(workspace)) =
-                            (first_message, this.workspace.upgrade())
-                        else {
-                            return;
-                        };
-                        let dispatched = workspace.update(cx, |workspace, cx| {
-                            WorkspaceHost::dispatch_to_workspace_agent(
-                                workspace,
-                                &detail.summary.id,
-                                message,
-                                cx,
-                            )
-                        });
-                        if !dispatched {
-                            log::error!("No chat received the issue for {}", detail.summary.id);
-                        }
+                })
+                .log_err();
+            }
+            Err(e) => {
+                log::error!("Failed to create workspace: {e}");
+                if first_message.is_some() {
+                    this.update_in(cx, |_, window, cx| {
+                        let _dismissed = window.prompt(
+                            PromptLevel::Critical,
+                            "Couldn't create workspace",
+                            Some(&e),
+                            &["OK"],
+                            cx,
+                        );
                     })
-                    .ok();
-                }
-                Err(e) => {
-                    log::error!("Failed to create workspace: {e}");
-                    if first_message.is_some() {
-                        this.update_in(cx, |_, window, cx| {
-                            let _dismissed = window.prompt(
-                                PromptLevel::Critical,
-                                "Couldn't create workspace",
-                                Some(&e),
-                                &["OK"],
-                                cx,
-                            );
-                        })
-                        .log_err();
-                    }
+                    .log_err();
                 }
             }
         })
         .detach();
+    }
+
+    fn workspace_names(&self) -> Vec<String> {
+        self.workspaces.iter().map(|ws| ws.name.clone()).collect()
+    }
+
+    /// Creates a workspace in the repository with a generated name and a
+    /// primary chat running `agent`, and lists it in this panel. Resolves to
+    /// the workspace and the primary chat's record id. Doesn't select it.
+    pub(crate) fn create_project_workspace(
+        &mut self,
+        repo: DiscoveredRepository,
+        agent: ChatAgent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<(WorkspaceDetail, String), String>> {
+        let workspace_name = generate_workspace_name(&self.workspace_names());
+        self.create_named_workspace(repo, workspace_name, agent, window, cx)
+    }
+
+    fn create_named_workspace(
+        &mut self,
+        repo: DiscoveredRepository,
+        workspace_name: String,
+        agent: ChatAgent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<(WorkspaceDetail, String), String>> {
+        let Some(state) = mnemonic_bridge::mnemonic_state_cloned() else {
+            return Task::ready(Err("Mnemonic isn't ready".to_string()));
+        };
+        cx.spawn_in(window, async move |this, cx| {
+            // Making the worktree and rescanning the repository run git, so
+            // this stays off the UI thread or the whole window freezes.
+            let created = cx
+                .background_spawn(async move {
+                    let input = workspace_service::new_workspace_input(
+                        &state,
+                        &repo,
+                        workspace_name,
+                        None,
+                        None,
+                    )?;
+                    let detail = workspace_service::create_workspace(&state, input)?;
+                    // New workspaces are chat-first: the saved chat session
+                    // makes the workspace view open a chat with the agent
+                    // instead of the claude CLI.
+                    let record = primary_chat_record(&detail.summary.id, agent);
+                    if let Err(err) = chat_session_repository::insert(&state.db, &record) {
+                        log::error!("Failed to save initial chat session: {err}");
+                    }
+                    Ok((detail, record.id))
+                })
+                .await;
+            if created.is_ok() {
+                this.update(cx, |this, cx| {
+                    this.refresh(cx);
+                    cx.notify();
+                })
+                .log_err();
+            }
+            created
+        })
     }
 
     fn open_issue_prompt(
@@ -2144,6 +2171,20 @@ const NAME_ANIMALS: &[&str] = &[
     "puma", "quail", "rabbit", "raven", "robin", "seal", "sparrow", "stork", "swan", "tapir",
     "tern", "vole", "walrus", "wren",
 ];
+
+/// The chat a new workspace opens with, in place of the claude CLI.
+fn primary_chat_record(workspace_id: &str, agent: ChatAgent) -> ChatSessionRecord {
+    ChatSessionRecord {
+        id: uuid::Uuid::new_v4().to_string(),
+        workspace_id: workspace_id.to_string(),
+        agent: agent.agent_id().to_string(),
+        title: agent.label().to_string(),
+        acp_session_id: None,
+        is_review: false,
+        is_primary: true,
+        position: 0,
+    }
+}
 
 /// Conductor-style two-word workspace names ("patient-cipher"), seeded from
 /// the clock so no rand dependency is needed. Falls back to a numeric suffix
@@ -3317,6 +3358,15 @@ fn free_workspace_ports(state: &mnemonic_core::state::AppState, workspace_id: &s
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_new_workspace_opens_a_chat_with_the_chosen_agent() {
+        let record = primary_chat_record("ws-1", ChatAgent::Codex);
+
+        assert_eq!(record.workspace_id, "ws-1");
+        assert_eq!(record.agent, ChatAgent::Codex.agent_id());
+        assert!(!crate::workspace_view::should_start_main_cli(&[record]));
+    }
 
     #[test]
     fn parses_github_repository_references() {

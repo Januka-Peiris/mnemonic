@@ -4,7 +4,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -63,6 +63,19 @@ pub struct TeamChat {
     /// teammate can stop it or message it.
     #[serde(default)]
     pub live: bool,
+    /// When the chat's last turn ended, in unix milliseconds. Only the phone
+    /// feed sets it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_turn_ended_at: Option<u64>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub last_turn_errored: bool,
+    /// Whether a permission prompt is pending. Only the phone feed sets it.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub waiting: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -667,11 +680,20 @@ fn tailscale_binary() -> Option<PathBuf> {
 // Only ever called from the share server's own threads, never the UI thread.
 #[allow(clippy::disallowed_methods)]
 fn run_tailscale(args: &[&str]) -> Result<Vec<u8>, String> {
-    let binary = tailscale_binary().ok_or_else(|| "Tailscale isn't installed".to_string())?;
-    let output = std::process::Command::new(&binary)
-        .args(args)
+    let output = tailscale_command(args)?
         .output()
         .map_err(|err| format!("Couldn't run Tailscale: {err}"))?;
+    tailscale_output(args, output)
+}
+
+fn tailscale_command(args: &[&str]) -> Result<std::process::Command, String> {
+    let binary = tailscale_binary().ok_or_else(|| "Tailscale isn't installed".to_string())?;
+    let mut command = std::process::Command::new(&binary);
+    command.args(args);
+    Ok(command)
+}
+
+fn tailscale_output(args: &[&str], output: std::process::Output) -> Result<Vec<u8>, String> {
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
         return Err(if stderr.is_empty() {
@@ -751,6 +773,142 @@ fn parse_tailscale_status(output: &[u8]) -> Result<TailscaleSelf, String> {
             .unwrap_or_default(),
         dns_name: node.dns_name.trim_end_matches('.').to_string(),
     })
+}
+
+/// A certificate and its private key, both PEM.
+#[derive(Clone, PartialEq)]
+pub struct TlsFiles {
+    pub certificate: Vec<u8>,
+    pub private_key: Vec<u8>,
+}
+
+/// This machine's HTTPS certificate from Tailscale, written into `directory`.
+/// Tailscale reuses the certificate it has until it nears expiry, so running
+/// this again is how it gets renewed.
+pub fn tailscale_cert(dns_name: &str, directory: &Path) -> Result<TlsFiles, String> {
+    tailscale_cert_with(dns_name, directory, |args| {
+        let output =
+            output_within(tailscale_command(args)?, TAILSCALE_CERT_TIMEOUT)?.ok_or_else(|| {
+                format!(
+                    "tailscale cert didn't finish within {} seconds",
+                    TAILSCALE_CERT_TIMEOUT.as_secs()
+                )
+            })?;
+        tailscale_output(args, output)
+    })
+}
+
+/// Long enough for Tailscale to get a certificate issued, short enough that
+/// a stuck run doesn't hold the phone server back from starting over HTTP.
+const TAILSCALE_CERT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Runs `command` to the end, or kills it and returns None once `timeout`
+/// has passed.
+// Only ever called from the phone server's own threads, never the UI thread.
+#[allow(clippy::disallowed_methods)]
+fn output_within(
+    mut command: std::process::Command,
+    timeout: Duration,
+) -> Result<Option<std::process::Output>, String> {
+    use std::io::Read as _;
+    use std::process::Stdio;
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|err| format!("Couldn't run {}: {err}", command.get_program().display()))?;
+    // Drained while waiting, so a child that fills a pipe can't stall on it.
+    let drain = |pipe: Option<Box<dyn std::io::Read + Send>>| {
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            if let Some(mut pipe) = pipe {
+                pipe.read_to_end(&mut bytes)?;
+            }
+            Ok::<_, std::io::Error>(bytes)
+        })
+    };
+    let stdout = drain(child.stdout.take().map(|pipe| Box::new(pipe) as _));
+    let stderr = drain(child.stderr.take().map(|pipe| Box::new(pipe) as _));
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() >= deadline => {
+                if let Err(err) = child.kill() {
+                    log::warn!("Couldn't stop {}: {err}", command.get_program().display());
+                }
+                if let Err(err) = child.wait() {
+                    log::warn!("Couldn't reap {}: {err}", command.get_program().display());
+                }
+                return Ok(None);
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(50)),
+            Err(err) => {
+                return Err(format!(
+                    "Couldn't wait for {}: {err}",
+                    command.get_program().display()
+                ));
+            }
+        }
+    };
+    let collect = |reader: std::thread::JoinHandle<std::io::Result<Vec<u8>>>| {
+        reader
+            .join()
+            .map_err(|_| "A pipe reader panicked".to_string())?
+            .map_err(|err| {
+                format!(
+                    "Couldn't read {}'s output: {err}",
+                    command.get_program().display()
+                )
+            })
+    };
+    Ok(Some(std::process::Output {
+        status,
+        stdout: collect(stdout)?,
+        stderr: collect(stderr)?,
+    }))
+}
+
+fn tailscale_cert_with(
+    dns_name: &str,
+    directory: &Path,
+    run: impl FnOnce(&[&str]) -> Result<Vec<u8>, String>,
+) -> Result<TlsFiles, String> {
+    std::fs::create_dir_all(directory)
+        .map_err(|err| format!("Couldn't create {}: {err}", directory.display()))?;
+    let certificate_path = directory.join("phone.crt");
+    let key_path = directory.join("phone.key");
+    let certificate_arg = certificate_path.to_string_lossy();
+    let key_arg = key_path.to_string_lossy();
+    run(&[
+        "cert",
+        "--cert-file",
+        &certificate_arg,
+        "--key-file",
+        &key_arg,
+        dns_name,
+    ])?;
+    set_owner_only(&key_path)?;
+    let read = |path: &Path| {
+        std::fs::read(path).map_err(|err| format!("Couldn't read {}: {err}", path.display()))
+    };
+    Ok(TlsFiles {
+        certificate: read(&certificate_path)?,
+        private_key: read(&key_path)?,
+    })
+}
+
+#[cfg(unix)]
+fn set_owner_only(path: &Path) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+        .map_err(|err| format!("Couldn't make {} private: {err}", path.display()))
+}
+
+#[cfg(not(unix))]
+fn set_owner_only(_path: &Path) -> Result<(), String> {
+    Ok(())
 }
 
 /// A machine on the tailnet that could run Mnemonic.
@@ -1687,5 +1845,63 @@ mod tests {
                 ),
             ]
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tailscale_cert_keeps_the_key_private() -> Result<(), String> {
+        use std::os::unix::fs::PermissionsExt as _;
+        let directory = tempfile::tempdir().map_err(|err| err.to_string())?;
+        let phone_directory = directory.path().join("phone");
+        let files = tailscale_cert_with("mac.example.ts.net", &phone_directory, |args| {
+            let [
+                "cert",
+                "--cert-file",
+                certificate,
+                "--key-file",
+                key,
+                "mac.example.ts.net",
+            ] = args
+            else {
+                return Err(format!("unexpected arguments {args:?}"));
+            };
+            std::fs::write(certificate, "certificate").map_err(|err| err.to_string())?;
+            std::fs::write(key, "key").map_err(|err| err.to_string())?;
+            std::fs::set_permissions(key, std::fs::Permissions::from_mode(0o644))
+                .map_err(|err| err.to_string())?;
+            Ok(Vec::new())
+        })?;
+        assert!(files.certificate == b"certificate" && files.private_key == b"key");
+        let mode = std::fs::metadata(phone_directory.join("phone.key"))
+            .map_err(|err| err.to_string())?
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
+
+        let failed = tailscale_cert_with("mac.example.ts.net", &phone_directory, |_| {
+            Err("HTTPS is not enabled for this tailnet".to_string())
+        });
+        assert!(
+            failed.is_err_and(|err| err == "HTTPS is not enabled for this tailnet"),
+            "the error is tailscale's own words"
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_hung_command_is_killed_at_its_timeout() -> Result<(), String> {
+        let started = Instant::now();
+        let mut hung = std::process::Command::new("sleep");
+        hung.arg("30");
+        assert!(output_within(hung, Duration::from_millis(200))?.is_none());
+        assert!(started.elapsed() < Duration::from_secs(5));
+
+        let mut quick = std::process::Command::new("echo");
+        quick.arg("done");
+        let output = output_within(quick, Duration::from_secs(10))?
+            .ok_or_else(|| "echo timed out".to_string())?;
+        assert_eq!(output.stdout, b"done\n");
+        Ok(())
     }
 }

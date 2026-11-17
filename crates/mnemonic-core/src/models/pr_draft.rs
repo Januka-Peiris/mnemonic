@@ -41,6 +41,19 @@ pub struct WorkspacePrStatus {
     pub warning: Option<String>,
 }
 
+impl WorkspacePrStatus {
+    /// Whether the PR is open, ready and clean, and pinned to a head commit
+    /// to merge at.
+    pub fn can_merge(&self) -> bool {
+        self.found
+            && self.state.as_deref() == Some("OPEN")
+            && !self.is_draft
+            && self.merge_state_status.as_deref() == Some("CLEAN")
+            && self.number.is_some()
+            && self.head_ref_oid.is_some()
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WorkspacePrCheck {
