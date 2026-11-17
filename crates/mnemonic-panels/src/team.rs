@@ -980,11 +980,7 @@ fn start_server(
     if !me.login.is_empty() {
         allowed_logins.push(me.login.clone());
     }
-    let diff_source: DiffSource = Arc::new(|workspace_id: &str| {
-        let state = mnemonic_bridge::mnemonic_state_cloned()
-            .ok_or_else(|| "Mnemonic isn't ready".to_string())?;
-        git_review_service::get_workspace_full_diff(&state, workspace_id)
-    });
+    let diff_source = workspace_diff_source();
     // Runs on a request thread, which waits here while the main thread
     // carries the action out.
     let action_handler: ActionHandler = Arc::new(move |action| {
@@ -1089,10 +1085,18 @@ fn start_server(
     .map(|server| (server, me))
 }
 
+pub(crate) fn workspace_diff_source() -> DiffSource {
+    Arc::new(|workspace_id: &str| {
+        let state = mnemonic_bridge::mnemonic_state_cloned()
+            .ok_or_else(|| "Mnemonic isn't ready".to_string())?;
+        git_review_service::get_workspace_full_diff(&state, workspace_id)
+    })
+}
+
 /// Waits on a request thread for the main thread's answer. Once the main
 /// thread has claimed the work, it is waited for to the end, as it will run
 /// whatever the requester is told.
-fn wait_for_reply<T>(
+pub(crate) fn wait_for_reply<T>(
     reply_receiver: &std::sync::mpsc::Receiver<Result<T, TeamActionError>>,
     claimed: &AtomicBool,
     timeout: Duration,
@@ -1350,7 +1354,13 @@ fn run_action(
             let Some(thread) = chat.thread else {
                 return Err(TeamActionError::NotLoaded);
             };
-            let (tool_title, chosen) = answer_permission(&thread, tool_call_id, option_id, cx)?;
+            let (tool_title, chosen) = answer_permission(
+                &thread,
+                tool_call_id,
+                option_id,
+                PermissionScope::StepInOnceOnly,
+                cx,
+            )?;
             let answer = match chosen {
                 acp::PermissionOptionKind::RejectOnce | acp::PermissionOptionKind::RejectAlways => {
                     "rejected"
@@ -1491,16 +1501,17 @@ pub(crate) fn thread_permissions(
         .collect()
 }
 
-/// Answers a waiting permission request with an option it offers
-/// teammates, and returns the tool call's title and the kind of answer.
-fn answer_permission(
+/// Answers a waiting permission request with an option `scope` offers, and
+/// returns the tool call's title and the kind of answer.
+pub(crate) fn answer_permission(
     thread: &Entity<AcpThread>,
     tool_call_id: &str,
     option_id: &str,
+    scope: PermissionScope,
     cx: &mut App,
 ) -> Result<(String, acp::PermissionOptionKind), TeamActionError> {
     let tool_call_id = acp::ToolCallId::new(tool_call_id.to_string());
-    let (option, title) = {
+    let (outcome, title) = {
         let thread = thread.read(cx);
         let no_longer_waiting =
             || TeamActionError::NothingToDo("The permission request is no longer waiting".into());
@@ -1511,29 +1522,61 @@ fn answer_permission(
             return Err(no_longer_waiting());
         };
         if *kind != AuthorizationKind::PermissionGrant {
-            return Err(TeamActionError::NotAllowed(
-                "Only the owner can answer this".into(),
-            ));
+            return Err(TeamActionError::NotAllowed(match scope {
+                PermissionScope::StepInOnceOnly => "Only the owner can answer this".into(),
+                PermissionScope::All => "Answer this on the Mac".into(),
+            }));
         }
-        let Some(option) = once_only_options(options)
-            .into_iter()
-            .find(|option| option.option_id.0.as_ref() == option_id)
-        else {
-            return Err(TeamActionError::NotAllowed(
-                "That answer isn't offered to teammates".into(),
-            ));
+        let outcome = match scope {
+            PermissionScope::StepInOnceOnly => once_only_options(options)
+                .into_iter()
+                .find(|option| option.option_id.0.as_ref() == option_id)
+                .map(|option| SelectedPermissionOutcome::new(option.option_id, option.kind)),
+            PermissionScope::All => outcome_for_option(options, option_id),
         };
-        (option, tool_call_title(tool_call, cx))
+        let Some(outcome) = outcome else {
+            return Err(TeamActionError::NotAllowed(match scope {
+                PermissionScope::StepInOnceOnly => "That answer isn't offered to teammates".into(),
+                PermissionScope::All => "That answer isn't offered".into(),
+            }));
+        };
+        (outcome, tool_call_title(tool_call, cx))
     };
-    let chosen = option.kind;
+    let chosen = outcome.option_kind;
     thread.update(cx, |thread, cx| {
-        thread.authorize_tool_call(
-            tool_call_id,
-            SelectedPermissionOutcome::new(option.option_id, option.kind),
-            cx,
-        )
+        thread.authorize_tool_call(tool_call_id, outcome, cx)
     });
     Ok((title, chosen))
+}
+
+/// The answer the Mac would give for the option offered as `option_id`. A
+/// dropdown's choice is built the way its own dropdown builds it, from the
+/// first choice holding that option, the one `all_options` offers.
+fn outcome_for_option(
+    options: &PermissionOptions,
+    option_id: &str,
+) -> Option<SelectedPermissionOutcome> {
+    let choices = match options {
+        PermissionOptions::Flat(options) => {
+            return options
+                .iter()
+                .find(|option| option.option_id.0.as_ref() == option_id)
+                .map(|option| {
+                    SelectedPermissionOutcome::new(option.option_id.clone(), option.kind)
+                });
+        }
+        PermissionOptions::Dropdown(choices)
+        | PermissionOptions::DropdownWithPatterns { choices, .. } => choices,
+    };
+    choices.iter().find_map(|choice| {
+        if choice.allow.option_id.0.as_ref() == option_id {
+            Some(choice.build_outcome(true))
+        } else if choice.deny.option_id.0.as_ref() == option_id {
+            Some(choice.build_outcome(false))
+        } else {
+            None
+        }
+    })
 }
 
 pub(crate) fn workspace_root(summary: &WorkspaceSummary) -> Option<PathBuf> {
@@ -2162,6 +2205,7 @@ mod tests {
         allow_always_and_once_options, is_waiting, new_thread, save_or_discard_options,
         thread_waiting_on,
     };
+    use PermissionScope::StepInOnceOnly;
     use acp_thread::{AuthorizationKind, PermissionOptions};
     use gpui::TestAppContext;
     use settings::SettingsStore;
@@ -2296,7 +2340,9 @@ mod tests {
         .await;
 
         for option_id in ["always", "never-offered"] {
-            let answered = cx.update(|cx| answer_permission(&thread, "run-tests", option_id, cx));
+            let answered = cx.update(|cx| {
+                answer_permission(&thread, "run-tests", option_id, StepInOnceOnly, cx)
+            });
             assert!(
                 matches!(answered, Err(TeamActionError::NotAllowed(_))),
                 "{option_id} gave {answered:?}"
@@ -2304,7 +2350,8 @@ mod tests {
             assert!(is_waiting(&thread, cx));
         }
 
-        let answered = cx.update(|cx| answer_permission(&thread, "run-tests", "allow", cx));
+        let answered =
+            cx.update(|cx| answer_permission(&thread, "run-tests", "allow", StepInOnceOnly, cx));
         assert_eq!(
             answered,
             Ok((
@@ -2314,7 +2361,8 @@ mod tests {
         );
         assert!(!is_waiting(&thread, cx));
 
-        let answered = cx.update(|cx| answer_permission(&thread, "run-tests", "allow", cx));
+        let answered =
+            cx.update(|cx| answer_permission(&thread, "run-tests", "allow", StepInOnceOnly, cx));
         assert!(matches!(answered, Err(TeamActionError::NothingToDo(_))));
 
         let (dirty_buffer, _answer) = thread_waiting_on(
@@ -2323,7 +2371,9 @@ mod tests {
             cx,
         )
         .await;
-        let answered = cx.update(|cx| answer_permission(&dirty_buffer, "run-tests", "discard", cx));
+        let answered = cx.update(|cx| {
+            answer_permission(&dirty_buffer, "run-tests", "discard", StepInOnceOnly, cx)
+        });
         assert!(
             matches!(answered, Err(TeamActionError::NotAllowed(_))),
             "discard gave {answered:?}"

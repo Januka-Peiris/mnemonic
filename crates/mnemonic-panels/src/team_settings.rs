@@ -17,6 +17,7 @@ use settings::{Settings as _, SettingsStore, TeamPeerContent, update_settings_fi
 use ui::{Checkbox, Headline, HeadlineSize, Switch, ToggleState, Tooltip, prelude::*};
 use util::ResultExt as _;
 
+use crate::phone::{phone_page_url, phone_share};
 use crate::team::{
     SharingStatus, TeamPeer, TeamSettings, is_workspace_shared, set_workspace_shared, team_share,
 };
@@ -48,6 +49,9 @@ impl TeamSettingsView {
         let mut subscriptions = vec![cx.observe_global::<SettingsStore>(|_, cx| cx.notify())];
         if let Some(team) = team_share(cx) {
             subscriptions.push(cx.observe(&team, |_, _, cx| cx.notify()));
+        }
+        if let Some(phone) = phone_share(cx) {
+            subscriptions.push(cx.observe(&phone, |_, _, cx| cx.notify()));
         }
         Self {
             fs,
@@ -184,6 +188,31 @@ impl TeamSettingsView {
         card("This computer", None, cx)
             .child(address)
             .child(Label::new(status).size(LabelSize::Small).color(color))
+            .when_some(phone_page_url(cx), |card, url| {
+                card.child(
+                    h_flex()
+                        .gap_1()
+                        .child(
+                            Label::new("Your phone page is at")
+                                .size(LabelSize::Small)
+                                .color(Color::Muted),
+                        )
+                        .child(
+                            Label::new(url.clone())
+                                .size(LabelSize::Small)
+                                .buffer_font(cx),
+                        )
+                        .child(
+                            IconButton::new("team-copy-phone-url", IconName::Copy)
+                                .icon_size(IconSize::XSmall)
+                                .icon_color(Color::Muted)
+                                .tooltip(Tooltip::text("Copy"))
+                                .on_click(move |_, _, cx| {
+                                    cx.write_to_clipboard(ClipboardItem::new_string(url.clone()));
+                                }),
+                        ),
+                )
+            })
     }
 
     fn render_workspaces(&self, cx: &mut Context<Self>) -> impl IntoElement {

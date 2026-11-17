@@ -24,7 +24,6 @@ use crate::team::{
 use crate::workspace_view::{LiveWorkspaceAgents, WorkspaceHost, chat_agent_label, open_windows};
 
 /// Which of an agent's permission options a hub offers.
-#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum PermissionScope {
     /// Once-only answers, and only in chats whose workspace allows stepping in.

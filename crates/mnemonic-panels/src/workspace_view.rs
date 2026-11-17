@@ -161,7 +161,7 @@ pub(crate) enum ChatAgent {
 }
 
 impl ChatAgent {
-    const ALL: [Self; 5] = [
+    pub(crate) const ALL: [Self; 5] = [
         Self::Claude,
         Self::Codex,
         Self::Gemini,
@@ -971,8 +971,12 @@ impl WorkspaceView {
 
     fn add_session(&mut self, kind: NewSession, window: &mut Window, cx: &mut Context<Self>) {
         match kind {
-            NewSession::DefaultChat => self.add_chat(ChatAgent::default_agent(cx), window, cx),
-            NewSession::Chat(agent) => self.add_chat(agent, window, cx),
+            NewSession::DefaultChat => {
+                self.add_chat(ChatAgent::default_agent(cx), window, cx);
+            }
+            NewSession::Chat(agent) => {
+                self.add_chat(agent, window, cx);
+            }
             NewSession::ClaudeCli => self.add_claude_terminal(window, cx),
             NewSession::CodexCli => self.add_codex_terminal(window, cx),
             NewSession::Shell => self.add_shell_terminal(window, cx),
@@ -2584,9 +2588,24 @@ impl WorkspaceView {
         cx.notify();
     }
 
+    /// Adds a new chat, as from the phone, and returns its record id.
+    pub(crate) fn start_chat(
+        &mut self,
+        agent: ChatAgent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> String {
+        self.add_chat(agent, window, cx)
+    }
+
     /// Adds a new chat tab running the given agent, persisted so it comes
-    /// back after a restart.
-    fn add_chat(&mut self, agent: ChatAgent, window: &mut Window, cx: &mut Context<Self>) {
+    /// back after a restart, and returns its record id.
+    fn add_chat(
+        &mut self,
+        agent: ChatAgent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> String {
         let same_agent_count = self
             .sessions
             .iter()
@@ -2612,7 +2631,9 @@ impl WorkspaceView {
         if let Err(err) = chat_session_repository::insert(&state.db, &record) {
             log::error!("Failed to save chat session: {err}");
         }
+        let record_id = record.id.clone();
         self.open_chat(record, None, window, cx);
+        record_id
     }
 
     /// Copies a chat's agent session, history included, into a new chat tab
@@ -3496,6 +3517,32 @@ impl WorkspaceView {
             }
         })
         .detach();
+    }
+
+    /// Queues the user's own message for a chat, as from the phone, sent
+    /// once the agent is idle. False when the chat isn't open here.
+    pub(crate) fn send_to_chat(
+        &mut self,
+        record_id: &str,
+        text: String,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(chat) = self
+            .sessions
+            .iter_mut()
+            .filter_map(WorkspaceSession::chat_mut)
+            .find(|chat| chat.record_id == record_id)
+        else {
+            return false;
+        };
+        chat.pending_messages.push(text);
+        let view_id = chat.view.entity_id();
+        self.flush_pending(view_id, cx);
+        true
+    }
+
+    pub(crate) fn window_handle(&self) -> AnyWindowHandle {
+        self.window_handle
     }
 
     /// Stops a chat's agent the way its own Stop button does. Always on the
@@ -5933,6 +5980,7 @@ mod tests {
     #[test]
     fn composer_text_goes_to_the_cli_tab_being_viewed() {
         let sessions = [chat(ChatAgent::Claude, false), terminal("claude-2")];
+
         assert_eq!(
             pick_dispatch_target(DispatchOrigin::Composer, &sessions, 1),
             Some(DispatchTarget::Terminal(1))
@@ -5980,5 +6028,4 @@ mod tests {
         assert_eq!(pending.take_next().as_deref(), Some("b"));
         assert_eq!(pending.take_next(), None);
     }
-
 }
