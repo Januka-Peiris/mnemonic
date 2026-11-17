@@ -321,6 +321,12 @@ const LONGEST_RETRY_MS = 15000;
 const NEW_CHAT_GRACE_MS = 6000;
 const NEW_CHAT_RETRY_MS = 500;
 const PROMPT_REFRESH_MS = 20000;
+// Checks turning green change nothing in the workspace feed, so an open
+// chat reads its PR status again on this period.
+const PR_REFRESH_MS = 15000;
+// The agent takes a while to open the PR it was asked for; until then the
+// status still says there is none, so Create PR stays held.
+const PR_REQUEST_HOLD_MS = 30000;
 const OPENED_MARK_PREFIX = "phone.opened.";
 const INSTALLED_AT_KEY = "phone.installedAt";
 const QUICK_REPLIES = ["Yes, go ahead", "Continue", "Open a PR"];
@@ -560,6 +566,9 @@ const app = {
   answered: new Set(),
   pr: null,
   prGeneration: 0,
+  prBusy: false,
+  // Workspace id to when Create PR was sent for it.
+  prRequested: new Map(),
 };
 
 function findChat(chatId) {
@@ -916,7 +925,8 @@ function renderChatHeader() {
   element("title").textContent = found ? workspaceTitle(found.workspace) : "Chat";
   if (found) {
     const prKey = found.workspace.pr_number + " " + found.workspace.pr_state;
-    if (!app.pr || app.pr.workspaceId !== found.workspace.id || app.pr.key !== prKey) {
+    const stale = app.pr && !app.pr.loading && Date.now() - app.pr.fetchedAt >= PR_REFRESH_MS;
+    if (!app.pr || app.pr.workspaceId !== found.workspace.id || app.pr.key !== prKey || stale) {
       loadPr(found.workspace.id, prKey);
     }
   }
@@ -1431,7 +1441,7 @@ async function startTask() {
 async function loadPr(workspaceId, key) {
   const generation = ++app.prGeneration;
   const previous = app.pr && app.pr.workspaceId === workspaceId ? app.pr.status : null;
-  app.pr = { workspaceId, key, status: previous, loading: true, error: null };
+  app.pr = { workspaceId, key, status: previous, loading: true, error: null, fetchedAt: 0 };
   renderPrButton();
   let status = null;
   let failure = null;
@@ -1441,7 +1451,7 @@ async function loadPr(workspaceId, key) {
     failure = error;
   }
   if (generation !== app.prGeneration || !app.pr) return;
-  app.pr = { workspaceId, key, status, loading: false, error: failure };
+  app.pr = { workspaceId, key, status, loading: false, error: failure, fetchedAt: Date.now() };
   renderPrButton();
 }
 
@@ -1451,15 +1461,18 @@ function prAction() {
   if (pr.error) return { kind: "retry", label: "PR" };
   const status = pr.status;
   const state = (status.state || "").toUpperCase();
-  if (!status.found || !status.number || state === "CLOSED") {
+  if (!status.found || !status.number || state !== "OPEN") {
+    const requestedAt = app.prRequested.get(pr.workspaceId);
+    if (requestedAt !== undefined && Date.now() - requestedAt < PR_REQUEST_HOLD_MS) {
+      return { kind: "requested", label: "PR requested" };
+    }
     return { kind: "create", label: "Create PR" };
   }
+  app.prRequested.delete(pr.workspaceId);
   const name = "PR #" + status.number;
   if (status.can_merge) return { kind: "merge", label: name + ": Merge", primary: true };
   let description;
-  if (state === "MERGED") {
-    description = "merged";
-  } else if (status.is_draft) {
+  if (status.is_draft) {
     description = "draft";
   } else {
     const workspace = findWorkspace(pr.workspaceId);
@@ -1473,7 +1486,7 @@ function renderPrButton() {
   const action = prAction();
   button.textContent = action.label;
   button.classList.toggle("primary", Boolean(action.primary));
-  button.disabled = action.kind === "loading" || Boolean(app.pr && app.pr.busy);
+  button.disabled = action.kind === "loading" || action.kind === "requested" || app.prBusy;
 }
 
 async function prClicked() {
@@ -1497,11 +1510,14 @@ async function prClicked() {
       "\nHead commit: " + (status.head_ref_oid || "").slice(0, 7);
     if (!confirm(question)) return;
   }
-  pr.busy = true;
+  if (action.kind !== "create" && action.kind !== "merge") return;
+  app.prBusy = true;
   renderPrButton();
   try {
     if (action.kind === "create") {
       await post(workspacePath + "/pr", {});
+      app.prRequested.set(pr.workspaceId, Date.now());
+      setTimeout(renderPrButton, PR_REQUEST_HOLD_MS);
       scrollToBottom();
     } else if (action.kind === "merge") {
       const outcome = await post(workspacePath + "/merge", { head: status.head_ref_oid });
@@ -1510,13 +1526,11 @@ async function prClicked() {
   } catch (error) {
     showError(error);
   } finally {
-    pr.busy = false;
+    app.prBusy = false;
     if (app.pr && app.pr.workspaceId === pr.workspaceId) {
-      if (action.kind === "merge") {
-        loadPr(pr.workspaceId, app.pr.key);
-      } else {
-        renderPrButton();
-      }
+      loadPr(pr.workspaceId, app.pr.key);
+    } else {
+      renderPrButton();
     }
   }
 }
