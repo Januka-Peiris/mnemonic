@@ -9,11 +9,11 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::RecvTimeoutError;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 
 use acp_thread::{
-    AcpThread, AcpThreadEvent, AgentThreadEntry, AssistantMessageChunk, AuthorizationKind,
-    PermissionOptions, PlanEntry, SANDBOX_AUTHORIZATION_META_KEY, SUBAGENT_SESSION_INFO_META_KEY,
+    AcpThread, AgentThreadEntry, AssistantMessageChunk, AuthorizationKind, PermissionOptions,
+    PlanEntry, SANDBOX_AUTHORIZATION_META_KEY, SUBAGENT_SESSION_INFO_META_KEY,
     SelectedPermissionOutcome, TOOL_NAME_META_KEY, ThreadStatus, ToolCall, ToolCallContent,
     ToolCallStatus,
 };
@@ -21,12 +21,13 @@ use agent_client_protocol::schema as acp;
 use futures::StreamExt as _;
 use futures::channel::mpsc;
 use gpui::{
-    AnyElement, App, AppContext as _, Context, Entity, EntityId, Global, IntoElement, SharedString,
-    Subscription, Task, WeakEntity, px,
+    AnyElement, App, AppContext as _, Context, Entity, Global, IntoElement, SharedString, Task,
+    WeakEntity, px,
 };
 use mnemonic_bridge::AgentAttention;
-use mnemonic_core::models::{ChatSessionRecord, WorkspaceSummary};
-use mnemonic_core::repositories::{chat_session_repository, settings_repository};
+use mnemonic_core::models::WorkspaceSummary;
+use mnemonic_core::repositories::settings_repository;
+use mnemonic_core::services::git_review_service;
 use mnemonic_core::services::team_files_service::{
     self, HashCache, SkipList, TeamBatchOutcome, normalize_remote_url, scan_workspace_cached,
 };
@@ -37,10 +38,9 @@ use mnemonic_core::services::team_share_server::{
 use mnemonic_core::services::team_share_service::{
     ActionHandler, BatchHandler, DEFAULT_TEAM_PORT, TailscaleSelf, TailscaleWhois, TeamAction,
     TeamActionError, TeamActionKind, TeamActionOutcome, TeamAgentState, TeamBatchRequest,
-    TeamCaller, TeamChat, TeamClient, TeamClientError, TeamEntry, TeamPermissionRequest,
-    TeamShareHub, TeamWorkspace, saved_chat_entries, tailscale_self,
+    TeamCaller, TeamClient, TeamClientError, TeamEntry, TeamPermissionRequest, TeamShareHub,
+    TeamWorkspace, tailscale_self,
 };
-use mnemonic_core::services::{chat_transcript_service, git_review_service, workspace_service};
 use settings::{RegisterSetting, Settings, SettingsStore};
 use ui::{CommonAnimationExt as _, Tooltip, prelude::*};
 use util::ResultExt as _;
@@ -48,14 +48,17 @@ use util::markdown::MarkdownCodeBlock;
 use workspace::notifications::NotificationId;
 use workspace::{Toast, Workspace};
 
+use crate::chat_feed::{
+    ChatFeed, PermissionScope, SharedRecords, TranscriptToRead, WorkspaceFlags, load_records,
+    read_saved_transcripts,
+};
 use crate::team_copy::{CopyFollow, resume_copies};
 use crate::team_live_chat::live_chats_root;
 use crate::team_settings::open_team_window;
 use crate::team_workspace_view::teammate_workspace_key;
 use crate::workspace_panel::WorkspacePanel;
 use crate::workspace_view::{
-    LiveWorkspaceAgents, WorkspaceHost, chat_agent_label, find_open_chat, find_workspace_window,
-    open_windows,
+    LiveWorkspaceAgents, find_open_chat, find_workspace_window, open_windows,
 };
 
 /// The `team` section of the settings file.
@@ -148,14 +151,6 @@ pub(crate) struct PeerState {
     _poll: Task<()>,
 }
 
-struct ChatWatch {
-    thread_id: EntityId,
-    _subscription: Subscription,
-}
-
-/// A shared chat with a saved transcript on disk.
-type SavedTranscript = (PathBuf, SystemTime);
-
 /// A teammate's action on its way to the main thread, with where to send
 /// the answer.
 struct PendingAction {
@@ -188,23 +183,11 @@ struct PendingBatch {
 /// Marker for the notices shown when a teammate acts in a chat.
 struct TeamStepInToast;
 
-/// The shared workspaces with their chats, as loaded off the main thread.
-type SharedRecords = Vec<(
-    WorkspaceSummary,
-    Vec<(ChatSessionRecord, Option<SavedTranscript>)>,
-)>;
-
-/// A closed chat whose saved transcript is newer than what is shared.
-struct TranscriptToRead {
-    workspace_id: String,
-    chat_id: String,
-    path: PathBuf,
-    modified: SystemTime,
-}
-
 pub(crate) struct TeamShare {
     applied: Option<TeamSettings>,
-    hub: TeamShareHub,
+    /// Publishes shared workspaces and their chats into the hub the share
+    /// server serves, replaced with each new server.
+    feed: Entity<ChatFeed>,
     server: Option<TeamShareServer>,
     server_key: Option<ServerKey>,
     pub sharing: SharingStatus,
@@ -219,10 +202,6 @@ pub(crate) struct TeamShare {
     batch_task: Option<Task<()>>,
     /// Checks teammates' agents' writes against unsaved editor changes.
     write_check_task: Option<Task<()>>,
-    chat_watches: HashMap<String, ChatWatch>,
-    /// Chats shared from their saved transcript, as they aren't loaded in
-    /// this app, with when that transcript was written.
-    saved_chats: HashMap<String, SystemTime>,
     pub peers: Vec<PeerState>,
     pub collapsed_peers: HashSet<String>,
     /// A teammate's projects folded in the sidebar, as (host, project).
@@ -298,12 +277,12 @@ pub fn init(cx: &mut App) {
     })
     .detach();
     let team = cx.new(|cx| {
-        let mut team = TeamShare::new();
+        let mut team = TeamShare::new(cx);
         team.apply_settings(cx);
         // Teammates' commands run in their own process group, so they would
         // outlive this app unless the server is stopped first.
-        cx.on_app_quit(|team, _| {
-            team.stop_sharing();
+        cx.on_app_quit(|team, cx| {
+            team.stop_sharing(cx);
             async {}
         })
         .detach();
@@ -318,11 +297,11 @@ pub fn init(cx: &mut App) {
 }
 
 impl TeamShare {
-    fn new() -> Self {
+    fn new(cx: &mut Context<Self>) -> Self {
         let shared_workspaces = load_workspace_ids(SHARED_WORKSPACES_KEY);
         Self {
             applied: None,
-            hub: TeamShareHub::new(),
+            feed: new_team_feed(TeamShareHub::new(), cx),
             server: None,
             server_key: None,
             sharing: SharingStatus::Off,
@@ -332,8 +311,6 @@ impl TeamShare {
             action_task: None,
             batch_task: None,
             write_check_task: None,
-            chat_watches: HashMap::new(),
-            saved_chats: HashMap::new(),
             peers: Vec::new(),
             collapsed_peers: HashSet::new(),
             collapsed_peer_projects: HashSet::new(),
@@ -346,6 +323,10 @@ impl TeamShare {
             batch_generation: 0,
         }
     }
+}
+
+fn new_team_feed(hub: TeamShareHub, cx: &mut Context<TeamShare>) -> Entity<ChatFeed> {
+    cx.new(|_| ChatFeed::new(hub, PermissionScope::StepInOnceOnly))
 }
 
 pub(crate) fn team_share(cx: &App) -> Option<Entity<TeamShare>> {
@@ -463,7 +444,7 @@ impl TeamShare {
         save_workspace_ids(SHARED_WORKSPACES_KEY, &self.shared_workspaces, cx);
         if !shared {
             self.stop_agents(workspace_id);
-            self.stop_sharing_files(workspace_id);
+            self.stop_sharing_files(workspace_id, cx);
         }
         self.update_sharing(cx);
         // Publishes straight away rather than on the next tick, so an
@@ -484,10 +465,10 @@ impl TeamShare {
     }
 
     /// Takes the workspace's files away from teammates at once.
-    fn stop_sharing_files(&mut self, workspace_id: &str) {
+    fn stop_sharing_files(&mut self, workspace_id: &str, cx: &App) {
         lock_file_roots(&self.file_roots).remove(workspace_id);
         self.remote_urls.remove(workspace_id);
-        self.hub.remove_file_manifest(workspace_id);
+        self.feed.read(cx).hub().remove_file_manifest(workspace_id);
     }
 
     fn shares_files(&self, workspace_id: &str) -> bool {
@@ -514,7 +495,7 @@ impl TeamShare {
         };
         if self.shared_workspaces.is_empty() {
             if self.server_key.is_some() {
-                self.stop_sharing();
+                self.stop_sharing(cx);
             }
             return;
         }
@@ -529,11 +510,11 @@ impl TeamShare {
     }
 
     fn start_sharing(&mut self, key: ServerKey, cx: &mut Context<Self>) {
-        self.stop_sharing();
+        self.stop_sharing(cx);
         self.server_key = Some(key.clone());
         self.sharing = SharingStatus::Starting;
         let hub = TeamShareHub::new();
-        self.hub = hub.clone();
+        self.feed = new_team_feed(hub.clone(), cx);
         let (action_sender, mut action_receiver) = mpsc::unbounded::<PendingAction>();
         let shared_file_roots = self.file_roots.clone();
         let shared_agent_roots = self.agent_roots.clone();
@@ -724,7 +705,7 @@ impl TeamShare {
         })
     }
 
-    fn stop_sharing(&mut self) {
+    fn stop_sharing(&mut self, cx: &mut Context<Self>) {
         self.start_task = None;
         self.publish_task = None;
         self.tailscale_watch = None;
@@ -733,12 +714,7 @@ impl TeamShare {
         self.scan_task = None;
         self.server = None;
         self.server_key = None;
-        self.chat_watches.clear();
-        self.saved_chats.clear();
-        // Wakes any viewer waiting on a chat, so it hears the chat is gone
-        // instead of waiting out its long-poll.
-        self.hub.retain_chats(|_| false);
-        self.hub.set_workspaces(Vec::new());
+        self.feed.update(cx, |feed, _| feed.clear());
         self.sharing = SharingStatus::Off;
     }
 
@@ -761,7 +737,7 @@ impl TeamShare {
                     let records = cx
                         .background_spawn({
                             let state = state.clone();
-                            async move { load_shared_records(&state, &shared_ids) }
+                            async move { load_records(&state, Some(&shared_ids)) }
                         })
                         .await;
                     let published = match records {
@@ -792,12 +768,14 @@ impl TeamShare {
                                     }
                                 }
                                 let to_read = this.publish(records, cx);
-                                (this.hub.clone(), to_read)
+                                (this.feed.read(cx).hub().clone(), to_read)
                             })
                         }
                         Err(err) => {
                             log::error!("Couldn't list workspaces to share: {err}");
-                            this.read_with(cx, |this, _| (this.hub.clone(), Vec::new()))
+                            this.read_with(cx, |this, cx| {
+                                (this.feed.read(cx).hub().clone(), Vec::new())
+                            })
                         }
                     };
                     let Ok((hub, to_read)) = published else {
@@ -808,7 +786,7 @@ impl TeamShare {
                             .background_spawn(async move { read_saved_transcripts(to_read) })
                             .await;
                         if this
-                            .update(cx, |this, _| this.share_saved_chats(saved))
+                            .update(cx, |this, cx| this.share_saved_chats(saved, cx))
                             .is_err()
                         {
                             break;
@@ -856,251 +834,56 @@ impl TeamShare {
         // The list was loaded off the main thread; a workspace unshared
         // meanwhile must not slip through.
         records.retain(|(summary, _)| self.shared_workspaces.contains(&summary.id));
-        let mut live: HashMap<String, LiveWorkspaceAgents> = HashMap::new();
-        for workspace in open_windows(cx) {
-            for agents in WorkspaceHost::live_agents(workspace.read(cx), cx) {
-                live.entry(agents.workspace_id.clone()).or_insert(agents);
-            }
-        }
-
-        let mut open_chats = Vec::new();
-        let mut step_in_chats = HashSet::new();
-        let mut closed_chats = HashSet::new();
-        let mut to_read = Vec::new();
-        let mut workspaces = Vec::with_capacity(records.len());
         let mut file_roots = HashMap::new();
         let mut agent_roots = HashMap::new();
-        for (summary, chat_records) in records {
-            let agents = live.get(&summary.id);
-            let step_in = self.allows_step_in(&summary.id);
-            let share_files = self.shares_files(&summary.id);
-            let agents_allowed = self.allows_agents(&summary.id);
-            let agent_root = workspace_root(&summary).filter(|_| agents_allowed);
-            if let Some(root) = &agent_root {
+        for (summary, _) in &records {
+            let Some(root) = workspace_root(summary) else {
+                continue;
+            };
+            if self.allows_agents(&summary.id) {
                 agent_roots.insert(summary.id.clone(), root.clone());
             }
-            if share_files {
-                if let Some(root) = workspace_root(&summary) {
-                    file_roots.insert(
-                        summary.id.clone(),
-                        (root, SkipList::default()),
-                    );
-                }
+            if self.shares_files(&summary.id) {
+                file_roots.insert(summary.id.clone(), (root, SkipList::default()));
             }
-            let mut chats = Vec::with_capacity(chat_records.len());
-            for (record, transcript) in chat_records {
-                let live_chat = agents.and_then(|agents| {
-                    agents.chats.iter().find(|chat| chat.record_id == record.id)
-                });
-                let thread = live_chat.and_then(|chat| chat.thread.clone());
-                chats.push(TeamChat {
-                    id: record.id.clone(),
-                    title: live_chat
-                        .map(|chat| chat.title.to_string())
-                        .unwrap_or(record.title),
-                    agent: chat_agent_label(&record.agent).to_string(),
-                    open: thread.is_some() || self.hub.has_chat(&record.id),
-                    live: thread.is_some(),
-                });
-                if step_in {
-                    step_in_chats.insert(record.id.clone());
-                }
-                if let Some(thread) = thread {
-                    open_chats.push((record.id, thread));
-                    continue;
-                }
-                // A chat loaded earlier in this session keeps what it showed
-                // then, which says more than its saved transcript.
-                let shown_live =
-                    self.hub.has_chat(&record.id) && !self.saved_chats.contains_key(&record.id);
-                if let Some((path, modified)) = transcript {
-                    if !shown_live && self.saved_chats.get(&record.id) != Some(&modified) {
-                        to_read.push(TranscriptToRead {
-                            workspace_id: summary.id.clone(),
-                            chat_id: record.id.clone(),
-                            path,
-                            modified,
-                        });
-                    }
-                }
-                closed_chats.insert(record.id);
-            }
-            workspaces.push(TeamWorkspace {
-                pr_number: mnemonic_bridge::pr_number(&summary.id),
-                pr_state: mnemonic_bridge::pr_state(&summary.id),
-                changed_files: summary.changed_files.len() as u32,
-                additions: summary
-                    .changed_files
-                    .iter()
-                    .map(|file| file.additions)
-                    .sum(),
-                deletions: summary
-                    .changed_files
-                    .iter()
-                    .map(|file| file.deletions)
-                    .sum(),
-                agent_state: agent_state(&summary.id, agents, cx),
-                idle_seconds: mnemonic_bridge::last_agent_activity(&summary.id)
-                    .map(|at| at.elapsed().as_secs()),
-                chats,
-                step_in,
-                share_files,
-                edit_files: self.allows_file_edits(&summary.id),
-                remote_url: self.remote_urls.get(&summary.id).cloned().flatten(),
-                base_branch: Some(summary.branch_health.base_branch.trim().to_string())
-                    .filter(|base_branch| !base_branch.is_empty()),
-                skip_patterns: SkipList::default().patterns,
-                agents: agent_root.is_some(),
-                root_path: agent_root.map(|root| root.to_string_lossy().into_owned()),
-                id: summary.id,
-                project: summary.repo,
-                name: summary.name,
-                branch: summary.branch,
-            });
         }
         {
+            let hub = self.feed.read(cx).hub();
             let mut roots = lock_file_roots(&self.file_roots);
             for id in roots.keys().filter(|id| !file_roots.contains_key(*id)) {
-                self.hub.remove_file_manifest(id);
+                hub.remove_file_manifest(id);
             }
             *roots = file_roots;
         }
         *lock_agent_roots(&self.agent_roots) = agent_roots;
-        self.hub.set_workspaces(workspaces);
-        self.hub.set_step_in_chats(step_in_chats);
-        self.watch_chats(open_chats, &closed_chats, cx);
-        to_read
+        let flags = |workspace_id: &str| self.workspace_flags(workspace_id);
+        self.feed
+            .update(cx, |feed, cx| feed.publish(records, &flags, cx))
     }
 
-    /// Follows the loaded chats. Closed chats keep what they last showed,
-    /// but idle and with nothing to answer, and chats no longer shared are
-    /// dropped.
-    fn watch_chats(
-        &mut self,
-        open_chats: Vec<(String, Entity<AcpThread>)>,
-        closed_chats: &HashSet<String>,
-        cx: &mut Context<Self>,
-    ) {
-        let open_ids: HashSet<String> = open_chats.iter().map(|(id, _)| id.clone()).collect();
-        self.chat_watches.retain(|id, _| open_ids.contains(id));
-        self.saved_chats.retain(|id, _| closed_chats.contains(id));
-        self.hub
-            .retain_chats(|id| open_ids.contains(id) || closed_chats.contains(id));
-        for chat_id in closed_chats.difference(&open_ids) {
-            self.hub.set_chat_activity(chat_id, false, Vec::new());
-        }
-        for (chat_id, thread) in open_chats {
-            let watched = self
-                .chat_watches
-                .get(&chat_id)
-                .is_some_and(|watch| watch.thread_id == thread.entity_id());
-            if watched && self.hub.has_chat(&chat_id) {
-                // A step-in switch flipped since the last event changes what
-                // is shared without the thread saying anything.
-                self.publish_activity(&chat_id, thread.read(cx));
-                continue;
-            }
-            self.replace_chat(&chat_id, thread.read(cx), cx);
-            let subscription = cx.subscribe(&thread, {
-                let chat_id = chat_id.clone();
-                move |this, thread, event, cx| {
-                    this.publish_thread_event(&chat_id, &thread, event, cx);
-                }
-            });
-            self.chat_watches.insert(
-                chat_id,
-                ChatWatch {
-                    thread_id: thread.entity_id(),
-                    _subscription: subscription,
-                },
-            );
-        }
-    }
-
-    fn publish_thread_event(
-        &mut self,
-        chat_id: &str,
-        thread: &Entity<AcpThread>,
-        event: &AcpThreadEvent,
-        cx: &mut Context<Self>,
-    ) {
-        let thread = thread.read(cx);
-        let entries = thread.entries();
-        let published = match event {
-            AcpThreadEvent::NewEntry => entries.len().checked_sub(1).is_some_and(|index| {
-                self.hub
-                    .set_chat_entry(chat_id, index, team_entry(&entries[index], cx))
-            }),
-            AcpThreadEvent::EntryUpdated(index) => entries.get(*index).is_some_and(|entry| {
-                self.hub
-                    .set_chat_entry(chat_id, *index, team_entry(entry, cx))
-            }),
-            AcpThreadEvent::EntriesRemoved(_) => false,
-            // These can change a tool call's status without an entry
-            // update of their own, so every entry is re-checked. Unchanged
-            // entries cost a comparison and wake nobody.
-            AcpThreadEvent::ToolAuthorizationRequested(_)
-            | AcpThreadEvent::ToolAuthorizationReceived(_)
-            | AcpThreadEvent::Stopped(_)
-            | AcpThreadEvent::Error => {
-                entries.iter().enumerate().all(|(index, entry)| {
-                    self.hub
-                        .set_chat_entry(chat_id, index, team_entry(entry, cx))
-                }) && self.hub.chat_len(chat_id) == Some(entries.len())
-            }
-            _ => true,
-        };
-        // A plan update raises no thread event of its own, so the plan is
-        // re-checked on every event. An unchanged plan wakes nobody.
-        let published = published
-            && self.hub.set_chat_plan(chat_id, thread_plan(thread, cx))
-            && self.publish_activity(chat_id, thread);
-        if !published {
-            self.replace_chat(chat_id, thread, cx);
+    fn workspace_flags(&self, workspace_id: &str) -> WorkspaceFlags {
+        WorkspaceFlags {
+            step_in: self.allows_step_in(workspace_id),
+            share_files: self.shares_files(workspace_id),
+            edit_files: self.allows_file_edits(workspace_id),
+            agents: self.allows_agents(workspace_id),
+            remote_url: self.remote_urls.get(workspace_id).cloned().flatten(),
         }
     }
 
     /// Shares closed chats from the transcripts just read, unless meanwhile
     /// a chat was loaded or its workspace unshared.
-    fn share_saved_chats(&mut self, saved: Vec<(TranscriptToRead, Vec<TeamEntry>)>) {
+    fn share_saved_chats(
+        &mut self,
+        mut saved: Vec<(TranscriptToRead, Vec<TeamEntry>)>,
+        cx: &mut Context<Self>,
+    ) {
         if self.server.is_none() {
             return;
         }
-        for (transcript, entries) in saved {
-            let shown_live = self.hub.has_chat(&transcript.chat_id)
-                && !self.saved_chats.contains_key(&transcript.chat_id);
-            if shown_live
-                || self.chat_watches.contains_key(&transcript.chat_id)
-                || !self.shared_workspaces.contains(&transcript.workspace_id)
-            {
-                continue;
-            }
-            self.hub.replace_chat(&transcript.chat_id, entries);
-            self.saved_chats
-                .insert(transcript.chat_id, transcript.modified);
-        }
-    }
-
-    fn replace_chat(&self, chat_id: &str, thread: &AcpThread, cx: &App) {
-        self.hub.replace_chat(chat_id, thread_entries(thread, cx));
-        self.hub.set_chat_plan(chat_id, thread_plan(thread, cx));
-        self.publish_activity(chat_id, thread);
-    }
-
-    /// Shares whether a chat's agent is mid-turn and, when teammates may
-    /// step in, what it is waiting on. Returns false when the chat isn't
-    /// known.
-    fn publish_activity(&self, chat_id: &str, thread: &AcpThread) -> bool {
-        let permissions = if self.hub.allows_step_in(chat_id) {
-            thread_permissions(thread)
-        } else {
-            Vec::new()
-        };
-        self.hub.set_chat_activity(
-            chat_id,
-            thread.status() == ThreadStatus::Generating,
-            permissions,
-        )
+        saved.retain(|(transcript, _)| self.shared_workspaces.contains(&transcript.workspace_id));
+        self.feed
+            .update(cx, |feed, _| feed.share_saved_chats(saved));
     }
 
     fn connect_peers(&mut self, settings: &TeamSettings, cx: &mut Context<Self>) {
@@ -1197,11 +980,7 @@ fn start_server(
     if !me.login.is_empty() {
         allowed_logins.push(me.login.clone());
     }
-    let diff_source: DiffSource = Arc::new(|workspace_id: &str| {
-        let state = mnemonic_bridge::mnemonic_state_cloned()
-            .ok_or_else(|| "Mnemonic isn't ready".to_string())?;
-        git_review_service::get_workspace_full_diff(&state, workspace_id)
-    });
+    let diff_source = workspace_diff_source();
     // Runs on a request thread, which waits here while the main thread
     // carries the action out.
     let action_handler: ActionHandler = Arc::new(move |action| {
@@ -1306,10 +1085,18 @@ fn start_server(
     .map(|server| (server, me))
 }
 
+pub(crate) fn workspace_diff_source() -> DiffSource {
+    Arc::new(|workspace_id: &str| {
+        let state = mnemonic_bridge::mnemonic_state_cloned()
+            .ok_or_else(|| "Mnemonic isn't ready".to_string())?;
+        git_review_service::get_workspace_full_diff(&state, workspace_id)
+    })
+}
+
 /// Waits on a request thread for the main thread's answer. Once the main
 /// thread has claimed the work, it is waited for to the end, as it will run
 /// whatever the requester is told.
-fn wait_for_reply<T>(
+pub(crate) fn wait_for_reply<T>(
     reply_receiver: &std::sync::mpsc::Receiver<Result<T, TeamActionError>>,
     claimed: &AtomicBool,
     timeout: Duration,
@@ -1387,7 +1174,9 @@ async fn apply_teammate_batch(
         let team = team.upgrade()?;
         let team = team.read(cx);
         let workspace_name = team
-            .hub
+            .feed
+            .read(cx)
+            .hub()
             .workspaces()
             .into_iter()
             .find(|workspace| workspace.id == workspace_id)
@@ -1565,7 +1354,13 @@ fn run_action(
             let Some(thread) = chat.thread else {
                 return Err(TeamActionError::NotLoaded);
             };
-            let (tool_title, chosen) = answer_permission(&thread, tool_call_id, option_id, cx)?;
+            let (tool_title, chosen) = answer_permission(
+                &thread,
+                tool_call_id,
+                option_id,
+                PermissionScope::StepInOnceOnly,
+                cx,
+            )?;
             let answer = match chosen {
                 acp::PermissionOptionKind::RejectOnce | acp::PermissionOptionKind::RejectAlways => {
                     "rejected"
@@ -1644,28 +1439,67 @@ pub(crate) fn once_only_options(options: &PermissionOptions) -> Vec<acp::Permiss
     offered
 }
 
-/// Only requests for permission are shared. An action choice, such as
-/// saving or discarding a file's unsaved changes, is the owner's to make.
-fn thread_permissions(thread: &AcpThread) -> Vec<TeamPermissionRequest> {
+/// Every option the agent offers, a dropdown contributing each choice's
+/// allow and deny.
+fn all_options(options: &PermissionOptions) -> Vec<acp::PermissionOption> {
+    let choices = match options {
+        PermissionOptions::Flat(options) => return options.clone(),
+        PermissionOptions::Dropdown(choices)
+        | PermissionOptions::DropdownWithPatterns { choices, .. } => choices,
+    };
+    let mut offered: Vec<acp::PermissionOption> = Vec::new();
+    for choice in choices {
+        for (verb, option) in [("Allow", &choice.allow), ("Deny", &choice.deny)] {
+            if offered
+                .iter()
+                .any(|offered| offered.option_id == option.option_id)
+            {
+                continue;
+            }
+            let mut option = option.clone();
+            // A choice's allow and deny carry the choice's name, so both
+            // would show as the same button.
+            option.name = format!("{verb}: {}", option.name);
+            offered.push(option);
+        }
+    }
+    offered
+}
+
+/// Only requests for permission are shared with teammates. An action
+/// choice, such as saving or discarding a file's unsaved changes, is the
+/// owner's to make: with `All` it is listed without options, since the
+/// wire can't otherwise tell a tool call waiting on the Mac from one that
+/// hasn't started, and the phone shows it as one to answer on the Mac.
+pub(crate) fn thread_permissions(
+    thread: &AcpThread,
+    scope: PermissionScope,
+) -> Vec<TeamPermissionRequest> {
     thread
         .entries()
         .iter()
         .filter_map(|entry| {
             let AgentThreadEntry::ToolCall(ToolCall {
                 id,
-                status:
-                    ToolCallStatus::WaitingForConfirmation {
-                        options,
-                        kind: AuthorizationKind::PermissionGrant,
-                        ..
-                    },
+                status: ToolCallStatus::WaitingForConfirmation { options, kind, .. },
                 ..
             }) = entry
             else {
                 return None;
             };
-            let options = once_only_options(options);
-            (!options.is_empty()).then(|| TeamPermissionRequest {
+            let options = match (scope, kind) {
+                (PermissionScope::StepInOnceOnly, AuthorizationKind::PermissionGrant) => {
+                    let options = once_only_options(options);
+                    if options.is_empty() {
+                        return None;
+                    }
+                    options
+                }
+                (PermissionScope::StepInOnceOnly, AuthorizationKind::ActionChoice) => return None,
+                (PermissionScope::All, AuthorizationKind::PermissionGrant) => all_options(options),
+                (PermissionScope::All, AuthorizationKind::ActionChoice) => Vec::new(),
+            };
+            Some(TeamPermissionRequest {
                 tool_call_id: id.0.to_string(),
                 options,
             })
@@ -1673,16 +1507,17 @@ fn thread_permissions(thread: &AcpThread) -> Vec<TeamPermissionRequest> {
         .collect()
 }
 
-/// Answers a waiting permission request with an option it offers
-/// teammates, and returns the tool call's title and the kind of answer.
-fn answer_permission(
+/// Answers a waiting permission request with an option `scope` offers, and
+/// returns the tool call's title and the kind of answer.
+pub(crate) fn answer_permission(
     thread: &Entity<AcpThread>,
     tool_call_id: &str,
     option_id: &str,
+    scope: PermissionScope,
     cx: &mut App,
 ) -> Result<(String, acp::PermissionOptionKind), TeamActionError> {
     let tool_call_id = acp::ToolCallId::new(tool_call_id.to_string());
-    let (option, title) = {
+    let (outcome, title) = {
         let thread = thread.read(cx);
         let no_longer_waiting =
             || TeamActionError::NothingToDo("The permission request is no longer waiting".into());
@@ -1693,29 +1528,61 @@ fn answer_permission(
             return Err(no_longer_waiting());
         };
         if *kind != AuthorizationKind::PermissionGrant {
-            return Err(TeamActionError::NotAllowed(
-                "Only the owner can answer this".into(),
-            ));
+            return Err(TeamActionError::NotAllowed(match scope {
+                PermissionScope::StepInOnceOnly => "Only the owner can answer this".into(),
+                PermissionScope::All => "Answer this on the Mac".into(),
+            }));
         }
-        let Some(option) = once_only_options(options)
-            .into_iter()
-            .find(|option| option.option_id.0.as_ref() == option_id)
-        else {
-            return Err(TeamActionError::NotAllowed(
-                "That answer isn't offered to teammates".into(),
-            ));
+        let outcome = match scope {
+            PermissionScope::StepInOnceOnly => once_only_options(options)
+                .into_iter()
+                .find(|option| option.option_id.0.as_ref() == option_id)
+                .map(|option| SelectedPermissionOutcome::new(option.option_id, option.kind)),
+            PermissionScope::All => outcome_for_option(options, option_id),
         };
-        (option, tool_call_title(tool_call, cx))
+        let Some(outcome) = outcome else {
+            return Err(TeamActionError::NotAllowed(match scope {
+                PermissionScope::StepInOnceOnly => "That answer isn't offered to teammates".into(),
+                PermissionScope::All => "That answer isn't offered".into(),
+            }));
+        };
+        (outcome, tool_call_title(tool_call, cx))
     };
-    let chosen = option.kind;
+    let chosen = outcome.option_kind;
     thread.update(cx, |thread, cx| {
-        thread.authorize_tool_call(
-            tool_call_id,
-            SelectedPermissionOutcome::new(option.option_id, option.kind),
-            cx,
-        )
+        thread.authorize_tool_call(tool_call_id, outcome, cx)
     });
     Ok((title, chosen))
+}
+
+/// The answer the Mac would give for the option offered as `option_id`. A
+/// dropdown's choice is built the way its own dropdown builds it, from the
+/// first choice holding that option, the one `all_options` offers.
+fn outcome_for_option(
+    options: &PermissionOptions,
+    option_id: &str,
+) -> Option<SelectedPermissionOutcome> {
+    let choices = match options {
+        PermissionOptions::Flat(options) => {
+            return options
+                .iter()
+                .find(|option| option.option_id.0.as_ref() == option_id)
+                .map(|option| {
+                    SelectedPermissionOutcome::new(option.option_id.clone(), option.kind)
+                });
+        }
+        PermissionOptions::Dropdown(choices)
+        | PermissionOptions::DropdownWithPatterns { choices, .. } => choices,
+    };
+    choices.iter().find_map(|choice| {
+        if choice.allow.option_id.0.as_ref() == option_id {
+            Some(choice.build_outcome(true))
+        } else if choice.deny.option_id.0.as_ref() == option_id {
+            Some(choice.build_outcome(false))
+        } else {
+            None
+        }
+    })
 }
 
 pub(crate) fn workspace_root(summary: &WorkspaceSummary) -> Option<PathBuf> {
@@ -1742,51 +1609,7 @@ async fn origin_remote(root: &Path) -> Option<String> {
     Some(normalize_remote_url(&url)).filter(|url| !url.is_empty())
 }
 
-fn load_shared_records(
-    state: &mnemonic_core::state::AppState,
-    shared_ids: &HashSet<String>,
-) -> Result<SharedRecords, String> {
-    workspace_service::list_workspaces(state)?
-        .into_iter()
-        .filter(|summary| shared_ids.contains(&summary.id))
-        .map(|summary| {
-            let chats = chat_session_repository::list_for_workspace(&state.db, &summary.id)?
-                .into_iter()
-                .map(|record| {
-                    let transcript = chat_transcript_service::saved_transcript_file(
-                        state,
-                        &summary.id,
-                        &record.id,
-                    );
-                    (record, transcript)
-                })
-                .collect();
-            Ok((summary, chats))
-        })
-        .collect()
-}
-
-fn read_saved_transcripts(
-    to_read: Vec<TranscriptToRead>,
-) -> Vec<(TranscriptToRead, Vec<TeamEntry>)> {
-    to_read
-        .into_iter()
-        .filter_map(
-            |transcript| match std::fs::read_to_string(&transcript.path) {
-                Ok(markdown) => {
-                    let entries = saved_chat_entries(&markdown);
-                    Some((transcript, entries))
-                }
-                Err(err) => {
-                    log::warn!("Couldn't read {}: {err}", transcript.path.display());
-                    None
-                }
-            },
-        )
-        .collect()
-}
-
-fn agent_state(
+pub(crate) fn agent_state(
     workspace_id: &str,
     agents: Option<&LiveWorkspaceAgents>,
     cx: &App,
@@ -1823,7 +1646,7 @@ fn agent_state(
     }
 }
 
-fn thread_entries(thread: &AcpThread, cx: &App) -> Vec<TeamEntry> {
+pub(crate) fn thread_entries(thread: &AcpThread, cx: &App) -> Vec<TeamEntry> {
     thread
         .entries()
         .iter()
@@ -1831,7 +1654,7 @@ fn thread_entries(thread: &AcpThread, cx: &App) -> Vec<TeamEntry> {
         .collect()
 }
 
-fn thread_plan(thread: &AcpThread, cx: &App) -> Vec<acp::PlanEntry> {
+pub(crate) fn thread_plan(thread: &AcpThread, cx: &App) -> Vec<acp::PlanEntry> {
     thread
         .plan()
         .entries
@@ -2384,24 +2207,14 @@ pub(crate) fn render_agent_state(id: &str, state: TeamAgentState, cx: &App) -> A
 #[cfg(test)]
 mod tests {
     use super::*;
-    use acp_thread::{
-        AgentConnection as _, AuthorizationKind, PermissionOptions, RequestPermissionOutcome,
-        StubAgentConnection,
+    use crate::chat_feed::test_support::{
+        allow_always_and_once_options, is_waiting, new_thread, save_or_discard_options,
+        thread_waiting_on,
     };
+    use PermissionScope::StepInOnceOnly;
+    use acp_thread::{AuthorizationKind, PermissionOptions};
     use gpui::TestAppContext;
-    use project::{FakeFs, Project};
     use settings::SettingsStore;
-    use std::rc::Rc;
-    use util::path_list::PathList;
-
-    async fn new_thread(cx: &mut TestAppContext) -> Entity<AcpThread> {
-        let fs = FakeFs::new(cx.executor());
-        let project = Project::test(fs, [], cx).await;
-        let connection = Rc::new(StubAgentConnection::new());
-        cx.update(|cx| connection.new_session(project, PathList::default(), cx))
-            .await
-            .expect("the stub connection starts a session")
-    }
 
     #[gpui::test]
     async fn team_entries_rebuild_the_same_thread(cx: &mut TestAppContext) {
@@ -2469,76 +2282,6 @@ mod tests {
         assert_eq!(mirror_markdown, shared_markdown);
     }
 
-    /// A thread with one tool call waiting on `options`, and the task that
-    /// receives the answer, which must be kept for the request to stay open.
-    async fn thread_waiting_on(
-        options: PermissionOptions,
-        kind: AuthorizationKind,
-        cx: &mut TestAppContext,
-    ) -> (Entity<AcpThread>, Task<RequestPermissionOutcome>) {
-        cx.update(|cx| {
-            let settings_store = SettingsStore::test(cx);
-            cx.set_global(settings_store);
-        });
-        let thread = new_thread(cx).await;
-        let tool_call_id = acp::ToolCallId::new("run-tests");
-        thread
-            .update(cx, |thread, cx| {
-                thread.handle_session_update(
-                    acp::SessionUpdate::ToolCall(
-                        acp::ToolCall::new(tool_call_id.clone(), "Run the tests")
-                            .kind(acp::ToolKind::Execute),
-                    ),
-                    cx,
-                )
-            })
-            .expect("the thread takes the tool call");
-        let answer = thread
-            .update(cx, |thread, cx| {
-                thread.request_tool_call_authorization(
-                    acp::ToolCallUpdate::new(tool_call_id, acp::ToolCallUpdateFields::new()),
-                    options,
-                    kind,
-                    cx,
-                )
-            })
-            .expect("the thread asks for permission");
-        (thread, answer)
-    }
-
-    /// The choice an agent offers before editing a file with unsaved changes.
-    fn save_or_discard_options() -> PermissionOptions {
-        PermissionOptions::Flat(vec![
-            acp::PermissionOption::new("save", "Save", acp::PermissionOptionKind::AllowOnce),
-            acp::PermissionOption::new("discard", "Discard", acp::PermissionOptionKind::RejectOnce),
-        ])
-    }
-
-    fn allow_always_and_once_options() -> PermissionOptions {
-        PermissionOptions::Flat(vec![
-            acp::PermissionOption::new("allow", "Allow", acp::PermissionOptionKind::AllowOnce),
-            acp::PermissionOption::new(
-                "always",
-                "Always allow",
-                acp::PermissionOptionKind::AllowAlways,
-            ),
-            acp::PermissionOption::new("reject", "Reject", acp::PermissionOptionKind::RejectOnce),
-        ])
-    }
-
-    fn is_waiting(thread: &Entity<AcpThread>, cx: &mut TestAppContext) -> bool {
-        thread.read_with(cx, |thread, _| {
-            thread
-                .tool_call(&acp::ToolCallId::new("run-tests"))
-                .is_some_and(|(_, tool_call)| {
-                    matches!(
-                        tool_call.status,
-                        ToolCallStatus::WaitingForConfirmation { .. }
-                    )
-                })
-        })
-    }
-
     #[gpui::test]
     async fn only_once_only_options_are_offered_to_teammates(cx: &mut TestAppContext) {
         let (thread, _answer) = thread_waiting_on(
@@ -2547,7 +2290,9 @@ mod tests {
             cx,
         )
         .await;
-        let requests = thread.read_with(cx, |thread, _| thread_permissions(thread));
+        let requests = thread.read_with(cx, |thread, _| {
+            thread_permissions(thread, PermissionScope::StepInOnceOnly)
+        });
         let offered: Vec<Vec<String>> = requests
             .iter()
             .map(|request| {
@@ -2574,7 +2319,9 @@ mod tests {
             cx,
         )
         .await;
-        let requests = always_only.read_with(cx, |thread, _| thread_permissions(thread));
+        let requests = always_only.read_with(cx, |thread, _| {
+            thread_permissions(thread, PermissionScope::StepInOnceOnly)
+        });
         assert!(requests.is_empty());
 
         let (dirty_buffer, _answer) = thread_waiting_on(
@@ -2583,7 +2330,9 @@ mod tests {
             cx,
         )
         .await;
-        let requests = dirty_buffer.read_with(cx, |thread, _| thread_permissions(thread));
+        let requests = dirty_buffer.read_with(cx, |thread, _| {
+            thread_permissions(thread, PermissionScope::StepInOnceOnly)
+        });
         assert!(requests.is_empty());
     }
 
@@ -2597,7 +2346,9 @@ mod tests {
         .await;
 
         for option_id in ["always", "never-offered"] {
-            let answered = cx.update(|cx| answer_permission(&thread, "run-tests", option_id, cx));
+            let answered = cx.update(|cx| {
+                answer_permission(&thread, "run-tests", option_id, StepInOnceOnly, cx)
+            });
             assert!(
                 matches!(answered, Err(TeamActionError::NotAllowed(_))),
                 "{option_id} gave {answered:?}"
@@ -2605,7 +2356,8 @@ mod tests {
             assert!(is_waiting(&thread, cx));
         }
 
-        let answered = cx.update(|cx| answer_permission(&thread, "run-tests", "allow", cx));
+        let answered =
+            cx.update(|cx| answer_permission(&thread, "run-tests", "allow", StepInOnceOnly, cx));
         assert_eq!(
             answered,
             Ok((
@@ -2615,7 +2367,8 @@ mod tests {
         );
         assert!(!is_waiting(&thread, cx));
 
-        let answered = cx.update(|cx| answer_permission(&thread, "run-tests", "allow", cx));
+        let answered =
+            cx.update(|cx| answer_permission(&thread, "run-tests", "allow", StepInOnceOnly, cx));
         assert!(matches!(answered, Err(TeamActionError::NothingToDo(_))));
 
         let (dirty_buffer, _answer) = thread_waiting_on(
@@ -2624,7 +2377,9 @@ mod tests {
             cx,
         )
         .await;
-        let answered = cx.update(|cx| answer_permission(&dirty_buffer, "run-tests", "discard", cx));
+        let answered = cx.update(|cx| {
+            answer_permission(&dirty_buffer, "run-tests", "discard", StepInOnceOnly, cx)
+        });
         assert!(
             matches!(answered, Err(TeamActionError::NotAllowed(_))),
             "discard gave {answered:?}"
@@ -2634,7 +2389,7 @@ mod tests {
 
     #[gpui::test]
     async fn sharing_turns_on_step_in_files_and_edits(cx: &mut TestAppContext) {
-        let team = cx.new(|_| TeamShare::new());
+        let team = cx.new(TeamShare::new);
         team.update(cx, |team, cx| {
             team.set_workspace_shared("workspace", true, cx);
             assert!(team.allows_step_in("workspace"));
@@ -2645,7 +2400,7 @@ mod tests {
 
     #[gpui::test]
     async fn unsharing_takes_the_folder_and_files_from_the_server(cx: &mut TestAppContext) {
-        let team = cx.new(|_| TeamShare::new());
+        let team = cx.new(TeamShare::new);
         team.update(cx, |team, cx| {
             team.set_workspace_shared("workspace", true, cx);
             assert!(team.allows_agents("workspace"));

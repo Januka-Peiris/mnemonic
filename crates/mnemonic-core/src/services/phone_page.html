@@ -1,0 +1,978 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>Mnemonic</title>
+<style>
+:root {
+  --background: #ffffff;
+  --surface: #f3f4f6;
+  --border: #d9dce1;
+  --text: #1c1e21;
+  --muted: #6b7280;
+  --accent: #2563eb;
+  --accent-text: #ffffff;
+  --attention: #b45309;
+  --error: #b91c1c;
+  --working: #047857;
+  --code: #eef0f3;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --background: #16181c;
+    --surface: #202328;
+    --border: #353a42;
+    --text: #e6e8eb;
+    --muted: #9aa1ab;
+    --accent: #4f8cff;
+    --accent-text: #ffffff;
+    --attention: #f59e0b;
+    --error: #f87171;
+    --working: #34d399;
+    --code: #262a30;
+  }
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; height: 100%; }
+body {
+  background: var(--background);
+  color: var(--text);
+  font: 15px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  display: flex;
+  flex-direction: column;
+}
+button {
+  font: inherit;
+  color: var(--text);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px 12px;
+}
+button:disabled { opacity: 0.5; }
+button.primary { background: var(--accent); color: var(--accent-text); border-color: var(--accent); }
+header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--border);
+  position: sticky;
+  top: 0;
+  background: var(--background);
+  z-index: 2;
+}
+header h1 {
+  flex: 1;
+  margin: 0;
+  font-size: 17px;
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+#banner {
+  display: none;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 10px 12px;
+  background: var(--error);
+  color: #ffffff;
+}
+#banner.shown { display: flex; }
+#banner-text { flex: 1; white-space: pre-wrap; word-break: break-word; }
+#banner button { background: transparent; color: #ffffff; border-color: #ffffff; padding: 2px 10px; }
+main { flex: 1; overflow-y: auto; -webkit-overflow-scrolling: touch; }
+.hidden { display: none !important; }
+.muted { color: var(--muted); }
+.workspace { border-bottom: 1px solid var(--border); }
+.workspace-row {
+  display: block;
+  width: 100%;
+  text-align: left;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  padding: 10px 12px;
+}
+.workspace-line { display: flex; gap: 8px; align-items: baseline; }
+.workspace-name { flex: 1; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.marker { width: 1em; font-weight: 700; }
+.state-waiting_for_approval { color: var(--attention); }
+.state-error { color: var(--error); }
+.state-working { color: var(--working); }
+.state-idle { color: var(--muted); }
+.workspace-details { font-size: 13px; color: var(--muted); padding-left: calc(1em + 8px); }
+.chat-list { padding: 0 12px 10px calc(1em + 20px); display: flex; flex-direction: column; gap: 6px; }
+.chat-list button { text-align: left; }
+.empty { padding: 24px 12px; color: var(--muted); text-align: center; }
+#transcript { padding: 8px 12px; }
+.message { margin: 10px 0; word-break: break-word; }
+.message .who { font-size: 12px; font-weight: 600; color: var(--muted); }
+.message.user .body { background: var(--surface); border-radius: 10px; padding: 8px 10px; white-space: pre-wrap; }
+.message p { margin: 6px 0; white-space: pre-wrap; }
+.message pre, #diff-text {
+  background: var(--code);
+  border-radius: 6px;
+  padding: 8px;
+  overflow-x: auto;
+  font: 12px/1.4 ui-monospace, Menlo, Consolas, monospace;
+  white-space: pre;
+}
+.message code { background: var(--code); border-radius: 4px; padding: 0 3px; font: 13px ui-monospace, Menlo, Consolas, monospace; }
+.message pre code { background: transparent; padding: 0; font: inherit; }
+.message a { color: var(--accent); }
+details.thought { margin: 6px 0; color: var(--muted); }
+details.thought summary { font-size: 13px; }
+.tool { margin: 4px 0; display: flex; gap: 8px; font-size: 13px; align-items: baseline; }
+.tool-kind { color: var(--muted); }
+.tool-title { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: ui-monospace, Menlo, Consolas, monospace; }
+.tool-status { color: var(--muted); }
+.tool-status.waiting { color: var(--attention); font-weight: 600; }
+.tool-status.failed { color: var(--error); }
+.tool-status.running { color: var(--working); }
+.prompt {
+  border: 1px solid var(--attention);
+  border-radius: 10px;
+  padding: 10px;
+  margin: 6px 0 10px;
+}
+.prompt-title { font-weight: 600; margin-bottom: 8px; word-break: break-word; }
+.prompt-options { display: flex; flex-wrap: wrap; gap: 8px; }
+.note { font-size: 13px; color: var(--muted); margin: 8px 0; }
+.plan { margin: 8px 0; padding: 8px 10px; background: var(--surface); border-radius: 10px; font-size: 13px; }
+.plan-title { font-weight: 600; margin-bottom: 4px; }
+.plan-entry { display: flex; gap: 6px; }
+.plan-entry.completed { color: var(--muted); text-decoration: line-through; }
+#chat-status { padding: 0 12px 8px; font-size: 13px; color: var(--muted); }
+footer { border-top: 1px solid var(--border); padding: 8px 12px calc(8px + env(safe-area-inset-bottom)); background: var(--background); }
+.composer { display: flex; gap: 8px; align-items: flex-end; }
+.composer textarea {
+  flex: 1;
+  font: inherit;
+  color: var(--text);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px;
+  resize: none;
+  min-height: 40px;
+  max-height: 160px;
+}
+.toolbar { display: flex; gap: 8px; margin-top: 8px; }
+.toolbar button { flex: 1; }
+.sheet {
+  position: fixed;
+  inset: 0;
+  background: var(--background);
+  z-index: 5;
+  display: flex;
+  flex-direction: column;
+}
+.sheet-body { flex: 1; overflow: auto; padding: 12px; }
+.sheet-body button { display: block; width: 100%; margin-bottom: 8px; text-align: left; }
+#diff-text { margin: 0; min-height: 100%; }
+</style>
+</head>
+<body>
+<header>
+  <button id="back" class="hidden" aria-label="Back to workspaces">&lt;</button>
+  <h1 id="title">Workspaces</h1>
+  <button id="refresh">Refresh</button>
+</header>
+<div id="banner" role="alert">
+  <div id="banner-text"></div>
+  <button id="banner-close" aria-label="Dismiss">x</button>
+</div>
+<main id="list-view"><div id="workspaces"><div class="empty">Loading...</div></div></main>
+<main id="chat-view" class="hidden">
+  <div id="transcript"></div>
+  <div id="prompts"></div>
+  <div id="plan"></div>
+  <div id="chat-status"></div>
+</main>
+<footer id="chat-footer" class="hidden">
+  <div class="composer">
+    <textarea id="message" rows="1" placeholder="Message..."></textarea>
+    <button id="send" class="primary">Send</button>
+  </div>
+  <div class="toolbar">
+    <button id="stop">Stop</button>
+    <button id="diff">Diff</button>
+    <button id="new-chat">New chat</button>
+  </div>
+</footer>
+<div id="diff-sheet" class="sheet hidden">
+  <header>
+    <h1>Diff</h1>
+    <button id="diff-close">Close</button>
+  </header>
+  <div class="sheet-body"><pre id="diff-text"></pre></div>
+</div>
+<div id="agent-sheet" class="sheet hidden">
+  <header>
+    <h1>New chat</h1>
+    <button id="agent-close">Close</button>
+  </header>
+  <div class="sheet-body" id="agent-list"></div>
+</div>
+<script>
+"use strict";
+
+const PHONE_HEADER = "X-Mnemonic-Phone";
+const WORKSPACE_POLL_MS = 5000;
+const CHAT_WAIT_SECONDS = 25;
+const FIRST_RETRY_MS = 2000;
+const LONGEST_RETRY_MS = 15000;
+const ATTENTION_ORDER = { waiting_for_approval: 0, error: 1, working: 2, idle: 3 };
+const STATE_MARKERS = { waiting_for_approval: "!", error: "x", working: "*", idle: "" };
+const TOOL_STATUS_LABELS = { pending: "pending", in_progress: "running", completed: "done", failed: "failed" };
+const PLAN_MARKERS = { pending: "[ ]", in_progress: "[~]", completed: "[x]" };
+
+const element = (id) => document.getElementById(id);
+
+function make(tag, className, text) {
+  const node = document.createElement(tag);
+  if (className) node.className = className;
+  if (text !== undefined) node.textContent = text;
+  return node;
+}
+
+class RequestError extends Error {}
+
+async function readError(response) {
+  const text = (await response.text()).trim();
+  return new RequestError(text || "The Mac answered " + response.status);
+}
+
+async function getJson(path, signal) {
+  const response = await fetch(path, { cache: "no-store", signal });
+  if (!response.ok) {
+    const error = await readError(response);
+    error.status = response.status;
+    throw error;
+  }
+  return response.json();
+}
+
+async function post(path, body) {
+  const response = await fetch(path, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", [PHONE_HEADER]: "1" },
+    body: JSON.stringify(body),
+  });
+  if (!response.ok) {
+    const error = await readError(response);
+    error.status = response.status;
+    throw error;
+  }
+  return response.json();
+}
+
+function showError(error) {
+  const message = error instanceof RequestError ? error.message : "Couldn't reach the Mac: " + error.message;
+  element("banner-text").textContent = message;
+  element("banner").classList.add("shown");
+}
+
+function hideError() {
+  element("banner").classList.remove("shown");
+}
+
+function delay(milliseconds, signal) {
+  return new Promise((resolve) => {
+    const timer = setTimeout(resolve, milliseconds);
+    if (signal) {
+      signal.addEventListener("abort", () => {
+        clearTimeout(timer);
+        resolve();
+      }, { once: true });
+    }
+  });
+}
+
+function nextRetry(previous) {
+  return previous ? Math.min(previous * 2, LONGEST_RETRY_MS) : FIRST_RETRY_MS;
+}
+
+function isWebUrl(text) {
+  try {
+    const url = new URL(text);
+    return url.protocol === "http:" || url.protocol === "https:";
+  } catch (error) {
+    return false;
+  }
+}
+
+// Light markdown, built only from DOM nodes and textContent, so nothing the
+// agent writes is ever read as HTML. It makes p, pre, code, strong and a.
+const INLINE_PATTERN = /`([^`\n]+)`|\*\*([^*\n](?:[^\n]*?[^*\n])?)\*\*|\[([^\]\n]+)\]\(([^)\s]+)\)|(https?:\/\/[^\s<>()]+)/g;
+
+function appendInline(parent, text) {
+  let position = 0;
+  const matches = Array.from(text.matchAll(INLINE_PATTERN));
+  for (const match of matches) {
+    if (match.index > position) {
+      parent.appendChild(document.createTextNode(text.slice(position, match.index)));
+    }
+    const [whole, code, bold, linkText, linkUrl, bareUrl] = match;
+    if (code !== undefined) {
+      parent.appendChild(make("code", "", code));
+    } else if (bold !== undefined) {
+      const strong = make("strong");
+      appendInline(strong, bold);
+      parent.appendChild(strong);
+    } else if (linkText !== undefined) {
+      if (isWebUrl(linkUrl)) {
+        parent.appendChild(makeLink(linkText, linkUrl));
+      } else {
+        parent.appendChild(document.createTextNode(whole));
+      }
+    } else {
+      const trimmed = bareUrl.replace(/[.,;:!?'"]+$/, "");
+      if (isWebUrl(trimmed)) {
+        parent.appendChild(makeLink(trimmed, trimmed));
+      } else {
+        parent.appendChild(document.createTextNode(trimmed));
+      }
+      if (trimmed.length < bareUrl.length) {
+        parent.appendChild(document.createTextNode(bareUrl.slice(trimmed.length)));
+      }
+    }
+    position = match.index + whole.length;
+  }
+  if (position < text.length) {
+    parent.appendChild(document.createTextNode(text.slice(position)));
+  }
+}
+
+function makeLink(text, url) {
+  const link = make("a", "", text);
+  link.href = url;
+  link.target = "_blank";
+  link.rel = "noopener noreferrer";
+  return link;
+}
+
+function renderMarkdown(text) {
+  const container = make("div", "body");
+  const lines = text.split("\n");
+  let paragraph = [];
+  const flushParagraph = () => {
+    if (paragraph.length) {
+      const node = make("p");
+      appendInline(node, paragraph.join("\n"));
+      container.appendChild(node);
+      paragraph = [];
+    }
+  };
+  for (let index = 0; index < lines.length; index++) {
+    const line = lines[index];
+    const fence = line.match(/^ {0,3}(```+|~~~+)/);
+    if (fence) {
+      flushParagraph();
+      const code = [];
+      index++;
+      while (index < lines.length && !lines[index].trimStart().startsWith(fence[1])) {
+        code.push(lines[index]);
+        index++;
+      }
+      const pre = make("pre");
+      pre.appendChild(make("code", "", code.join("\n")));
+      container.appendChild(pre);
+    } else if (line.trim() === "") {
+      flushParagraph();
+    } else {
+      paragraph.push(line);
+    }
+  }
+  flushParagraph();
+  return container;
+}
+
+function formatIdle(seconds) {
+  if (seconds === null || seconds === undefined) return "idle";
+  if (seconds < 60) return "idle now";
+  if (seconds < 3600) return "idle " + Math.floor(seconds / 60) + "m";
+  if (seconds < 86400) return "idle " + Math.floor(seconds / 3600) + "h";
+  return "idle " + Math.floor(seconds / 86400) + "d";
+}
+
+function stateLabel(workspace) {
+  switch (workspace.agent_state) {
+    case "waiting_for_approval": return "needs you";
+    case "error": return "error";
+    case "working": return "working";
+    default: return formatIdle(workspace.idle_seconds);
+  }
+}
+
+const app = {
+  workspaces: [],
+  workspacesLoaded: false,
+  expanded: new Set(),
+  agents: null,
+  chat: null,
+};
+
+function findChat(chatId) {
+  for (const workspace of app.workspaces) {
+    for (const chat of workspace.chats || []) {
+      if (chat.id === chatId) return { workspace, chat };
+    }
+  }
+  return null;
+}
+
+async function loadWorkspaces() {
+  try {
+    const list = await getJson("/v1/workspaces");
+    app.workspaces = list.workspaces || [];
+    app.workspacesLoaded = true;
+    renderWorkspaces();
+    renderChatHeader();
+  } catch (error) {
+    showError(error);
+  }
+}
+
+async function pollWorkspaces() {
+  for (;;) {
+    if (document.visibilityState === "visible") {
+      await loadWorkspaces();
+    }
+    await delay(WORKSPACE_POLL_MS);
+  }
+}
+
+function renderWorkspaces() {
+  const container = element("workspaces");
+  container.replaceChildren();
+  if (!app.workspaces.length) {
+    container.appendChild(make("div", "empty", "No workspaces"));
+    return;
+  }
+  const sorted = app.workspaces
+    .map((workspace, index) => ({ workspace, index }))
+    .sort((left, right) => {
+      const leftRank = ATTENTION_ORDER[left.workspace.agent_state] ?? 3;
+      const rightRank = ATTENTION_ORDER[right.workspace.agent_state] ?? 3;
+      return leftRank - rightRank || left.index - right.index;
+    })
+    .map((item) => item.workspace);
+  for (const workspace of sorted) {
+    container.appendChild(renderWorkspace(workspace));
+  }
+}
+
+function renderWorkspace(workspace) {
+  const state = workspace.agent_state || "idle";
+  const wrapper = make("div", "workspace");
+  const row = make("button", "workspace-row");
+  const line = make("div", "workspace-line");
+  line.appendChild(make("span", "marker state-" + state, STATE_MARKERS[state] || ""));
+  line.appendChild(make("span", "workspace-name", workspace.name));
+  line.appendChild(make("span", "state-" + state, stateLabel(workspace)));
+  if (workspace.pr_number !== null && workspace.pr_number !== undefined) {
+    line.appendChild(make("span", "muted", "PR #" + workspace.pr_number + (workspace.pr_state ? " " + workspace.pr_state : "")));
+  }
+  row.appendChild(line);
+  const chats = workspace.chats || [];
+  const details = [];
+  if (workspace.additions || workspace.deletions) {
+    details.push("+" + workspace.additions + " -" + workspace.deletions);
+  }
+  details.push(chats.length === 1 ? "1 chat" : chats.length + " chats");
+  if (workspace.branch) details.push(workspace.branch);
+  row.appendChild(make("div", "workspace-details", details.join("   ")));
+  row.addEventListener("click", () => {
+    if (app.expanded.has(workspace.id)) {
+      app.expanded.delete(workspace.id);
+    } else {
+      app.expanded.add(workspace.id);
+    }
+    renderWorkspaces();
+  });
+  wrapper.appendChild(row);
+  if (app.expanded.has(workspace.id)) {
+    const list = make("div", "chat-list");
+    for (const chat of chats) {
+      const button = make("button", "", chat.title || "Untitled chat");
+      const suffix = [chat.agent, chat.live ? "" : chat.open ? "saved" : "not open"].filter(Boolean).join(", ");
+      if (suffix) {
+        button.appendChild(make("span", "muted", "  " + suffix));
+      }
+      button.disabled = !chat.open;
+      button.addEventListener("click", () => openChat(chat.id));
+      list.appendChild(button);
+    }
+    const newChat = make("button", "", "New chat");
+    newChat.addEventListener("click", () => chooseAgent(workspace.id));
+    list.appendChild(newChat);
+    wrapper.appendChild(list);
+  }
+  return wrapper;
+}
+
+function openChat(chatId) {
+  location.hash = "chat=" + encodeURIComponent(chatId);
+}
+
+function chatIdFromHash() {
+  const match = location.hash.match(/^#chat=(.+)$/);
+  if (!match) return null;
+  try {
+    return decodeURIComponent(match[1]);
+  } catch (error) {
+    return null;
+  }
+}
+
+function route() {
+  const chatId = chatIdFromHash();
+  if (app.chat && app.chat.id !== chatId) {
+    app.chat.abort.abort();
+    app.chat = null;
+  }
+  const inChat = chatId !== null;
+  element("list-view").classList.toggle("hidden", inChat);
+  element("chat-view").classList.toggle("hidden", !inChat);
+  element("chat-footer").classList.toggle("hidden", !inChat);
+  element("back").classList.toggle("hidden", !inChat);
+  element("refresh").classList.toggle("hidden", inChat);
+  if (!inChat) {
+    element("title").textContent = "Workspaces";
+    return;
+  }
+  if (!app.chat) {
+    startChat(chatId);
+  }
+  renderChatHeader();
+}
+
+function startChat(chatId) {
+  app.chat = {
+    id: chatId,
+    abort: new AbortController(),
+    cursor: null,
+    entries: [],
+    nodes: [],
+    toolIndexes: new Map(),
+    permissions: new Map(),
+    generating: false,
+    plan: [],
+  };
+  element("transcript").replaceChildren();
+  element("prompts").replaceChildren();
+  element("plan").replaceChildren();
+  element("chat-status").textContent = "Loading...";
+  element("message").value = "";
+  element("stop").disabled = true;
+  followChat(app.chat);
+}
+
+function renderChatHeader() {
+  if (!app.chat) return;
+  const found = findChat(app.chat.id);
+  element("title").textContent = found
+    ? found.workspace.name + " / " + (found.chat.title || "Untitled chat")
+    : "Chat";
+}
+
+async function followChat(chat) {
+  let retry = 0;
+  while (!chat.abort.signal.aborted) {
+    const query = "?wait=" + CHAT_WAIT_SECONDS + (chat.cursor ? "&cursor=" + encodeURIComponent(chat.cursor) : "");
+    try {
+      const update = await getJson("/v1/chats/" + encodeURIComponent(chat.id) + query, chat.abort.signal);
+      if (chat.abort.signal.aborted) return;
+      retry = 0;
+      applyUpdate(chat, update);
+      continue;
+    } catch (error) {
+      if (chat.abort.signal.aborted) return;
+      retry = nextRetry(retry);
+      if (error.status === 404) {
+        element("chat-status").textContent = "Waiting for this chat to open on the Mac...";
+      } else if (error instanceof RequestError) {
+        showError(error);
+      } else {
+        element("chat-status").textContent = "Can't reach the Mac, retrying...";
+      }
+    }
+    await delay(retry, chat.abort.signal);
+  }
+}
+
+function applyUpdate(chat, update) {
+  const transcript = element("transcript");
+  const stickToBottom = isNearBottom();
+  const dirty = new Set();
+  if (update.reset) {
+    chat.entries = [];
+    chat.nodes = [];
+    chat.toolIndexes = new Map();
+    transcript.replaceChildren();
+  }
+  for (const change of update.changes || []) {
+    chat.entries[change.index] = change.entry;
+    dirty.add(change.index);
+  }
+  const length = update.len;
+  for (let index = length; index < chat.nodes.length; index++) {
+    if (chat.nodes[index]) chat.nodes[index].remove();
+  }
+  chat.entries.length = length;
+  chat.nodes.length = Math.min(chat.nodes.length, length);
+
+  const permissions = new Map();
+  for (const request of update.permissions || []) {
+    permissions.set(request.tool_call_id, request.options || []);
+  }
+  const allToolIds = new Set([...chat.permissions.keys(), ...permissions.keys()]);
+  for (const toolId of allToolIds) {
+    if (JSON.stringify(chat.permissions.get(toolId)) !== JSON.stringify(permissions.get(toolId))) {
+      const index = chat.toolIndexes.get(toolId);
+      if (index !== undefined && index < length) dirty.add(index);
+    }
+  }
+  chat.permissions = permissions;
+
+  for (let index = 0; index < length; index++) {
+    if (chat.nodes[index] && !dirty.has(index)) continue;
+    const node = renderEntry(chat, index, chat.entries[index]);
+    if (chat.nodes[index]) {
+      transcript.replaceChild(node, chat.nodes[index]);
+    } else {
+      transcript.appendChild(node);
+    }
+    chat.nodes[index] = node;
+  }
+
+  chat.cursor = update.cursor;
+  chat.generating = Boolean(update.generating);
+  chat.plan = update.plan || [];
+  renderUnplacedPrompts(chat);
+  renderPlan(chat);
+  element("chat-status").textContent = chat.generating ? "Working..." : "";
+  element("stop").disabled = !chat.generating;
+  if (stickToBottom) scrollToBottom();
+}
+
+function isNearBottom() {
+  const view = element("chat-view");
+  return view.scrollHeight - view.scrollTop - view.clientHeight < 80;
+}
+
+function scrollToBottom() {
+  const view = element("chat-view");
+  view.scrollTop = view.scrollHeight;
+}
+
+function contentText(content) {
+  if (!content) return "";
+  switch (content.type) {
+    case "text": return content.text || "";
+    case "resource_link": return "[" + (content.title || content.name || content.uri || "link") + "]";
+    case "resource": return "[" + ((content.resource && content.resource.uri) || "resource") + "]";
+    case "image": return "[image]";
+    case "audio": return "[audio]";
+    default: return "";
+  }
+}
+
+// One entry is one thread entry: a user message, an agent message (with
+// any thoughts), or a tool call followed by its updates.
+function rebuildEntry(updates) {
+  const built = { user: "", parts: [], tool: null };
+  for (const update of updates) {
+    switch (update.sessionUpdate) {
+      case "user_message_chunk":
+        built.user += contentText(update.content);
+        break;
+      case "agent_message_chunk":
+      case "agent_thought_chunk": {
+        const kind = update.sessionUpdate === "agent_message_chunk" ? "message" : "thought";
+        const last = built.parts[built.parts.length - 1];
+        if (last && last.kind === kind) {
+          last.text += contentText(update.content);
+        } else {
+          built.parts.push({ kind, text: contentText(update.content) });
+        }
+        break;
+      }
+      case "tool_call":
+        built.tool = {
+          id: update.toolCallId,
+          title: update.title || "",
+          kind: update.kind || "other",
+          status: update.status || "pending",
+        };
+        break;
+      case "tool_call_update":
+        if (built.tool && built.tool.id === update.toolCallId) {
+          if (update.title) built.tool.title = update.title;
+          if (update.kind) built.tool.kind = update.kind;
+          if (update.status) built.tool.status = update.status;
+        }
+        break;
+      default:
+        break;
+    }
+  }
+  return built;
+}
+
+function renderEntry(chat, index, entry) {
+  const node = make("div");
+  if (!entry) return node;
+  if (entry.kind === "completed_plan") {
+    node.appendChild(renderPlanBox("Plan done", entry.entries || []));
+    return node;
+  }
+  if (entry.kind === "compaction") {
+    node.appendChild(make("div", "note", "Earlier messages were summarised"));
+    return node;
+  }
+  if (entry.kind !== "updates") return node;
+  const built = rebuildEntry(entry.updates || []);
+  if (built.tool) {
+    chat.toolIndexes.set(built.tool.id, index);
+    renderTool(node, chat, built.tool);
+    return node;
+  }
+  if (built.user) {
+    node.className = "message user";
+    node.appendChild(make("div", "who", "you"));
+    node.appendChild(make("div", "body", built.user));
+    return node;
+  }
+  if (built.parts.length) {
+    node.className = "message agent";
+    node.appendChild(make("div", "who", "agent"));
+    for (const part of built.parts) {
+      if (part.kind === "thought") {
+        const details = make("details", "thought");
+        details.appendChild(make("summary", "", "Thinking"));
+        details.appendChild(renderMarkdown(part.text));
+        node.appendChild(details);
+      } else {
+        node.appendChild(renderMarkdown(part.text));
+      }
+    }
+  }
+  return node;
+}
+
+function renderTool(node, chat, tool) {
+  const options = chat.permissions.get(tool.id);
+  const waiting = options !== undefined;
+  const line = make("div", "tool");
+  line.appendChild(make("span", "tool-kind", "[" + tool.kind.replace("_", " ") + "]"));
+  line.appendChild(make("span", "tool-title", tool.title));
+  const statusText = waiting ? "waiting" : TOOL_STATUS_LABELS[tool.status] || tool.status;
+  const statusClass = waiting ? "waiting" : tool.status === "failed" ? "failed" : tool.status === "in_progress" ? "running" : "";
+  line.appendChild(make("span", "tool-status " + statusClass, statusText));
+  node.appendChild(line);
+  if (waiting) {
+    node.appendChild(renderPrompt(chat, tool.id, tool.title, options));
+  }
+}
+
+function renderPrompt(chat, toolCallId, title, options) {
+  const box = make("div", "prompt");
+  box.appendChild(make("div", "prompt-title", (title || "The agent") + "?"));
+  if (!options.length) {
+    box.appendChild(make("div", "muted", "Answer this on the Mac"));
+    return box;
+  }
+  const row = make("div", "prompt-options");
+  for (const option of options) {
+    const allows = option.kind === "allow_once" || option.kind === "allow_always";
+    const button = make("button", allows ? "primary" : "", option.name);
+    button.addEventListener("click", () => answer(chat, toolCallId, option.optionId, row));
+    row.appendChild(button);
+  }
+  box.appendChild(row);
+  return box;
+}
+
+// A request whose tool call isn't in the transcript yet still needs an answer.
+function renderUnplacedPrompts(chat) {
+  const container = element("prompts");
+  container.replaceChildren();
+  for (const [toolCallId, options] of chat.permissions) {
+    if (chat.toolIndexes.has(toolCallId)) continue;
+    container.appendChild(renderPrompt(chat, toolCallId, "Permission needed", options));
+  }
+}
+
+function renderPlanBox(title, entries) {
+  const box = make("div", "plan");
+  box.appendChild(make("div", "plan-title", title));
+  for (const entry of entries) {
+    const row = make("div", "plan-entry " + (entry.status || ""));
+    row.appendChild(make("span", "", PLAN_MARKERS[entry.status] || "[ ]"));
+    row.appendChild(make("span", "", entry.content || ""));
+    box.appendChild(row);
+  }
+  return box;
+}
+
+function renderPlan(chat) {
+  const container = element("plan");
+  container.replaceChildren();
+  if (chat.plan.length) {
+    container.appendChild(renderPlanBox("Plan", chat.plan));
+  }
+}
+
+async function answer(chat, toolCallId, optionId, row) {
+  for (const button of row.querySelectorAll("button")) button.disabled = true;
+  try {
+    await post("/v1/chats/" + encodeURIComponent(chat.id) + "/permission", {
+      tool_call_id: toolCallId,
+      option_id: optionId,
+    });
+  } catch (error) {
+    for (const button of row.querySelectorAll("button")) button.disabled = false;
+    // Answered on the Mac first: the next update clears the prompt.
+    if (!(error.status === 409 && /no longer waiting/i.test(error.message))) {
+      showError(error);
+    }
+  }
+}
+
+async function sendMessage() {
+  if (!app.chat) return;
+  const input = element("message");
+  const text = input.value;
+  if (!text.trim()) return;
+  const button = element("send");
+  button.disabled = true;
+  try {
+    await post("/v1/chats/" + encodeURIComponent(app.chat.id) + "/message", { text });
+    input.value = "";
+    resizeComposer();
+    scrollToBottom();
+  } catch (error) {
+    showError(error);
+  } finally {
+    button.disabled = false;
+  }
+}
+
+async function stopChat() {
+  if (!app.chat) return;
+  try {
+    await post("/v1/chats/" + encodeURIComponent(app.chat.id) + "/stop", {});
+  } catch (error) {
+    showError(error);
+  }
+}
+
+async function showDiff() {
+  if (!app.chat) return;
+  const found = findChat(app.chat.id);
+  if (!found) {
+    showError(new RequestError("This chat's workspace isn't in the list yet"));
+    return;
+  }
+  const text = element("diff-text");
+  text.textContent = "Loading...";
+  element("diff-sheet").classList.remove("hidden");
+  try {
+    const response = await fetch("/v1/workspaces/" + encodeURIComponent(found.workspace.id) + "/diff", { cache: "no-store" });
+    if (!response.ok) throw await readError(response);
+    const diff = await response.text();
+    text.textContent = diff.trim() ? diff : "No changes";
+  } catch (error) {
+    element("diff-sheet").classList.add("hidden");
+    showError(error);
+  }
+}
+
+async function chooseAgent(workspaceId) {
+  const list = element("agent-list");
+  list.replaceChildren(make("div", "muted", "Loading..."));
+  element("agent-sheet").classList.remove("hidden");
+  try {
+    if (!app.agents || !app.agents.length) {
+      app.agents = (await getJson("/v1/agents")).agents || [];
+    }
+  } catch (error) {
+    element("agent-sheet").classList.add("hidden");
+    showError(error);
+    return;
+  }
+  list.replaceChildren();
+  if (!app.agents.length) {
+    list.appendChild(make("div", "muted", "No agents are enabled on the Mac"));
+  }
+  for (const agent of app.agents) {
+    const button = make("button", "", agent.label);
+    button.addEventListener("click", () => startNewChat(workspaceId, agent.id, list));
+    list.appendChild(button);
+  }
+}
+
+async function startNewChat(workspaceId, agentId, list) {
+  for (const button of list.querySelectorAll("button")) button.disabled = true;
+  try {
+    const outcome = await post("/v1/workspaces/" + encodeURIComponent(workspaceId) + "/chats", { agent: agentId });
+    element("agent-sheet").classList.add("hidden");
+    // The agents may change on the Mac, so the next picker asks again.
+    app.agents = null;
+    if (outcome.chat_id) {
+      openChat(outcome.chat_id);
+    }
+    loadWorkspaces();
+  } catch (error) {
+    for (const button of list.querySelectorAll("button")) button.disabled = false;
+    showError(error);
+  }
+}
+
+function newChatFromChat() {
+  if (!app.chat) return;
+  const found = findChat(app.chat.id);
+  if (!found) {
+    showError(new RequestError("This chat's workspace isn't in the list yet"));
+    return;
+  }
+  chooseAgent(found.workspace.id);
+}
+
+function resizeComposer() {
+  const input = element("message");
+  input.style.height = "auto";
+  input.style.height = Math.min(input.scrollHeight, 160) + "px";
+}
+
+element("banner-close").addEventListener("click", hideError);
+element("back").addEventListener("click", () => {
+  location.hash = "";
+});
+element("refresh").addEventListener("click", () => {
+  hideError();
+  loadWorkspaces();
+});
+element("send").addEventListener("click", sendMessage);
+element("stop").addEventListener("click", stopChat);
+element("diff").addEventListener("click", showDiff);
+element("new-chat").addEventListener("click", newChatFromChat);
+element("diff-close").addEventListener("click", () => element("diff-sheet").classList.add("hidden"));
+element("agent-close").addEventListener("click", () => element("agent-sheet").classList.add("hidden"));
+element("message").addEventListener("input", resizeComposer);
+window.addEventListener("hashchange", route);
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible") loadWorkspaces();
+});
+
+route();
+pollWorkspaces();
+</script>
+</body>
+</html>

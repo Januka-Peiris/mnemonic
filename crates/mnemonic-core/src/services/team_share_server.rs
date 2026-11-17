@@ -89,7 +89,6 @@ struct Shared {
     running_commands: RunningCommands,
     hello: String,
     allowed_logins: Vec<String>,
-    active_requests: AtomicUsize,
 }
 
 /// A running share server. Dropping it stops the server and kills the
@@ -141,14 +140,13 @@ impl TeamShareServer {
                 .map(|login| login.trim().to_lowercase())
                 .filter(|login| !login.is_empty())
                 .collect(),
-            active_requests: AtomicUsize::new(0),
         });
         let server = Arc::new(server);
         let accept_thread = std::thread::Builder::new()
             .name("mnemonic-team-share".into())
             .spawn({
                 let server = server.clone();
-                move || accept_requests(&server, &shared)
+                move || accept_requests(&server, &shared, "mnemonic-team-request", handle)
             })
             .map_err(|err| format!("Couldn't start the share server: {err}"))?;
         log::info!(target: "mnemonic_lib", "Sharing workspaces with the team on {address}");
@@ -183,30 +181,39 @@ impl Drop for TeamShareServer {
     }
 }
 
-fn accept_requests(server: &Server, shared: &Arc<Shared>) {
+/// Hands each request to `handle` on its own thread until the server is
+/// unblocked.
+pub(crate) fn accept_requests<S: Send + Sync + 'static>(
+    server: &Server,
+    shared: &Arc<S>,
+    request_thread_name: &str,
+    handle: fn(Request, &S),
+) {
+    let active_requests = Arc::new(AtomicUsize::new(0));
     loop {
         let request = match server.recv() {
             Ok(request) => request,
             // `unblock` makes `recv` fail, which is how the server stops.
             Err(_) => break,
         };
-        if shared.active_requests.fetch_add(1, Ordering::SeqCst) >= MAX_ACTIVE_REQUESTS {
-            shared.active_requests.fetch_sub(1, Ordering::SeqCst);
+        if active_requests.fetch_add(1, Ordering::SeqCst) >= MAX_ACTIVE_REQUESTS {
+            active_requests.fetch_sub(1, Ordering::SeqCst);
             respond(request, text_response(503, "Too many requests"));
             continue;
         }
-        let shared_for_request = shared.clone();
         let spawned = std::thread::Builder::new()
-            .name("mnemonic-team-request".into())
-            .spawn(move || {
-                handle(request, &shared_for_request);
-                shared_for_request
-                    .active_requests
-                    .fetch_sub(1, Ordering::SeqCst);
+            .name(request_thread_name.into())
+            .spawn({
+                let shared = shared.clone();
+                let active_requests = active_requests.clone();
+                move || {
+                    handle(request, &shared);
+                    active_requests.fetch_sub(1, Ordering::SeqCst);
+                }
             });
         if let Err(err) = spawned {
-            shared.active_requests.fetch_sub(1, Ordering::SeqCst);
-            log::error!(target: "mnemonic_lib", "Couldn't handle a team request: {err}");
+            active_requests.fetch_sub(1, Ordering::SeqCst);
+            log::error!(target: "mnemonic_lib", "Couldn't start a {request_thread_name} thread: {err}");
         }
     }
 }
@@ -348,19 +355,7 @@ fn handle(mut request: Request, shared: &Shared) {
             }
         }
         ["v1", "chats", chat_id] if is_plain_id(chat_id) => {
-            let cursor = query_value(query, "cursor");
-            let wait = query_value(query, "wait")
-                .and_then(|wait| wait.parse::<u64>().ok())
-                .map(Duration::from_secs)
-                .unwrap_or_default()
-                .min(MAX_CHAT_WAIT);
-            match shared.hub.wait_chat_update(chat_id, cursor, wait) {
-                Some(update) => match serde_json::to_string(&update) {
-                    Ok(body) => json_response(200, body),
-                    Err(err) => text_response(500, &err.to_string()),
-                },
-                None => text_response(404, "Not open"),
-            }
+            chat_update_response(&shared.hub, chat_id, query)
         }
         _ => text_response(404, "Not found"),
     };
@@ -373,38 +368,64 @@ fn handle(mut request: Request, shared: &Shared) {
 /// `Host` means DNS rebinding, and a JSON body or a custom header makes a
 /// browser ask first with a CORS preflight, which this server never answers.
 fn check_request(request: &Request) -> Result<(), (u16, &'static str)> {
-    let header_value = |name: &'static str| {
-        request
-            .headers()
-            .iter()
-            .find(|header| header.field.equiv(name))
-            .map(|header| header.value.as_str())
-    };
-    if header_value("Origin").is_some() {
+    if header_value(request, "Origin").is_some() {
         return Err((403, "Requests from web pages are refused"));
     }
-    if !header_value("Host").is_some_and(is_allowed_host) {
+    if !header_value(request, "Host").is_some_and(is_allowed_host) {
         return Err((403, "Unexpected host name"));
     }
     if *request.method() == Method::Post {
-        let is_json = header_value("Content-Type").is_some_and(|value| {
-            value.split(';').next().is_some_and(|media_type| {
-                media_type.trim().eq_ignore_ascii_case("application/json")
-            })
-        });
-        if !is_json {
+        if !has_json_body(request) {
             return Err((400, "Expected a JSON body"));
         }
-        if header_value(TEAM_REQUEST_HEADER).is_none_or(|value| value.trim().is_empty()) {
+        if header_value(request, TEAM_REQUEST_HEADER).is_none_or(|value| value.trim().is_empty()) {
             return Err((400, "Not a Mnemonic request"));
         }
     }
     Ok(())
 }
 
+pub(crate) fn header_value<'a>(request: &'a Request, name: &'static str) -> Option<&'a str> {
+    request
+        .headers()
+        .iter()
+        .find(|header| header.field.equiv(name))
+        .map(|header| header.value.as_str())
+}
+
+pub(crate) fn has_json_body(request: &Request) -> bool {
+    header_value(request, "Content-Type").is_some_and(|value| {
+        value
+            .split(';')
+            .next()
+            .is_some_and(|media_type| media_type.trim().eq_ignore_ascii_case("application/json"))
+    })
+}
+
+/// The long-poll answer to `GET /v1/chats/<id>?cursor=&wait=`.
+pub(crate) fn chat_update_response(
+    hub: &TeamShareHub,
+    chat_id: &str,
+    query: &str,
+) -> Response<std::io::Cursor<Vec<u8>>> {
+    let cursor = query_value(query, "cursor");
+    let wait = query_value(query, "wait")
+        .and_then(|wait| wait.parse::<u64>().ok())
+        .map(Duration::from_secs)
+        .unwrap_or_default()
+        .min(MAX_CHAT_WAIT);
+    match hub.wait_chat_update(chat_id, cursor, wait) {
+        Some(update) => match serde_json::to_string(&update) {
+            Ok(body) => json_response(200, body),
+            Err(err) => text_response(500, &err.to_string()),
+        },
+        None => text_response(404, "Not open"),
+    }
+}
+
 /// The names a teammate reaches this machine by: an address, a Tailscale
 /// MagicDNS name, or a bare machine name.
-fn is_allowed_host(host: &str) -> bool {
+pub(crate) fn is_allowed_host(host: &str) -> bool {
     let host = host.trim();
     if let Some(bracketed) = host.strip_prefix('[') {
         return bracketed
@@ -489,18 +510,11 @@ fn handle_agent(
     let Some(root) = root else {
         return refuse(403, "Teammates' agents can't work in this workspace");
     };
-    let header_value = |name: &'static str| {
-        request
-            .headers()
-            .iter()
-            .find(|header| header.field.equiv(name))
-            .map(|header| header.value.as_str().to_string())
-    };
-    let git_author = header_value(TEAM_GIT_AUTHOR_HEADER)
-        .as_deref()
-        .and_then(parse_git_author);
-    let session = header_value(MCP_SESSION_HEADER).unwrap_or_default();
-    let accepts_event_stream = header_value("Accept").is_some_and(|accept| {
+    let git_author = header_value(request, TEAM_GIT_AUTHOR_HEADER).and_then(parse_git_author);
+    let session = header_value(request, MCP_SESSION_HEADER)
+        .unwrap_or_default()
+        .to_string();
+    let accepts_event_stream = header_value(request, "Accept").is_some_and(|accept| {
         accept.split(',').any(|media_type| {
             media_type.split(';').next().is_some_and(|media_type| {
                 media_type.trim().eq_ignore_ascii_case("text/event-stream")
@@ -819,7 +833,7 @@ fn parse_action(action: &str, body: &[u8]) -> Result<TeamActionKind, String> {
     }
 }
 
-fn query_value<'a>(query: &'a str, key: &str) -> Option<&'a str> {
+pub(crate) fn query_value<'a>(query: &'a str, key: &str) -> Option<&'a str> {
     query
         .split('&')
         .filter_map(|pair| pair.split_once('='))
@@ -827,7 +841,7 @@ fn query_value<'a>(query: &'a str, key: &str) -> Option<&'a str> {
         .map(|(_, value)| value)
 }
 
-fn truncate_diff(mut diff: String) -> String {
+pub(crate) fn truncate_diff(mut diff: String) -> String {
     if diff.len() <= MAX_DIFF_BYTES {
         return diff;
     }
@@ -844,7 +858,7 @@ fn header(name: &str, value: &str) -> Option<Header> {
     Header::from_bytes(name.as_bytes(), value.as_bytes()).ok()
 }
 
-fn json_response(status: u16, body: String) -> Response<std::io::Cursor<Vec<u8>>> {
+pub(crate) fn json_response(status: u16, body: String) -> Response<std::io::Cursor<Vec<u8>>> {
     let mut response = Response::from_string(body).with_status_code(status);
     if let Some(header) = header("Content-Type", "application/json") {
         response.add_header(header);
@@ -852,7 +866,7 @@ fn json_response(status: u16, body: String) -> Response<std::io::Cursor<Vec<u8>>
     response
 }
 
-fn text_response(status: u16, body: &str) -> Response<std::io::Cursor<Vec<u8>>> {
+pub(crate) fn text_response(status: u16, body: &str) -> Response<std::io::Cursor<Vec<u8>>> {
     let mut response = Response::from_string(body).with_status_code(status);
     if let Some(header) = header("Content-Type", "text/plain; charset=utf-8") {
         response.add_header(header);
@@ -860,7 +874,7 @@ fn text_response(status: u16, body: &str) -> Response<std::io::Cursor<Vec<u8>>> 
     response
 }
 
-fn respond<R: std::io::Read>(request: Request, response: Response<R>) {
+pub(crate) fn respond<R: std::io::Read>(request: Request, response: Response<R>) {
     if let Err(err) = request.respond(response) {
         log::debug!(target: "mnemonic_lib", "A team request ended early: {err}");
     }
