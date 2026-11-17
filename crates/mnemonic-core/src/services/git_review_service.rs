@@ -695,8 +695,8 @@ mod tests {
     }
 
     #[test]
-    fn full_diff_covers_commits_edits_and_untracked_files_without_staging_them(
-    ) -> Result<(), String> {
+    fn full_diff_covers_commits_edits_and_untracked_files_without_staging_them()
+    -> Result<(), String> {
         let root = std::env::temp_dir().join(format!(
             "mnemonic-full-diff-test-{}-{}",
             std::process::id(),

@@ -1,6 +1,6 @@
 use crate::context::schema::{
-    estimate_tokens, ContextCandidate, ContextSegment, RenderMode, RepoMapV2, SelectConfig,
-    WorkspaceOverlay,
+    ContextCandidate, ContextSegment, RenderMode, RepoMapV2, SelectConfig, WorkspaceOverlay,
+    estimate_tokens,
 };
 
 pub fn fit_to_budget(

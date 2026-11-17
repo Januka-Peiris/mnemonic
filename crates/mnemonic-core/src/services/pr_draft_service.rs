@@ -499,15 +499,7 @@ pub fn merge_workspace_pr(
     match run_in_dir(
         &work_dir,
         &gh,
-        &[
-            "pr",
-            "view",
-            selector,
-            "--json",
-            "state",
-            "--jq",
-            ".state",
-        ],
+        &["pr", "view", selector, "--json", "state", "--jq", ".state"],
     ) {
         Ok(pr_state) if pr_state == "MERGED" => Ok(format!("Merged PR #{number} ({method})")),
         Ok(pr_state) => Ok(format!(
@@ -918,7 +910,11 @@ mod tests {
         );
         assert_eq!(
             parse_pr_url("https://github.com/axe-payments/sidekick-analytics/pull/622"),
-            Some(("axe-payments".to_string(), "sidekick-analytics".to_string(), 622))
+            Some((
+                "axe-payments".to_string(),
+                "sidekick-analytics".to_string(),
+                622
+            ))
         );
     }
 }

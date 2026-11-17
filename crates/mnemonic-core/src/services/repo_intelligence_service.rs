@@ -12,8 +12,8 @@ use crate::context::graph::FileGraph;
 use crate::context::ignore::IgnoreSet;
 use crate::context::overlay;
 use crate::context::schema::{
-    ContextPreview, ContextSegment, RepoEntry, RepoMapQuality, RepoMapV2, SelectConfig,
-    PARSER_VERSION, REPO_MAP_VERSION,
+    ContextPreview, ContextSegment, PARSER_VERSION, REPO_MAP_VERSION, RepoEntry, RepoMapQuality,
+    RepoMapV2, SelectConfig,
 };
 use crate::context::{select, summary, token_fit};
 use crate::db::Database;
@@ -65,14 +65,16 @@ pub fn repo_intelligence_enabled(state: &AppState) -> bool {
 }
 
 pub fn start_repo_intelligence_loop(state: AppState) {
-    std::thread::spawn(move || loop {
-        std::thread::sleep(Duration::from_secs(BACKGROUND_REFRESH_SECONDS));
-        if !repo_intelligence_enabled(&state) {
-            continue;
-        }
-        let repos = repository_repository::list(&state.db).unwrap_or_default();
-        for repo in repos {
-            let _ = refresh_repository_intelligence(&state, &repo.id, &repo.path, false);
+    std::thread::spawn(move || {
+        loop {
+            std::thread::sleep(Duration::from_secs(BACKGROUND_REFRESH_SECONDS));
+            if !repo_intelligence_enabled(&state) {
+                continue;
+            }
+            let repos = repository_repository::list(&state.db).unwrap_or_default();
+            for repo in repos {
+                let _ = refresh_repository_intelligence(&state, &repo.id, &repo.path, false);
+            }
         }
     });
 }

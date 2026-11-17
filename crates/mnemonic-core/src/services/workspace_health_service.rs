@@ -1,7 +1,7 @@
 use std::sync::atomic::Ordering;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use rusqlite::{params, OptionalExtension};
+use rusqlite::{OptionalExtension, params};
 
 use crate::models::{
     ApplyWorkspaceSessionRecoveryInput, TerminalSession, WorkspaceHealth,
@@ -458,9 +458,11 @@ mod tests {
             stuck_since: None,
         };
 
-        assert!(terminal_recovery_reason(&terminal)
-            .unwrap()
-            .contains("stale"));
+        assert!(
+            terminal_recovery_reason(&terminal)
+                .unwrap()
+                .contains("stale")
+        );
     }
 
     #[test]

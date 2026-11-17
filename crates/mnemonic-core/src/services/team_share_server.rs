@@ -6,8 +6,8 @@
 //! workspaces whose agents switch is on.
 
 use std::io::Read as _;
-use std::path::PathBuf;
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread::JoinHandle;
@@ -20,9 +20,10 @@ use crate::services::team_agent_tools::{
 };
 use crate::services::team_files_service::{SkipList, TeamFileKind, safe_relative_path};
 use crate::services::team_share_service::{
-    ActionHandler, BatchHandler, CallerIdentity, MAX_CHAT_WAIT, TEAM_ACP_CRATE_VERSION, TEAM_PROTOCOL_VERSION,
-    TEAM_GIT_AUTHOR_HEADER, TEAM_REQUEST_HEADER, TeamAction, TeamActionError, TeamActionKind, TeamBatchRequest, TeamCaller, TeamHello,
-    TeamShareHub, TeamWorkspaceList, is_plain_id, percent_decode,
+    ActionHandler, BatchHandler, CallerIdentity, MAX_CHAT_WAIT, TEAM_ACP_CRATE_VERSION,
+    TEAM_GIT_AUTHOR_HEADER, TEAM_PROTOCOL_VERSION, TEAM_REQUEST_HEADER, TeamAction,
+    TeamActionError, TeamActionKind, TeamBatchRequest, TeamCaller, TeamHello, TeamShareHub,
+    TeamWorkspaceList, is_plain_id, percent_decode,
 };
 
 /// Produces a workspace's diff. Behind a closure so tests don't need a
@@ -262,9 +263,7 @@ fn handle(mut request: Request, shared: &Shared) {
     let method = request.method().clone();
     if method == Method::Post {
         let response = match segments.as_slice() {
-            ["v1", "chats", chat_id, action @ ("stop" | "permission")]
-                if is_plain_id(chat_id) =>
-            {
+            ["v1", "chats", chat_id, action @ ("stop" | "permission")] if is_plain_id(chat_id) => {
                 handle_action(&mut request, shared, &caller, chat_id, action)
             }
             ["v1", "workspaces", workspace_id, "changes"] if is_plain_id(workspace_id) => {
@@ -293,7 +292,10 @@ fn handle(mut request: Request, shared: &Shared) {
         return;
     }
     if method != Method::Get {
-        respond(request, text_response(405, "Only GET and POST are supported"));
+        respond(
+            request,
+            text_response(405, "Only GET and POST are supported"),
+        );
         return;
     }
     let response = match segments.as_slice() {
@@ -683,10 +685,16 @@ fn shared_root(
         .then(|| (shared.files)(workspace_id))
         .flatten();
     let Some(root) = root else {
-        return Err(text_response(403, "Sharing files is off for this workspace"));
+        return Err(text_response(
+            403,
+            "Sharing files is off for this workspace",
+        ));
     };
     if for_edit && !workspace.edit_files {
-        return Err(text_response(403, "Editing files is off for this workspace"));
+        return Err(text_response(
+            403,
+            "Editing files is off for this workspace",
+        ));
     }
     Ok(root)
 }
@@ -884,13 +892,13 @@ pub(crate) fn respond<R: std::io::Read>(request: Request, response: Response<R>)
 mod tests {
     use super::*;
     use crate::services::team_agent_tools::AGENT_MCP_SERVER_NAME;
-    use agent_client_protocol::schema as acp;
-    use crate::services::team_share_service::{
-        TeamActionOutcome, TeamCaller, TeamClient, TeamClientError, TeamEntry, TeamWorkspace,
-    };
     use crate::services::team_files_service::{
         TeamChangeBatch, TeamFileEntry, TeamFileManifest, file_hash,
     };
+    use crate::services::team_share_service::{
+        TeamActionOutcome, TeamCaller, TeamClient, TeamClientError, TeamEntry, TeamWorkspace,
+    };
+    use agent_client_protocol::schema as acp;
     use std::collections::HashSet;
     use std::io::{BufRead as _, Write as _};
     use std::net::{Ipv4Addr, TcpStream};
@@ -1394,7 +1402,8 @@ mod tests {
     #[test]
     fn agent_read_maps_a_missing_file_to_none() -> Result<(), String> {
         let root = tempfile::tempdir().map_err(|err| err.to_string())?;
-        std::fs::write(root.path().join("a.txt"), "first\n\tsecond\n").map_err(|err| err.to_string())?;
+        std::fs::write(root.path().join("a.txt"), "first\n\tsecond\n")
+            .map_err(|err| err.to_string())?;
         let server = start_agents(
             root.path().to_path_buf(),
             true,
@@ -1443,24 +1452,26 @@ mod tests {
     #[test]
     fn file_routes_are_refused_when_share_files_is_off() -> Result<(), String> {
         let root = tempfile::tempdir().map_err(|err| err.to_string())?;
-        let server = start_sharing_files(
-            root.path().to_path_buf(),
-            false,
-            false,
-            TeamShareHub::new(),
-        )?;
+        let server =
+            start_sharing_files(root.path().to_path_buf(), false, false, TeamShareHub::new())?;
         let client =
             TeamClient::new(&server.address().to_string(), 0).map_err(|err| err.to_string())?;
 
-        assert!(client
-            .files("ws-1", None, Duration::ZERO)
-            .is_err_and(|err| err == TeamClientError::Forbidden));
-        assert!(client
-            .file("ws-1", "a.txt")
-            .is_err_and(|err| refused(403)(&err)));
-        assert!(client
-            .bundle("ws-1", &[])
-            .is_err_and(|err| refused(403)(&err)));
+        assert!(
+            client
+                .files("ws-1", None, Duration::ZERO)
+                .is_err_and(|err| err == TeamClientError::Forbidden)
+        );
+        assert!(
+            client
+                .file("ws-1", "a.txt")
+                .is_err_and(|err| refused(403)(&err))
+        );
+        assert!(
+            client
+                .bundle("ws-1", &[])
+                .is_err_and(|err| refused(403)(&err))
+        );
         Ok(())
     }
 
@@ -1522,28 +1533,34 @@ mod tests {
         let client =
             TeamClient::new(&server.address().to_string(), 0).map_err(|err| err.to_string())?;
 
-        assert!(client.file("ws-1", ".env").is_err_and(|err| refused(404)(&err)));
-        assert!(client
-            .file("ws-1", "unlisted.txt")
-            .is_err_and(|err| refused(404)(&err)));
-        assert!(client
-            .file("ws-1", "../x")
-            .is_err_and(|err| refused(400)(&err)));
-        assert!(client
-            .file("ws-1", ".claude/./settings.local.json")
-            .is_err_and(|err| refused(400)(&err)));
+        assert!(
+            client
+                .file("ws-1", ".env")
+                .is_err_and(|err| refused(404)(&err))
+        );
+        assert!(
+            client
+                .file("ws-1", "unlisted.txt")
+                .is_err_and(|err| refused(404)(&err))
+        );
+        assert!(
+            client
+                .file("ws-1", "../x")
+                .is_err_and(|err| refused(400)(&err))
+        );
+        assert!(
+            client
+                .file("ws-1", ".claude/./settings.local.json")
+                .is_err_and(|err| refused(400)(&err))
+        );
         Ok(())
     }
 
     #[test]
     fn changes_are_refused_when_edit_files_is_off() -> Result<(), String> {
         let root = tempfile::tempdir().map_err(|err| err.to_string())?;
-        let server = start_sharing_files(
-            root.path().to_path_buf(),
-            true,
-            false,
-            TeamShareHub::new(),
-        )?;
+        let server =
+            start_sharing_files(root.path().to_path_buf(), true, false, TeamShareHub::new())?;
         let client =
             TeamClient::new(&server.address().to_string(), 0).map_err(|err| err.to_string())?;
         let batch = TeamChangeBatch {
@@ -1551,9 +1568,11 @@ mod tests {
             changes: Vec::new(),
         };
 
-        assert!(client
-            .send_changes("ws-1", &batch)
-            .is_err_and(|err| refused(403)(&err)));
+        assert!(
+            client
+                .send_changes("ws-1", &batch)
+                .is_err_and(|err| refused(403)(&err))
+        );
         Ok(())
     }
 
@@ -1564,9 +1583,9 @@ mod tests {
         hub.replace_chat(
             "chat-1",
             vec![TeamEntry::Updates {
-                updates: vec![acp::SessionUpdate::UserMessageChunk(acp::ContentChunk::new(
-                    "Fix the login page".into(),
-                ))],
+                updates: vec![acp::SessionUpdate::UserMessageChunk(
+                    acp::ContentChunk::new("Fix the login page".into()),
+                )],
             }],
         );
         let server = start(Some("bob@example.com"), hub.clone())?;
@@ -1597,9 +1616,9 @@ mod tests {
             "chat-1",
             1,
             TeamEntry::Updates {
-                updates: vec![acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new(
-                    "On it".into(),
-                ))],
+                updates: vec![acp::SessionUpdate::AgentMessageChunk(
+                    acp::ContentChunk::new("On it".into()),
+                )],
             },
         );
         let update = waiting
@@ -1636,7 +1655,10 @@ mod tests {
             TeamClient::new(&server.address().to_string(), 0).map_err(|err| err.to_string())?;
 
         assert_eq!(client.stop("chat-1"), Ok(()));
-        assert_eq!(client.answer_permission("chat-1", "call-1", "allow"), Ok(()));
+        assert_eq!(
+            client.answer_permission("chat-1", "call-1", "allow"),
+            Ok(())
+        );
 
         let kinds: Vec<TeamActionKind> = recorded
             .lock()
@@ -1684,9 +1706,11 @@ mod tests {
             TeamClient::new(&server.address().to_string(), 0).map_err(|err| err.to_string())?;
 
         assert!(client.stop("chat-1").is_err_and(|err| refused(403)(&err)));
-        assert!(client
-            .answer_permission("chat-1", "call-1", "allow")
-            .is_err_and(|err| refused(403)(&err)));
+        assert!(
+            client
+                .answer_permission("chat-1", "call-1", "allow")
+                .is_err_and(|err| refused(403)(&err))
+        );
         assert!(recorded.lock().map_err(|err| err.to_string())?.is_empty());
         Ok(())
     }
@@ -1711,8 +1735,7 @@ mod tests {
 
         let plain_text = post_hello_message(address, "Content-Type: text/plain\r\n");
         assert_eq!(raw_status(address, &plain_text)?, 400);
-        let without_team_header =
-            post_hello_message(address, "Content-Type: application/json\r\n");
+        let without_team_header = post_hello_message(address, "Content-Type: application/json\r\n");
         assert_eq!(raw_status(address, &without_team_header)?, 400);
         let from_a_web_page = post_hello_message(
             address,
@@ -1748,7 +1771,9 @@ mod tests {
         let (server, _recorded) = start_with_handler(
             Some("bob@example.com"),
             step_in_hub(true),
-            Err(TeamActionError::NothingToDo("The agent isn't running".into())),
+            Err(TeamActionError::NothingToDo(
+                "The agent isn't running".into(),
+            )),
         )?;
         let client =
             TeamClient::new(&server.address().to_string(), 0).map_err(|err| err.to_string())?;

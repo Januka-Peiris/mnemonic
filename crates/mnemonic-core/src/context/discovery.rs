@@ -8,8 +8,8 @@ use crate::context::extract;
 use crate::context::graph::FileGraph;
 use crate::context::ignore::IgnoreSet;
 use crate::context::schema::{
-    GeneratorInfo, RepoEntry, RepoMapMetaV2, RepoMapQuality, RepoMapStats, RepoMapV2,
-    PARSER_VERSION, REPO_MAP_VERSION,
+    GeneratorInfo, PARSER_VERSION, REPO_MAP_VERSION, RepoEntry, RepoMapMetaV2, RepoMapQuality,
+    RepoMapStats, RepoMapV2,
 };
 use crate::context::summary;
 use crate::db::Database;

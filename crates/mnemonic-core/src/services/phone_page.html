@@ -5,6 +5,8 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, interactive-widget=resizes-content">
 <meta name="color-scheme" content="light dark">
 <title>Mnemonic</title>
+<link rel="manifest" href="/manifest.webmanifest">
+<meta name="theme-color" content="#16181c">
 <style>
 :root {
   --background: #ffffff;
@@ -258,6 +260,7 @@ button.listening { border-color: var(--attention); color: var(--attention); }
     <button id="new-task">+ New task</button>
   </div>
   <div id="workspaces"><div class="empty">Loading...</div></div>
+  <button id="enable-alerts" class="hidden">Turn on alerts</button>
 </main>
 <main id="task-view" class="hidden">
   <div class="form">
@@ -1627,8 +1630,45 @@ document.addEventListener("visibilitychange", () => {
   if (document.visibilityState === "visible") loadWorkspaces();
 });
 
+function base64UrlToBytes(text) {
+  const padded = text.replace(/-/g, "+").replace(/_/g, "/").padEnd(Math.ceil(text.length / 4) * 4, "=");
+  const binary = atob(padded);
+  return Uint8Array.from(binary, (character) => character.charCodeAt(0));
+}
+
+async function setUpAlerts() {
+  if (!("serviceWorker" in navigator)) return;
+  const registration = await navigator.serviceWorker.register("/sw.js");
+  const button = element("enable-alerts");
+  if (location.protocol !== "https:" || !("PushManager" in window) || !("Notification" in window)) return;
+  await navigator.serviceWorker.ready;
+  if (await registration.pushManager.getSubscription()) return;
+  button.classList.remove("hidden");
+  button.addEventListener("click", async () => {
+    button.disabled = true;
+    try {
+      if ((await Notification.requestPermission()) !== "granted") {
+        showNotice("Alerts are blocked for this page");
+        return;
+      }
+      const { key } = await getJson("/v1/push/key");
+      const subscription = await registration.pushManager.subscribe({
+        userVisibleOnly: true,
+        applicationServerKey: base64UrlToBytes(key),
+      });
+      await post("/v1/push/subscriptions", subscription.toJSON());
+      button.classList.add("hidden");
+    } catch (error) {
+      showError(error);
+    } finally {
+      button.disabled = false;
+    }
+  });
+}
+
 route();
 pollWorkspaces();
+setUpAlerts().catch((error) => console.warn("Alerts setup failed", error));
 </script>
 </body>
 </html>

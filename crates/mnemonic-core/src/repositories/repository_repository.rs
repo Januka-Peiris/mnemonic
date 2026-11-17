@@ -1,4 +1,4 @@
-use rusqlite::{params, Row};
+use rusqlite::{Row, params};
 
 use crate::db::Database;
 use crate::models::{DiscoveredRepository, DiscoveredWorktree};

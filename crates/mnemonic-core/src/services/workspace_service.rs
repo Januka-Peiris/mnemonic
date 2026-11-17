@@ -572,7 +572,10 @@ mod tests {
             ("frontend".to_string(), "backend".to_string()),
             ("docs".to_string(), "frontend".to_string()),
         ];
-        assert_eq!(linked_workspace_ids(&links, "frontend"), ["backend", "docs"]);
+        assert_eq!(
+            linked_workspace_ids(&links, "frontend"),
+            ["backend", "docs"]
+        );
         assert_eq!(linked_workspace_ids(&links, "backend"), ["frontend"]);
         assert!(linked_workspace_ids(&links, "unrelated").is_empty());
     }

@@ -219,12 +219,16 @@ mod tests {
         let items = check_environment();
         assert_eq!(items.len(), 5);
         assert!(items.iter().any(|item| item.binary == "git"));
-        assert!(items
-            .iter()
-            .any(|item| item.binary == "gh" && item.optional));
-        assert!(items
-            .iter()
-            .any(|item| item.binary == "ollama" && item.optional));
+        assert!(
+            items
+                .iter()
+                .any(|item| item.binary == "gh" && item.optional)
+        );
+        assert!(
+            items
+                .iter()
+                .any(|item| item.binary == "ollama" && item.optional)
+        );
     }
 
     #[test]

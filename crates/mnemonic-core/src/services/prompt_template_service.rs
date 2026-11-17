@@ -224,10 +224,12 @@ mod tests {
         .expect("write prompts");
         let result = load_templates_from_root(&dir);
         assert_eq!(result.templates.len(), 2);
-        assert!(result
-            .templates
-            .iter()
-            .any(|item| item.title == "Fix Tests"));
+        assert!(
+            result
+                .templates
+                .iter()
+                .any(|item| item.title == "Fix Tests")
+        );
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -238,10 +240,12 @@ mod tests {
         fs::write(dir.join(PROMPTS_JSON), "{").expect("write prompts");
         let result = load_templates_from_root(&dir);
         assert!(result.templates.is_empty());
-        assert!(result
-            .warning
-            .unwrap()
-            .contains("Invalid .mnemonic/prompts.json"));
+        assert!(
+            result
+                .warning
+                .unwrap()
+                .contains("Invalid .mnemonic/prompts.json")
+        );
         let _ = fs::remove_dir_all(dir);
     }
 

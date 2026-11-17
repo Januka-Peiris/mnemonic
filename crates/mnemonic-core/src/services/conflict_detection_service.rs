@@ -173,12 +173,16 @@ mod tests {
         assert_eq!(conflict.workspace_id_a, "ws-1");
         assert_eq!(conflict.workspace_id_b, "ws-2");
         assert_eq!(conflict.shared_files, vec!["src/auth.rs"]);
-        assert!(result
-            .conflicting_workspace_ids
-            .contains(&"ws-1".to_string()));
-        assert!(result
-            .conflicting_workspace_ids
-            .contains(&"ws-2".to_string()));
+        assert!(
+            result
+                .conflicting_workspace_ids
+                .contains(&"ws-1".to_string())
+        );
+        assert!(
+            result
+                .conflicting_workspace_ids
+                .contains(&"ws-2".to_string())
+        );
     }
 
     #[test]

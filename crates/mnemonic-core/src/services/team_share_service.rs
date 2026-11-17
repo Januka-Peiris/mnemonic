@@ -136,8 +136,12 @@ pub struct TeamWorkspaceList {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum TeamEntry {
     /// Applied in order to the end of a thread, these rebuild one entry.
-    Updates { updates: Vec<acp::SessionUpdate> },
-    CompletedPlan { entries: Vec<acp::PlanEntry> },
+    Updates {
+        updates: Vec<acp::SessionUpdate>,
+    },
+    CompletedPlan {
+        entries: Vec<acp::PlanEntry>,
+    },
     Compaction {
         #[serde(default)]
         summary: Option<String>,
@@ -199,7 +203,10 @@ pub struct TeamAction {
 #[derive(Clone, Debug, PartialEq)]
 pub enum TeamActionKind {
     Stop,
-    Permission { tool_call_id: String, option_id: String },
+    Permission {
+        tool_call_id: String,
+        option_id: String,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1090,7 +1097,10 @@ impl std::fmt::Display for TeamClientError {
             Self::Unreachable(_) => write!(f, "Offline"),
             Self::Forbidden => write!(f, "Hasn't added you to their allow list"),
             Self::Incompatible { .. } => write!(f, "On a different Mnemonic version"),
-            Self::Other(message) | Self::Refused { reason: message, .. } => {
+            Self::Other(message)
+            | Self::Refused {
+                reason: message, ..
+            } => {
                 write!(f, "{message}")
             }
         }
@@ -1616,9 +1626,9 @@ mod tests {
 
     fn user(text: &str) -> TeamEntry {
         TeamEntry::Updates {
-            updates: vec![acp::SessionUpdate::UserMessageChunk(acp::ContentChunk::new(
-                text.into(),
-            ))],
+            updates: vec![acp::SessionUpdate::UserMessageChunk(
+                acp::ContentChunk::new(text.into()),
+            )],
         }
     }
 

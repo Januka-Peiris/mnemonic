@@ -1,7 +1,7 @@
 use std::path::Path;
 use std::process::Command;
 
-use super::{enriched_path, TerminalCommandSpec};
+use super::{TerminalCommandSpec, enriched_path};
 
 /// Dedicated tmux server socket so agent sessions are isolated from the
 /// user's own tmux: their config (status bar, prefix key, mouse mode) does

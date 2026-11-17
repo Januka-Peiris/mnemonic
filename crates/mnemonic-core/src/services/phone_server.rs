@@ -24,6 +24,9 @@ use crate::services::web_push_service::PushSubscription;
 pub const PHONE_REQUEST_HEADER: &str = "X-Mnemonic-Phone";
 
 const PAGE: &str = include_str!("phone_page.html");
+const SERVICE_WORKER: &str = include_str!("phone_sw.js");
+const MANIFEST: &str = include_str!("phone_manifest.json");
+const ICON: &[u8] = include_bytes!("../../../zed/resources/app-icon@2x.png");
 
 const MAX_MESSAGE_BYTES: usize = 16 * 1024;
 /// Room for a message of `MAX_MESSAGE_BYTES` whose characters JSON escapes.
@@ -301,6 +304,17 @@ fn handle(mut request: Request, shared: &Shared) {
     }
     let response = match segments.as_slice() {
         [""] => page_response(),
+        ["manifest.webmanifest"] => static_response(
+            MANIFEST.as_bytes().to_vec(),
+            "application/manifest+json",
+            "no-cache",
+        ),
+        ["sw.js"] => static_response(
+            SERVICE_WORKER.as_bytes().to_vec(),
+            "text/javascript",
+            "no-store",
+        ),
+        ["icon.png"] => static_response(ICON.to_vec(), "image/png", "max-age=86400"),
         ["v1", "agents"] => {
             let list = PhoneAgentList {
                 agents: (shared.sources.agents)(),
@@ -373,7 +387,8 @@ const PAGE_HEADERS: [(&str, &str); 4] = [
     (
         "Content-Security-Policy",
         "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; \
-         connect-src 'self'; frame-ancestors 'none'",
+         connect-src 'self'; img-src 'self'; manifest-src 'self'; \
+         worker-src 'self'; frame-ancestors 'none'",
     ),
 ];
 
@@ -386,6 +401,24 @@ fn page_response() -> Response<std::io::Cursor<Vec<u8>>> {
                 log::error!(target: "mnemonic_lib", "The phone page's {name} header is invalid");
                 return text_response(500, "The page couldn't be served");
             }
+        }
+    }
+    response
+}
+
+fn static_response(
+    body: Vec<u8>,
+    content_type: &str,
+    cache_control: &str,
+) -> Response<std::io::Cursor<Vec<u8>>> {
+    let mut response = Response::from_data(body);
+    for (name, value) in [
+        ("Content-Type", content_type),
+        ("Cache-Control", cache_control),
+    ] {
+        match Header::from_bytes(name.as_bytes(), value.as_bytes()) {
+            Ok(header) => response.add_header(header),
+            Err(()) => return text_response(500, "The file couldn't be served"),
         }
     }
     response
@@ -897,6 +930,31 @@ mod tests {
         assert!(head.contains("x-frame-options: deny"), "answered {head}");
         assert!(head.contains("frame-ancestors 'none'"), "answered {head}");
         assert!(body.contains(PHONE_REQUEST_HEADER));
+        Ok(())
+    }
+
+    #[test]
+    fn serves_the_service_worker_as_javascript() -> Result<(), String> {
+        let (server, _recorded) = start("jay@example.com", Vec::new(), TeamShareHub::new())?;
+        let address = server.address();
+
+        let mut stream = TcpStream::connect(address).map_err(|err| err.to_string())?;
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .map_err(|err| err.to_string())?;
+        stream
+            .write_all(get(address, "/sw.js").as_bytes())
+            .map_err(|err| err.to_string())?;
+        let mut response = String::new();
+        std::io::Read::read_to_string(&mut stream, &mut response).map_err(|err| err.to_string())?;
+        let head = response.to_ascii_lowercase();
+
+        assert!(head.starts_with("http/1.1 200"), "answered {head}");
+        assert!(
+            head.contains("content-type: text/javascript"),
+            "answered {head}"
+        );
+        assert!(head.contains("cache-control: no-store"), "answered {head}");
         Ok(())
     }
 

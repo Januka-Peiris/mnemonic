@@ -1,0 +1,11 @@
+{
+  "name": "Mnemonic",
+  "short_name": "Mnemonic",
+  "display": "standalone",
+  "start_url": "/",
+  "theme_color": "#16181c",
+  "background_color": "#16181c",
+  "icons": [
+    { "src": "/icon.png", "sizes": "1024x1024", "type": "image/png", "purpose": "any" }
+  ]
+}
