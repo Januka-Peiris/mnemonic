@@ -230,19 +230,6 @@ pub(crate) struct TeamShare {
     /// Workspaces the user chose to share, saved in the core's settings
     /// table so the choice survives restarts.
     shared_workspaces: HashSet<String>,
-    /// Shared workspaces whose chats teammates may act in, saved the same
-    /// way.
-    step_in_workspaces: HashSet<String>,
-    /// Shared workspaces where teammates' agents may work, saved the same
-    /// way.
-    agent_workspaces: HashSet<String>,
-    /// Shared workspaces whose files teammates may read, saved the same way.
-    share_files_workspaces: HashSet<String>,
-    /// Workspaces with Share files on whose files teammates may also change.
-    edit_files_workspaces: HashSet<String>,
-    /// Skip lists by repo name, so every workspace of a repo skips the same
-    /// files.
-    skip_lists: HashMap<String, SkipList>,
     /// What the share server's request threads read to find a workspace's
     /// files: only workspaces with Share files on, as (root, skip list).
     file_roots: FileRoots,
@@ -252,15 +239,11 @@ pub(crate) struct TeamShare {
     /// Each file-sharing workspace's normalized `origin`, looked up once.
     remote_urls: HashMap<String, Option<String>>,
     scan_task: Option<Task<()>>,
-    skip_list_save_count: u64,
     /// This machine's copies of teammates' workspaces, by local workspace id.
     pub copies: HashMap<String, CopyFollow>,
     /// Bumped each time a teammate's batch is recorded, so views listing
     /// batches know to reload them.
     pub batch_generation: u64,
-    /// The newest skip-list save written, so a slower older write can't
-    /// land after a newer one.
-    skip_list_written: Arc<Mutex<u64>>,
 }
 
 type FileRoots = Arc<Mutex<HashMap<String, (PathBuf, SkipList)>>>;
@@ -284,16 +267,6 @@ fn lock_file_roots(
 
 /// The core settings key holding the ids of shared workspaces, as JSON.
 const SHARED_WORKSPACES_KEY: &str = "team_shared_workspaces";
-/// The core settings key holding the ids of workspaces teammates may step
-/// in on, as JSON.
-const STEP_IN_WORKSPACES_KEY: &str = "team_step_in_workspaces";
-/// The core settings key holding the ids of workspaces where teammates'
-/// agents may work, as JSON.
-const AGENT_WORKSPACES_KEY: &str = "team_agent_workspaces";
-const SHARE_FILES_WORKSPACES_KEY: &str = "team_share_files_workspaces";
-const EDIT_FILES_WORKSPACES_KEY: &str = "team_edit_files_workspaces";
-/// The core settings key holding each repo's skip list, as a JSON map.
-const SKIP_LISTS_KEY: &str = "team_repo_skip_lists";
 
 struct GlobalTeamShare(Entity<TeamShare>);
 
@@ -347,12 +320,6 @@ pub fn init(cx: &mut App) {
 impl TeamShare {
     fn new() -> Self {
         let shared_workspaces = load_workspace_ids(SHARED_WORKSPACES_KEY);
-        let saved_agent_workspaces = load_saved_workspace_ids(AGENT_WORKSPACES_KEY);
-        let first_run = saved_agent_workspaces.is_none();
-        let agent_workspaces = initial_agent_workspaces(saved_agent_workspaces, &shared_workspaces);
-        if first_run {
-            save_workspace_ids_now(AGENT_WORKSPACES_KEY, &agent_workspaces);
-        }
         Self {
             applied: None,
             hub: TeamShareHub::new(),
@@ -371,19 +338,12 @@ impl TeamShare {
             collapsed_peers: HashSet::new(),
             collapsed_peer_projects: HashSet::new(),
             shared_workspaces,
-            step_in_workspaces: load_workspace_ids(STEP_IN_WORKSPACES_KEY),
-            agent_workspaces,
-            share_files_workspaces: load_workspace_ids(SHARE_FILES_WORKSPACES_KEY),
-            edit_files_workspaces: load_workspace_ids(EDIT_FILES_WORKSPACES_KEY),
-            skip_lists: load_skip_lists(),
             file_roots: Arc::new(Mutex::new(HashMap::new())),
             agent_roots: Arc::new(Mutex::new(HashMap::new())),
             remote_urls: HashMap::new(),
             scan_task: None,
-            skip_list_save_count: 0,
             copies: HashMap::new(),
             batch_generation: 0,
-            skip_list_written: Arc::new(Mutex::new(0)),
         }
     }
 }
@@ -436,156 +396,22 @@ pub(crate) fn set_workspace_shared(workspace_id: &str, shared: bool, cx: &mut Ap
     }
 }
 
-pub(crate) fn workspace_allows_step_in(workspace_id: &str, cx: &App) -> bool {
-    team_share(cx).is_some_and(|team| team.read(cx).allows_step_in(workspace_id))
-}
-
-pub(crate) fn set_workspace_step_in(workspace_id: &str, allowed: bool, cx: &mut App) {
-    if let Some(team) = team_share(cx) {
-        team.update(cx, |team, cx| {
-            team.set_workspace_step_in(workspace_id, allowed, cx)
-        });
-    }
-}
-
-pub(crate) fn workspace_allows_agents(workspace_id: &str, cx: &App) -> bool {
-    team_share(cx).is_some_and(|team| team.read(cx).allows_agents(workspace_id))
-}
-
-pub(crate) fn set_workspace_agents(workspace_id: &str, allowed: bool, cx: &mut App) {
-    if let Some(team) = team_share(cx) {
-        team.update(cx, |team, cx| {
-            team.set_workspace_agents(workspace_id, allowed, cx)
-        });
-    }
-}
-
-pub(crate) fn workspace_shares_files(workspace_id: &str, cx: &App) -> bool {
-    team_share(cx).is_some_and(|team| team.read(cx).shares_files(workspace_id))
-}
-
-pub(crate) fn set_workspace_share_files(workspace_id: &str, shared: bool, cx: &mut App) {
-    if let Some(team) = team_share(cx) {
-        team.update(cx, |team, cx| {
-            team.set_workspace_share_files(workspace_id, shared, cx)
-        });
-    }
-}
-
-pub(crate) fn workspace_allows_file_edits(workspace_id: &str, cx: &App) -> bool {
-    team_share(cx).is_some_and(|team| team.read(cx).allows_file_edits(workspace_id))
-}
-
-pub(crate) fn set_workspace_file_edits(workspace_id: &str, allowed: bool, cx: &mut App) {
-    if let Some(team) = team_share(cx) {
-        team.update(cx, |team, cx| {
-            team.set_workspace_file_edits(workspace_id, allowed, cx)
-        });
-    }
-}
-
-pub(crate) fn repo_skip_list(repo: &str, cx: &App) -> SkipList {
-    team_share(cx)
-        .and_then(|team| team.read(cx).skip_lists.get(repo).cloned())
-        .unwrap_or_default()
-}
-
-pub(crate) fn set_repo_skip_list(repo: &str, skip_list: SkipList, cx: &mut App) {
-    if let Some(team) = team_share(cx) {
-        team.update(cx, |team, cx| team.set_repo_skip_list(repo, skip_list, cx));
-    }
-}
-
-fn load_skip_lists() -> HashMap<String, SkipList> {
-    let Some(state) = mnemonic_bridge::mnemonic_state_cloned() else {
-        return HashMap::new();
-    };
-    match settings_repository::get_value(&state.db, SKIP_LISTS_KEY) {
-        Ok(Some(json)) => serde_json::from_str(&json).unwrap_or_else(|err| {
-            log::error!("Couldn't read {SKIP_LISTS_KEY}: {err}");
-            HashMap::new()
-        }),
-        Ok(None) => HashMap::new(),
-        Err(err) => {
-            log::error!("Couldn't read {SKIP_LISTS_KEY}: {err}");
-            HashMap::new()
-        }
-    }
-}
-
-fn save_skip_lists(
-    skip_lists: &HashMap<String, SkipList>,
-    sequence: u64,
-    written: Arc<Mutex<u64>>,
-    cx: &App,
-) {
-    let skip_lists = skip_lists.clone();
-    cx.background_spawn(async move {
-        let Some(state) = mnemonic_bridge::mnemonic_state_cloned() else {
-            return;
-        };
-        let mut written = written
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if *written >= sequence {
-            return;
-        }
-        *written = sequence;
-        let saved = serde_json::to_string(&skip_lists)
-            .map_err(|err| err.to_string())
-            .and_then(|json| settings_repository::set_value(&state.db, SKIP_LISTS_KEY, &json));
-        if let Err(err) = saved {
-            log::error!("Couldn't save {SKIP_LISTS_KEY}: {err}");
-        }
-    })
-    .detach();
-}
-
 fn load_workspace_ids(key: &str) -> HashSet<String> {
-    load_saved_workspace_ids(key).unwrap_or_default()
-}
-
-/// The saved ids, or None when nothing was ever saved under `key`, which
-/// is different from a saved empty list.
-fn load_saved_workspace_ids(key: &str) -> Option<HashSet<String>> {
-    let state = mnemonic_bridge::mnemonic_state_cloned()?;
+    let Some(state) = mnemonic_bridge::mnemonic_state_cloned() else {
+        return HashSet::new();
+    };
     match settings_repository::get_value(&state.db, key) {
-        Ok(Some(json)) => Some(
-            serde_json::from_str::<Vec<String>>(&json)
-                .map(|ids| ids.into_iter().collect())
-                .unwrap_or_else(|err| {
-                    log::error!("Couldn't read {key}: {err}");
-                    HashSet::new()
-                }),
-        ),
-        Ok(None) => None,
+        Ok(Some(json)) => serde_json::from_str::<Vec<String>>(&json)
+            .map(|ids| ids.into_iter().collect())
+            .unwrap_or_else(|err| {
+                log::error!("Couldn't read {key}: {err}");
+                HashSet::new()
+            }),
+        Ok(None) => HashSet::new(),
         Err(err) => {
             log::error!("Couldn't read {key}: {err}");
-            Some(HashSet::new())
+            HashSet::new()
         }
-    }
-}
-
-/// A first run, with nothing saved, turns agents on for the workspaces
-/// already shared.
-fn initial_agent_workspaces(
-    saved: Option<HashSet<String>>,
-    shared: &HashSet<String>,
-) -> HashSet<String> {
-    saved.unwrap_or_else(|| shared.clone())
-}
-
-fn save_workspace_ids_now(key: &str, ids: &HashSet<String>) {
-    let Some(state) = mnemonic_bridge::mnemonic_state_cloned() else {
-        return;
-    };
-    let mut ids: Vec<&String> = ids.iter().collect();
-    ids.sort();
-    let saved = serde_json::to_string(&ids)
-        .map_err(|err| err.to_string())
-        .and_then(|json| settings_repository::set_value(&state.db, key, &json));
-    if let Err(err) = saved {
-        log::error!("Couldn't save {key}: {err}");
     }
 }
 
@@ -635,67 +461,13 @@ impl TeamShare {
             return;
         }
         save_workspace_ids(SHARED_WORKSPACES_KEY, &self.shared_workspaces, cx);
-        if shared {
-            for (ids, key) in [
-                (&mut self.step_in_workspaces, STEP_IN_WORKSPACES_KEY),
-                (&mut self.agent_workspaces, AGENT_WORKSPACES_KEY),
-                (&mut self.share_files_workspaces, SHARE_FILES_WORKSPACES_KEY),
-                (&mut self.edit_files_workspaces, EDIT_FILES_WORKSPACES_KEY),
-            ] {
-                if ids.insert(workspace_id.to_string()) {
-                    save_workspace_ids(key, ids, cx);
-                }
-            }
-        } else {
-            if self.step_in_workspaces.remove(workspace_id) {
-                save_workspace_ids(STEP_IN_WORKSPACES_KEY, &self.step_in_workspaces, cx);
-            }
-            if self.agent_workspaces.remove(workspace_id) {
-                save_workspace_ids(AGENT_WORKSPACES_KEY, &self.agent_workspaces, cx);
-            }
+        if !shared {
             self.stop_agents(workspace_id);
-            self.stop_sharing_files(workspace_id, cx);
+            self.stop_sharing_files(workspace_id);
         }
         self.update_sharing(cx);
         // Publishes straight away rather than on the next tick, so an
         // unshared workspace disappears for teammates at once.
-        if self.server.is_some() {
-            self.start_publishing(cx);
-        }
-        cx.notify();
-    }
-
-    fn set_workspace_step_in(&mut self, workspace_id: &str, allowed: bool, cx: &mut Context<Self>) {
-        let changed = if allowed {
-            self.shared_workspaces.contains(workspace_id)
-                && self.step_in_workspaces.insert(workspace_id.to_string())
-        } else {
-            self.step_in_workspaces.remove(workspace_id)
-        };
-        if !changed {
-            return;
-        }
-        save_workspace_ids(STEP_IN_WORKSPACES_KEY, &self.step_in_workspaces, cx);
-        if self.server.is_some() {
-            self.start_publishing(cx);
-        }
-        cx.notify();
-    }
-
-    fn set_workspace_agents(&mut self, workspace_id: &str, allowed: bool, cx: &mut Context<Self>) {
-        let changed = if allowed {
-            self.shared_workspaces.contains(workspace_id)
-                && self.agent_workspaces.insert(workspace_id.to_string())
-        } else {
-            self.agent_workspaces.remove(workspace_id)
-        };
-        if !changed {
-            return;
-        }
-        save_workspace_ids(AGENT_WORKSPACES_KEY, &self.agent_workspaces, cx);
-        if !allowed {
-            self.stop_agents(workspace_id);
-        }
         if self.server.is_some() {
             self.start_publishing(cx);
         }
@@ -711,103 +483,27 @@ impl TeamShare {
         }
     }
 
-    fn set_workspace_share_files(
-        &mut self,
-        workspace_id: &str,
-        shared: bool,
-        cx: &mut Context<Self>,
-    ) {
-        if shared {
-            if !self.shared_workspaces.contains(workspace_id)
-                || !self.share_files_workspaces.insert(workspace_id.to_string())
-            {
-                return;
-            }
-            save_workspace_ids(SHARE_FILES_WORKSPACES_KEY, &self.share_files_workspaces, cx);
-        } else if !self.stop_sharing_files(workspace_id, cx) {
-            return;
-        }
-        if self.server.is_some() {
-            self.start_publishing(cx);
-        }
-        cx.notify();
-    }
-
-    /// Turns off both file switches and takes the workspace's files away
-    /// from teammates at once. True when Share files was on.
-    fn stop_sharing_files(&mut self, workspace_id: &str, cx: &mut Context<Self>) -> bool {
-        if self.edit_files_workspaces.remove(workspace_id) {
-            save_workspace_ids(EDIT_FILES_WORKSPACES_KEY, &self.edit_files_workspaces, cx);
-        }
-        let was_sharing = self.share_files_workspaces.remove(workspace_id);
-        if was_sharing {
-            save_workspace_ids(SHARE_FILES_WORKSPACES_KEY, &self.share_files_workspaces, cx);
-        }
+    /// Takes the workspace's files away from teammates at once.
+    fn stop_sharing_files(&mut self, workspace_id: &str) {
         lock_file_roots(&self.file_roots).remove(workspace_id);
         self.remote_urls.remove(workspace_id);
         self.hub.remove_file_manifest(workspace_id);
-        was_sharing
-    }
-
-    fn set_workspace_file_edits(
-        &mut self,
-        workspace_id: &str,
-        allowed: bool,
-        cx: &mut Context<Self>,
-    ) {
-        let changed = if allowed {
-            self.shares_files(workspace_id)
-                && self.edit_files_workspaces.insert(workspace_id.to_string())
-        } else {
-            self.edit_files_workspaces.remove(workspace_id)
-        };
-        if !changed {
-            return;
-        }
-        save_workspace_ids(EDIT_FILES_WORKSPACES_KEY, &self.edit_files_workspaces, cx);
-        if self.server.is_some() {
-            self.start_publishing(cx);
-        }
-        cx.notify();
-    }
-
-    fn set_repo_skip_list(&mut self, repo: &str, skip_list: SkipList, cx: &mut Context<Self>) {
-        if self.skip_lists.get(repo) == Some(&skip_list) {
-            return;
-        }
-        self.skip_lists.insert(repo.to_string(), skip_list);
-        self.skip_list_save_count += 1;
-        save_skip_lists(
-            &self.skip_lists,
-            self.skip_list_save_count,
-            self.skip_list_written.clone(),
-            cx,
-        );
-        // Publishing rebuilds the file roots, which carry each workspace's
-        // skip list, from the repo's list.
-        if self.server.is_some() {
-            self.start_publishing(cx);
-        }
-        cx.notify();
     }
 
     fn shares_files(&self, workspace_id: &str) -> bool {
         self.shared_workspaces.contains(workspace_id)
-            && self.share_files_workspaces.contains(workspace_id)
     }
 
     fn allows_file_edits(&self, workspace_id: &str) -> bool {
-        self.shares_files(workspace_id) && self.edit_files_workspaces.contains(workspace_id)
+        self.shared_workspaces.contains(workspace_id)
     }
 
     fn allows_agents(&self, workspace_id: &str) -> bool {
         self.shared_workspaces.contains(workspace_id)
-            && self.agent_workspaces.contains(workspace_id)
     }
 
     fn allows_step_in(&self, workspace_id: &str) -> bool {
         self.shared_workspaces.contains(workspace_id)
-            && self.step_in_workspaces.contains(workspace_id)
     }
 
     /// Runs the share server exactly while some workspace is shared,
@@ -1052,7 +748,7 @@ impl TeamShare {
             loop {
                 let Ok((shared_ids, unlooked_ids)) = this.read_with(cx, |this, _| {
                     let unlooked: HashSet<String> = this
-                        .share_files_workspaces
+                        .shared_workspaces
                         .iter()
                         .filter(|id| !this.remote_urls.contains_key(*id))
                         .cloned()
@@ -1091,7 +787,7 @@ impl TeamShare {
                             };
                             this.update(cx, |this, cx| {
                                 for (id, remote) in remotes {
-                                    if this.share_files_workspaces.contains(&id) {
+                                    if this.shared_workspaces.contains(&id) {
                                         this.remote_urls.insert(id, remote);
                                     }
                                 }
@@ -1187,13 +883,7 @@ impl TeamShare {
                 if let Some(root) = workspace_root(&summary) {
                     file_roots.insert(
                         summary.id.clone(),
-                        (
-                            root,
-                            self.skip_lists
-                                .get(&summary.repo)
-                                .cloned()
-                                .unwrap_or_default(),
-                        ),
+                        (root, SkipList::default()),
                     );
                 }
             }
@@ -1259,12 +949,7 @@ impl TeamShare {
                 remote_url: self.remote_urls.get(&summary.id).cloned().flatten(),
                 base_branch: Some(summary.branch_health.base_branch.trim().to_string())
                     .filter(|base_branch| !base_branch.is_empty()),
-                skip_patterns: self
-                    .skip_lists
-                    .get(&summary.repo)
-                    .cloned()
-                    .unwrap_or_default()
-                    .patterns,
+                skip_patterns: SkipList::default().patterns,
                 agents: agent_root.is_some(),
                 root_path: agent_root.map(|root| root.to_string_lossy().into_owned()),
                 id: summary.id,
@@ -2959,41 +2644,18 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn sharing_turns_on_teammates_agents(cx: &mut TestAppContext) {
+    async fn unsharing_takes_the_folder_and_files_from_the_server(cx: &mut TestAppContext) {
         let team = cx.new(|_| TeamShare::new());
         team.update(cx, |team, cx| {
             team.set_workspace_shared("workspace", true, cx);
             assert!(team.allows_agents("workspace"));
-        });
-    }
-
-    #[gpui::test]
-    async fn unsharing_turns_off_teammates_agents(cx: &mut TestAppContext) {
-        let team = cx.new(|_| TeamShare::new());
-        team.update(cx, |team, cx| {
-            team.set_workspace_shared("workspace", true, cx);
+            lock_agent_roots(&team.agent_roots).insert("workspace".into(), "/work".into());
+            lock_file_roots(&team.file_roots)
+                .insert("workspace".into(), (PathBuf::from("/root"), SkipList::default()));
             team.set_workspace_shared("workspace", false, cx);
             assert!(!team.allows_agents("workspace"));
-            team.set_workspace_shared("workspace", true, cx);
-            assert!(team.allows_agents("workspace"));
-        });
-    }
-
-    #[gpui::test]
-    async fn agents_off_and_unsharing_take_the_folder_from_the_server(cx: &mut TestAppContext) {
-        let team = cx.new(|_| TeamShare::new());
-        team.update(cx, |team, cx| {
-            team.set_workspace_shared("workspace", true, cx);
-            let has_root =
-                |team: &TeamShare| lock_agent_roots(&team.agent_roots).contains_key("workspace");
-            lock_agent_roots(&team.agent_roots).insert("workspace".into(), "/work".into());
-            team.set_workspace_agents("workspace", false, cx);
-            assert!(!has_root(team));
-
-            team.set_workspace_agents("workspace", true, cx);
-            lock_agent_roots(&team.agent_roots).insert("workspace".into(), "/work".into());
-            team.set_workspace_shared("workspace", false, cx);
-            assert!(!has_root(team));
+            assert!(!lock_agent_roots(&team.agent_roots).contains_key("workspace"));
+            assert!(lock_file_roots(&team.file_roots).is_empty());
         });
     }
 
@@ -3006,65 +2668,6 @@ mod tests {
             assert!(check_agent_write(root, Path::new("/elsewhere/main.rs"), "Jay", cx).is_err());
             let not_utf8 = root.join(std::ffi::OsStr::from_bytes(b"bad\xff.rs"));
             assert!(check_agent_write(root, &not_utf8, "Jay", cx).is_err());
-        });
-    }
-
-    #[test]
-    fn agents_start_on_for_workspaces_already_shared() {
-        let shared: HashSet<String> = ["a", "b"].into_iter().map(String::from).collect();
-        assert_eq!(initial_agent_workspaces(None, &shared), shared);
-        let saved: HashSet<String> = ["a"].into_iter().map(String::from).collect();
-        assert_eq!(
-            initial_agent_workspaces(Some(saved.clone()), &shared),
-            saved
-        );
-        assert!(initial_agent_workspaces(Some(HashSet::new()), &shared).is_empty());
-    }
-
-    #[gpui::test]
-    async fn turning_off_share_files_turns_off_edits(cx: &mut TestAppContext) {
-        let team = cx.new(|_| TeamShare::new());
-        team.update(cx, |team, cx| {
-            team.set_workspace_shared("workspace", true, cx);
-            team.set_workspace_share_files("workspace", true, cx);
-            team.set_workspace_file_edits("workspace", true, cx);
-            assert!(team.shares_files("workspace"));
-            assert!(team.allows_file_edits("workspace"));
-
-            team.set_workspace_share_files("workspace", false, cx);
-            assert!(!team.allows_file_edits("workspace"));
-            team.set_workspace_share_files("workspace", true, cx);
-            assert!(!team.allows_file_edits("workspace"));
-
-            team.set_workspace_file_edits("workspace", true, cx);
-            team.set_workspace_shared("workspace", false, cx);
-            assert!(!team.shares_files("workspace"));
-            assert!(!team.allows_file_edits("workspace"));
-        });
-    }
-
-    #[gpui::test]
-    async fn dropping_file_sharing_removes_the_snapshot_and_manifest(cx: &mut TestAppContext) {
-        let team = cx.new(|_| TeamShare::new());
-        team.update(cx, |team, cx| {
-            let manifest = || mnemonic_core::services::team_files_service::TeamFileManifest {
-                head_commit: "abc".into(),
-                entries: Vec::new(),
-            };
-            for turn_off in [false, true] {
-                team.set_workspace_shared("workspace", true, cx);
-                team.set_workspace_share_files("workspace", true, cx);
-                lock_file_roots(&team.file_roots)
-                    .insert("workspace".into(), (PathBuf::from("/root"), SkipList::default()));
-                team.hub.set_file_manifest("workspace", manifest());
-                if turn_off {
-                    team.set_workspace_share_files("workspace", false, cx);
-                } else {
-                    team.set_workspace_shared("workspace", false, cx);
-                }
-                assert!(lock_file_roots(&team.file_roots).is_empty());
-                assert!(team.hub.file_manifest("workspace").is_none());
-            }
         });
     }
 }

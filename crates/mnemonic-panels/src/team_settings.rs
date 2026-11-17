@@ -3,17 +3,14 @@
 //! allowing are written straight to the settings file; which workspaces are
 //! shared is kept in the core's settings table.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
-use editor::Editor;
 use fs::Fs;
 use gpui::{
     App, AppContext as _, Bounds, ClipboardItem, Context, Entity, FocusHandle, Focusable,
     IntoElement, Render, SharedString, Subscription, Task, TitlebarOptions, Window, WindowBounds,
     WindowOptions, px, size,
 };
-use mnemonic_core::services::team_files_service::SkipList;
 use mnemonic_core::services::team_share_service::{TailnetDevice, tailnet_devices};
 use mnemonic_core::services::workspace_service;
 use settings::{Settings as _, SettingsStore, TeamPeerContent, update_settings_file};
@@ -21,10 +18,7 @@ use ui::{Checkbox, Headline, HeadlineSize, Switch, ToggleState, Tooltip, prelude
 use util::ResultExt as _;
 
 use crate::team::{
-    SharingStatus, TeamPeer, TeamSettings, is_workspace_shared, repo_skip_list, set_repo_skip_list,
-    set_workspace_agents, set_workspace_file_edits, set_workspace_share_files,
-    set_workspace_shared, set_workspace_step_in, team_share, workspace_allows_agents,
-    workspace_allows_file_edits, workspace_allows_step_in, workspace_shares_files,
+    SharingStatus, TeamPeer, TeamSettings, is_workspace_shared, set_workspace_shared, team_share,
 };
 
 enum Devices {
@@ -44,9 +38,6 @@ pub(crate) struct TeamSettingsView {
     focus_handle: FocusHandle,
     devices: Devices,
     workspaces: Vec<LocalWorkspace>,
-    /// One pattern per line, by repo, created the first time one of the
-    /// repo's workspaces has Share files on.
-    skip_list_editors: HashMap<String, Entity<Editor>>,
     _load_devices: Task<()>,
     _load_workspaces: Task<()>,
     _subscriptions: Vec<Subscription>,
@@ -63,7 +54,6 @@ impl TeamSettingsView {
             focus_handle: cx.focus_handle(),
             devices: Devices::Loading,
             workspaces: Vec::new(),
-            skip_list_editors: HashMap::new(),
             _load_devices: Self::load_devices(cx),
             _load_workspaces: Self::load_workspaces(cx),
             _subscriptions: subscriptions,
@@ -196,24 +186,6 @@ impl TeamSettingsView {
             .child(Label::new(status).size(LabelSize::Small).color(color))
     }
 
-    fn ensure_skip_list_editors(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        for workspace in &self.workspaces {
-            if self.skip_list_editors.contains_key(&workspace.project)
-                || !workspace_shares_files(&workspace.id, cx)
-            {
-                continue;
-            }
-            let patterns = repo_skip_list(&workspace.project, cx).patterns.join("\n");
-            let editor = cx.new(|cx| {
-                let mut editor = Editor::auto_height(3, 10, window, cx);
-                editor.set_text(patterns, window, cx);
-                editor
-            });
-            self.skip_list_editors
-                .insert(workspace.project.clone(), editor);
-        }
-    }
-
     fn render_workspaces(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let mut section = card(
             "Your workspaces",
@@ -242,82 +214,9 @@ impl TeamSettingsView {
                             .color(Color::Muted),
                     ),
                 );
-                let repo_shares_files = self.workspaces.iter().any(|other| {
-                    other.project == workspace.project && workspace_shares_files(&other.id, cx)
-                });
-                section = section.children(
-                    repo_shares_files
-                        .then(|| self.skip_list_editors.get(&workspace.project))
-                        .flatten()
-                        .map(|editor| render_skip_list_editor(&workspace.project, editor, cx)),
-                );
             }
             let shared = is_workspace_shared(&workspace.id, cx);
-            let step_in = workspace_allows_step_in(&workspace.id, cx);
             let workspace_id = workspace.id.clone();
-            let step_in_toggle = shared.then(|| {
-                let workspace_id = workspace_id.clone();
-                Checkbox::new(
-                    SharedString::from(format!("team-step-in-{}", workspace.id)),
-                    if step_in {
-                        ToggleState::Selected
-                    } else {
-                        ToggleState::Unselected
-                    },
-                )
-                .label("Let teammates step in")
-                .on_click(move |state, _, cx| {
-                    set_workspace_step_in(&workspace_id, *state == ToggleState::Selected, cx);
-                })
-            });
-            let agents = workspace_allows_agents(&workspace.id, cx);
-            let agents_toggle = shared.then(|| {
-                let workspace_id = workspace_id.clone();
-                Checkbox::new(
-                    SharedString::from(format!("team-agents-{}", workspace.id)),
-                    if agents {
-                        ToggleState::Selected
-                    } else {
-                        ToggleState::Unselected
-                    },
-                )
-                .label("Teammates' agents can work here")
-                .on_click(move |state, _, cx| {
-                    set_workspace_agents(&workspace_id, *state == ToggleState::Selected, cx);
-                })
-            });
-            let share_files = shared && workspace_shares_files(&workspace.id, cx);
-            let file_edits = share_files && workspace_allows_file_edits(&workspace.id, cx);
-            let share_files_toggle = shared.then(|| {
-                let workspace_id = workspace_id.clone();
-                Checkbox::new(
-                    SharedString::from(format!("team-share-files-{}", workspace.id)),
-                    if share_files {
-                        ToggleState::Selected
-                    } else {
-                        ToggleState::Unselected
-                    },
-                )
-                .label("Share files")
-                .on_click(move |state, _, cx| {
-                    set_workspace_share_files(&workspace_id, *state == ToggleState::Selected, cx);
-                })
-            });
-            let file_edits_toggle = share_files.then(|| {
-                let workspace_id = workspace_id.clone();
-                Checkbox::new(
-                    SharedString::from(format!("team-edit-files-{}", workspace.id)),
-                    if file_edits {
-                        ToggleState::Selected
-                    } else {
-                        ToggleState::Unselected
-                    },
-                )
-                .label("Teammates can edit files")
-                .on_click(move |state, _, cx| {
-                    set_workspace_file_edits(&workspace_id, *state == ToggleState::Selected, cx);
-                })
-            });
             section =
                 section.child(
                     h_flex()
@@ -338,10 +237,6 @@ impl TeamSettingsView {
                                     .single_line(),
                             ),
                         )
-                        .children(step_in_toggle)
-                        .children(agents_toggle)
-                        .children(share_files_toggle)
-                        .children(file_edits_toggle)
                         .child(
                             Switch::new(
                                 SharedString::from(format!("team-share-{}", workspace.id)),
@@ -685,45 +580,6 @@ fn card(title: &'static str, description: Option<&'static str>, cx: &App) -> Div
         })
 }
 
-fn render_skip_list_editor(repo: &str, editor: &Entity<Editor>, cx: &App) -> impl IntoElement {
-    let editor_for_save = editor.clone();
-    let repo = repo.to_string();
-    v_flex()
-        .w_full()
-        .pb_1()
-        .gap_1()
-        .child(
-            Label::new("Skip these files in every workspace of this repo (one pattern per line)")
-                .size(LabelSize::XSmall)
-                .color(Color::Muted),
-        )
-        .child(
-            div()
-                .px_2()
-                .py_1()
-                .rounded_md()
-                .border_1()
-                .border_color(cx.theme().colors().border)
-                .bg(cx.theme().colors().editor_background)
-                .child(editor.clone()),
-        )
-        .child(
-            Button::new(SharedString::from(format!("team-skip-save-{repo}")), "Save")
-                .label_size(LabelSize::Small)
-                .on_click(move |_, _, cx| {
-                    let patterns = editor_for_save
-                        .read(cx)
-                        .text(cx)
-                        .lines()
-                        .map(str::trim)
-                        .filter(|line| !line.is_empty())
-                        .map(str::to_string)
-                        .collect();
-                    set_repo_skip_list(&repo, SkipList { patterns }, cx);
-                }),
-        )
-}
-
 impl Focusable for TeamSettingsView {
     fn focus_handle(&self, _cx: &App) -> FocusHandle {
         self.focus_handle.clone()
@@ -731,8 +587,7 @@ impl Focusable for TeamSettingsView {
 }
 
 impl Render for TeamSettingsView {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        self.ensure_skip_list_editors(window, cx);
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let settings = TeamSettings::get_global(cx).clone();
         div()
             .id("team-settings")

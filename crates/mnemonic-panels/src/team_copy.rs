@@ -911,7 +911,7 @@ fn why_cant_send(team: &TeamShare, state: &CopyState) -> Option<String> {
     {
         Some(workspace) if workspace.share_files && workspace.edit_files => None,
         Some(workspace) if workspace.share_files => Some(format!(
-            "{name} hasn't turned on \"Teammates can edit files\""
+            "{name} isn't letting teammates edit these files"
         )),
         _ => Some(format!("{name} isn't sharing these files")),
     }
