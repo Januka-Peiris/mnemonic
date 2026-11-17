@@ -57,11 +57,11 @@
 
 - [ ] **Step 1: Write the failing tests**
   - `phone_server.rs`: `lists_repositories` (GET `/v1/repositories` with a source returning two repos → 200 and both names in the body); `unknown_workspace_pr_is_404`.
-  - `chat_feed.rs`: `team_feed_leaves_turn_info_unset` — a `StepInOnceOnly` feed publishing a chat whose turn ended serializes a `TeamChat` with no `last_turn_ended_at`, `last_turn_errored` or `waiting` keys; `phone_feed_records_a_turn_end` — the `All` feed sets `last_turn_ended_at` after `TurnEnded` and `last_turn_errored: true` after `Errored`.
-- [ ] **Step 2: Run them and see them fail** — `cargo test -p mnemonic-core phone_server` and `cargo test -p mnemonic-panels chat_feed`.
+  - `chat_feed.rs`: `team_feed_leaves_turn_info_unset`: a `StepInOnceOnly` feed publishing a chat whose turn ended serializes a `TeamChat` with no `last_turn_ended_at`, `last_turn_errored` or `waiting` keys; `phone_feed_records_a_turn_end`: the `All` feed sets `last_turn_ended_at` after `TurnEnded` and `last_turn_errored: true` after `Errored`.
+- [ ] **Step 2: Run them and see them fail**: `cargo test -p mnemonic-core phone_server` and `cargo test -p mnemonic-panels chat_feed`.
 - [ ] **Step 3: Implement** the fields, the feed bookkeeping, `can_merge`, `PhoneSources` and both routes; build the sources in `phone.rs::start_server` (repositories from `repository_repository::list` plus workspace dates; PR status from `pr_draft_service::get_workspace_pr_status` and `configured_merge_method`).
 - [ ] **Step 4: Run the tests and see them pass**, plus `cargo test -p mnemonic-core -p mnemonic-panels`.
-- [ ] **Step 5: Commit** — `git commit -m "Give the phone repositories, PR status and chat turn info"`.
+- [ ] **Step 5: Commit**: `git commit -m "Give the phone repositories, PR status and chat turn info"`.
 
 ### Task 2: Start, ship, and act on workspaces not open on the Mac
 
@@ -92,12 +92,12 @@ Behaviour:
 
 - [ ] **Step 1: Write the failing tests**
   - `phone_server.rs`: `refuses_a_task_from_another_origin` (POST `/v1/tasks` with a foreign `Origin` → 403); `parses_new_actions` (the three routes produce the three `PhoneAction`s; empty `text` and empty `head` → 400).
-  - `phone.rs` (gpui): `message_opens_a_workspace_not_on_screen` — a saved chat in a workspace not loaded in the window receives the message after `run_phone_action` and the workspace is now loaded; `no_window_says_open_mnemonic`; `start_task_refuses_an_unknown_repository` (no workspace row created); `start_task_queues_the_first_message` (the message sits in the primary chat's `pending_messages` while the agent connects).
+  - `phone.rs` (gpui): `message_opens_a_workspace_not_on_screen`: a saved chat in a workspace not loaded in the window receives the message after `run_phone_action` and the workspace is now loaded; `no_window_says_open_mnemonic`; `start_task_refuses_an_unknown_repository` (no workspace row created); `start_task_queues_the_first_message` (the message sits in the primary chat's `pending_messages` while the agent connects).
   - `phone.rs`: `merge_refuses_a_moved_head` using a pure `fn check_merge(status: &WorkspacePrStatus, head: &str) -> Result<i64, TeamActionError>`.
 - [ ] **Step 2: Run them and see them fail.**
 - [ ] **Step 3: Implement** the factoring, the async action loop, the new actions and routes.
 - [ ] **Step 4: Run the tests and see them pass**, plus the two crates' full suites.
-- [ ] **Step 5: Commit** — `git commit -m "Start tasks, open PRs and merge from the phone"`.
+- [ ] **Step 5: Commit**: `git commit -m "Start tasks, open PRs and merge from the phone"`.
 
 ### Task 3: Serve the phone page over Tailscale HTTPS
 
@@ -116,11 +116,11 @@ Behaviour:
   - Directory: `<AppState.data_dir>/phone`.
 - Behaviour: `start_server` tries `tailscale_cert` (skipped when `dns_name` is empty); on error it starts over HTTP and stores the reason. Once a day `PhoneShare` re-runs `tailscale cert` (it renews by itself near expiry) and restarts the server when the certificate bytes changed. The Team window's "This computer" card shows `Phone alerts are off: <reason>` when `https_error` is set.
 
-- [ ] **Step 1: Write the failing test** — `origin_must_match_the_scheme`: a pure `fn is_same_origin(origin: &str, host: &str, https: bool) -> bool`; `https://h` passes only when `https`, `http://h` only when not.
+- [ ] **Step 1: Write the failing test**: `origin_must_match_the_scheme`: a pure `fn is_same_origin(origin: &str, host: &str, https: bool) -> bool`; `https://h` passes only when `https`, `http://h` only when not.
 - [ ] **Step 2: Run it and see it fail.**
 - [ ] **Step 3: Implement** TLS start, cert fetch with fallback, daily renewal, the Team card line.
 - [ ] **Step 4: Run tests**; then by hand: with HTTPS enabled in the tailnet, `curl -sI https://<dns_name>:47232/` from another tailnet device answers; with it disabled, the Team card shows the reason and HTTP still works.
-- [ ] **Step 5: Commit** — `git commit -m "Serve the phone page over Tailscale HTTPS"`.
+- [ ] **Step 5: Commit**: `git commit -m "Serve the phone page over Tailscale HTTPS"`.
 
 ### Task 4: Web push sending
 
@@ -145,7 +145,7 @@ Behaviour:
 - [ ] **Step 2: Run them and see them fail.**
 - [ ] **Step 3: Implement.** Prefer RustCrypto crates already in `Cargo.lock` (`p256`, `hkdf`, `sha2`) plus `aes-gcm`; `jsonwebtoken` may sign ES256 from the key's PKCS#8 form.
 - [ ] **Step 4: Run the tests and see them pass.**
-- [ ] **Step 5: Commit** — `git commit -m "Add web push sending"`.
+- [ ] **Step 5: Commit**: `git commit -m "Add web push sending"`.
 
 ### Task 5: Send alerts by web push
 
@@ -163,11 +163,11 @@ Behaviour:
   - Push payload JSON: `{ "title": "<repo> / <workspace>", "body": "<v1 generic line>", "chat_id", "url": "<page url>#chat=<chat id>", "permission": { "tool_call_id", "allow_option_id", "deny_option_id" } | null }`.
 - Behaviour: `notify_idle_phone` keeps one gate (`should_notify` + the 30 s collapse) and then sends to ntfy when `ntfy_url` is set and to every stored subscription; a `Gone` deletes that subscription; other errors are logged with `log::warn!`. No subscriptions and no ntfy → nothing sent.
 
-- [ ] **Step 1: Write the failing tests** — `quick_answers_need_both_once_options` (AllowOnce+RejectOnce → Some with their ids; AllowAlways+RejectOnce only → None); `refuses_a_non_https_push_endpoint` (POST with `http://` endpoint → 400).
+- [ ] **Step 1: Write the failing tests**: `quick_answers_need_both_once_options` (AllowOnce+RejectOnce → Some with their ids; AllowAlways+RejectOnce only → None); `refuses_a_non_https_push_endpoint` (POST with `http://` endpoint → 400).
 - [ ] **Step 2: Run them and see them fail.**
 - [ ] **Step 3: Implement.**
 - [ ] **Step 4: Run the tests and see them pass.**
-- [ ] **Step 5: Commit** — `git commit -m "Send phone alerts by web push"`.
+- [ ] **Step 5: Commit**: `git commit -m "Send phone alerts by web push"`.
 
 ### Task 6: The page: home, new task, chat, ship
 
@@ -187,7 +187,7 @@ Behaviour:
 - [ ] **Step 1:** Implement the page changes.
 - [ ] **Step 2:** Check by hand with the mock server (`/tmp/phone-mock/mock.py`, extended with the new routes) in Chrome device mode at 360 px: Needs you shows a waiting chat with buttons; New task opens the new chat; folding, quick replies and the Merge confirm work; nothing clips.
 - [ ] **Step 3:** `cargo test -p mnemonic-core phone_server` still passes (`serves_the_page`).
-- [ ] **Step 4: Commit** — `git commit -m "Rework the phone page for starting and shipping work"`.
+- [ ] **Step 4: Commit**: `git commit -m "Rework the phone page for starting and shipping work"`.
 
 ### Task 7: Installable page and alert buttons
 
@@ -203,8 +203,8 @@ Behaviour:
   - Page: registers `/sw.js` when `navigator.serviceWorker` exists; a `Turn on alerts` button (hidden when push is unsupported or the page isn't on `https:`, hidden once subscribed) that requests permission, subscribes with the key from `/v1/push/key`, and posts the subscription.
   - Service worker: `push` → `showNotification(title, { body, tag: chat_id, data, actions })` with actions `allow` (`Allow once`) and `deny` (`Deny`) only when `permission` is present. `notificationclick`: action `allow`/`deny` → `fetch('/v1/chats/<id>/permission', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Mnemonic-Phone': '1' }, body })`, then replace the notification (same tag, no actions) with `Allowed`/`Denied`, or `Already answered` on 409; a plain tap focuses an open page client or opens `url`. No caching or fetch handler.
 
-- [ ] **Step 1: Write the failing test** — `serves_the_service_worker_as_javascript` (GET `/sw.js` → 200 with `Content-Type: text/javascript`; a wrong type makes Chrome refuse to register it).
+- [ ] **Step 1: Write the failing test**: `serves_the_service_worker_as_javascript` (GET `/sw.js` → 200 with `Content-Type: text/javascript`; a wrong type makes Chrome refuse to register it).
 - [ ] **Step 2: Run it and see it fail.**
 - [ ] **Step 3: Implement.**
 - [ ] **Step 4:** Tests pass; by hand on the phone over HTTPS: install from Chrome, Turn on alerts, leave the Mac idle past the threshold, trigger a permission prompt, tap `Allow once` on the notification and see the agent continue; tap it again on a second alert after answering on the Mac and see `Already answered`.
-- [ ] **Step 5: Commit** — `git commit -m "Make the phone page installable with actionable alerts"`.
+- [ ] **Step 5: Commit**: `git commit -m "Make the phone page installable with actionable alerts"`.
