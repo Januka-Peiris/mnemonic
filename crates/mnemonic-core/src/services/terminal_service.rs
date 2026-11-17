@@ -1673,7 +1673,6 @@ mod tests {
             skills: vec![],
             templates: vec![],
             role_preference: None,
-            coordinator_eligible: Some(true),
         };
 
         let session_id = "11111111-1111-4111-8111-111111111111".to_string();
@@ -1747,7 +1746,6 @@ mod tests {
             skills: vec![],
             templates: vec![],
             role_preference: None,
-            coordinator_eligible: None,
         };
 
         let details = activity::format_terminal_start_activity_details(
@@ -1782,7 +1780,6 @@ mod tests {
             skills: vec![],
             templates: vec![],
             role_preference: None,
-            coordinator_eligible: None,
         };
 
         let details =

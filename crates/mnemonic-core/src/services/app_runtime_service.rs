@@ -1,7 +1,7 @@
 use std::sync::atomic::Ordering;
 
 use crate::repositories::orchestrator_repository;
-use crate::services::{coordinator_service, orchestrator_service, repo_intelligence_service};
+use crate::services::{orchestrator_service, repo_intelligence_service};
 use crate::state::AppState;
 
 #[derive(Clone, Copy, Debug)]
@@ -12,7 +12,6 @@ pub struct BackgroundServiceOptions {
     pub orchestrator: bool,
     pub repo_intelligence: bool,
     pub prune_old_data: bool,
-    pub reconcile_coordinators: bool,
 }
 
 impl BackgroundServiceOptions {
@@ -47,7 +46,6 @@ impl Default for BackgroundServiceOptions {
             orchestrator: true,
             repo_intelligence: true,
             prune_old_data: true,
-            reconcile_coordinators: true,
         }
     }
 }
@@ -66,12 +64,6 @@ pub fn start_background_services(
     }
 
     restore_orchestrator_settings(state);
-
-    if options.reconcile_coordinators {
-        if let Err(error) = coordinator_service::reconcile_all_active_runs_on_startup(state) {
-            log::warn!(target: "mnemonic_lib", "Failed to reconcile active coordinator runs on startup: {error}");
-        }
-    }
 
     if options.terminal_ws {
         start_terminal_ws_bridge(state)?;
@@ -132,7 +124,6 @@ mod tests {
         assert!(options.orchestrator);
         assert!(options.repo_intelligence);
         assert!(options.prune_old_data);
-        assert!(options.reconcile_coordinators);
     }
 
     #[test]
@@ -142,6 +133,5 @@ mod tests {
         assert!(options.orchestrator);
         assert!(options.repo_intelligence);
         assert!(options.prune_old_data);
-        assert!(options.reconcile_coordinators);
     }
 }

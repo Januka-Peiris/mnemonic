@@ -341,6 +341,14 @@ pub fn mnemonic_event_hub(cx: &App) -> Entity<MnemonicEventHub> {
 
 static MNEMONIC_STATE: std::sync::Mutex<Option<AppState>> = std::sync::Mutex::new(None);
 
+/// Installs the given state without the event reader `init` starts, for
+/// tests that need `mnemonic_state` backed by a throwaway database.
+#[cfg(any(test, feature = "test-support"))]
+pub fn init_for_test(state: AppState, cx: &mut App) {
+    let event_hub = cx.new(|_| MnemonicEventHub);
+    cx.set_global(GlobalMnemonicState { state, event_hub });
+}
+
 pub fn init(cx: &mut App) {
     let data_dir = paths::data_dir().clone();
     let cache_dir = paths::data_dir().join("cache");

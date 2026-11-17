@@ -9,7 +9,6 @@ pub const COMMAND_APPROVAL_REQUIRED: &str = "mn://command-approval-required";
 pub const AGENT_MODE_CHANGED: &str = "mn://agent-mode-changed";
 pub const AGENT_DECISION_REQUIRED: &str = "mn://agent-decision-required";
 pub const AGENT_DECISION_RESOLVED: &str = "mn://agent-decision-resolved";
-pub const COORDINATOR_NOTIFY: &str = "mn://coordinator-notify";
 pub const ORCHESTRATOR_NOTIFY: &str = "mn://orchestrator-notify";
 pub const WORKSPACE_REBASE_CONFLICT: &str = "mn://workspace-rebase-conflict";
 
@@ -24,7 +23,6 @@ mod tests {
         assert_eq!(AGENT_MODE_CHANGED, "mn://agent-mode-changed");
         assert_eq!(AGENT_DECISION_REQUIRED, "mn://agent-decision-required");
         assert_eq!(AGENT_DECISION_RESOLVED, "mn://agent-decision-resolved");
-        assert_eq!(COORDINATOR_NOTIFY, "mn://coordinator-notify");
         assert_eq!(ORCHESTRATOR_NOTIFY, "mn://orchestrator-notify");
         assert_eq!(WORKSPACE_REBASE_CONFLICT, "mn://workspace-rebase-conflict");
     }

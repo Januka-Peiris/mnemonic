@@ -1,6 +1,7 @@
 use std::any::Any;
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -19,7 +20,10 @@ use gpui::{
 };
 use mnemonic_bridge::AgentAttention;
 use mnemonic_core::models::{ChatSessionRecord, WorkspaceSummary};
-use mnemonic_core::repositories::{chat_session_repository, workspace_repository};
+use mnemonic_core::repositories::{
+    agent_started_chat_repository, chat_session_repository, workspace_repository,
+};
+use mnemonic_core::services::agent_hub_service::{ChatAgentChoice, ChatState};
 use mnemonic_core::services::chat_transcript_service::{self, LinkedChat};
 use mnemonic_core::services::pr_draft_service::OpenReviewComment;
 use mnemonic_core::services::workspace_script_service::RunCommandPlan;
@@ -200,6 +204,13 @@ impl ChatAgent {
         }
     }
 
+    pub(crate) fn from_choice(choice: ChatAgentChoice) -> Self {
+        match choice {
+            ChatAgentChoice::Claude => Self::Claude,
+            ChatAgentChoice::Codex => Self::Codex,
+        }
+    }
+
     fn from_agent_id(agent_id: &str) -> Self {
         Self::ALL
             .into_iter()
@@ -349,6 +360,8 @@ pub(crate) struct SessionItem {
     title: SharedString,
     content: SessionContent,
     workspace_view: WeakEntity<WorkspaceView>,
+    /// The chat that started this one through the agent hub.
+    starter_record_id: Option<String>,
 }
 
 impl EventEmitter<ItemEvent> for SessionItem {}
@@ -367,6 +380,14 @@ impl Item for SessionItem {
 
     fn tab_content_text(&self, _detail: usize, _cx: &App) -> SharedString {
         self.title.clone()
+    }
+
+    fn tab_tooltip_text(&self, cx: &App) -> Option<SharedString> {
+        if !matches!(self.content, SessionContent::Chat { .. }) {
+            return None;
+        }
+        let starter = find_open_chat(self.starter_record_id.as_deref()?, cx)?;
+        Some(SharedString::from(format!("Started by {}", starter.title)))
     }
 
     fn tab_icon(&self, _window: &Window, _cx: &App) -> Option<Icon> {
@@ -733,6 +754,10 @@ impl PendingMessages {
     pub(crate) fn take_next(&mut self) -> Option<String> {
         self.0.pop_front()
     }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
 }
 
 /// What dispatch routing needs to know about a session.
@@ -777,15 +802,45 @@ pub(crate) fn releases_pending(event: &acp_thread::AcpThreadEvent) -> bool {
 
 /// The typed text of a user message, without mentions or attachments.
 fn user_message_text(message: &acp_thread::UserMessage) -> String {
-    message
-        .chunks
+    typed_text(&message.chunks)
+}
+
+fn typed_text(blocks: &[acp::ContentBlock]) -> String {
+    blocks
         .iter()
-        .filter_map(|chunk| match chunk {
+        .filter_map(|block| match block {
             acp::ContentBlock::Text(text) => Some(text.text.as_str()),
             _ => None,
         })
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+/// A queued message as text, with its mentions as `[@name](uri)` links. None
+/// when it holds an image or anything else text can't stand in for.
+fn queued_message_text(blocks: &[acp::ContentBlock]) -> Option<String> {
+    let mut text = String::new();
+    for block in blocks {
+        match block {
+            acp::ContentBlock::Text(content) => text.push_str(&content.text),
+            acp::ContentBlock::ResourceLink(link) => {
+                text.push_str(&format!("[@{}]({})", link.name, link.uri));
+            }
+            acp::ContentBlock::Resource(acp::EmbeddedResource { resource, .. }) => {
+                let uri = match resource {
+                    acp::EmbeddedResourceResource::TextResourceContents(contents) => &contents.uri,
+                    acp::EmbeddedResourceResource::BlobResourceContents(contents) => &contents.uri,
+                    _ => return None,
+                };
+                let link = acp_thread::MentionUri::parse(uri, util::paths::PathStyle::local())
+                    .map(|mention| mention.as_link().to_string())
+                    .unwrap_or_else(|_| format!("[@{uri}]({uri})"));
+                text.push_str(&link);
+            }
+            _ => return None,
+        }
+    }
+    Some(text)
 }
 
 /// Workspaces created chat-first have a primary chat; every other workspace
@@ -960,6 +1015,9 @@ pub struct WorkspaceView {
     _diagnostics_updated: Subscription,
     /// Redraws the line above a teammate's copy when its following changes.
     _team_copy_watch: Option<Subscription>,
+    /// Built for a chat an agent started while another workspace was shown.
+    /// Its new tabs don't take focus until the user selects it.
+    opened_in_background: bool,
 }
 
 impl WorkspaceView {
@@ -1065,7 +1123,7 @@ impl WorkspaceView {
             if let Err(err) = chat_session_repository::insert(&state.db, &record) {
                 log::error!("Failed to save review chat session: {err}");
             }
-            self.open_chat(record, Some(prompt), window, cx);
+            self.open_chat(record, Some(prompt), true, window, cx);
             return;
         }
 
@@ -1524,6 +1582,7 @@ impl WorkspaceView {
             title,
             content,
             workspace_view,
+            starter_record_id: None,
         })
     }
 
@@ -1536,8 +1595,9 @@ impl WorkspaceView {
         cx: &mut Context<Self>,
     ) {
         self.active_session = self.sessions.len().saturating_sub(1);
+        let focus = !self.opened_in_background;
         self.active_pane.update(cx, |pane, cx| {
-            pane.add_item(Box::new(item), true, true, None, window, cx);
+            pane.add_item(Box::new(item), true, focus, None, window, cx);
         });
         cx.notify();
     }
@@ -2577,10 +2637,11 @@ impl WorkspaceView {
         };
         let item = session.item.clone();
         self.active_session = index;
+        let focus = !self.opened_in_background;
         if let Some(pane) = self.pane_for_item(item.entity_id(), cx) {
             pane.update(cx, |pane, cx| {
                 if let Some(item_index) = pane.index_for_item(&item) {
-                    pane.activate_item(item_index, true, true, window, cx);
+                    pane.activate_item(item_index, true, focus, window, cx);
                 }
             });
             self.active_pane = pane;
@@ -2632,7 +2693,7 @@ impl WorkspaceView {
             log::error!("Failed to save chat session: {err}");
         }
         let record_id = record.id.clone();
-        self.open_chat(record, None, window, cx);
+        self.open_chat(record, None, true, window, cx);
         record_id
     }
 
@@ -2686,7 +2747,7 @@ impl WorkspaceView {
                     if let Err(err) = chat_session_repository::insert(&state.db, &record) {
                         log::error!("Failed to save forked chat session: {err}");
                     }
-                    this.open_chat(record, None, window, cx);
+                    this.open_chat(record, None, true, window, cx);
                 }
                 Err(err) => {
                     log::error!("Failed to fork chat: {err:#}");
@@ -2745,6 +2806,7 @@ impl WorkspaceView {
     fn build_chat(
         &mut self,
         record: &ChatSessionRecord,
+        server: Rc<dyn agent_servers::AgentServer>,
         initial_prompt: Option<String>,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -2762,8 +2824,6 @@ impl WorkspaceView {
         let agent = Agent::Custom {
             id: AgentId(SharedString::from(record.agent.clone())),
         };
-        let fs = project.read(cx).fs().clone();
-        let server = agent.server(fs, agent::ThreadStore::global(cx));
         let resume_session_id = record.acp_session_id.clone().map(acp::SessionId::new);
         let work_dirs = self.chat_work_dirs(cx);
         let title = SharedString::from(record.title.clone());
@@ -2823,16 +2883,59 @@ impl WorkspaceView {
         })
     }
 
-    /// Opens a chat tab for a saved chat session.
+    /// Opens a chat tab for a saved chat session. Unless `show` is set, the
+    /// tab goes in beside the one being shown, which stays shown and keeps
+    /// the focus. Returns false when the chat couldn't be built.
     fn open_chat(
         &mut self,
         record: ChatSessionRecord,
         initial_prompt: Option<String>,
+        show: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) {
-        let Some(chat) = self.build_chat(&record, initial_prompt, window, cx) else {
-            return;
+    ) -> bool {
+        let Some(server) = self.chat_server(&record, cx) else {
+            return false;
+        };
+        self.open_chat_with_server(record, server, initial_prompt, show, window, cx)
+    }
+
+    fn chat_server(
+        &self,
+        record: &ChatSessionRecord,
+        cx: &App,
+    ) -> Option<Rc<dyn agent_servers::AgentServer>> {
+        #[cfg(test)]
+        if let Some(server) = cx.try_global::<tests::TestChatServer>() {
+            return Some(server.0.clone());
+        }
+        let project = self.project.upgrade()?;
+        let agent = Agent::Custom {
+            id: AgentId(SharedString::from(record.agent.clone())),
+        };
+        let fs = project.read(cx).fs().clone();
+        Some(agent.server(fs, agent::ThreadStore::global(cx)))
+    }
+
+    fn open_chat_with_server(
+        &mut self,
+        record: ChatSessionRecord,
+        server: Rc<dyn agent_servers::AgentServer>,
+        initial_prompt: Option<String>,
+        show: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let state = mnemonic_bridge::mnemonic_state(cx);
+        let starter_record_id = match agent_started_chat_repository::get(&state.db, &record.id) {
+            Ok(started) => started.map(|started| started.started_by_chat_id),
+            Err(err) => {
+                log::error!("Failed to read which chat started a chat: {err}");
+                None
+            }
+        };
+        let Some(chat) = self.build_chat(&record, server, initial_prompt, window, cx) else {
+            return false;
         };
         let view_id = chat.view.entity_id();
         let title = SharedString::from(record.title);
@@ -2845,13 +2948,23 @@ impl WorkspaceView {
             },
             cx,
         );
+        item.update(cx, |item, _| item.starter_record_id = starter_record_id);
         self.sessions.push(WorkspaceSession {
             title,
             item: item.clone(),
             kind: SessionKind::Chat(chat),
         });
-        self.show_new_session(item, window, cx);
+        if show {
+            self.show_new_session(item, window, cx);
+        } else {
+            // `add_item` always makes the new tab the pane's active one.
+            self.active_pane.update(cx, |pane, cx| {
+                pane.add_item_inner(Box::new(item), false, false, false, None, window, cx);
+            });
+            cx.notify();
+        }
         self.handle_chat_changed(view_id, cx);
+        true
     }
 
     fn chat_index(&self, view_id: EntityId) -> Option<usize> {
@@ -3556,6 +3669,27 @@ impl WorkspaceView {
             return;
         };
         root_thread_view.update(cx, |thread_view, cx| thread_view.cancel_generation(cx));
+    }
+
+    /// Queues a message from another chat's agent, sent as soon as this chat
+    /// is connected and idle.
+    fn queue_agent_message(
+        &mut self,
+        record_id: &str,
+        text: String,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        let chat = self
+            .sessions
+            .iter_mut()
+            .filter_map(WorkspaceSession::chat_mut)
+            .find(|chat| chat.record_id == record_id)
+            .ok_or_else(|| "That chat isn't open.".to_string())?;
+        chat.app_messages.push(text.clone());
+        chat.pending_messages.push(text);
+        let view_id = chat.view.entity_id();
+        self.flush_pending(view_id, cx);
+        Ok(())
     }
 
     fn chat_by_record(&self, record_id: &str) -> Option<&ChatSession> {
@@ -4361,7 +4495,10 @@ impl WorkspaceView {
         }
         record.acp_session_id = None;
 
-        let Some(chat) = self.build_chat(&record, None, window, cx) else {
+        let Some(server) = self.chat_server(&record, cx) else {
+            return;
+        };
+        let Some(chat) = self.build_chat(&record, server, None, window, cx) else {
             return;
         };
         let view_id = chat.view.entity_id();
@@ -4791,6 +4928,14 @@ pub(crate) fn register_window(
     windows.0.push((workspace, window));
 }
 
+/// The OS window showing this Mnemonic window's workspace.
+pub(crate) fn window_handle_of(workspace: &Entity<Workspace>, cx: &App) -> Option<AnyWindowHandle> {
+    open_window_handles(cx)
+        .into_iter()
+        .find(|(open, _)| open == workspace)
+        .map(|(_, window)| window)
+}
+
 pub(crate) fn open_windows(cx: &App) -> Vec<Entity<Workspace>> {
     open_window_handles(cx)
         .into_iter()
@@ -4853,6 +4998,170 @@ pub(crate) fn find_open_chat(record_id: &str, cx: &App) -> Option<OpenChat> {
                 title: session.title.clone(),
                 thread: session.chat()?.view.read(cx).root_thread(cx),
             })
+        })
+    })
+}
+
+/// What a chat's agent is doing, for the agent hub.
+pub(crate) fn chat_state(record_id: &str, cx: &App) -> ChatState {
+    let Some(open_chat) = find_open_chat(record_id, cx) else {
+        return ChatState::Closed;
+    };
+    let Some(chat) = open_chat.view.read(cx).chat_by_record(record_id) else {
+        return ChatState::Closed;
+    };
+    let conversation = chat.view.read(cx);
+    if conversation.is_loading() {
+        return ChatState::Starting;
+    }
+    // Not loading and no thread: the agent failed to load or exited, or is
+    // waiting for sign-in. Neither ends on its own.
+    let Some(thread) = conversation.root_thread(cx) else {
+        return ChatState::Stopped;
+    };
+    // A message queued here hasn't reached the thread yet, so the reply on
+    // screen still answers the previous one.
+    if !chat.pending_messages.is_empty() {
+        return ChatState::Replying;
+    }
+    let thread = thread.read(cx);
+    match thread.status() {
+        acp_thread::ThreadStatus::Generating if thread.is_waiting_for_confirmation() => {
+            ChatState::WaitingForApproval
+        }
+        acp_thread::ThreadStatus::Generating => ChatState::Replying,
+        acp_thread::ThreadStatus::Idle
+            if replies_since_last_user_message(thread).next().is_some() =>
+        {
+            ChatState::Replied
+        }
+        acp_thread::ThreadStatus::Idle => ChatState::Stopped,
+    }
+}
+
+/// The agent's text since the last user message, without its thinking.
+pub(crate) fn latest_reply(record_id: &str, cx: &App) -> Option<String> {
+    let thread = find_open_chat(record_id, cx)?.thread?;
+    let thread = thread.read(cx);
+    let reply = replies_since_last_user_message(thread)
+        .flat_map(|message| &message.chunks)
+        .filter_map(|chunk| match chunk {
+            acp_thread::AssistantMessageChunk::Message { block } => Some(block.to_markdown(cx)),
+            acp_thread::AssistantMessageChunk::Thought { .. } => None,
+        })
+        .filter(|text| !text.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    (!reply.is_empty()).then_some(reply)
+}
+
+fn replies_since_last_user_message(
+    thread: &acp_thread::AcpThread,
+) -> impl Iterator<Item = &acp_thread::AssistantMessage> {
+    let entries = thread.entries();
+    let start = entries
+        .iter()
+        .rposition(|entry| matches!(entry, acp_thread::AgentThreadEntry::UserMessage(_)))
+        .map_or(0, |index| index + 1);
+    entries[start..].iter().filter_map(|entry| match entry {
+        acp_thread::AgentThreadEntry::AssistantMessage(message) => Some(message),
+        _ => None,
+    })
+}
+
+/// Which turn a chat's agent is on: how many user messages its thread has,
+/// and whether the latest turn is still running.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct ChatTurn {
+    pub user_messages: usize,
+    pub running: bool,
+}
+
+pub(crate) fn chat_turn(record_id: &str, cx: &App) -> Option<ChatTurn> {
+    let thread = find_open_chat(record_id, cx)?.thread?;
+    let thread = thread.read(cx);
+    Some(ChatTurn {
+        user_messages: thread
+            .entries()
+            .iter()
+            .filter(|entry| matches!(entry, acp_thread::AgentThreadEntry::UserMessage(_)))
+            .count(),
+        running: thread.status() == acp_thread::ThreadStatus::Generating,
+    })
+}
+
+/// The agent a loaded chat runs.
+pub(crate) fn chat_agent(record_id: &str, cx: &App) -> Option<ChatAgent> {
+    let open_chat = find_open_chat(record_id, cx)?;
+    let agent = open_chat.view.read(cx).chat_by_record(record_id)?.agent;
+    Some(agent)
+}
+
+/// Takes the messages the user typed into a chat while its agent was busy
+/// off the chat's queue, so they aren't also sent when its turn ends.
+/// Messages holding an image, or with no text at all, stay queued and are
+/// sent as usual when the turn ends.
+pub(crate) fn take_typed_messages(record_id: &str, cx: &mut App) -> Vec<String> {
+    let Some(thread_view) = find_open_chat(record_id, cx).and_then(|chat| {
+        chat.view
+            .read(cx)
+            .chat_by_record(record_id)?
+            .view
+            .read(cx)
+            .root_thread_view()
+    }) else {
+        return Vec::new();
+    };
+    thread_view.update(cx, |thread_view, cx| {
+        let mut typed = Vec::new();
+        let mut index = 0;
+        while let Some(queued) = thread_view.local_queued_messages.get(index) {
+            let Some(text) =
+                queued_message_text(&queued.content).filter(|text| !text.trim().is_empty())
+            else {
+                index += 1;
+                continue;
+            };
+            // Removing through the thread view keeps its queued flag right.
+            if thread_view.remove_from_queue(index, cx).is_none() {
+                break;
+            }
+            typed.push(text);
+        }
+        if !typed.is_empty() {
+            cx.notify();
+        }
+        typed
+    })
+}
+
+/// Sends a message to a chat, queued until it is connected and idle.
+pub(crate) fn send_to_chat(record_id: &str, text: String, cx: &mut App) -> Result<(), String> {
+    let chat = find_open_chat(record_id, cx).ok_or_else(|| "That chat isn't open.".to_string())?;
+    chat.view
+        .update(cx, |view, cx| view.queue_agent_message(record_id, text, cx))
+}
+
+/// The open chat whose agent session has this id.
+pub(crate) fn chat_record_for_session(session_id: &str, cx: &App) -> Option<String> {
+    open_windows(cx).into_iter().find_map(|window| {
+        let host = window.read(cx).panes().iter().find_map(|pane| {
+            pane.read(cx)
+                .items()
+                .find_map(|item| item.downcast::<WorkspaceHost>())
+        })?;
+        host.read(cx).views.values().find_map(|view| {
+            view.read(cx)
+                .sessions
+                .iter()
+                .filter_map(WorkspaceSession::chat)
+                .find(|chat| {
+                    chat.view
+                        .read(cx)
+                        .root_thread(cx)
+                        .is_some_and(|thread| thread.read(cx).session_id().0.as_ref() == session_id)
+                })
+                .map(|chat| chat.record_id.clone())
         })
     })
 }
@@ -4943,7 +5252,7 @@ fn agent_chat_title(thread: &acp_thread::AcpThread, agent_label: &str) -> Option
     clean_chat_title(&thread.title()?, agent_label)
 }
 
-fn clean_chat_title(title: &str, agent_label: &str) -> Option<String> {
+pub(crate) fn clean_chat_title(title: &str, agent_label: &str) -> Option<String> {
     let title = title.split_whitespace().collect::<Vec<_>>().join(" ");
     let title = title
         .trim_matches(|character: char| matches!(character, '"' | '\'' | '.' | ':'))
@@ -5204,11 +5513,12 @@ impl WorkspaceHost {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.ensure_view(summary, workspace, project, database_id, window, cx);
+        self.ensure_view(summary, workspace, project, database_id, false, window, cx);
         self.active = Some(ActiveView::Local(summary.id.clone()));
         self.release_inactive_teammates(cx);
         if let Some(view) = self.views.get(&summary.id) {
             view.update(cx, |view, cx| {
+                view.opened_in_background = false;
                 view.load_run_config(cx);
                 view.mark_seen(cx);
             });
@@ -5220,13 +5530,16 @@ impl WorkspaceHost {
     }
 
     /// Builds the workspace's view and resumes its chats, unless it is
-    /// already loaded. Doesn't change which workspace is shown.
+    /// already loaded. Doesn't change which workspace is shown. A view built
+    /// in the background leaves the focus where it is.
+    #[allow(clippy::too_many_arguments)]
     fn ensure_view(
         &mut self,
         summary: &WorkspaceSummary,
         workspace: WeakEntity<Workspace>,
         project: Entity<Project>,
         database_id: Option<WorkspaceId>,
+        in_background: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -5343,6 +5656,7 @@ impl WorkspaceHost {
                     run_command_count: 0,
                     run_tooltip: SharedString::from("Reading .mnemonic/config.json…"),
                     run_starting: false,
+                    opened_in_background: in_background,
                 }
             });
             let state = mnemonic_bridge::mnemonic_state(cx);
@@ -5358,7 +5672,7 @@ impl WorkspaceHost {
                 view.refresh_diagnostic_summary(&project, cx);
                 let start_main_cli = should_start_main_cli(&chat_records);
                 for record in chat_records {
-                    view.open_chat(record, None, window, cx);
+                    view.open_chat(record, None, true, window, cx);
                 }
                 if start_main_cli {
                     view.spawn_primary_agent(window, cx);
@@ -5769,6 +6083,127 @@ impl WorkspaceHost {
         false
     }
 
+    /// Creates the workspace's view if needed (via `ensure_view`, without
+    /// activating it) and opens a new chat tab in it without activating the
+    /// tab. A `primary` chat is saved before a new view is built, so the
+    /// view opens it in place of the main CLI, as for a workspace made in
+    /// the sidebar. The chat record gets `record_id`, chosen by the caller so
+    /// it can record who started the chat before the tab reads that.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn open_chat_in_background(
+        workspace: &mut Workspace,
+        workspace_id: &str,
+        record_id: String,
+        agent: ChatAgent,
+        title: String,
+        prompt: String,
+        primary: bool,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
+    ) -> Result<(), String> {
+        let state = mnemonic_bridge::mnemonic_state(cx);
+        let host = Self::host_for_background_view(workspace, workspace_id, cx)?;
+        let saved_primary = if primary && !host.read(cx).views.contains_key(workspace_id) {
+            let record = ChatSessionRecord {
+                id: record_id.clone(),
+                workspace_id: workspace_id.to_string(),
+                agent: agent.agent_id().to_string(),
+                title: title.clone(),
+                acp_session_id: None,
+                is_review: false,
+                is_primary: true,
+                position: 0,
+            };
+            chat_session_repository::insert(&state.db, &record)?;
+            Some(record.id)
+        } else {
+            None
+        };
+        let view = Self::ensure_background_view(workspace, workspace_id, window, cx)?;
+        view.update(cx, |view, cx| match saved_primary {
+            // The view opened the saved chat, without a prompt.
+            Some(record_id) => view.queue_agent_message(&record_id, prompt, cx),
+            None => {
+                let record = ChatSessionRecord {
+                    id: record_id,
+                    workspace_id: view.workspace_id.clone(),
+                    agent: agent.agent_id().to_string(),
+                    title,
+                    acp_session_id: None,
+                    is_review: false,
+                    is_primary: false,
+                    position: view.next_chat_position(cx),
+                };
+                chat_session_repository::insert(&state.db, &record)?;
+                if !view.open_chat(record, Some(prompt), false, window, cx) {
+                    return Err("Couldn't start the chat.".to_string());
+                }
+                Ok(())
+            }
+        })
+    }
+
+    /// This window's host, unless another window shows the workspace.
+    fn host_for_background_view(
+        workspace: &Workspace,
+        workspace_id: &str,
+        cx: &App,
+    ) -> Result<Entity<WorkspaceHost>, String> {
+        let this_window = workspace.weak_handle().entity_id();
+        let hosted_elsewhere = open_windows(cx)
+            .into_iter()
+            .filter(|other| other.entity_id() != this_window)
+            .any(|other| Self::hosts(other.read(cx), workspace_id, cx));
+        if hosted_elsewhere {
+            // A second view would connect a second copy of its chats.
+            return Err("That workspace is open in another window.".to_string());
+        }
+        workspace
+            .panes()
+            .iter()
+            .find_map(|pane| {
+                pane.read(cx)
+                    .items()
+                    .find_map(|item| item.downcast::<WorkspaceHost>())
+            })
+            .ok_or_else(|| "This window shows no workspaces.".to_string())
+    }
+
+    /// The workspace's view in this window, built without showing it or
+    /// moving the focus if it isn't loaded yet.
+    pub(crate) fn ensure_background_view(
+        workspace: &mut Workspace,
+        workspace_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
+    ) -> Result<Entity<WorkspaceView>, String> {
+        let host = Self::host_for_background_view(workspace, workspace_id, cx)?;
+        if let Some(view) = host.read(cx).views.get(workspace_id).cloned() {
+            return Ok(view);
+        }
+        let state = mnemonic_bridge::mnemonic_state(cx);
+        let summary = workspace_repository::list(&state.db)?
+            .into_iter()
+            .find(|summary| summary.id == workspace_id)
+            .ok_or_else(|| format!("There is no workspace {workspace_id}."))?;
+        let workspace_handle = workspace.weak_handle();
+        let project = workspace.project().clone();
+        let database_id = workspace.database_id();
+        host.update(cx, |host, cx| {
+            host.ensure_view(
+                &summary,
+                workspace_handle,
+                project,
+                database_id,
+                true,
+                window,
+                cx,
+            );
+            host.views.get(workspace_id).cloned()
+        })
+        .ok_or_else(|| "Couldn't open the workspace.".to_string())
+    }
+
     /// Sends an instruction to the agent terminal of the given workspace, if
     /// its view exists in this window. Returns false when the workspace has
     /// no live view (it hasn't been opened yet).
@@ -5878,7 +6313,7 @@ impl Render for WorkspaceHost {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[test]
@@ -6026,5 +6461,433 @@ mod tests {
         assert_eq!(pending.take_next().as_deref(), Some("a"));
         assert_eq!(pending.take_next().as_deref(), Some("b"));
         assert_eq!(pending.take_next(), None);
+    }
+
+    fn workspace_detail(id: &str) -> mnemonic_core::models::WorkspaceDetail {
+        use mnemonic_core::models::{AgentSessionSummary, BranchHealth, WorkspaceDetail};
+        WorkspaceDetail {
+            summary: WorkspaceSummary {
+                id: id.to_string(),
+                name: id.to_string(),
+                repo: "repo".to_string(),
+                branch: id.to_string(),
+                agent: "claude".to_string(),
+                status: "idle".to_string(),
+                current_step: String::new(),
+                completed_steps: Vec::new(),
+                changed_files: Vec::new(),
+                last_updated: String::new(),
+                pr_status: None,
+                pr_number: None,
+                description: String::new(),
+                current_task: String::new(),
+                branch_health: BranchHealth {
+                    ahead_by: 0,
+                    behind_by: 0,
+                    merge_risk: String::new(),
+                    last_rebase: String::new(),
+                    base_branch: "main".to_string(),
+                },
+                agent_session: AgentSessionSummary {
+                    id: String::new(),
+                    agent: String::new(),
+                    status: String::new(),
+                    model: String::new(),
+                    token_count: 0,
+                    estimated_cost: String::new(),
+                    last_message: String::new(),
+                    started_at: String::new(),
+                },
+                repository_id: None,
+                repository_path: None,
+                selected_branch: None,
+                selected_worktree_id: None,
+                selected_worktree_path: None,
+                workspace_root_path: None,
+                worktree_managed_by_mnemonic: false,
+                workspace_source: "test".to_string(),
+                parent_workspace_id: None,
+                source_workspace_id: None,
+                derived_from_branch: None,
+                linked_worktrees: Vec::new(),
+                cost_limit_usd: None,
+                run_tests_on_create: false,
+                create_pr_on_complete: false,
+            },
+            worktree_path: String::new(),
+            base_branch: "main".to_string(),
+            recent_events: Vec::new(),
+        }
+    }
+
+    /// A workspace with a primary chat, so opening it never starts the
+    /// main CLI terminal.
+    fn add_chat_first_workspace(
+        db: &mnemonic_core::db::Database,
+        id: &str,
+    ) -> Result<WorkspaceSummary, String> {
+        let detail = workspace_detail(id);
+        workspace_repository::insert(db, &detail)?;
+        chat_session_repository::insert(
+            db,
+            &ChatSessionRecord {
+                id: format!("{id}-primary"),
+                workspace_id: id.to_string(),
+                agent: ChatAgent::Claude.agent_id().to_string(),
+                title: "Claude".to_string(),
+                acp_session_id: None,
+                is_review: false,
+                is_primary: true,
+                position: 0,
+            },
+        )?;
+        Ok(detail.summary)
+    }
+
+    fn host_of(workspace: &Workspace, cx: &App) -> Option<Entity<WorkspaceHost>> {
+        workspace.panes().iter().find_map(|pane| {
+            pane.read(cx)
+                .items()
+                .find_map(|item| item.downcast::<WorkspaceHost>())
+        })
+    }
+
+    /// The titles of the workspace's terminal tabs; None while its view
+    /// isn't built.
+    pub(crate) fn terminal_tabs(
+        workspace: &Workspace,
+        workspace_id: &str,
+        cx: &App,
+    ) -> Option<Vec<String>> {
+        let view = host_of(workspace, cx)?
+            .read(cx)
+            .views
+            .get(workspace_id)?
+            .clone();
+        Some(
+            view.read(cx)
+                .terminal_titles()
+                .map(|title| title.to_string())
+                .collect(),
+        )
+    }
+
+    pub(crate) struct StubServer(pub(crate) acp_thread::StubAgentConnection);
+
+    /// Makes every chat opened from now on run on this server.
+    pub(crate) struct TestChatServer(pub(crate) Rc<dyn agent_servers::AgentServer>);
+
+    impl gpui::Global for TestChatServer {}
+
+    impl agent_servers::AgentServer for StubServer {
+        fn logo(&self) -> IconName {
+            IconName::Chat
+        }
+
+        fn agent_id(&self) -> AgentId {
+            AgentId::new("stub-agent")
+        }
+
+        fn connect(
+            &self,
+            _delegate: agent_servers::AgentServerDelegate,
+            _project: Entity<Project>,
+            _cx: &mut App,
+        ) -> gpui::Task<anyhow::Result<Rc<dyn acp_thread::AgentConnection>>> {
+            gpui::Task::ready(Ok(Rc::new(self.0.clone())))
+        }
+
+        fn into_any(self: Rc<Self>) -> Rc<dyn Any> {
+            self
+        }
+    }
+
+    /// A window showing chat-first workspace A, with chat-first workspace B
+    /// saved but not opened. Their chats' agents never connect.
+    /// Queues a message in a chat as the user typing it during a turn does.
+    pub(crate) fn queue_typed_message(
+        record_id: &str,
+        content: Vec<acp::ContentBlock>,
+        cx: &mut App,
+    ) {
+        let thread_view = find_open_chat(record_id, cx)
+            .and_then(|chat| {
+                chat.view
+                    .read(cx)
+                    .chat_by_record(record_id)?
+                    .view
+                    .read(cx)
+                    .root_thread_view()
+            })
+            .expect("the chat is connected");
+        thread_view.update(cx, |thread_view, cx| {
+            thread_view.add_to_queue(content, Vec::new(), cx)
+        });
+    }
+
+    pub(crate) fn queued_message_count(record_id: &str, cx: &App) -> usize {
+        find_open_chat(record_id, cx)
+            .and_then(|chat| {
+                chat.view
+                    .read(cx)
+                    .chat_by_record(record_id)?
+                    .view
+                    .read(cx)
+                    .root_thread_view()
+            })
+            .map_or(0, |thread_view| thread_view.read(cx).local_queued_messages.len())
+    }
+
+    pub(crate) async fn window_showing_workspace_a(
+        cx: &mut gpui::TestAppContext,
+    ) -> (
+        Entity<Workspace>,
+        mnemonic_core::state::AppState,
+        tempfile::TempDir,
+        &mut gpui::VisualTestContext,
+    ) {
+        let data_dir = tempfile::tempdir().expect("a temporary data folder");
+        let state = mnemonic_core::state::AppState::initialize(
+            data_dir.path().to_path_buf(),
+            data_dir.path().join("cache"),
+            Arc::new(mnemonic_core::state::NoopEventEmitter),
+        )
+        .expect("the test database opens");
+        let summary_a = add_chat_first_workspace(&state.db, "ws-a").expect("workspace A is saved");
+        add_chat_first_workspace(&state.db, "ws-b").expect("workspace B is saved");
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+            editor::init(cx);
+            agent::ThreadStore::init_global(cx);
+            release_channel::init(semver::Version::new(0, 0, 0), cx);
+            mnemonic_bridge::init_for_test(state.clone(), cx);
+        });
+        let fs = project::FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project.clone(), window, cx));
+        workspace.update_in(cx, |workspace, window, cx| {
+            register_window(workspace.weak_handle(), window.window_handle(), cx);
+            WorkspaceHost::activate_workspace(workspace, &summary_a, window, cx);
+        });
+        cx.run_until_parked();
+        (workspace, state, data_dir, cx)
+    }
+
+    #[gpui::test]
+    async fn background_chat_does_not_take_the_active_tab(cx: &mut gpui::TestAppContext) {
+        let (workspace, state, _data_dir, cx) = window_showing_workspace_a(cx).await;
+
+        let host = workspace
+            .read_with(cx, host_of)
+            .expect("the window hosts workspaces");
+        let view_a = host
+            .read_with(cx, |host, _| host.views.get("ws-a").cloned())
+            .expect("workspace A is open");
+        let (sessions_before, active_item_before, focused_before) =
+            view_a.update_in(cx, |view, window, cx| {
+                let active_item = view
+                    .active_pane
+                    .read(cx)
+                    .active_item()
+                    .map(|item| item.item_id());
+                (view.sessions.len(), active_item, window.focused(cx))
+            });
+        let starts_focused = view_a.update_in(cx, |view, window, cx| {
+            view.focus_handle(cx).contains_focused(window, cx)
+        });
+        assert!(starts_focused, "workspace A's chat tab starts out focused");
+
+        let chat_in_a = "helper-in-a".to_string();
+        agent_started_chat_repository::insert(
+            &state.db,
+            &mnemonic_core::models::AgentStartedChat {
+                chat_id: chat_in_a.clone(),
+                started_by_chat_id: "ws-a-primary".to_string(),
+                workspace_id: "ws-a".to_string(),
+                made_workspace: false,
+            },
+        )
+        .expect("the starter is recorded");
+        workspace
+            .update_in(cx, |workspace, window, cx| {
+                WorkspaceHost::open_chat_in_background(
+                    workspace,
+                    "ws-a",
+                    chat_in_a.clone(),
+                    ChatAgent::Claude,
+                    "Helper".to_string(),
+                    "Look at the tests".to_string(),
+                    false,
+                    window,
+                    cx,
+                )
+            })
+            .expect("the chat opens in workspace A");
+        cx.run_until_parked();
+
+        view_a.update_in(cx, |view, window, cx| {
+            assert_eq!(view.sessions.len(), sessions_before + 1);
+            assert_eq!(
+                view.active_pane
+                    .read(cx)
+                    .active_item()
+                    .map(|item| item.item_id()),
+                active_item_before,
+                "the new tab is not the active one"
+            );
+            assert_eq!(
+                window.focused(cx),
+                focused_before,
+                "focus stays where it was"
+            );
+        });
+        let saved = chat_session_repository::list_for_workspace(&state.db, "ws-a")
+            .expect("chats are listed")
+            .into_iter()
+            .find(|record| record.id == chat_in_a)
+            .expect("the new chat is saved");
+        assert_eq!(saved.title, "Helper");
+        assert!(!saved.is_primary);
+        assert_eq!(saved.position, 1);
+        let tooltip = view_a.read_with(cx, |view, cx| {
+            view.sessions
+                .iter()
+                .find(|session| {
+                    session
+                        .chat()
+                        .is_some_and(|chat| chat.record_id == chat_in_a)
+                })
+                .and_then(|session| session.item.read(cx).tab_tooltip_text(cx))
+        });
+        assert_eq!(tooltip.as_deref(), Some("Started by Claude"));
+
+        workspace
+            .update_in(cx, |workspace, window, cx| {
+                WorkspaceHost::open_chat_in_background(
+                    workspace,
+                    "ws-b",
+                    "helper-in-b".to_string(),
+                    ChatAgent::Codex,
+                    "Helper".to_string(),
+                    "Look at the docs".to_string(),
+                    false,
+                    window,
+                    cx,
+                )
+            })
+            .expect("the chat opens in workspace B");
+        cx.run_until_parked();
+
+        host.update_in(cx, |host, window, cx| {
+            assert!(
+                host.views.contains_key("ws-b"),
+                "workspace B's view is built"
+            );
+            assert!(
+                matches!(&host.active, Some(ActiveView::Local(id)) if id == "ws-a"),
+                "workspace A stays shown"
+            );
+            assert_eq!(
+                window.focused(cx),
+                focused_before,
+                "focus stays where it was"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn chat_state_follows_the_thread_and_queued_messages(cx: &mut gpui::TestAppContext) {
+        let (workspace, _state, _data_dir, cx) = window_showing_workspace_a(cx).await;
+        let view_a = workspace
+            .read_with(cx, host_of)
+            .and_then(|host| host.read_with(cx, |host, _| host.views.get("ws-a").cloned()))
+            .expect("workspace A is open");
+
+        // The test project has no claude-acp server, so A's own chat failed
+        // to load.
+        let failed_to_load = view_a.read_with(cx, |view, cx| {
+            view.chat_by_record("ws-a-primary")
+                .is_some_and(|chat| chat.view.read(cx).has_load_error())
+        });
+        assert!(failed_to_load);
+        assert_eq!(
+            cx.read(|cx| chat_state("ws-a-primary", cx)),
+            ChatState::Stopped
+        );
+        assert_eq!(cx.read(|cx| chat_state("missing", cx)), ChatState::Closed);
+
+        let connection = acp_thread::StubAgentConnection::new();
+        let record = ChatSessionRecord {
+            id: "stub-chat".to_string(),
+            workspace_id: "ws-a".to_string(),
+            agent: "stub-agent".to_string(),
+            title: "Stub".to_string(),
+            acp_session_id: None,
+            is_review: false,
+            is_primary: false,
+            position: 1,
+        };
+        let server = Rc::new(StubServer(connection.clone()));
+        view_a.update_in(cx, |view, window, cx| {
+            view.open_chat_with_server(record, server, Some("Start".to_string()), false, window, cx)
+        });
+        assert_eq!(
+            cx.read(|cx| chat_state("stub-chat", cx)),
+            ChatState::Starting
+        );
+
+        cx.run_until_parked();
+        assert_eq!(
+            cx.read(|cx| chat_state("stub-chat", cx)),
+            ChatState::Replying,
+            "the stub holds the first turn open"
+        );
+
+        let session_id = view_a
+            .read_with(cx, |view, cx| {
+                let thread = view
+                    .chat_by_record("stub-chat")?
+                    .view
+                    .read(cx)
+                    .root_thread(cx)?;
+                Some(thread.read(cx).session_id().clone())
+            })
+            .expect("the stub chat is connected");
+        cx.update(|_, cx| {
+            connection.send_update(
+                session_id.clone(),
+                acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new("Done".into())),
+                cx,
+            );
+        });
+        connection.end_turn(session_id, acp::StopReason::EndTurn);
+        cx.run_until_parked();
+        assert_eq!(
+            cx.read(|cx| chat_state("stub-chat", cx)),
+            ChatState::Replied
+        );
+        assert_eq!(
+            cx.read(|cx| latest_reply("stub-chat", cx)).as_deref(),
+            Some("Done")
+        );
+
+        view_a.update(cx, |view, _| {
+            if let Some(chat) = view
+                .sessions
+                .iter_mut()
+                .filter_map(WorkspaceSession::chat_mut)
+                .find(|chat| chat.record_id == "stub-chat")
+            {
+                chat.pending_messages.push("Next".to_string());
+            }
+        });
+        assert_eq!(
+            cx.read(|cx| chat_state("stub-chat", cx)),
+            ChatState::Replying,
+            "a message still queued in Mnemonic means the reply shown is stale"
+        );
     }
 }

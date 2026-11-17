@@ -591,9 +591,9 @@ pub struct ThreadView {
     /// Tracks which context compaction entries (by entry index) have their
     /// summary expanded.
     expanded_compactions: HashSet<usize>,
-    /// Finished turns whose folded work (tool calls and interim messages) the
-    /// user has opened, keyed by the index of the turn's first entry.
-    expanded_turns: HashSet<usize>,
+    /// Folded runs of tool calls the user has opened, keyed by the index of
+    /// the run's first entry.
+    expanded_work: HashSet<usize>,
     pub subagent_scroll_handles: RefCell<HashMap<acp::SessionId, ScrollHandle>>,
     pub edits_expanded: bool,
     pub plan_expanded: bool,
@@ -1058,7 +1058,7 @@ impl ThreadView {
             auto_expanded_thinking_block: None,
             user_toggled_thinking_blocks: HashSet::default(),
             expanded_compactions: HashSet::default(),
-            expanded_turns: HashSet::default(),
+            expanded_work: HashSet::default(),
             subagent_scroll_handles: RefCell::new(HashMap::default()),
             edits_expanded: false,
             plan_expanded: false,
@@ -5681,14 +5681,13 @@ impl ThreadView {
                             this.render_entry(index, entries.len(), entry, window, cx)
                         }
                         TurnFold::Summary {
-                            turn_start,
+                            run_start,
                             tool_calls,
-                            messages,
                             expanded,
                         } => v_flex()
                             .w_full()
                             .child(Self::render_turn_summary(
-                                turn_start, tool_calls, messages, expanded, cx,
+                                run_start, tool_calls, expanded, cx,
                             ))
                             .when(expanded, |this_element| {
                                 this_element.child(this.render_entry(
@@ -5717,110 +5716,56 @@ impl ThreadView {
         .flex_grow_1()
     }
 
-    /// How a finished turn's work is folded. Once a turn has produced its
-    /// answer, the tool calls and interim messages that led to it collapse
-    /// into one summary row, so the thread reads as question and answer.
+    /// How an entry's work is folded. The tool calls that lead up to a
+    /// message collapse into one summary row; every message itself stays
+    /// visible. Turns the agent starts on its own, such as after a
+    /// background task finishes, add no user message, so folding everything
+    /// between user messages would hide their replies.
     fn turn_fold(&self, entry_ix: usize, entries: &[AgentThreadEntry], cx: &App) -> TurnFold {
-        let is_work = |entry: &AgentThreadEntry| {
-            matches!(
-                entry,
-                AgentThreadEntry::ToolCall(_) | AgentThreadEntry::AssistantMessage(_)
-            )
-        };
-        let Some(entry) = entries.get(entry_ix) else {
-            return TurnFold::Visible;
-        };
-        if !is_work(entry) {
-            return TurnFold::Visible;
-        }
-
-        let turn_start = entries[..entry_ix]
-            .iter()
-            .rposition(|entry| matches!(entry, AgentThreadEntry::UserMessage(_)))
-            .unwrap_or(0);
-        let turn_end = entries[entry_ix..]
-            .iter()
-            .position(|entry| matches!(entry, AgentThreadEntry::UserMessage(_)))
-            .map_or(entries.len(), |offset| entry_ix + offset);
-
-        // The turn still running stays open so its progress can be followed.
-        let is_last_turn = turn_end == entries.len();
-        if is_last_turn && self.thread.read(cx).status() != ThreadStatus::Idle {
-            return TurnFold::Visible;
-        }
-
-        let has_text = |entry: &AgentThreadEntry| match entry {
-            AgentThreadEntry::AssistantMessage(message) => {
-                message.chunks.iter().any(|chunk| match chunk {
+        let kind_of = |ix: usize| match entries.get(ix) {
+            Some(AgentThreadEntry::UserMessage(_)) => FoldKind::User,
+            Some(AgentThreadEntry::ToolCall(_)) => FoldKind::ToolCall,
+            Some(AgentThreadEntry::AssistantMessage(message)) => {
+                let has_text = message.chunks.iter().any(|chunk| match chunk {
                     AssistantMessageChunk::Message { block } => block
                         .markdown()
                         .is_some_and(|markdown| !markdown.read(cx).source().trim().is_empty()),
                     AssistantMessageChunk::Thought { .. } => false,
-                })
+                });
+                if has_text {
+                    FoldKind::Message
+                } else {
+                    FoldKind::Silent
+                }
             }
-            _ => false,
+            Some(AgentThreadEntry::CompletedPlan(_))
+            | Some(AgentThreadEntry::ContextCompaction(_))
+            | None => FoldKind::Other,
         };
-        let turn = &entries[turn_start..turn_end];
-        let Some(answer) = turn
-            .iter()
-            .rposition(has_text)
-            .map(|offset| turn_start + offset)
-        else {
-            return TurnFold::Visible;
-        };
-        if entry_ix >= answer {
-            return TurnFold::Visible;
-        }
-
-        let work = &entries[turn_start..answer];
-        let work_count = work.iter().filter(|entry| is_work(entry)).count();
-        if work_count < MIN_FOLDED_TURN_ENTRIES {
-            return TurnFold::Visible;
-        }
-
-        let expanded = self.expanded_turns.contains(&turn_start);
-        let is_first_work_entry = !entries[turn_start..entry_ix].iter().any(is_work);
-        if is_first_work_entry {
-            TurnFold::Summary {
-                turn_start,
-                tool_calls: work
-                    .iter()
-                    .filter(|entry| matches!(entry, AgentThreadEntry::ToolCall(_)))
-                    .count(),
-                messages: work.iter().filter(|entry| has_text(entry)).count(),
-                expanded,
-            }
-        } else if expanded {
-            TurnFold::Visible
-        } else {
-            TurnFold::Hidden
-        }
+        let last_turn_running = self.thread.read(cx).status() != ThreadStatus::Idle;
+        work_fold(
+            entry_ix,
+            entries.len(),
+            kind_of,
+            last_turn_running,
+            &self.expanded_work,
+        )
     }
 
     fn render_turn_summary(
-        turn_start: usize,
+        run_start: usize,
         tool_calls: usize,
-        messages: usize,
         expanded: bool,
         cx: &Context<Self>,
     ) -> impl IntoElement {
-        let plural = |count: usize, noun: &str| {
-            if count == 1 {
-                format!("{count} {noun}")
-            } else {
-                format!("{count} {noun}s")
-            }
+        let label = if tool_calls == 1 {
+            "1 tool call".to_string()
+        } else {
+            format!("{tool_calls} tool calls")
         };
-        let mut parts = Vec::new();
-        if tool_calls > 0 {
-            parts.push(plural(tool_calls, "tool call"));
-        }
-        if messages > 0 {
-            parts.push(plural(messages, "message"));
-        }
 
         h_flex()
-            .id(("turn-summary", turn_start))
+            .id(("turn-summary", run_start))
             .mx_5()
             .my_1()
             .gap_1()
@@ -5834,14 +5779,10 @@ impl ThreadView {
                 .size(IconSize::XSmall)
                 .color(Color::Muted),
             )
-            .child(
-                Label::new(parts.join(", "))
-                    .size(LabelSize::Small)
-                    .color(Color::Muted),
-            )
+            .child(Label::new(label).size(LabelSize::Small).color(Color::Muted))
             .on_click(cx.listener(move |this, _, _, cx| {
-                if !this.expanded_turns.remove(&turn_start) {
-                    this.expanded_turns.insert(turn_start);
+                if !this.expanded_work.remove(&run_start) {
+                    this.expanded_work.insert(run_start);
                 }
                 cx.notify();
             }))
@@ -11302,19 +11243,76 @@ impl ThreadView {
     }
 }
 
-/// A turn folds only when that hides more than the summary row adds.
+/// Work folds only when that hides more than the summary row adds.
 const MIN_FOLDED_TURN_ENTRIES: usize = 2;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FoldKind {
+    User,
+    /// An agent message with text in it.
+    Message,
+    ToolCall,
+    /// An agent message with only thinking in it.
+    Silent,
+    Other,
+}
+
+#[derive(Debug, PartialEq, Eq)]
 enum TurnFold {
     Visible,
-    /// The first folded entry, which carries the turn's summary row.
+    /// The first folded entry, which carries the run's summary row.
     Summary {
-        turn_start: usize,
+        run_start: usize,
         tool_calls: usize,
-        messages: usize,
         expanded: bool,
     },
     Hidden,
+}
+
+fn work_fold(
+    entry_ix: usize,
+    len: usize,
+    kind_of: impl Fn(usize) -> FoldKind,
+    last_turn_running: bool,
+    expanded: &HashSet<usize>,
+) -> TurnFold {
+    let is_work = |ix: usize| matches!(kind_of(ix), FoldKind::ToolCall | FoldKind::Silent);
+    if entry_ix >= len || !is_work(entry_ix) {
+        return TurnFold::Visible;
+    }
+    // The turn still running stays open so its progress can be followed.
+    if last_turn_running && !(entry_ix..len).any(|ix| kind_of(ix) == FoldKind::User) {
+        return TurnFold::Visible;
+    }
+
+    let run_start = (0..entry_ix)
+        .rev()
+        .find(|ix| !is_work(*ix))
+        .map_or(0, |ix| ix + 1);
+    let run_end = (entry_ix..len).find(|ix| !is_work(*ix)).unwrap_or(len);
+    // Work that hasn't led to a message yet stays open.
+    if run_end >= len || kind_of(run_end) != FoldKind::Message {
+        return TurnFold::Visible;
+    }
+    let tool_calls = (run_start..run_end)
+        .filter(|ix| kind_of(*ix) == FoldKind::ToolCall)
+        .count();
+    if run_end - run_start < MIN_FOLDED_TURN_ENTRIES || tool_calls == 0 {
+        return TurnFold::Visible;
+    }
+
+    let expanded = expanded.contains(&run_start);
+    if entry_ix == run_start {
+        TurnFold::Summary {
+            run_start,
+            tool_calls,
+            expanded,
+        }
+    } else if expanded {
+        TurnFold::Visible
+    } else {
+        TurnFold::Hidden
+    }
 }
 
 /// Room for the toolbar row and a couple of lines of text.
@@ -11759,6 +11757,42 @@ mod tests {
         acp::AvailableCommand::new(name, "").meta(acp_thread::meta_with_command_category(
             acp_thread::CommandCategory::Mcp,
         ))
+    }
+
+    #[test]
+    fn test_messages_between_user_messages_stay_visible() {
+        use FoldKind::*;
+        // A reply, then two replies the agent sent on its own after
+        // background tasks finished, with no user message between them.
+        let kinds = [
+            User, ToolCall, ToolCall, Message, Silent, ToolCall, ToolCall, Message, ToolCall,
+            ToolCall, Message,
+        ];
+        let fold =
+            |ix: usize| work_fold(ix, kinds.len(), |ix| kinds[ix], false, &HashSet::default());
+
+        for message_ix in [3, 7, 10] {
+            assert_eq!(fold(message_ix), TurnFold::Visible);
+        }
+        assert_eq!(
+            fold(1),
+            TurnFold::Summary {
+                run_start: 1,
+                tool_calls: 2,
+                expanded: false
+            }
+        );
+        assert_eq!(fold(2), TurnFold::Hidden);
+        assert_eq!(
+            fold(4),
+            TurnFold::Summary {
+                run_start: 4,
+                tool_calls: 2,
+                expanded: false
+            }
+        );
+        assert_eq!(fold(5), TurnFold::Hidden);
+        assert_eq!(fold(6), TurnFold::Hidden);
     }
 
     #[test]

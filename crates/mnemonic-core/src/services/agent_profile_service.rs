@@ -90,13 +90,6 @@ pub fn resolve_agent_profile(
         })
 }
 
-pub fn is_coordinator_eligible(profile: &AgentProfile) -> bool {
-    if profile.agent == "shell" {
-        return false;
-    }
-    profile.coordinator_eligible.unwrap_or(true)
-}
-
 pub(crate) fn raw_to_profile(raw: RawAgentProfile) -> Option<AgentProfile> {
     let id = raw.id?.trim().to_string();
     if id.is_empty() {
@@ -133,7 +126,6 @@ pub(crate) fn raw_to_profile(raw: RawAgentProfile) -> Option<AgentProfile> {
         skills: raw.skills,
         templates: raw.templates,
         role_preference: trim_optional(raw.role_preference),
-        coordinator_eligible: raw.coordinator_eligible,
     })
 }
 
@@ -196,69 +188,6 @@ fn normalize_saved_profile(mut profile: AgentProfile) -> Option<AgentProfile> {
     Some(profile)
 }
 
-pub fn resolve_profile_for_role(
-    state: &AppState,
-    workspace_id: Option<&str>,
-    role: &str,
-    requested_profile_id: Option<&str>,
-) -> Result<AgentProfile, String> {
-    if let Some(requested_profile_id) = requested_profile_id {
-        let profile = resolve_agent_profile(state, workspace_id, Some(requested_profile_id), None)?;
-        if profile.agent == "shell" {
-            return Err(
-                "Shell profile is not eligible for coordinator brain/coder roles".to_string(),
-            );
-        }
-        return Ok(profile);
-    }
-
-    let profiles = list_workspace_agent_profiles(state, workspace_id)?;
-    let is_eligible = |p: &&AgentProfile| is_coordinator_eligible(p);
-    let role = role.to_ascii_lowercase();
-
-    let setting_key = if role == "brain" {
-        "coordinator_default_brain_profile_id"
-    } else if role == "coder" {
-        "coordinator_default_coder_profile_id"
-    } else {
-        "default_agent_profile_id"
-    };
-    if let Ok(Some(saved)) = settings_repository::get_value(&state.db, setting_key) {
-        if let Some(profile) = profiles
-            .iter()
-            .find(|p| p.id == saved && is_eligible(p))
-            .cloned()
-        {
-            return Ok(profile);
-        }
-    }
-
-    if let Some(profile) = profiles
-        .iter()
-        .filter(is_eligible)
-        .find(|p| {
-            p.role_preference
-                .as_deref()
-                .map(|value| value.eq_ignore_ascii_case(&role))
-                .unwrap_or(false)
-        })
-        .cloned()
-    {
-        return Ok(profile);
-    }
-
-    let ordered = profiles.iter().filter(is_eligible).collect::<Vec<_>>();
-    ordered
-        .first()
-        .map(|profile| (*profile).clone())
-        .ok_or_else(|| {
-            format!(
-                "No eligible {} profile found. Add one in Settings → Agent Profiles or .mnemonic/config.json.",
-                role
-            )
-        })
-}
-
 fn trim_optional(value: Option<String>) -> Option<String> {
     value
         .map(|value| value.trim().to_string())
@@ -283,7 +212,6 @@ pub fn default_profiles() -> Vec<AgentProfile> {
             skills: vec![],
             templates: vec![],
             role_preference: None,
-            coordinator_eligible: Some(true),
         },
         AgentProfile {
             id: "codex".to_string(),
@@ -301,7 +229,6 @@ pub fn default_profiles() -> Vec<AgentProfile> {
             skills: vec![],
             templates: vec![],
             role_preference: None,
-            coordinator_eligible: Some(true),
         },
         AgentProfile {
             id: "shell".to_string(),
@@ -319,7 +246,6 @@ pub fn default_profiles() -> Vec<AgentProfile> {
             skills: vec![],
             templates: vec![],
             role_preference: None,
-            coordinator_eligible: Some(false),
         },
     ]
 }
@@ -405,7 +331,6 @@ mod tests {
             skills: vec![],
             templates: vec![],
             role_preference: None,
-            coordinator_eligible: None,
         })
         .expect("profile");
 

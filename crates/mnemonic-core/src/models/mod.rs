@@ -6,7 +6,6 @@ pub mod agent_run;
 pub mod chat_session;
 pub mod checkpoint;
 pub mod coordination_artifact;
-pub mod coordinator;
 pub mod deep_link;
 pub mod environment;
 pub mod git_review;
@@ -43,7 +42,7 @@ pub use agent_context::{
 pub use agent_memory::{AgentMemory, SetAgentMemoryInput};
 pub use agent_profile::AgentProfile;
 pub use agent_run::WorkspaceRun;
-pub use chat_session::ChatSessionRecord;
+pub use chat_session::{AgentStartedChat, ChatSessionRecord};
 pub use checkpoint::{
     WorkspaceCheckpoint, WorkspaceCheckpointBranchResult, WorkspaceCheckpointDeleteResult,
     WorkspaceCheckpointDiff, WorkspaceCheckpointRestorePlan, WorkspaceCheckpointRestoreResult,
@@ -52,11 +51,6 @@ pub use coordination_artifact::{
     is_valid_coordination_artifact_kind, is_valid_coordination_artifact_status,
     CoordinationArtifact, CreateCoordinationArtifactInput, UpdateCoordinationArtifactInput,
     UpdateCoordinationArtifactStatusInput,
-};
-pub use coordinator::{
-    CoordinatorAction, CoordinatorActionLog, CoordinatorResultArtifact, CoordinatorResultPayload,
-    CoordinatorRun, CoordinatorWorker, ReplayWorkspaceCoordinatorActionInput,
-    StartWorkspaceCoordinatorInput, StepWorkspaceCoordinatorInput, WorkspaceCoordinatorStatus,
 };
 pub use deep_link::{OpenDeepLinkInput, OpenDeepLinkResult};
 pub use environment::EnvironmentCheckItem;

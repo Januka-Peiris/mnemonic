@@ -17,7 +17,6 @@ use crate::repositories::{
 pub type TerminalRegistry = Arc<Mutex<HashMap<String, Arc<ActiveTerminal>>>>;
 /// Maps session_id → raw PTY input bytes that are pending user approval.
 pub type PendingCommandRegistry = Arc<Mutex<HashMap<String, String>>>;
-pub type CoordinatorStepRegistry = Arc<Mutex<HashSet<String>>>;
 pub type SchedulerJobRegistry = Arc<Mutex<HashSet<String>>>;
 pub type RepoIntelligenceRegistry = Arc<Mutex<HashSet<String>>>;
 /// Maps session_id to a list of WS writer channels for live terminal output.
@@ -68,8 +67,6 @@ pub struct AppState {
     pub orchestrator_last_run: Arc<Mutex<Option<String>>>,
     /// Actions taken in the most recent orchestrator pass.
     pub orchestrator_last_actions: Arc<Mutex<Vec<OrchestratorAction>>>,
-    /// Workspace ids with an in-flight coordinator step.
-    pub coordinator_step_inflight: CoordinatorStepRegistry,
     /// Single-flight key set for scheduler jobs (`workspace_id:job_kind`).
     pub scheduler_job_inflight: SchedulerJobRegistry,
     /// Single-flight key set for per-repo intelligence refresh jobs (`repo_id`).
@@ -140,7 +137,6 @@ impl AppState {
             orchestrator_model: Arc::new(Mutex::new("claude-opus-5-5".to_string())),
             orchestrator_last_run: Arc::new(Mutex::new(None)),
             orchestrator_last_actions: Arc::new(Mutex::new(Vec::new())),
-            coordinator_step_inflight: Arc::new(Mutex::new(HashSet::new())),
             scheduler_job_inflight: Arc::new(Mutex::new(HashSet::new())),
             repo_intelligence_inflight: Arc::new(Mutex::new(HashSet::new())),
             ws_port: Arc::new(Mutex::new(0)),
