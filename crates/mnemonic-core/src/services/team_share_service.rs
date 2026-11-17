@@ -637,6 +637,8 @@ pub struct TailscaleSelf {
     pub ip: Ipv4Addr,
     pub login: String,
     pub display_name: String,
+    /// The MagicDNS name without its trailing dot.
+    pub dns_name: String,
 }
 
 const TAILSCALE_LOCATIONS: &[&str] = &[
@@ -747,6 +749,7 @@ fn parse_tailscale_status(output: &[u8]) -> Result<TailscaleSelf, String> {
         display_name: user
             .map(|user| user.display_name.clone())
             .unwrap_or_default(),
+        dns_name: node.dns_name.trim_end_matches('.').to_string(),
     })
 }
 
@@ -1604,9 +1607,23 @@ mod tests {
                 ip: Ipv4Addr::new(100, 101, 102, 103),
                 login: "jay@example.com".to_string(),
                 display_name: "Jay".to_string(),
+                dns_name: String::new(),
             })
         );
         assert!(parse_tailscale_status(br#"{"BackendState": "Stopped"}"#).is_err());
+    }
+
+    #[test]
+    fn status_reports_the_magic_dns_name() {
+        let status = br#"{
+            "BackendState": "Running",
+            "Self": { "TailscaleIPs": ["100.101.102.103"], "UserID": 42,
+                      "DNSName": "jay-mbp.tail1234.ts.net." }
+        }"#;
+        assert_eq!(
+            parse_tailscale_status(status).map(|status| status.dns_name),
+            Ok("jay-mbp.tail1234.ts.net".to_string())
+        );
     }
 
     #[test]

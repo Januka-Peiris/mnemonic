@@ -8519,6 +8519,54 @@ fn workspaces_page() -> SettingsPage {
         ]
     }
 
+    fn phone_section() -> [SettingsPageItem; 4] {
+        [
+            SettingsPageItem::SectionHeader("Phone"),
+            SettingsPageItem::SettingItem(SettingItem {
+                title: "Serve Phone Page",
+                description: "Whether your agent chats can be reached from your phone over Tailscale.",
+                field: Box::new(SettingField {
+                    organization_override: None,
+                    json_path: Some("phone.enabled"),
+                    pick: |settings_content| settings_content.phone.as_ref()?.enabled.as_ref(),
+                    write: |settings_content, value, _| {
+                        settings_content.phone.get_or_insert_default().enabled = value;
+                    },
+                }),
+                metadata: None,
+                files: USER,
+            }),
+            SettingsPageItem::SettingItem(SettingItem {
+                title: "Notification URL",
+                description: "The ntfy topic URL notifications are posted to. When empty, no notifications are sent.",
+                field: Box::new(SettingField {
+                    organization_override: None,
+                    json_path: Some("phone.ntfy_url"),
+                    pick: |settings_content| settings_content.phone.as_ref()?.ntfy_url.as_ref(),
+                    write: |settings_content, value, _| {
+                        settings_content.phone.get_or_insert_default().ntfy_url = value;
+                    },
+                }),
+                metadata: None,
+                files: USER,
+            }),
+            SettingsPageItem::SettingItem(SettingItem {
+                title: "Notify After Idle Minutes",
+                description: "Minutes without keyboard or mouse input on this Mac before alerts are sent.",
+                field: Box::new(SettingField {
+                    organization_override: None,
+                    json_path: Some("phone.notify_after_idle_minutes"),
+                    pick: |settings_content| settings_content.phone.as_ref()?.notify_after_idle_minutes.as_ref(),
+                    write: |settings_content, value, _| {
+                        settings_content.phone.get_or_insert_default().notify_after_idle_minutes = value;
+                    },
+                }),
+                metadata: None,
+                files: USER,
+            }),
+        ]
+    }
+
     SettingsPage {
         title: "Workspaces",
         items: concat_sections![
@@ -8527,7 +8575,8 @@ fn workspaces_page() -> SettingsPage {
             branches_section(),
             pull_requests_section(),
             scripts_section(),
-            team_section()
+            team_section(),
+            phone_section()
         ],
     }
 }

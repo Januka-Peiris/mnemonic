@@ -1,5 +1,7 @@
 mod agent_hub;
+mod chat_feed;
 mod command_approval_panel;
+mod phone;
 mod team;
 mod team_connection;
 mod team_copy;
@@ -29,6 +31,7 @@ pub fn init(cx: &mut gpui::App) {
     workspaces_settings::init(cx);
     team::init(cx);
     agent_hub::init(cx);
+    phone::init(cx);
 }
 
 pub use mnemonic_bridge::ActiveWorkspace;
