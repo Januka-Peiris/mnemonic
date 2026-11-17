@@ -26,6 +26,7 @@ pub mod review_cockpit_service;
 pub mod review_summary_service;
 pub mod settings_service;
 pub mod task_lifecycle_service;
+pub mod agent_hub_server;
 pub mod mcp_http;
 pub mod team_agent_tools;
 pub mod team_files_service;
