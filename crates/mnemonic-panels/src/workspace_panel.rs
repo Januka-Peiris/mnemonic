@@ -10,7 +10,7 @@ use gpui::{
 };
 use mnemonic_bridge::AgentAttention;
 use mnemonic_core::models::{
-    ActivityItem, ArchivedWorkspace, ChatSessionRecord, CreateWorkspaceInput, DiscoveredRepository,
+    ActivityItem, ArchivedWorkspace, ChatSessionRecord, DiscoveredRepository,
     WorkspaceSummary,
 };
 use mnemonic_core::repositories::{
@@ -1027,54 +1027,13 @@ impl WorkspacePanel {
             // Making the worktree and rescanning the repository run git, so
             // this stays off the UI thread or the whole window freezes.
             let result = cx.background_spawn(async move {
-                // Settings keys (DB): branch_prefix (default: OS username)
-                // and default_base_branch (default: main).
-                let branch_prefix = settings_repository::get_value(&state.db, "branch_prefix")
-                    .ok()
-                    .flatten()
-                    .map(|value| value.trim().trim_matches('/').to_string())
-                    .filter(|value| !value.is_empty())
-                    .unwrap_or_else(default_branch_prefix);
-                let default_base_branch =
-                    settings_repository::get_value(&state.db, "default_base_branch")
-                        .ok()
-                        .flatten()
-                        .map(|value| value.trim().to_string())
-                        .filter(|value| !value.is_empty())
-                        .unwrap_or_else(|| "main".to_string());
-                let project_base_branch = match repository_settings_repository::get_value(
-                    &state.db,
-                    &repo.id,
-                    PROJECT_BASE_BRANCH_KEY,
-                ) {
-                    Ok(value) => value
-                        .map(|value| value.trim().to_string())
-                        .filter(|value| !value.is_empty()),
-                    Err(err) => {
-                        log::error!("Failed to read the base branch of {}: {err}", repo.name);
-                        None
-                    }
-                };
-                let base_branch = project_base_branch.unwrap_or(default_base_branch);
-                let branch_name = format!("{branch_prefix}/{workspace_name}");
-                let input = CreateWorkspaceInput {
-                    name: workspace_name,
-                    repo: repo.name.clone(),
-                    base_branch,
-                    branch: Some(branch_name),
-                    agent: "claude".to_string(),
-                    task_prompt: String::new(),
-                    open_in_cursor: false,
-                    run_tests: false,
-                    create_pr: true,
-                    repository_id: Some(repo.id.clone()),
-                    selected_worktree_id: None,
-                    selected_branch: None,
-                    parent_workspace_id: None,
-                    source_workspace_id: None,
-                    derived_from_branch: None,
-                    workspace_source: None,
-                };
+                let input = workspace_service::new_workspace_input(
+                    &state,
+                    &repo,
+                    workspace_name,
+                    None,
+                    None,
+                )?;
                 workspace_service::create_workspace(&state, input)
             })
             .await;
@@ -2219,27 +2178,6 @@ const NAME_ANIMALS: &[&str] = &[
     "puma", "quail", "rabbit", "raven", "robin", "seal", "sparrow", "stork", "swan", "tapir",
     "tern", "vole", "walrus", "wren",
 ];
-
-/// Branch prefix fallback: the OS username, sanitized for git ref syntax.
-fn default_branch_prefix() -> String {
-    std::env::var("USER")
-        .ok()
-        .map(|user| {
-            user.trim()
-                .to_lowercase()
-                .chars()
-                .map(|ch| {
-                    if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_') {
-                        ch
-                    } else {
-                        '-'
-                    }
-                })
-                .collect::<String>()
-        })
-        .filter(|user| !user.is_empty())
-        .unwrap_or_else(|| "mnemonic".to_string())
-}
 
 /// Conductor-style two-word workspace names ("patient-cipher"), seeded from
 /// the clock so no rand dependency is needed. Falls back to a numeric suffix
