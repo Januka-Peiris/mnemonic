@@ -255,19 +255,20 @@ pub struct ListedWorkspace {
     pub chats: Vec<(String, String, String, ChatState)>,
 }
 
-/// `repos` are (name, path) pairs.
+/// `repos` are (name, default base branch) pairs.
 pub fn render_list(
     repos: &[(String, String)],
     workspaces: &[ListedWorkspace],
     caller_chat_id: &str,
+    caller_workspace_id: &str,
     started: &[String],
 ) -> String {
     let mut lines = vec!["Repositories (pass the name as `repo` to start_chat):".to_string()];
     if repos.is_empty() {
         lines.push("  none".to_string());
     }
-    for (name, path) in repos {
-        lines.push(format!("  {name} - {path}"));
+    for (name, default_branch) in repos {
+        lines.push(format!("  {name} (default branch {default_branch})"));
     }
     lines.push(String::new());
     lines.push("Workspaces:".to_string());
@@ -276,7 +277,7 @@ pub fn render_list(
     }
     for workspace in workspaces {
         lines.push(format!(
-            "  {} \"{}\" ({}, branch {}){}",
+            "  {} \"{}\" ({}, branch {}){}{}",
             workspace.id,
             workspace.name,
             workspace.repo,
@@ -285,7 +286,12 @@ pub fn render_list(
                 .path
                 .as_ref()
                 .map(|path| format!(" at {path}"))
-                .unwrap_or_default()
+                .unwrap_or_default(),
+            if workspace.id == caller_workspace_id {
+                " [your workspace]"
+            } else {
+                ""
+            }
         ));
         for (id, title, agent, state) in &workspace.chats {
             let mut marks = String::new();
@@ -661,5 +667,47 @@ mod tests {
         assert!(check_can_stop(&db, "chat").is_ok());
         assert!(check_can_stop(&db, "not-agent-started").is_err());
         Ok(())
+    }
+
+    #[test]
+    fn render_list_marks_caller_and_shows_default_branches() {
+        let workspace =
+            |id: &str, chats: Vec<(String, String, String, ChatState)>| ListedWorkspace {
+                id: id.to_string(),
+                name: format!("name-{id}"),
+                repo: "app".to_string(),
+                branch: "b".to_string(),
+                path: None,
+                chats,
+            };
+        let chat = |id: &str| {
+            (
+                id.to_string(),
+                "t".to_string(),
+                "claude-acp".to_string(),
+                ChatState::Replied,
+            )
+        };
+        let text = render_list(
+            &[("app".to_string(), "develop".to_string())],
+            &[
+                workspace("ws-mine", vec![chat("me"), chat("kid")]),
+                workspace("ws-other", vec![chat("else")]),
+            ],
+            "me",
+            "ws-mine",
+            &["kid".to_string()],
+        );
+        let line = |needle: &str| {
+            text.lines()
+                .find(|line| line.contains(needle))
+                .unwrap_or("")
+        };
+        assert!(line("app (").contains("develop"), "{text}");
+        assert!(line("ws-mine").contains("[your workspace]"), "{text}");
+        assert!(!line("ws-other").contains("[your workspace]"), "{text}");
+        assert!(line("chat me").contains("[you]"), "{text}");
+        assert!(line("chat kid").contains("[started by you]"), "{text}");
+        assert!(!line("chat else").contains('['), "{text}");
     }
 }

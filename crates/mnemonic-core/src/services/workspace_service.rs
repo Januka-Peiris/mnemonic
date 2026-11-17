@@ -123,6 +123,33 @@ fn default_branch_prefix() -> String {
         .unwrap_or_else(|| "mnemonic".to_string())
 }
 
+/// The base a new workspace branches from: the project's base_branch
+/// setting, else default_base_branch, else main.
+pub fn default_base_branch(state: &AppState, repository_id: &str) -> String {
+    let project_base_branch = match repository_settings_repository::get_value(
+        &state.db,
+        repository_id,
+        PROJECT_BASE_BRANCH_KEY,
+    ) {
+        Ok(value) => value
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty()),
+        Err(err) => {
+            log::error!("Failed to read the base branch of {repository_id}: {err}");
+            None
+        }
+    };
+    project_base_branch
+        .or_else(|| {
+            settings_repository::get_value(&state.db, "default_base_branch")
+                .ok()
+                .flatten()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+        })
+        .unwrap_or_else(|| "main".to_string())
+}
+
 fn branch_exists(repository_path: &Path, branch: &str) -> bool {
     [
         format!("refs/heads/{branch}"),
@@ -155,30 +182,10 @@ pub fn new_workspace_input(
         .map(|value| value.trim().trim_matches('/').to_string())
         .filter(|value| !value.is_empty())
         .unwrap_or_else(default_branch_prefix);
-    let default_base_branch = settings_repository::get_value(&state.db, "default_base_branch")
-        .ok()
-        .flatten()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| "main".to_string());
-    let project_base_branch = match repository_settings_repository::get_value(
-        &state.db,
-        &repo.id,
-        PROJECT_BASE_BRANCH_KEY,
-    ) {
-        Ok(value) => value
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty()),
-        Err(err) => {
-            log::error!("Failed to read the base branch of {}: {err}", repo.name);
-            None
-        }
-    };
     let base_branch = base
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
-        .or(project_base_branch)
-        .unwrap_or(default_base_branch);
+        .unwrap_or_else(|| default_base_branch(state, &repo.id));
     let branch_name = branch
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
