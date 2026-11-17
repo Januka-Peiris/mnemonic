@@ -20,6 +20,8 @@ const MCP_SESSION_HEADER: &str = "Mcp-Session-Id";
 const MAX_BODY_BYTES: usize = 1024 * 1024;
 const MAX_ACTIVE_REQUESTS: usize = 64;
 const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(15);
+// An agent connects during `session/new`, before the key is bound, so its first call can arrive early.
+const BIND_WAIT: Duration = Duration::from_secs(10);
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex
@@ -59,7 +61,8 @@ pub struct HubCaller {
 }
 
 pub trait AgentHubHandler: Send + Sync + 'static {
-    fn definitions(&self, caller: &HubCaller) -> serde_json::Value;
+    /// `None` while the chat's key isn't bound to a session yet.
+    fn definitions(&self, caller: Option<&HubCaller>) -> serde_json::Value;
     /// Blocking; runs on a request thread. `cancelled` turns true when the client cancels the call.
     fn call(
         &self,
@@ -78,6 +81,7 @@ struct Shared {
     cancel_flags: CancelFlags,
     port: u16,
     keep_alive: Duration,
+    bind_wait: Duration,
     active_requests: AtomicUsize,
 }
 
@@ -89,13 +93,14 @@ pub struct AgentHubServer {
 
 impl AgentHubServer {
     pub fn start(keys: HubKeys, handler: Arc<dyn AgentHubHandler>) -> Result<Self, String> {
-        Self::start_with_keep_alive(keys, handler, KEEP_ALIVE_INTERVAL)
+        Self::start_with_timings(keys, handler, KEEP_ALIVE_INTERVAL, BIND_WAIT)
     }
 
-    fn start_with_keep_alive(
+    fn start_with_timings(
         keys: HubKeys,
         handler: Arc<dyn AgentHubHandler>,
         keep_alive: Duration,
+        bind_wait: Duration,
     ) -> Result<Self, String> {
         let server = Server::http((Ipv4Addr::LOCALHOST, 0))
             .map_err(|err| format!("Couldn't start the agent hub: {err}"))?;
@@ -109,6 +114,7 @@ impl AgentHubServer {
             cancel_flags: CancelFlags::default(),
             port: address.port(),
             keep_alive,
+            bind_wait,
             active_requests: AtomicUsize::new(0),
         });
         let server = Arc::new(server);
@@ -171,7 +177,7 @@ fn accept_requests(server: &Server, shared: &Arc<Shared>) {
 
 struct HubTools {
     handler: Arc<dyn AgentHubHandler>,
-    caller: HubCaller,
+    caller: Option<HubCaller>,
     cancel_flags: CancelFlags,
 }
 
@@ -181,7 +187,7 @@ impl McpTools for HubTools {
     }
 
     fn definitions(&self) -> serde_json::Value {
-        self.handler.definitions(&self.caller)
+        self.handler.definitions(self.caller.as_ref())
     }
 
     fn call(
@@ -190,19 +196,26 @@ impl McpTools for HubTools {
         name: &str,
         arguments: &serde_json::Value,
     ) -> Result<String, String> {
+        let Some(caller) = &self.caller else {
+            return Err("This chat's session isn't ready yet".to_string());
+        };
         let cancelled = Arc::new(AtomicBool::new(false));
         lock(&self.cancel_flags).insert(call_key.to_string(), cancelled.clone());
         let outcome = self
             .handler
-            .call(&self.caller, name, arguments.clone(), cancelled);
+            .call(caller, name, arguments.clone(), cancelled);
         lock(&self.cancel_flags).remove(call_key);
         outcome
     }
 
     fn cancel(&self, call_key: &str) {
-        if let Some(cancelled) = lock(&self.cancel_flags).get(call_key) {
-            cancelled.store(true, Ordering::SeqCst);
-        }
+        cancel_call(&self.cancel_flags, call_key);
+    }
+}
+
+fn cancel_call(cancel_flags: &CancelFlags, call_key: &str) {
+    if let Some(cancelled) = lock(cancel_flags).get(call_key) {
+        cancelled.store(true, Ordering::SeqCst);
     }
 }
 
@@ -249,14 +262,7 @@ fn handle(mut request: Request, shared: &Shared) {
             respond(request, text_response(401, "Unknown chat key"));
             return;
         }
-        Some(None) => {
-            respond(
-                request,
-                text_response(409, "This chat's session isn't ready yet"),
-            );
-            return;
-        }
-        Some(Some(session_id)) => session_id,
+        Some(session_id) => session_id,
     };
 
     let wants_event_stream = {
@@ -300,13 +306,35 @@ fn handle(mut request: Request, shared: &Shared) {
         mcp_session
     };
     let caller_key = format!("{}:{mcp_session}", key.trim());
+    let mut session_id = session_id;
+    if session_id.is_none() && is_tool_call {
+        let deadline = std::time::Instant::now() + shared.bind_wait;
+        while session_id.is_none() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+            session_id = shared.keys.session_for(key.trim()).flatten();
+        }
+        if session_id.is_none() {
+            respond(
+                request,
+                text_response(409, "This chat's session isn't ready yet"),
+            );
+            return;
+        }
+    }
     let tools = HubTools {
         handler: shared.handler.clone(),
-        caller: HubCaller { session_id },
+        caller: session_id.map(|session_id| HubCaller { session_id }),
         cancel_flags: shared.cancel_flags.clone(),
     };
 
     if is_tool_call && wants_event_stream {
+        let call_key = serde_json::from_slice::<serde_json::Value>(&body)
+            .ok()
+            .and_then(|message| message.get("id").cloned())
+            .map(|id| match id {
+                serde_json::Value::String(text) => format!("{caller_key}:{text}"),
+                other => format!("{caller_key}:{other}"),
+            });
         let (sender, receiver) = std::sync::mpsc::channel();
         let spawned = std::thread::Builder::new()
             .name("mnemonic-agent-hub-tool".into())
@@ -326,6 +354,9 @@ fn handle(mut request: Request, shared: &Shared) {
         }
         let mut writer = request.into_writer();
         if let Err(err) = write_event_stream(&mut writer, &receiver, shared.keep_alive) {
+            if let Some(call_key) = call_key {
+                cancel_call(&shared.cancel_flags, &call_key);
+            }
             log::debug!(target: "mnemonic_lib", "An agent stopped listening to the hub: {err}");
         }
         return;
@@ -374,23 +405,37 @@ mod tests {
     use std::net::TcpStream;
 
     struct FakeHandler {
-        sessions_seen: Mutex<Vec<String>>,
+        sessions_seen: Mutex<Vec<Option<String>>>,
+        calls_seen: Mutex<Vec<String>>,
+        observed_cancel: AtomicBool,
     }
 
     impl AgentHubHandler for FakeHandler {
-        fn definitions(&self, caller: &HubCaller) -> serde_json::Value {
-            lock(&self.sessions_seen).push(caller.session_id.clone());
+        fn definitions(&self, caller: Option<&HubCaller>) -> serde_json::Value {
+            lock(&self.sessions_seen).push(caller.map(|caller| caller.session_id.clone()));
             serde_json::json!([{"name": "fake_tool", "inputSchema": {"type": "object"}}])
         }
 
         fn call(
             &self,
-            _caller: &HubCaller,
+            caller: &HubCaller,
             tool: &str,
             _arguments: serde_json::Value,
             cancelled: Arc<AtomicBool>,
         ) -> Result<String, String> {
+            lock(&self.calls_seen).push(caller.session_id.clone());
             match tool {
+                "observe_cancel" => {
+                    let started = std::time::Instant::now();
+                    while !cancelled.load(Ordering::SeqCst) {
+                        if started.elapsed() > Duration::from_secs(10) {
+                            return Err("never cancelled".to_string());
+                        }
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    self.observed_cancel.store(true, Ordering::SeqCst);
+                    Ok("cancelled".to_string())
+                }
                 "slow" => {
                     std::thread::sleep(Duration::from_millis(300));
                     Ok("slow result".to_string())
@@ -413,12 +458,15 @@ mod tests {
     fn start() -> Result<(AgentHubServer, HubKeys, Arc<FakeHandler>), String> {
         let handler = Arc::new(FakeHandler {
             sessions_seen: Mutex::new(Vec::new()),
+            calls_seen: Mutex::new(Vec::new()),
+            observed_cancel: AtomicBool::new(false),
         });
         let keys = HubKeys::default();
-        let server = AgentHubServer::start_with_keep_alive(
+        let server = AgentHubServer::start_with_timings(
             keys.clone(),
             handler.clone(),
             Duration::from_millis(50),
+            Duration::from_millis(500),
         )?;
         Ok((server, keys, handler))
     }
@@ -472,13 +520,95 @@ mod tests {
     }
 
     #[test]
-    fn refuses_a_key_whose_session_is_not_bound_yet() -> Result<(), String> {
-        let (server, keys, _handler) = start()?;
+    fn unbound_key_can_initialize_and_list_tools() -> Result<(), String> {
+        let (server, keys, handler) = start()?;
+        let key = keys.mint();
+        let initialize = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#;
+
+        let (initialized, _) = post(&server, &key_header(&key), initialize)?;
+        let (listed, answer) = post(&server, &key_header(&key), LIST_BODY)?;
+
+        assert_eq!(initialized, 200);
+        assert_eq!(listed, 200);
+        assert!(answer.contains("fake_tool"), "{answer}");
+        assert_eq!(*lock(&handler.sessions_seen), vec![None]);
+        Ok(())
+    }
+
+    #[test]
+    fn call_waits_for_the_key_to_be_bound() -> Result<(), String> {
+        let (server, keys, handler) = start()?;
+        let key = keys.mint();
+        let binder = std::thread::spawn({
+            let (keys, key) = (keys.clone(), key.clone());
+            move || {
+                std::thread::sleep(Duration::from_millis(100));
+                keys.bind(&key, "s9");
+            }
+        });
+
+        let (status, answer) = post(&server, &key_header(&key), &call_body(1, "slow"))?;
+        binder
+            .join()
+            .map_err(|_| "The binder thread panicked".to_string())?;
+
+        assert_eq!(status, 200);
+        assert!(answer.contains("slow result"), "{answer}");
+        assert_eq!(*lock(&handler.calls_seen), vec!["s9".to_string()]);
+        Ok(())
+    }
+
+    #[test]
+    fn call_on_a_key_that_never_binds_is_refused() -> Result<(), String> {
+        let (server, keys, handler) = start()?;
         let key = keys.mint();
 
-        let (status, _) = post(&server, &key_header(&key), LIST_BODY)?;
+        let (status, _) = post(&server, &key_header(&key), &call_body(1, "slow"))?;
 
         assert_eq!(status, 409);
+        assert!(lock(&handler.calls_seen).is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn dropped_event_stream_cancels_the_call() -> Result<(), String> {
+        let (server, keys, handler) = start()?;
+        let key = keys.mint();
+        keys.bind(&key, "s1");
+        let body = call_body(1, "observe_cancel");
+        let request = format!(
+            "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Type: application/json\r\n{}\
+             Accept: text/event-stream\r\nContent-Length: {}\r\n\r\n{body}",
+            server.address.port(),
+            key_header(&key),
+            body.len()
+        );
+        let mut stream = TcpStream::connect(server.address).map_err(|err| err.to_string())?;
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .map_err(|err| err.to_string())?;
+        stream
+            .write_all(request.as_bytes())
+            .map_err(|err| err.to_string())?;
+        let mut received = Vec::new();
+        let mut buffer = [0u8; 256];
+        while !String::from_utf8_lossy(&received).contains(": keep-alive") {
+            let count = stream.read(&mut buffer).map_err(|err| err.to_string())?;
+            if count == 0 {
+                return Err("The stream ended before a keep-alive".to_string());
+            }
+            received.extend_from_slice(&buffer[..count]);
+        }
+
+        drop(stream);
+
+        let started = std::time::Instant::now();
+        while !handler.observed_cancel.load(Ordering::SeqCst) {
+            if started.elapsed() > Duration::from_secs(1) {
+                return Err("The call wasn't cancelled after the client left".to_string());
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
         Ok(())
     }
 
@@ -533,7 +663,7 @@ mod tests {
 
         assert_eq!(status, 200);
         assert!(answer.contains("fake_tool"), "{answer}");
-        assert_eq!(*lock(&handler.sessions_seen), vec!["s1".to_string()]);
+        assert_eq!(*lock(&handler.sessions_seen), vec![Some("s1".to_string())]);
         Ok(())
     }
 
