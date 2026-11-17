@@ -62,7 +62,7 @@ const CHECK_TAILSCALE_EVERY: Duration = Duration::from_secs(15);
 /// How often the running server re-runs `tailscale cert`, which renews the
 /// certificate by itself once it nears expiry.
 const CHECK_CERTIFICATE_EVERY: Duration = Duration::from_secs(24 * 60 * 60);
-/// A chat's repeated alert of one kind within this long is sent once.
+/// An alert repeated within this long is sent once. See `AlertKey`.
 const NOTIFY_COLLAPSE_WITHIN: Duration = Duration::from_secs(30);
 /// How long the phone's request waits for the app to carry out its action.
 const ACTION_TIMEOUT: Duration = Duration::from_secs(10);
@@ -132,8 +132,8 @@ pub(crate) struct PhoneShare {
     tailscale_watch: Option<Task<()>>,
     /// Carries out the phone's actions on the main thread.
     action_task: Option<Task<()>>,
-    /// When each chat's last alert of each kind went out.
-    last_notified: HashMap<(String, NoticeKind), Instant>,
+    /// When each alert last went out.
+    last_notified: HashMap<AlertKey, Instant>,
     /// The agents new chats may use, kept here for the server's request
     /// threads, which can't read the settings.
     enabled_agents: Arc<Mutex<Vec<PhoneAgent>>>,
@@ -148,8 +148,8 @@ pub(crate) fn init(cx: &mut App) {
     let phone = cx.new(|cx| {
         let mut phone = PhoneShare::new(cx);
         phone.apply_settings(cx);
-        cx.on_app_quit(|phone, cx| {
-            phone.stop(cx);
+        cx.on_app_quit(|phone, _| {
+            phone.stop();
             async {}
         })
         .detach();
@@ -278,6 +278,7 @@ impl PhoneShare {
             chat_title,
             tool_kind,
         };
+        let key = alert_key(event);
         let ntfy_url = Some(settings.ntfy_url.clone()).filter(|url| !url.is_empty());
         let token = settings.ntfy_token.clone();
         let threshold_minutes = settings.notify_after_idle_minutes;
@@ -287,18 +288,7 @@ impl PhoneShare {
                 return;
             }
             let Ok(collapsed) = this.update(cx, |this, _| {
-                let now = Instant::now();
-                let key = (notice.chat_id.clone(), notice.kind);
-                let collapsed = this
-                    .last_notified
-                    .get(&key)
-                    .is_some_and(|sent| now.duration_since(*sent) < NOTIFY_COLLAPSE_WITHIN);
-                if !collapsed {
-                    this.last_notified
-                        .retain(|_, sent| now.duration_since(*sent) < NOTIFY_COLLAPSE_WITHIN);
-                    this.last_notified.insert(key, now);
-                }
-                collapsed
+                collapse_repeat(&mut this.last_notified, key, Instant::now())
             }) else {
                 return;
             };
@@ -329,7 +319,10 @@ impl PhoneShare {
         }
         match port {
             Some(port) => self.start(port, cx),
-            None => self.stop(cx),
+            None => {
+                self.stop();
+                self.feed.update(cx, |feed, _| feed.clear());
+            }
         }
         cx.notify();
     }
@@ -341,7 +334,7 @@ impl PhoneShare {
     }
 
     fn start(&mut self, port: u16, cx: &mut Context<Self>) {
-        self.stop(cx);
+        self.stop();
         self.port = Some(port);
         let hub = self.feed.read(cx).hub().clone();
         let enabled_agents = self.enabled_agents.clone();
@@ -354,8 +347,10 @@ impl PhoneShare {
                 }
                 let PendingPhoneAction { action, reply, .. } = pending;
                 let timeout = action_timeout(&action);
-                let outcome =
-                    cx.update(|cx| within_timeout(run_phone_action(action, cx), timeout, cx));
+                let on_timeout = timed_out(&action);
+                let outcome = cx.update(|cx| {
+                    within_timeout(run_phone_action(action, cx), timeout, on_timeout, cx)
+                });
                 // Awaited on its own, so a task being started or a merge
                 // doesn't hold up a Stop or a permission answer behind it.
                 cx.spawn(async move |_| {
@@ -475,7 +470,9 @@ impl PhoneShare {
         })
     }
 
-    fn stop(&mut self, cx: &mut Context<Self>) {
+    /// Keeps the feed, so a restart for a renewed certificate or a Tailscale
+    /// change doesn't lose which turns ended and when.
+    fn stop(&mut self) {
         self.start_task = None;
         self.publish_task = None;
         self.tailscale_watch = None;
@@ -485,7 +482,6 @@ impl PhoneShare {
         self.page_url = None;
         self.start_error = None;
         self.https_error = None;
-        self.feed.update(cx, |feed, _| feed.clear());
     }
 
     fn start_publishing(&mut self, cx: &mut Context<Self>) {
@@ -679,6 +675,57 @@ fn start_server(
     })
 }
 
+/// What a repeated alert is matched on. Permission prompts match by their
+/// tool call, so the agent's next prompt after one answered from the
+/// notification still alerts; a chat's finishes and errors match by kind.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct AlertKey {
+    chat_id: String,
+    kind: NoticeKind,
+    tool_call_id: Option<String>,
+}
+
+fn alert_key(event: &ChatFeedEvent) -> AlertKey {
+    match event {
+        ChatFeedEvent::PermissionRequested {
+            chat_id,
+            tool_call_id,
+            ..
+        } => AlertKey {
+            chat_id: chat_id.clone(),
+            kind: NoticeKind::Permission,
+            tool_call_id: Some(tool_call_id.clone()),
+        },
+        ChatFeedEvent::TurnEnded { chat_id, .. } => AlertKey {
+            chat_id: chat_id.clone(),
+            kind: NoticeKind::Finished,
+            tool_call_id: None,
+        },
+        ChatFeedEvent::Errored { chat_id, .. } => AlertKey {
+            chat_id: chat_id.clone(),
+            kind: NoticeKind::Error,
+            tool_call_id: None,
+        },
+    }
+}
+
+/// Whether an alert matching `key` went out within `NOTIFY_COLLAPSE_WITHIN`
+/// of `now`. When it didn't, records it as going out now.
+fn collapse_repeat(
+    last_notified: &mut HashMap<AlertKey, Instant>,
+    key: AlertKey,
+    now: Instant,
+) -> bool {
+    let collapsed = last_notified
+        .get(&key)
+        .is_some_and(|sent| now.duration_since(*sent) < NOTIFY_COLLAPSE_WITHIN);
+    if !collapsed {
+        last_notified.retain(|_, sent| now.duration_since(*sent) < NOTIFY_COLLAPSE_WITHIN);
+        last_notified.insert(key, now);
+    }
+    collapsed
+}
+
 struct PushPermission {
     tool_call_id: String,
     answers: QuickAnswers,
@@ -724,7 +771,11 @@ fn try_send_web_push(payload: &str) -> Result<(), String> {
         match web_push_service::send(&subscription, payload.as_bytes(), &keys) {
             Ok(PushOutcome::Delivered) => {}
             Ok(PushOutcome::Gone) => {
-                push_subscription_repository::delete(&state.db, &subscription.endpoint)?;
+                if let Err(err) =
+                    push_subscription_repository::delete(&state.db, &subscription.endpoint)
+                {
+                    log::warn!("Couldn't forget a push subscription the browser dropped: {err}");
+                }
             }
             Err(err) => log::warn!("Couldn't send a web push: {err}"),
         }
@@ -804,12 +855,34 @@ fn action_timeout(action: &PhoneAction) -> Duration {
     }
 }
 
-/// The action's outcome, or "Timed out" once it has run for `timeout`, so
+/// What the phone hears when an action outlasts its timeout. A task or a
+/// merge is usually still going, so calling it a failure would invite the
+/// owner to start a second one.
+fn timed_out(action: &PhoneAction) -> Result<PhoneActionOutcome, TeamActionError> {
+    let still_running = |message: &str| {
+        Ok(PhoneActionOutcome {
+            message: Some(message.to_string()),
+            ..PhoneActionOutcome::default()
+        })
+    };
+    match action {
+        PhoneAction::StartTask { .. } => {
+            still_running("Still starting on the Mac; it will appear in the list shortly")
+        }
+        PhoneAction::Merge { .. } => {
+            still_running("Still merging on the Mac; check the PR in a moment")
+        }
+        _ => Err(TeamActionError::Failed("Timed out".to_string())),
+    }
+}
+
+/// The action's outcome, or `on_timeout` once it has run for `timeout`, so
 /// a hung `git` or `gh` can't hold the phone's request open forever. The
 /// action itself carries on, so a half-made workspace isn't abandoned.
 fn within_timeout(
     action: Task<Result<PhoneActionOutcome, TeamActionError>>,
     timeout: Duration,
+    on_timeout: Result<PhoneActionOutcome, TeamActionError>,
     cx: &mut App,
 ) -> Task<Result<PhoneActionOutcome, TeamActionError>> {
     let (outcome_sender, outcome_receiver) = oneshot::channel();
@@ -826,7 +899,7 @@ fn within_timeout(
             Either::Left((Err(oneshot::Canceled), _)) => Err(TeamActionError::Failed(
                 "The action stopped before it finished".to_string(),
             )),
-            Either::Right(_) => Err(TeamActionError::Failed("Timed out".to_string())),
+            Either::Right(_) => on_timeout,
         }
     })
 }
@@ -1516,7 +1589,14 @@ mod tests {
     async fn a_hung_action_times_out(cx: &mut TestAppContext) {
         let hung: Task<Result<PhoneActionOutcome, TeamActionError>> =
             cx.update(|cx| cx.spawn(async move |_| futures::future::pending().await));
-        let reply = cx.update(|cx| within_timeout(hung, LONG_ACTION_TIMEOUT, cx));
+        let reply = cx.update(|cx| {
+            within_timeout(
+                hung,
+                LONG_ACTION_TIMEOUT,
+                Err(TeamActionError::Failed("Timed out".to_string())),
+                cx,
+            )
+        });
         cx.executor().advance_clock(LONG_ACTION_TIMEOUT);
 
         assert_eq!(
@@ -1528,10 +1608,63 @@ mod tests {
             within_timeout(
                 Task::ready(Ok(PhoneActionOutcome::default())),
                 ACTION_TIMEOUT,
+                Err(TeamActionError::Failed("Timed out".to_string())),
                 cx,
             )
         });
         assert_eq!(quick.await, Ok(PhoneActionOutcome::default()));
+    }
+
+    #[test]
+    fn each_permission_prompt_alerts_once_while_finishes_collapse() {
+        let prompt = |tool_call_id: &str| ChatFeedEvent::PermissionRequested {
+            workspace_id: "ws-1".to_string(),
+            chat_id: "chat-1".to_string(),
+            tool_kind: acp::ToolKind::Execute,
+            tool_call_id: tool_call_id.to_string(),
+            quick_answers: None,
+        };
+        let finished = ChatFeedEvent::TurnEnded {
+            workspace_id: "ws-1".to_string(),
+            chat_id: "chat-1".to_string(),
+            chat_title: "Claude".to_string(),
+            stop_reason: acp::StopReason::EndTurn,
+        };
+        let start = Instant::now();
+        let after = |seconds: u64| start + Duration::from_secs(seconds);
+        let mut last_notified = HashMap::new();
+
+        assert!(!collapse_repeat(
+            &mut last_notified,
+            alert_key(&prompt("run-tests")),
+            start
+        ));
+        assert!(!collapse_repeat(
+            &mut last_notified,
+            alert_key(&prompt("push")),
+            after(5)
+        ));
+        assert!(collapse_repeat(
+            &mut last_notified,
+            alert_key(&prompt("push")),
+            after(10)
+        ));
+
+        assert!(!collapse_repeat(
+            &mut last_notified,
+            alert_key(&finished),
+            after(10)
+        ));
+        assert!(collapse_repeat(
+            &mut last_notified,
+            alert_key(&finished),
+            after(20)
+        ));
+        assert!(!collapse_repeat(
+            &mut last_notified,
+            alert_key(&finished),
+            after(41)
+        ));
     }
 
     #[test]

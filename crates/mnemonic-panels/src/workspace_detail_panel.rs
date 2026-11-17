@@ -952,7 +952,7 @@ impl WorkspaceDetailPanel {
             });
             this_handle
                 .update(cx, |this, cx| this.note_dispatch(sent, &label, cx))
-                .ok();
+                .log_err();
         });
     }
 
@@ -1184,6 +1184,18 @@ impl WorkspaceDetailPanel {
     /// Creates the PR, also starting the CI watch when the `keep_ci_green`
     /// setting is on.
     pub fn create_pr_per_settings(&mut self, cx: &mut Context<Self>) {
+        self.send_pr_request(false, cx);
+    }
+
+    /// Create PR and immediately arm the CI auto-fix loop, so the whole
+    /// create, watch checks, fix, push cycle runs hands-off.
+    pub fn create_pr_with_auto_fix(&mut self, cx: &mut Context<Self>) {
+        self.send_pr_request(true, cx);
+    }
+
+    /// Asks the agent for the PR as the phone does. `auto_fix` arms the CI
+    /// auto-fix even when `keep_ci_green` is off.
+    fn send_pr_request(&mut self, auto_fix: bool, cx: &mut Context<Self>) {
         let (Some(summary), Some(workspace)) = (&self.summary, self.workspace.upgrade()) else {
             return;
         };
@@ -1194,31 +1206,18 @@ impl WorkspaceDetailPanel {
         // update of the workspace.
         cx.defer(move |cx| {
             let sent = workspace.update(cx, |workspace, cx| {
-                request_pr(workspace, &workspace_id, &branch, cx)
+                let sent = request_pr(workspace, &workspace_id, &branch, cx);
+                if sent && auto_fix {
+                    WorkspaceHost::enable_auto_fix_for_workspace(workspace, &workspace_id, cx);
+                }
+                sent
             });
             this_handle
                 .update(cx, |this, cx| {
                     this.note_dispatch(sent, PR_INSTRUCTION_LABEL, cx)
                 })
-                .ok();
+                .log_err();
         });
-    }
-
-    /// Create PR and immediately arm the CI auto-fix loop, so the whole
-    /// create → watch checks → fix → push cycle runs hands-off.
-    pub fn create_pr_with_auto_fix(&mut self, cx: &mut Context<Self>) {
-        self.create_pr(cx);
-        let Some(workspace_id) = self.summary.as_ref().map(|summary| summary.id.clone()) else {
-            return;
-        };
-        if let Some(workspace) = self.workspace.upgrade() {
-            let workspace_id = workspace_id.clone();
-            cx.defer(move |cx| {
-                workspace.update(cx, |workspace, cx| {
-                    WorkspaceHost::enable_auto_fix_for_workspace(workspace, &workspace_id, cx);
-                });
-            });
-        }
     }
 
     fn render_header(&self, ws: &WorkspaceSummary, cx: &mut Context<Self>) -> impl IntoElement {

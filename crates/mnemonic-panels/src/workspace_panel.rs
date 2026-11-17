@@ -1045,7 +1045,7 @@ impl WorkspacePanel {
                         log::error!("No chat received the issue for {}", detail.summary.id);
                     }
                 })
-                .ok();
+                .log_err();
             }
             Err(e) => {
                 log::error!("Failed to create workspace: {e}");
@@ -1164,7 +1164,7 @@ impl WorkspacePanel {
                     this.refresh(cx);
                     cx.notify();
                 })
-                .ok();
+                .log_err();
             }
             created
         })

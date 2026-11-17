@@ -33,6 +33,15 @@ pub struct PushSubscription {
     pub auth: String,
 }
 
+impl PushSubscription {
+    /// Whether pushes can be encrypted to this subscription's keys, so a
+    /// browser's malformed keys are refused when it subscribes rather than
+    /// failing every push later.
+    pub fn check_keys(&self) -> Result<(), String> {
+        decode_keys(self).map(|_| ())
+    }
+}
+
 /// Deliberately not `Debug`, so the private key can't end up in a log.
 pub struct VapidKeys {
     signing_key: p256::ecdsa::SigningKey,
@@ -110,6 +119,24 @@ fn decode_base64url(value: &str, name: &str) -> Result<Vec<u8>, String> {
         .map_err(|err| format!("The subscription's {name} isn't base64url: {err}"))
 }
 
+/// The browser's public key, an uncompressed P-256 point, and its 16-byte
+/// auth secret.
+fn decode_keys(subscription: &PushSubscription) -> Result<(PublicKey, Vec<u8>), String> {
+    let receiver_public_bytes = decode_base64url(&subscription.p256dh, "p256dh key")?;
+    if receiver_public_bytes.len() != usize::from(UNCOMPRESSED_POINT_LENGTH)
+        || receiver_public_bytes.first() != Some(&4)
+    {
+        return Err("The subscription's p256dh key isn't an uncompressed P-256 point".to_string());
+    }
+    let receiver_public = PublicKey::from_sec1_bytes(&receiver_public_bytes)
+        .map_err(|_| "The subscription's p256dh key isn't a P-256 point".to_string())?;
+    let auth_secret = decode_base64url(&subscription.auth, "auth secret")?;
+    if auth_secret.len() != 16 {
+        return Err("The subscription's auth secret isn't 16 bytes".to_string());
+    }
+    Ok((receiver_public, auth_secret))
+}
+
 fn hkdf_expand<const LENGTH: usize>(
     salt: &[u8],
     input_key_material: &[u8],
@@ -135,13 +162,7 @@ pub fn encrypt_with(
             plaintext.len()
         ));
     }
-    let receiver_public_bytes = decode_base64url(&subscription.p256dh, "p256dh key")?;
-    let receiver_public = PublicKey::from_sec1_bytes(&receiver_public_bytes)
-        .map_err(|_| "The subscription's p256dh key isn't a P-256 point".to_string())?;
-    let auth_secret = decode_base64url(&subscription.auth, "auth secret")?;
-    if auth_secret.len() != 16 {
-        return Err("The subscription's auth secret isn't 16 bytes".to_string());
-    }
+    let (receiver_public, auth_secret) = decode_keys(subscription)?;
     let server_secret = SecretKey::from_be_bytes(server_private)
         .map_err(|_| "The push encryption key isn't a valid P-256 key".to_string())?;
 

@@ -86,7 +86,8 @@ pub struct PhoneActionOutcome {
     pub chat_id: Option<String>,
     /// The new workspace's id, for `PhoneAction::StartTask`.
     pub workspace_id: Option<String>,
-    /// What GitHub said, for `PhoneAction::Merge`.
+    /// What GitHub said, for `PhoneAction::Merge`, or, for a task or merge
+    /// that outlasted its timeout, that it is still going on the Mac.
     pub message: Option<String>,
 }
 
@@ -574,11 +575,13 @@ fn parse_push_subscription(body: &[u8]) -> Result<PushSubscription, String> {
     if !browser.endpoint.starts_with("https://") {
         return Err("The push endpoint must be an https address".to_string());
     }
-    Ok(PushSubscription {
+    let subscription = PushSubscription {
         endpoint: browser.endpoint,
         p256dh: browser.keys.p256dh,
         auth: browser.keys.auth,
-    })
+    };
+    subscription.check_keys()?;
+    Ok(subscription)
 }
 
 fn parse_action(segments: &[&str], body: &[u8]) -> Result<PhoneAction, (u16, String)> {
@@ -902,6 +905,39 @@ mod tests {
             body.len()
         );
         assert_eq!(raw_status(address, &request)?, 400);
+        Ok(())
+    }
+
+    #[test]
+    fn refuses_malformed_push_keys() -> Result<(), String> {
+        let (server, _recorded) = start("jay@example.com", Vec::new(), TeamShareHub::new())?;
+        let address = server.address();
+        let subscribe = |p256dh: &str, auth: &str| {
+            let body = format!(
+                r#"{{"endpoint":"https://push.example/x","keys":{{"p256dh":"{p256dh}","auth":"{auth}"}}}}"#
+            );
+            raw_status(
+                address,
+                &format!(
+                    "POST /v1/push/subscriptions HTTP/1.1\r\nHost: {address}\r\n\
+                     Origin: http://{address}\r\nContent-Type: application/json\r\n\
+                     {PHONE_REQUEST_HEADER}: 1\r\nContent-Length: {}\r\n\
+                     Connection: close\r\n\r\n{body}",
+                    body.len()
+                ),
+            )
+        };
+        let p256dh = concat!(
+            "BCVxsr7N_eNgVRqvHtD0zTZsEc6-VV-JvLexhqUzORcx",
+            "aOzi6-AYWXvTBHm4bjyPjs7Vd8pZGH6SRpkNtoIAiw4"
+        );
+        let compressed = "AiVxsr7N_eNgVRqvHtD0zTZsEc6-VV-JvLexhqUzORcx";
+        let auth = "BTBZMqHH6r4Tts7J_aSIgg";
+
+        assert_eq!(subscribe(p256dh, auth)?, 200);
+        assert_eq!(subscribe("not a key", auth)?, 400);
+        assert_eq!(subscribe(compressed, auth)?, 400);
+        assert_eq!(subscribe(p256dh, "BTBZMqHH6r4Tts7J_aSI")?, 400);
         Ok(())
     }
 

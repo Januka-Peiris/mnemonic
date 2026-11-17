@@ -327,9 +327,11 @@ const PROMPT_REFRESH_MS = 20000;
 // Checks turning green change nothing in the workspace feed, so an open
 // chat reads its PR status again on this period.
 const PR_REFRESH_MS = 15000;
-// The agent takes a while to open the PR it was asked for; until then the
-// status still says there is none, so Create PR stays held.
-const PR_REQUEST_HOLD_MS = 30000;
+// The agent takes a while to open the PR it was asked for, and until then
+// the status says there is none, so Create PR stays held until a PR is open
+// or the agent stops working. An agent that hasn't started on the request
+// within this long isn't going to.
+const PR_REQUEST_START_MS = 30000;
 const OPENED_MARK_PREFIX = "phone.opened.";
 const INSTALLED_AT_KEY = "phone.installedAt";
 const QUICK_REPLIES = ["Yes, go ahead", "Continue", "Open a PR"];
@@ -570,7 +572,7 @@ const app = {
   pr: null,
   prGeneration: 0,
   prBusy: false,
-  // Workspace id to when Create PR was sent for it.
+  // Workspace id to { at, sawWorking, stoppedAt } for a sent Create PR.
   prRequested: new Map(),
 };
 
@@ -598,6 +600,7 @@ async function loadWorkspaces() {
     app.workspacesLoaded = true;
     renderHome();
     renderChatHeader();
+    renderPrButton();
   } catch (error) {
     showError(error);
   }
@@ -751,7 +754,8 @@ async function answerFromHome(chatId, toolCallId, optionId) {
     });
     app.answered.add(chatId + " " + toolCallId);
   } catch (error) {
-    if (error.status === 409 && /no longer waiting/i.test(error.message)) {
+    // Answered on the Mac first, or already answered from a notification.
+    if (error.status === 409) {
       app.answered.add(chatId + " " + toolCallId);
     } else {
       showError(error);
@@ -1031,6 +1035,7 @@ function applyUpdate(chat, update) {
   renderPlan(chat);
   element("chat-status").textContent = chat.generating ? "Working..." : "";
   element("stop").disabled = !chat.generating;
+  renderPrButton();
   if (stickToBottom) scrollToBottom();
 }
 
@@ -1258,7 +1263,7 @@ async function answer(chat, toolCallId, optionId, row) {
   } catch (error) {
     for (const button of row.querySelectorAll("button")) button.disabled = false;
     // Answered on the Mac first: the next update clears the prompt.
-    if (!(error.status === 409 && /no longer waiting/i.test(error.message))) {
+    if (error.status !== 409) {
       showError(error);
     }
   }
@@ -1433,6 +1438,7 @@ async function startTask() {
     } else {
       location.hash = "";
     }
+    if (outcome.message) showNotice(outcome.message);
   } catch (error) {
     showError(error);
   } finally {
@@ -1465,10 +1471,7 @@ function prAction() {
   const status = pr.status;
   const state = (status.state || "").toUpperCase();
   if (!status.found || !status.number || state !== "OPEN") {
-    const requestedAt = app.prRequested.get(pr.workspaceId);
-    if (requestedAt !== undefined && Date.now() - requestedAt < PR_REQUEST_HOLD_MS) {
-      return { kind: "requested", label: "PR requested" };
-    }
+    if (prRequestHeld(pr)) return { kind: "requested", label: "PR requested" };
     return { kind: "create", label: "Create PR" };
   }
   app.prRequested.delete(pr.workspaceId);
@@ -1482,6 +1485,40 @@ function prAction() {
     description = (workspace && workspace.pr_state) || state.toLowerCase();
   }
   return { kind: "open", label: description ? name + " " + description : name };
+}
+
+function agentWorking(workspaceId) {
+  const workspace = findWorkspace(workspaceId);
+  if (workspace && (workspace.agent_state === "working" || workspace.agent_state === "waiting_for_approval")) {
+    return true;
+  }
+  if (!app.chat || !app.chat.generating) return false;
+  const found = findChat(app.chat.id);
+  return Boolean(found && found.workspace.id === workspaceId);
+}
+
+function prRequestHeld(pr) {
+  const request = app.prRequested.get(pr.workspaceId);
+  if (!request) return false;
+  if (agentWorking(pr.workspaceId)) {
+    request.sawWorking = true;
+    request.stoppedAt = null;
+    return true;
+  }
+  if (!request.sawWorking) {
+    if (Date.now() - request.at < PR_REQUEST_START_MS) return true;
+  } else if (request.stoppedAt === null) {
+    // The status last read may predate the PR the agent just opened.
+    request.stoppedAt = Date.now();
+    setTimeout(() => {
+      if (app.pr && app.pr.workspaceId === pr.workspaceId) loadPr(pr.workspaceId, app.pr.key);
+    }, 0);
+    return true;
+  } else if (pr.loading || pr.fetchedAt <= request.stoppedAt) {
+    return true;
+  }
+  app.prRequested.delete(pr.workspaceId);
+  return false;
 }
 
 function renderPrButton() {
@@ -1519,8 +1556,8 @@ async function prClicked() {
   try {
     if (action.kind === "create") {
       await post(workspacePath + "/pr", {});
-      app.prRequested.set(pr.workspaceId, Date.now());
-      setTimeout(renderPrButton, PR_REQUEST_HOLD_MS);
+      app.prRequested.set(pr.workspaceId, { at: Date.now(), sawWorking: false, stoppedAt: null });
+      setTimeout(renderPrButton, PR_REQUEST_START_MS);
       scrollToBottom();
     } else if (action.kind === "merge") {
       const outcome = await post(workspacePath + "/merge", { head: status.head_ref_oid });
@@ -1636,14 +1673,38 @@ function base64UrlToBytes(text) {
   return Uint8Array.from(binary, (character) => character.charCodeAt(0));
 }
 
+function hasKey(buffer, key) {
+  const current = new Uint8Array(buffer);
+  const wanted = base64UrlToBytes(key);
+  return current.length === wanted.length && current.every((byte, index) => byte === wanted[index]);
+}
+
+// Saving is an upsert, so sending a subscription the Mac already has is
+// harmless, and restores one it lost or dropped. A subscription made for
+// another key, as after the Mac's key was reset, can't be pushed to.
+async function saveSubscription(registration) {
+  const { key } = await getJson("/v1/push/key");
+  let subscription = await registration.pushManager.getSubscription();
+  const subscribedKey = subscription && subscription.options && subscription.options.applicationServerKey;
+  if (subscribedKey && !hasKey(subscribedKey, key)) {
+    await subscription.unsubscribe();
+    subscription = null;
+  }
+  if (!subscription) {
+    subscription = await registration.pushManager.subscribe({
+      userVisibleOnly: true,
+      applicationServerKey: base64UrlToBytes(key),
+    });
+  }
+  await post("/v1/push/subscriptions", subscription.toJSON());
+}
+
 async function setUpAlerts() {
   if (!("serviceWorker" in navigator)) return;
   const registration = await navigator.serviceWorker.register("/sw.js");
   const button = element("enable-alerts");
   if (location.protocol !== "https:" || !("PushManager" in window) || !("Notification" in window)) return;
   await navigator.serviceWorker.ready;
-  if (await registration.pushManager.getSubscription()) return;
-  button.classList.remove("hidden");
   button.addEventListener("click", async () => {
     button.disabled = true;
     try {
@@ -1651,12 +1712,7 @@ async function setUpAlerts() {
         showNotice("Alerts are blocked for this page");
         return;
       }
-      const { key } = await getJson("/v1/push/key");
-      const subscription = await registration.pushManager.subscribe({
-        userVisibleOnly: true,
-        applicationServerKey: base64UrlToBytes(key),
-      });
-      await post("/v1/push/subscriptions", subscription.toJSON());
+      await saveSubscription(registration);
       button.classList.add("hidden");
     } catch (error) {
       showError(error);
@@ -1664,6 +1720,17 @@ async function setUpAlerts() {
       button.disabled = false;
     }
   });
+  if (!(await registration.pushManager.getSubscription())) {
+    button.classList.remove("hidden");
+    return;
+  }
+  try {
+    await saveSubscription(registration);
+  } catch (error) {
+    const reason = error instanceof RequestError ? error.message : "couldn't reach the Mac";
+    showError(new RequestError("Alerts aren't set up: " + reason));
+    button.classList.remove("hidden");
+  }
 }
 
 route();
