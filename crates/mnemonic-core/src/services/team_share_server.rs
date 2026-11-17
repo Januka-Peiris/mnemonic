@@ -67,6 +67,11 @@ const MAX_ACTION_BODY_BYTES: usize = 16 * 1024;
 /// Write carries whole files.
 const MAX_AGENT_BODY_BYTES: usize = MAX_ACTION_BODY_BYTES * 64;
 const MCP_SESSION_HEADER: &str = "Mcp-Session-Id";
+/// Claude's MCP client is Node's fetch, which gives up on a response whose
+/// headers take over 300 seconds and on a body that goes quiet as long, so
+/// a tool call answers as an event stream that starts at once and sends a
+/// comment this often until the tool finishes.
+const MCP_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(15);
 const MAX_BATCH_BODY_BYTES: usize = 512 * 1024 * 1024;
 pub const MAX_BUNDLE_HAVE: usize = 64;
 
@@ -259,7 +264,21 @@ fn handle(mut request: Request, shared: &Shared) {
                 handle_changes(&mut request, shared, &caller, workspace_id)
             }
             ["v1", "workspaces", workspace_id, "agent"] if is_plain_id(workspace_id) => {
-                handle_agent(&mut request, shared, &caller, workspace_id)
+                match handle_agent(&mut request, shared, &caller, workspace_id) {
+                    AgentReply::Response(response) => response,
+                    AgentReply::EventStream(reply) => {
+                        let mut writer = request.into_writer();
+                        if let Err(err) =
+                            write_event_stream(&mut writer, &reply, MCP_KEEP_ALIVE_INTERVAL)
+                        {
+                            log::debug!(
+                                target: "mnemonic_lib",
+                                "A teammate's agent stopped listening: {err}"
+                            );
+                        }
+                        return;
+                    }
+                }
             }
             _ => text_response(404, "Not found"),
         };
@@ -442,26 +461,33 @@ fn handle_action(
     outcome_response(outcome)
 }
 
+enum AgentReply {
+    Response(Response<std::io::Cursor<Vec<u8>>>),
+    /// The JSON-RPC reply arrives on the channel once the tool finishes.
+    EventStream(std::sync::mpsc::Receiver<String>),
+}
+
 fn handle_agent(
     request: &mut Request,
     shared: &Shared,
     caller: &TeamCaller,
     workspace_id: &str,
-) -> Response<std::io::Cursor<Vec<u8>>> {
+) -> AgentReply {
+    let refuse = |status: u16, reason: &str| AgentReply::Response(text_response(status, reason));
     let Some(workspace) = shared
         .hub
         .workspaces()
         .into_iter()
         .find(|workspace| workspace.id == workspace_id)
     else {
-        return text_response(404, "No such workspace");
+        return refuse(404, "No such workspace");
     };
     let root = workspace
         .agents
         .then(|| (shared.agent_roots)(workspace_id))
         .flatten();
     let Some(root) = root else {
-        return text_response(403, "Teammates' agents can't work in this workspace");
+        return refuse(403, "Teammates' agents can't work in this workspace");
     };
     let header_value = |name: &'static str| {
         request
@@ -474,11 +500,18 @@ fn handle_agent(
         .as_deref()
         .and_then(parse_git_author);
     let session = header_value(MCP_SESSION_HEADER).unwrap_or_default();
+    let accepts_event_stream = header_value("Accept").is_some_and(|accept| {
+        accept.split(',').any(|media_type| {
+            media_type.split(';').next().is_some_and(|media_type| {
+                media_type.trim().eq_ignore_ascii_case("text/event-stream")
+            })
+        })
+    }) && *request.http_version() >= (1, 1);
     if request
         .body_length()
         .is_some_and(|length| length > MAX_AGENT_BODY_BYTES)
     {
-        return text_response(413, "The request is too long");
+        return refuse(413, "The request is too long");
     }
     let mut body = Vec::new();
     let read = request
@@ -486,17 +519,22 @@ fn handle_agent(
         .take(MAX_AGENT_BODY_BYTES as u64 + 1)
         .read_to_end(&mut body);
     if let Err(err) = read {
-        return text_response(400, &format!("Couldn't read the request: {err}"));
+        return refuse(400, &format!("Couldn't read the request: {err}"));
     }
     if body.len() > MAX_AGENT_BODY_BYTES {
-        return text_response(413, "The request is too long");
+        return refuse(413, "The request is too long");
     }
 
-    let is_initialize = serde_json::from_slice::<serde_json::Value>(&body)
-        .ok()
-        .is_some_and(|message| {
-            message.get("method").and_then(|method| method.as_str()) == Some("initialize")
-        });
+    let message = serde_json::from_slice::<serde_json::Value>(&body).ok();
+    let method = message
+        .as_ref()
+        .and_then(|message| message.get("method"))
+        .and_then(|method| method.as_str());
+    let is_initialize = method == Some("initialize");
+    let is_tool_call = method == Some("tools/call")
+        && message
+            .as_ref()
+            .is_some_and(|message| message.get("id").is_some());
     let session = if is_initialize {
         uuid::Uuid::new_v4().to_string()
     } else {
@@ -514,6 +552,26 @@ fn handle_agent(
         }),
     };
     let caller_key = format!("{}:{session}", caller.login);
+
+    if is_tool_call && accepts_event_stream {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let running_commands = shared.running_commands.clone();
+        let spawned = std::thread::Builder::new()
+            .name("mnemonic-team-agent-tool".into())
+            .spawn(move || {
+                let reply = handle_mcp_message(&context, &running_commands, &caller_key, &body);
+                if let McpReply::Json(text) = reply {
+                    if sender.send(text).is_err() {
+                        log::debug!(target: "mnemonic_lib", "A tool finished after its caller left");
+                    }
+                }
+            });
+        return match spawned {
+            Ok(_) => AgentReply::EventStream(receiver),
+            Err(err) => refuse(503, &format!("Couldn't run the tool: {err}")),
+        };
+    }
+
     let mut response =
         match handle_mcp_message(&context, &shared.running_commands, &caller_key, &body) {
             McpReply::Json(text) => json_response(200, text),
@@ -524,7 +582,46 @@ fn handle_agent(
             response.add_header(header);
         }
     }
-    response
+    AgentReply::Response(response)
+}
+
+/// Writes a chunked server-sent event response by hand, since tiny_http
+/// buffers a streamed body and would hold back the headers and the
+/// keep-alive comments.
+fn write_event_stream(
+    writer: &mut dyn std::io::Write,
+    reply: &std::sync::mpsc::Receiver<String>,
+    keep_alive: Duration,
+) -> std::io::Result<()> {
+    use std::sync::mpsc::RecvTimeoutError;
+
+    writer.write_all(
+        b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\n\
+          Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+    )?;
+    writer.flush()?;
+    loop {
+        match reply.recv_timeout(keep_alive) {
+            Ok(json) => {
+                write_chunk(
+                    writer,
+                    format!("event: message\ndata: {json}\n\n").as_bytes(),
+                )?;
+                break;
+            }
+            Err(RecvTimeoutError::Timeout) => write_chunk(writer, b": keep-alive\n\n")?,
+            Err(RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    writer.write_all(b"0\r\n\r\n")?;
+    writer.flush()
+}
+
+fn write_chunk(writer: &mut dyn std::io::Write, data: &[u8]) -> std::io::Result<()> {
+    write!(writer, "{:x}\r\n", data.len())?;
+    writer.write_all(data)?;
+    writer.write_all(b"\r\n")?;
+    writer.flush()
 }
 
 fn parse_git_author(value: &str) -> Option<GitAuthor> {
@@ -1031,6 +1128,75 @@ mod tests {
             answer.to_lowercase().contains("mcp-session-id:"),
             "{answer}"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn a_tool_call_accepting_an_event_stream_is_answered_as_one() -> Result<(), String> {
+        let root = tempfile::tempdir().map_err(|err| err.to_string())?;
+        let server = start_agents(
+            root.path().to_path_buf(),
+            true,
+            "bob@example.com",
+            Arc::new(|_, _| Ok(())),
+        )?;
+        let body = call_body(
+            1,
+            "Bash",
+            serde_json::json!({"command": "sleep 1; echo slept"}),
+        );
+        let headers = format!("{TEAM_HEADER}Accept: application/json, text/event-stream\r\n");
+
+        let (status, answer) = raw_agent_post(server.address(), &headers, &body)?;
+
+        assert_eq!(status, 200);
+        assert!(
+            answer
+                .to_lowercase()
+                .contains("content-type: text/event-stream"),
+            "{answer}"
+        );
+        let data = answer
+            .lines()
+            .find_map(|line| line.strip_prefix("data: "))
+            .ok_or_else(|| format!("No data line in {answer:?}"))?;
+        let reply: serde_json::Value = serde_json::from_str(data).map_err(|err| err.to_string())?;
+        assert_eq!(reply["id"], 1);
+        assert_eq!(reply["result"]["isError"], false);
+        let text = reply["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(text.contains("slept"), "{text}");
+        Ok(())
+    }
+
+    #[test]
+    fn an_event_stream_sends_keep_alives_until_the_reply() -> Result<(), String> {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let reply = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            sender.send(r#"{"jsonrpc":"2.0","id":1,"result":{}}"#.to_string())
+        });
+        let mut written = Vec::new();
+
+        write_event_stream(&mut written, &receiver, Duration::from_millis(50))
+            .map_err(|err| err.to_string())?;
+
+        reply
+            .join()
+            .map_err(|_| "The reply thread panicked".to_string())?
+            .map_err(|err| err.to_string())?;
+        let written = String::from_utf8(written).map_err(|err| err.to_string())?;
+        let (head, body) = written
+            .split_once("\r\n\r\n")
+            .ok_or_else(|| format!("No end of headers in {written:?}"))?;
+        assert!(head.contains("Transfer-Encoding: chunked"), "{head}");
+        assert!(body.contains(": keep-alive\n\n"), "{body}");
+        assert!(
+            body.contains("event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\n\n"),
+            "{body}"
+        );
+        assert!(body.ends_with("0\r\n\r\n"), "{body}");
         Ok(())
     }
 
