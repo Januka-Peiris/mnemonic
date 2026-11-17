@@ -1,3 +1,4 @@
+mod chat_feed;
 mod command_approval_panel;
 mod coordinator_panel;
 mod phone;
