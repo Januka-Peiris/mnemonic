@@ -1521,6 +1521,50 @@ pub fn requires_session_extras(cwd: &Path, cx: &App) -> bool {
         .is_some_and(|required| required.0.iter().any(|prefix| cwd.starts_with(prefix)))
 }
 
+pub trait SessionToolProvider: 'static {
+    /// MCP servers to add to a session in `cwd` and the key they carry; None to add nothing.
+    fn tools_for_session(&self, cwd: &Path) -> Option<(Vec<acp::McpServer>, String)>;
+    fn bind(&self, key: &str, session_id: &acp::SessionId);
+}
+
+#[derive(Default)]
+struct SessionToolProviderGlobal(Option<Rc<dyn SessionToolProvider>>);
+
+impl gpui::Global for SessionToolProviderGlobal {}
+
+pub fn set_session_tool_provider(provider: Rc<dyn SessionToolProvider>, cx: &mut App) {
+    cx.set_global(SessionToolProviderGlobal(Some(provider)));
+}
+
+struct SessionTools {
+    provider: Rc<dyn SessionToolProvider>,
+    servers: Vec<acp::McpServer>,
+    key: String,
+}
+
+fn session_tools_for_cwd(cwd: &Path, cx: &App) -> Option<SessionTools> {
+    if requires_session_extras(cwd, cx) {
+        return None;
+    }
+    let provider = cx.try_global::<SessionToolProviderGlobal>()?.0.clone()?;
+    let (servers, key) = provider.tools_for_session(cwd)?;
+    Some(SessionTools {
+        provider,
+        servers,
+        key,
+    })
+}
+
+fn with_session_tools(
+    mut mcp_servers: Vec<acp::McpServer>,
+    tools: Option<&SessionTools>,
+) -> Vec<acp::McpServer> {
+    if let Some(tools) = tools {
+        mcp_servers.extend(tools.servers.iter().cloned());
+    }
+    mcp_servers
+}
+
 fn required_session_extras_for_cwd(cwd: &Path, cx: &App) -> Result<Option<SessionExtras>> {
     let extras = session_extras_for_cwd(cwd, cx);
     if extras.is_none() && requires_session_extras(cwd, cx) {
@@ -1750,7 +1794,8 @@ impl AgentConnection for AcpConnection {
             Err(error) => return Task::ready(Err(error)),
         };
         let name = self.id.0.clone();
-        let mcp_servers = mcp_servers_for_project(&project, cx);
+        let tools = session_tools_for_cwd(&directories.cwd, cx);
+        let mcp_servers = with_session_tools(mcp_servers_for_project(&project, cx), tools.as_ref());
 
         cx.spawn(async move |cx| {
             let response = into_foreground_future(
@@ -1760,6 +1805,9 @@ impl AgentConnection for AcpConnection {
             )
             .await
             .map_err(map_acp_error)?;
+            if let Some(tools) = &tools {
+                tools.provider.bind(&tools.key, &response.session_id);
+            }
 
             let (modes, config_options) = config_state(response.modes, response.config_options);
 
@@ -1891,7 +1939,11 @@ impl AgentConnection for AcpConnection {
             Ok(extras) => extras,
             Err(error) => return Task::ready(Err(error)),
         };
-        let mcp_servers = mcp_servers_for_project(&project, cx);
+        let tools = work_dirs
+            .ordered_paths()
+            .next()
+            .and_then(|cwd| session_tools_for_cwd(cwd, cx));
+        let mcp_servers = with_session_tools(mcp_servers_for_project(&project, cx), tools.as_ref());
         self.open_or_create_session(
             session_id,
             project,
@@ -1899,6 +1951,9 @@ impl AgentConnection for AcpConnection {
             title,
             move |connection, session_id, directories| {
                 Box::pin(async move {
+                    if let Some(tools) = &tools {
+                        tools.provider.bind(&tools.key, &session_id);
+                    }
                     let response = into_foreground_future(connection.send_request(
                         directories.into_load_session_request(
                             session_id.clone(),
@@ -1941,7 +1996,11 @@ impl AgentConnection for AcpConnection {
             Ok(extras) => extras,
             Err(error) => return Task::ready(Err(error)),
         };
-        let mcp_servers = mcp_servers_for_project(&project, cx);
+        let tools = work_dirs
+            .ordered_paths()
+            .next()
+            .and_then(|cwd| session_tools_for_cwd(cwd, cx));
+        let mcp_servers = with_session_tools(mcp_servers_for_project(&project, cx), tools.as_ref());
         self.open_or_create_session(
             session_id,
             project,
@@ -1949,6 +2008,9 @@ impl AgentConnection for AcpConnection {
             title,
             move |connection, session_id, directories| {
                 Box::pin(async move {
+                    if let Some(tools) = &tools {
+                        tools.provider.bind(&tools.key, &session_id);
+                    }
                     let response = into_foreground_future(connection.send_request(
                         directories.into_resume_session_request(
                             session_id.clone(),
@@ -1998,12 +2060,17 @@ impl AgentConnection for AcpConnection {
             .and_then(|session| session.thread.upgrade())
             .map(|thread| mcp_servers_for_project(thread.read(cx).project(), cx))
             .unwrap_or_default();
+        let tools = session_tools_for_cwd(&directories.cwd, cx);
+        let mcp_servers = with_session_tools(mcp_servers, tools.as_ref());
         let request = directories.into_fork_session_request(session_id, mcp_servers, extras);
         let connection = self.connection.clone();
         cx.foreground_executor().spawn(async move {
             let response = into_foreground_future(connection.send_request(request))
                 .await
                 .map_err(map_acp_error)?;
+            if let Some(tools) = &tools {
+                tools.provider.bind(&tools.key, &response.session_id);
+            }
             Ok(response.session_id)
         })
     }
@@ -2395,6 +2462,7 @@ pub mod test_support {
         pub load_session_count: Arc<AtomicUsize>,
         pub close_session_count: Arc<AtomicUsize>,
         pub logout_count: Arc<AtomicUsize>,
+        pub received_requests: Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
         pub keep_agent_alive: Task<anyhow::Result<()>>,
     }
 
@@ -2576,6 +2644,7 @@ pub mod test_support {
         let (client_transport, agent_transport) = agent_client_protocol::Channel::duplex();
 
         let logout_count = Arc::new(AtomicUsize::new(0));
+        let received_requests = Arc::new(std::sync::Mutex::new(Vec::new()));
         let sessions: Rc<RefCell<HashMap<acp::SessionId, AcpSession>>> =
             Rc::new(RefCell::new(HashMap::default()));
         let client_session_list: Rc<RefCell<Option<Rc<AcpSessionList>>>> =
@@ -2606,8 +2675,23 @@ pub mod test_support {
                 agent_client_protocol::on_receive_request!(),
             )
             .on_receive_request(
-                async move |_req: acp::NewSessionRequest, responder, _cx| {
-                    responder.respond(acp::NewSessionResponse::new(acp::SessionId::new("unused")))
+                {
+                    let received_requests = received_requests.clone();
+                    async move |req: acp::NewSessionRequest, responder, _cx| {
+                        record_request(&received_requests, &req);
+                        responder
+                            .respond(acp::NewSessionResponse::new(acp::SessionId::new("unused")))
+                    }
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_request(
+                {
+                    let received_requests = received_requests.clone();
+                    async move |req: acp::ResumeSessionRequest, responder, _cx| {
+                        record_request(&received_requests, &req);
+                        responder.respond(acp::ResumeSessionResponse::new())
+                    }
                 },
                 agent_client_protocol::on_receive_request!(),
             )
@@ -2627,7 +2711,9 @@ pub mod test_support {
             .on_receive_request(
                 {
                     let load_session_count = load_session_count.clone();
-                    async move |_req: acp::LoadSessionRequest, responder, _cx| {
+                    let received_requests = received_requests.clone();
+                    async move |req: acp::LoadSessionRequest, responder, _cx| {
+                        record_request(&received_requests, &req);
                         load_session_count.fetch_add(1, Ordering::SeqCst);
                         responder.respond(acp::LoadSessionResponse::new())
                     }
@@ -2635,10 +2721,14 @@ pub mod test_support {
                 agent_client_protocol::on_receive_request!(),
             )
             .on_receive_request(
-                async move |req: acp::ForkSessionRequest, responder, _cx| {
-                    responder.respond(acp::ForkSessionResponse::new(acp::SessionId::new(
-                        format!("{}-fork", req.session_id),
-                    )))
+                {
+                    let received_requests = received_requests.clone();
+                    async move |req: acp::ForkSessionRequest, responder, _cx| {
+                        record_request(&received_requests, &req);
+                        responder.respond(acp::ForkSessionResponse::new(acp::SessionId::new(
+                            format!("{}-fork", req.session_id),
+                        )))
+                    }
                 },
                 agent_client_protocol::on_receive_request!(),
             )
@@ -2735,8 +2825,20 @@ pub mod test_support {
             load_session_count,
             close_session_count,
             logout_count,
+            received_requests,
             keep_agent_alive,
         })
+    }
+
+    fn record_request(
+        received_requests: &std::sync::Mutex<Vec<serde_json::Value>>,
+        request: &impl serde::Serialize,
+    ) {
+        if let (Ok(mut requests), Ok(value)) =
+            (received_requests.lock(), serde_json::to_value(request))
+        {
+            requests.push(value);
+        }
     }
 
     pub async fn connect_fake_acp_connection(
@@ -3379,6 +3481,177 @@ mod tests {
         .await
         .expect("loading with extras proceeds");
         assert_eq!(harness.load_session_count.load(Ordering::SeqCst), 1);
+    }
+
+    mod session_tool {
+        use super::*;
+
+        struct RecordingToolProvider {
+            binds: RefCell<Vec<(String, acp::SessionId)>>,
+        }
+
+        impl SessionToolProvider for RecordingToolProvider {
+            fn tools_for_session(&self, _cwd: &Path) -> Option<(Vec<acp::McpServer>, String)> {
+                Some((
+                    vec![acp::McpServer::Http(acp::McpServerHttp::new(
+                        "mnemonic",
+                        "http://127.0.0.1:1/mcp",
+                    ))],
+                    "chat-key".to_string(),
+                ))
+            }
+
+            fn bind(&self, key: &str, session_id: &acp::SessionId) {
+                self.binds
+                    .borrow_mut()
+                    .push((key.to_string(), session_id.clone()));
+            }
+        }
+
+        fn server_names(request: &serde_json::Value) -> Vec<String> {
+            request["mcpServers"]
+                .as_array()
+                .map(|servers| {
+                    servers
+                        .iter()
+                        .filter_map(|server| server["name"].as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default()
+        }
+
+        async fn session_tool_harness(
+            cx: &mut gpui::TestAppContext,
+        ) -> (
+            test_support::FakeAcpConnectionHarness,
+            Entity<Project>,
+            Rc<RecordingToolProvider>,
+        ) {
+            cx.update(|cx| {
+                let store = settings::SettingsStore::test(cx);
+                cx.set_global(store);
+            });
+            let fs = fs::FakeFs::new(cx.executor());
+            fs.insert_tree(
+                "/",
+                serde_json::json!({ "a": {}, "guarded": { "chat": {} } }),
+            )
+            .await;
+            let project = project::Project::test(fs, [std::path::Path::new("/a")], cx).await;
+            let mut harness = test_support::connect_fake_acp_connection(project.clone(), cx).await;
+            let capabilities = &mut Rc::get_mut(&mut harness.connection)
+                .expect("test harness should own the only ACP connection handle")
+                .agent_capabilities
+                .session_capabilities;
+            capabilities.resume = Some(acp::SessionResumeCapabilities::new());
+            capabilities.fork = Some(acp::SessionForkCapabilities::new());
+            let provider = Rc::new(RecordingToolProvider {
+                binds: RefCell::new(Vec::new()),
+            });
+            cx.update(|cx| set_session_tool_provider(provider.clone(), cx));
+            (harness, project, provider)
+        }
+
+        #[gpui::test]
+        async fn new_session_gets_tools_and_binds_the_new_id(cx: &mut gpui::TestAppContext) {
+            let (harness, project, provider) = session_tool_harness(cx).await;
+            let connection = harness.connection.clone();
+            cx.update(|cx| {
+                connection.new_session(
+                    project,
+                    PathList::new(&[std::path::PathBuf::from("/a")]),
+                    cx,
+                )
+            })
+            .await
+            .expect("new session starts");
+
+            let requests = harness.received_requests.lock().expect("lock").clone();
+            assert_eq!(server_names(&requests[0]), vec!["mnemonic"]);
+            assert_eq!(
+                *provider.binds.borrow(),
+                vec![("chat-key".to_string(), acp::SessionId::new("unused"))]
+            );
+        }
+
+        #[gpui::test]
+        async fn resumed_session_gets_tools_bound_to_its_id(cx: &mut gpui::TestAppContext) {
+            let (harness, project, provider) = session_tool_harness(cx).await;
+            let connection = harness.connection.clone();
+            cx.update(|cx| {
+                connection.resume_session(
+                    acp::SessionId::new("s-7"),
+                    project,
+                    PathList::new(&[std::path::PathBuf::from("/a")]),
+                    None,
+                    cx,
+                )
+            })
+            .await
+            .expect("resume starts");
+
+            let requests = harness.received_requests.lock().expect("lock").clone();
+            assert_eq!(server_names(&requests[0]), vec!["mnemonic"]);
+            assert_eq!(
+                *provider.binds.borrow(),
+                vec![("chat-key".to_string(), acp::SessionId::new("s-7"))]
+            );
+        }
+
+        #[gpui::test]
+        async fn forked_session_binds_the_id_the_fork_returns(cx: &mut gpui::TestAppContext) {
+            let (harness, _project, provider) = session_tool_harness(cx).await;
+            let connection = harness.connection.clone();
+            cx.update(|cx| {
+                connection.fork_session(
+                    acp::SessionId::new("original"),
+                    PathList::new(&[std::path::PathBuf::from("/a")]),
+                    cx,
+                )
+            })
+            .await
+            .expect("fork starts");
+
+            let requests = harness.received_requests.lock().expect("lock").clone();
+            assert_eq!(server_names(&requests[0]), vec!["mnemonic"]);
+            assert_eq!(
+                *provider.binds.borrow(),
+                vec![("chat-key".to_string(), acp::SessionId::new("original-fork"))]
+            );
+        }
+
+        #[gpui::test]
+        async fn teammate_sessions_get_no_tools(cx: &mut gpui::TestAppContext) {
+            let (harness, project, provider) = session_tool_harness(cx).await;
+            cx.update(|cx| {
+                require_session_extras_under("/guarded".into(), cx);
+                set_session_extras(
+                    "/guarded/chat".into(),
+                    SessionExtras {
+                        mcp_servers: vec![acp::McpServer::Http(acp::McpServerHttp::new(
+                            "teammate_workspace",
+                            "http://127.0.0.1:2/mcp",
+                        ))],
+                        meta: acp::Meta::new(),
+                    },
+                    cx,
+                );
+            });
+            let connection = harness.connection.clone();
+            cx.update(|cx| {
+                connection.new_session(
+                    project,
+                    PathList::new(&[std::path::PathBuf::from("/guarded/chat")]),
+                    cx,
+                )
+            })
+            .await
+            .expect("teammate session starts");
+
+            let requests = harness.received_requests.lock().expect("lock").clone();
+            assert_eq!(server_names(&requests[0]), vec!["teammate_workspace"]);
+            assert!(provider.binds.borrow().is_empty());
+        }
     }
 
     async fn connect_session_delete_test_agent(
