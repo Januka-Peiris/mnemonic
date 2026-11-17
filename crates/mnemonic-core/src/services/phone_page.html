@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, interactive-widget=resizes-content">
 <meta name="color-scheme" content="light dark">
 <title>Mnemonic</title>
 <style>
@@ -18,6 +18,7 @@
   --error: #b91c1c;
   --working: #047857;
   --code: #eef0f3;
+  --notice: #374151;
 }
 @media (prefers-color-scheme: dark) {
   :root {
@@ -32,6 +33,7 @@
     --error: #f87171;
     --working: #34d399;
     --code: #262a30;
+    --notice: #4b5563;
   }
 }
 * { box-sizing: border-box; }
@@ -66,6 +68,7 @@ header {
 }
 header h1 {
   flex: 1;
+  min-width: 0;
   margin: 0;
   font-size: 17px;
   font-weight: 600;
@@ -73,6 +76,7 @@ header h1 {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+header button { flex-shrink: 0; }
 #banner {
   display: none;
   align-items: flex-start;
@@ -82,11 +86,36 @@ header h1 {
   color: #ffffff;
 }
 #banner.shown { display: flex; }
+#banner.notice { background: var(--notice); }
 #banner-text { flex: 1; white-space: pre-wrap; word-break: break-word; }
 #banner button { background: transparent; color: #ffffff; border-color: #ffffff; padding: 2px 10px; }
 main { flex: 1; overflow-y: auto; -webkit-overflow-scrolling: touch; }
 .hidden { display: none !important; }
 .muted { color: var(--muted); }
+.single-line { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.section-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 14px 12px 6px;
+  border-bottom: 1px solid var(--border);
+}
+.section-title {
+  margin: 0;
+  font-size: 13px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--muted);
+}
+.section-head button { padding: 6px 10px; flex-shrink: 0; }
+.repository-heading { padding: 12px 12px 2px; font-size: 13px; font-weight: 600; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.card { border-bottom: 1px solid var(--border); padding: 10px 12px; }
+.card-detail { font-size: 13px; color: var(--muted); padding-left: calc(1em + 8px); }
+.card-tool { font: 12px/1.4 ui-monospace, Menlo, Consolas, monospace; }
+.card-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; padding-left: calc(1em + 8px); }
+.card-actions button { padding: 6px 12px; }
 .workspace { border-bottom: 1px solid var(--border); }
 .workspace-row {
   display: block;
@@ -97,17 +126,34 @@ main { flex: 1; overflow-y: auto; -webkit-overflow-scrolling: touch; }
   background: transparent;
   padding: 10px 12px;
 }
-.workspace-line { display: flex; gap: 8px; align-items: baseline; }
-.workspace-name { flex: 1; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.workspace-line { display: flex; gap: 8px; align-items: baseline; min-width: 0; }
+.workspace-line > span { flex-shrink: 0; white-space: nowrap; }
+.workspace-line > .workspace-name { flex: 1 1 auto; min-width: 0; font-weight: 600; overflow: hidden; text-overflow: ellipsis; }
+.workspace-line .tag { font-size: 13px; }
 .marker { width: 1em; font-weight: 700; }
 .state-waiting_for_approval { color: var(--attention); }
 .state-error { color: var(--error); }
 .state-working { color: var(--working); }
 .state-idle { color: var(--muted); }
-.workspace-details { font-size: 13px; color: var(--muted); padding-left: calc(1em + 8px); }
+.state-finished { color: var(--working); }
+.workspace-details { font-size: 13px; color: var(--muted); padding-left: calc(1em + 8px); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .chat-list { padding: 0 12px 10px calc(1em + 20px); display: flex; flex-direction: column; gap: 6px; }
-.chat-list button { text-align: left; }
+.chat-list button { text-align: left; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .empty { padding: 24px 12px; color: var(--muted); text-align: center; }
+.form { padding: 12px; display: flex; flex-direction: column; gap: 14px; }
+.field { display: flex; flex-direction: column; gap: 4px; font-size: 13px; color: var(--muted); }
+select, textarea {
+  font: inherit;
+  color: var(--text);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px;
+  width: 100%;
+  min-width: 0;
+}
+#task-text { min-height: 180px; resize: vertical; }
+.form-row { display: flex; gap: 8px; justify-content: flex-end; }
 #transcript { padding: 8px 12px; }
 .message { margin: 10px 0; word-break: break-word; }
 .message .who { font-size: 12px; font-weight: 600; color: var(--muted); }
@@ -126,10 +172,25 @@ main { flex: 1; overflow-y: auto; -webkit-overflow-scrolling: touch; }
 .message a { color: var(--accent); }
 details.thought { margin: 6px 0; color: var(--muted); }
 details.thought summary { font-size: 13px; }
+.fold {
+  display: block;
+  width: 100%;
+  margin: 2px 0;
+  padding: 4px 0;
+  text-align: left;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  color: var(--muted);
+  font-size: 13px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 .tool { margin: 4px 0; display: flex; gap: 8px; font-size: 13px; align-items: baseline; }
-.tool-kind { color: var(--muted); }
-.tool-title { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: ui-monospace, Menlo, Consolas, monospace; }
-.tool-status { color: var(--muted); }
+.tool-kind { color: var(--muted); flex-shrink: 0; }
+.tool-title { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: ui-monospace, Menlo, Consolas, monospace; }
+.tool-status { color: var(--muted); flex-shrink: 0; }
 .tool-status.waiting { color: var(--attention); font-weight: 600; }
 .tool-status.failed { color: var(--error); }
 .tool-status.running { color: var(--working); }
@@ -148,21 +209,21 @@ details.thought summary { font-size: 13px; }
 .plan-entry.completed { color: var(--muted); text-decoration: line-through; }
 #chat-status { padding: 0 12px 8px; font-size: 13px; color: var(--muted); }
 footer { border-top: 1px solid var(--border); padding: 8px 12px calc(8px + env(safe-area-inset-bottom)); background: var(--background); }
+.quick-replies { display: flex; gap: 6px; margin-bottom: 8px; overflow-x: auto; }
+.quick-replies button { flex: 0 0 auto; padding: 6px 10px; font-size: 14px; white-space: nowrap; }
 .composer { display: flex; gap: 8px; align-items: flex-end; }
 .composer textarea {
   flex: 1;
-  font: inherit;
-  color: var(--text);
-  background: var(--surface);
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  padding: 8px;
+  width: auto;
   resize: none;
   min-height: 40px;
   max-height: 160px;
 }
+.composer button { flex-shrink: 0; }
+button.listening { border-color: var(--attention); color: var(--attention); }
 .toolbar { display: flex; gap: 8px; margin-top: 8px; }
-.toolbar button { flex: 1; }
+.toolbar button { flex: 1 1 0; min-width: 0; padding: 8px 6px; font-size: 14px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.toolbar #pr { flex-grow: 2; }
 .sheet {
   position: fixed;
   inset: 0;
@@ -179,14 +240,42 @@ footer { border-top: 1px solid var(--border); padding: 8px 12px calc(8px + env(s
 <body>
 <header>
   <button id="back" class="hidden" aria-label="Back to workspaces">&lt;</button>
-  <h1 id="title">Workspaces</h1>
+  <h1 id="title">Mnemonic</h1>
+  <button id="stop" class="hidden" disabled>Stop</button>
   <button id="refresh">Refresh</button>
 </header>
 <div id="banner" role="alert">
   <div id="banner-text"></div>
   <button id="banner-close" aria-label="Dismiss">x</button>
 </div>
-<main id="list-view"><div id="workspaces"><div class="empty">Loading...</div></div></main>
+<main id="home-view">
+  <section id="needs-you" class="hidden">
+    <div class="section-head"><h2 class="section-title">Needs you</h2></div>
+    <div id="needs-list"></div>
+  </section>
+  <div class="section-head">
+    <h2 class="section-title">Workspaces</h2>
+    <button id="new-task">+ New task</button>
+  </div>
+  <div id="workspaces"><div class="empty">Loading...</div></div>
+</main>
+<main id="task-view" class="hidden">
+  <div class="form">
+    <label class="field">Repository
+      <select id="task-repository"></select>
+    </label>
+    <label class="field">Task
+      <textarea id="task-text" placeholder="What should the agent do?"></textarea>
+    </label>
+    <div class="form-row">
+      <button id="task-mic" class="hidden">Mic</button>
+    </div>
+    <label class="field">Agent
+      <select id="task-agent"></select>
+    </label>
+    <button id="task-start" class="primary">Start</button>
+  </div>
+</main>
 <main id="chat-view" class="hidden">
   <div id="transcript"></div>
   <div id="prompts"></div>
@@ -194,14 +283,16 @@ footer { border-top: 1px solid var(--border); padding: 8px 12px calc(8px + env(s
   <div id="chat-status"></div>
 </main>
 <footer id="chat-footer" class="hidden">
+  <div class="quick-replies" id="quick-replies"></div>
   <div class="composer">
     <textarea id="message" rows="1" placeholder="Message..."></textarea>
+    <button id="message-mic" class="hidden">Mic</button>
     <button id="send" class="primary">Send</button>
   </div>
   <div class="toolbar">
-    <button id="stop">Stop</button>
-    <button id="diff">Diff</button>
     <button id="new-chat">New chat</button>
+    <button id="diff">Diff</button>
+    <button id="pr" disabled>PR</button>
   </div>
 </footer>
 <div id="diff-sheet" class="sheet hidden">
@@ -226,10 +317,20 @@ const WORKSPACE_POLL_MS = 5000;
 const CHAT_WAIT_SECONDS = 25;
 const FIRST_RETRY_MS = 2000;
 const LONGEST_RETRY_MS = 15000;
+// A chat made by Start or New chat reaches the Mac's feed a moment later.
+const NEW_CHAT_GRACE_MS = 6000;
+const NEW_CHAT_RETRY_MS = 500;
+const PROMPT_REFRESH_MS = 20000;
+const OPENED_MARK_PREFIX = "phone.opened.";
+const INSTALLED_AT_KEY = "phone.installedAt";
+const QUICK_REPLIES = ["Yes, go ahead", "Continue", "Open a PR"];
 const ATTENTION_ORDER = { waiting_for_approval: 0, error: 1, working: 2, idle: 3 };
 const STATE_MARKERS = { waiting_for_approval: "!", error: "x", working: "*", idle: "" };
 const TOOL_STATUS_LABELS = { pending: "pending", in_progress: "running", completed: "done", failed: "failed" };
 const PLAN_MARKERS = { pending: "[ ]", in_progress: "[~]", completed: "[x]" };
+const SpeechRecognitionClass = window.isSecureContext
+  ? window.SpeechRecognition || window.webkitSpeechRecognition
+  : undefined;
 
 const element = (id) => document.getElementById(id);
 
@@ -274,11 +375,17 @@ async function post(path, body) {
 function showError(error) {
   const message = error instanceof RequestError ? error.message : "Couldn't reach the Mac: " + error.message;
   element("banner-text").textContent = message;
+  element("banner").classList.remove("notice");
   element("banner").classList.add("shown");
 }
 
+function showNotice(text) {
+  element("banner-text").textContent = text;
+  element("banner").classList.add("notice", "shown");
+}
+
 function hideError() {
-  element("banner").classList.remove("shown");
+  element("banner").classList.remove("shown", "notice");
 }
 
 function delay(milliseconds, signal) {
@@ -303,6 +410,23 @@ function isWebUrl(text) {
     return url.protocol === "http:" || url.protocol === "https:";
   } catch (error) {
     return false;
+  }
+}
+
+function readStoredNumber(key) {
+  try {
+    const value = Number(localStorage.getItem(key));
+    return Number.isFinite(value) ? value : 0;
+  } catch (error) {
+    return 0;
+  }
+}
+
+function writeStoredNumber(key, value) {
+  try {
+    localStorage.setItem(key, String(value));
+  } catch (error) {
+    console.warn("Couldn't save " + key, error);
   }
 }
 
@@ -409,12 +533,33 @@ function stateLabel(workspace) {
   }
 }
 
+// The same generic lines the Mac's alerts use.
+function permissionLine(tool) {
+  switch (tool && tool.kind) {
+    case "execute": return "needs permission to run a command";
+    case "edit":
+    case "delete":
+    case "move": return "needs permission to change files";
+    case "read":
+    case "search": return "needs permission to read files";
+    case "fetch": return "needs permission to fetch from the web";
+    default: return tool ? "needs permission to use a tool" : "needs permission";
+  }
+}
+
 const app = {
   workspaces: [],
   workspacesLoaded: false,
   expanded: new Set(),
-  agents: null,
   chat: null,
+  // Chat id to the time Start or New chat made it.
+  newChats: new Map(),
+  // Chat id to the pending prompt a Needs you card shows.
+  prompts: new Map(),
+  answering: new Set(),
+  answered: new Set(),
+  pr: null,
+  prGeneration: 0,
 };
 
 function findChat(chatId) {
@@ -426,12 +571,20 @@ function findChat(chatId) {
   return null;
 }
 
+function findWorkspace(workspaceId) {
+  return app.workspaces.find((workspace) => workspace.id === workspaceId) || null;
+}
+
+function workspaceTitle(workspace) {
+  return workspace.project ? workspace.project + " / " + workspace.name : workspace.name;
+}
+
 async function loadWorkspaces() {
   try {
     const list = await getJson("/v1/workspaces");
     app.workspaces = list.workspaces || [];
     app.workspacesLoaded = true;
-    renderWorkspaces();
+    renderHome();
     renderChatHeader();
   } catch (error) {
     showError(error);
@@ -447,23 +600,188 @@ async function pollWorkspaces() {
   }
 }
 
+function markOpened(chatId) {
+  const found = findChat(chatId);
+  const ended = found ? found.chat.last_turn_ended_at || 0 : 0;
+  writeStoredNumber(OPENED_MARK_PREFIX + chatId, Math.max(Date.now(), ended));
+}
+
+function needsYou() {
+  const installedAt = readStoredNumber(INSTALLED_AT_KEY);
+  const waiting = [];
+  const finished = [];
+  for (const workspace of app.workspaces) {
+    for (const chat of workspace.chats || []) {
+      if (chat.waiting) {
+        waiting.push({ workspace, chat });
+        continue;
+      }
+      const ended = chat.last_turn_ended_at || 0;
+      if (ended > installedAt && ended > readStoredNumber(OPENED_MARK_PREFIX + chat.id)) {
+        finished.push({ workspace, chat });
+      }
+    }
+  }
+  finished.sort((left, right) => right.chat.last_turn_ended_at - left.chat.last_turn_ended_at);
+  return { waiting, finished };
+}
+
+function renderHome() {
+  const { waiting, finished } = needsYou();
+  const waitingIds = new Set(waiting.map((item) => item.chat.id));
+  for (const chatId of app.prompts.keys()) {
+    if (!waitingIds.has(chatId)) app.prompts.delete(chatId);
+  }
+  const needsList = element("needs-list");
+  needsList.replaceChildren();
+  const homeShown = !element("home-view").classList.contains("hidden");
+  for (const item of waiting) {
+    if (homeShown) loadPrompt(item.chat.id);
+    needsList.appendChild(renderWaitingCard(item));
+  }
+  for (const item of finished) {
+    needsList.appendChild(renderFinishedCard(item));
+  }
+  element("needs-you").classList.toggle("hidden", !waiting.length && !finished.length);
+  renderWorkspaces();
+}
+
+function makeCardLine(marker, markerClass, text) {
+  const line = make("div", "workspace-line");
+  line.appendChild(make("span", "marker " + markerClass, marker));
+  line.appendChild(make("span", "workspace-name", text));
+  return line;
+}
+
+function renderWaitingCard({ workspace, chat }) {
+  const card = make("div", "card");
+  card.appendChild(makeCardLine("!", "state-waiting_for_approval", workspaceTitle(workspace)));
+  const prompt = app.prompts.get(chat.id);
+  const request = prompt && prompt.request && !app.answered.has(chat.id + " " + prompt.request.tool_call_id)
+    ? prompt.request
+    : null;
+  const answered = prompt && prompt.request && !request;
+  const tool = request ? prompt.tool : null;
+  card.appendChild(make("div", "card-detail single-line", answered ? "answered" : permissionLine(tool)));
+  if (tool && tool.title) {
+    card.appendChild(make("div", "card-detail card-tool single-line", tool.title));
+  }
+  const actions = make("div", "card-actions");
+  const options = request ? request.options || [] : [];
+  const allow = options.find((option) => option.kind === "allow_once");
+  const deny = options.find((option) => option.kind === "reject_once");
+  if (allow && deny) {
+    const busy = app.answering.has(chat.id);
+    const allowButton = make("button", "primary", "Allow once");
+    const denyButton = make("button", "", "Deny");
+    allowButton.disabled = busy;
+    denyButton.disabled = busy;
+    allowButton.addEventListener("click", () => answerFromHome(chat.id, request.tool_call_id, allow.optionId));
+    denyButton.addEventListener("click", () => answerFromHome(chat.id, request.tool_call_id, deny.optionId));
+    actions.appendChild(allowButton);
+    actions.appendChild(denyButton);
+  }
+  const open = make("button", "", "Open");
+  open.addEventListener("click", () => openChat(chat.id));
+  actions.appendChild(open);
+  card.appendChild(actions);
+  return card;
+}
+
+function renderFinishedCard({ workspace, chat }) {
+  const card = make("div", "card");
+  const errored = Boolean(chat.last_turn_errored);
+  card.appendChild(makeCardLine(errored ? "x" : "✓", errored ? "state-error" : "state-finished", workspaceTitle(workspace)));
+  const title = chat.title || "Untitled chat";
+  card.appendChild(make("div", "card-detail single-line", errored ? "hit an error in " + title : "finished: " + title));
+  const actions = make("div", "card-actions");
+  const open = make("button", "", "Open");
+  open.addEventListener("click", () => openChat(chat.id));
+  actions.appendChild(open);
+  card.appendChild(actions);
+  return card;
+}
+
+// The workspace list says a chat is waiting but not on what, so the card
+// reads the chat once to find the request and its tool.
+async function loadPrompt(chatId) {
+  const cached = app.prompts.get(chatId);
+  if (cached && (cached.loading || Date.now() - cached.fetchedAt < PROMPT_REFRESH_MS)) return;
+  app.prompts.set(chatId, { loading: true, fetchedAt: 0, request: null, tool: null });
+  let prompt = { loading: false, fetchedAt: Date.now(), request: null, tool: null };
+  try {
+    const update = await getJson("/v1/chats/" + encodeURIComponent(chatId));
+    const request = (update.permissions || [])[0] || null;
+    let tool = null;
+    if (request) {
+      for (const change of update.changes || []) {
+        if (!change.entry || change.entry.kind !== "updates") continue;
+        const built = rebuildEntry(change.entry.updates || []);
+        if (built.tool && built.tool.id === request.tool_call_id) tool = built.tool;
+      }
+    }
+    prompt = { loading: false, fetchedAt: Date.now(), request, tool };
+  } catch (error) {
+    console.warn("Couldn't read the prompt in " + chatId, error);
+  }
+  if (!app.prompts.has(chatId)) return;
+  app.prompts.set(chatId, prompt);
+  renderHome();
+}
+
+async function answerFromHome(chatId, toolCallId, optionId) {
+  app.answering.add(chatId);
+  renderHome();
+  try {
+    await post("/v1/chats/" + encodeURIComponent(chatId) + "/permission", {
+      tool_call_id: toolCallId,
+      option_id: optionId,
+    });
+    app.answered.add(chatId + " " + toolCallId);
+  } catch (error) {
+    if (error.status === 409 && /no longer waiting/i.test(error.message)) {
+      app.answered.add(chatId + " " + toolCallId);
+    } else {
+      showError(error);
+    }
+  } finally {
+    app.answering.delete(chatId);
+    app.prompts.delete(chatId);
+    renderHome();
+    loadWorkspaces();
+  }
+}
+
 function renderWorkspaces() {
   const container = element("workspaces");
   container.replaceChildren();
+  if (!app.workspacesLoaded) {
+    container.appendChild(make("div", "empty", "Loading..."));
+    return;
+  }
   if (!app.workspaces.length) {
     container.appendChild(make("div", "empty", "No workspaces"));
     return;
   }
-  const sorted = app.workspaces
-    .map((workspace, index) => ({ workspace, index }))
-    .sort((left, right) => {
+  const groups = new Map();
+  app.workspaces.forEach((workspace, index) => {
+    const repository = workspace.project || "";
+    if (!groups.has(repository)) groups.set(repository, []);
+    groups.get(repository).push({ workspace, index });
+  });
+  const repositories = Array.from(groups.keys()).sort((left, right) => left.localeCompare(right));
+  for (const repository of repositories) {
+    container.appendChild(make("div", "repository-heading", repository || "Other"));
+    const sorted = groups.get(repository).sort((left, right) => {
       const leftRank = ATTENTION_ORDER[left.workspace.agent_state] ?? 3;
       const rightRank = ATTENTION_ORDER[right.workspace.agent_state] ?? 3;
-      return leftRank - rightRank || left.index - right.index;
-    })
-    .map((item) => item.workspace);
-  for (const workspace of sorted) {
-    container.appendChild(renderWorkspace(workspace));
+      const leftIdle = left.workspace.idle_seconds ?? Infinity;
+      const rightIdle = right.workspace.idle_seconds ?? Infinity;
+      return leftRank - rightRank || (leftIdle === rightIdle ? 0 : leftIdle < rightIdle ? -1 : 1) || left.index - right.index;
+    });
+    for (const { workspace } of sorted) {
+      container.appendChild(renderWorkspace(workspace));
+    }
   }
 }
 
@@ -474,9 +792,9 @@ function renderWorkspace(workspace) {
   const line = make("div", "workspace-line");
   line.appendChild(make("span", "marker state-" + state, STATE_MARKERS[state] || ""));
   line.appendChild(make("span", "workspace-name", workspace.name));
-  line.appendChild(make("span", "state-" + state, stateLabel(workspace)));
+  line.appendChild(make("span", "tag state-" + state, stateLabel(workspace)));
   if (workspace.pr_number !== null && workspace.pr_number !== undefined) {
-    line.appendChild(make("span", "muted", "PR #" + workspace.pr_number + (workspace.pr_state ? " " + workspace.pr_state : "")));
+    line.appendChild(make("span", "tag muted", "PR #" + workspace.pr_number + (workspace.pr_state ? " " + workspace.pr_state : "")));
   }
   row.appendChild(line);
   const chats = workspace.chats || [];
@@ -532,21 +850,33 @@ function chatIdFromHash() {
 
 function route() {
   const chatId = chatIdFromHash();
+  const view = chatId !== null ? "chat" : location.hash === "#new" ? "task" : "home";
   if (app.chat && app.chat.id !== chatId) {
+    // Turns that ended while the chat was on screen have been seen.
+    markOpened(app.chat.id);
     app.chat.abort.abort();
     app.chat = null;
+    app.pr = null;
   }
-  const inChat = chatId !== null;
-  element("list-view").classList.toggle("hidden", inChat);
-  element("chat-view").classList.toggle("hidden", !inChat);
-  element("chat-footer").classList.toggle("hidden", !inChat);
-  element("back").classList.toggle("hidden", !inChat);
-  element("refresh").classList.toggle("hidden", inChat);
-  if (!inChat) {
-    element("title").textContent = "Workspaces";
+  element("home-view").classList.toggle("hidden", view !== "home");
+  element("task-view").classList.toggle("hidden", view !== "task");
+  element("chat-view").classList.toggle("hidden", view !== "chat");
+  element("chat-footer").classList.toggle("hidden", view !== "chat");
+  element("stop").classList.toggle("hidden", view !== "chat");
+  element("back").classList.toggle("hidden", view === "home");
+  element("refresh").classList.toggle("hidden", view !== "home");
+  if (view === "home") {
+    element("title").textContent = "Mnemonic";
+    renderHome();
+    return;
+  }
+  if (view === "task") {
+    element("title").textContent = "New task";
+    showNewTask();
     return;
   }
   if (!app.chat) {
+    markOpened(chatId);
     startChat(chatId);
   }
   renderChatHeader();
@@ -559,61 +889,88 @@ function startChat(chatId) {
     cursor: null,
     entries: [],
     nodes: [],
+    tools: [],
+    folds: [],
+    expandedFolds: new Set(),
     toolIndexes: new Map(),
     permissions: new Map(),
     generating: false,
     plan: [],
+    loaded: false,
   };
+  app.pr = null;
   element("transcript").replaceChildren();
   element("prompts").replaceChildren();
   element("plan").replaceChildren();
   element("chat-status").textContent = "Loading...";
   element("message").value = "";
+  resizeComposer();
   element("stop").disabled = true;
+  renderPrButton();
   followChat(app.chat);
 }
 
 function renderChatHeader() {
   if (!app.chat) return;
   const found = findChat(app.chat.id);
-  element("title").textContent = found
-    ? found.workspace.name + " / " + (found.chat.title || "Untitled chat")
-    : "Chat";
+  element("title").textContent = found ? workspaceTitle(found.workspace) : "Chat";
+  if (found) {
+    const prKey = found.workspace.pr_number + " " + found.workspace.pr_state;
+    if (!app.pr || app.pr.workspaceId !== found.workspace.id || app.pr.key !== prKey) {
+      loadPr(found.workspace.id, prKey);
+    }
+  }
 }
 
 async function followChat(chat) {
   let retry = 0;
   while (!chat.abort.signal.aborted) {
     const query = "?wait=" + CHAT_WAIT_SECONDS + (chat.cursor ? "&cursor=" + encodeURIComponent(chat.cursor) : "");
+    let wait;
     try {
       const update = await getJson("/v1/chats/" + encodeURIComponent(chat.id) + query, chat.abort.signal);
       if (chat.abort.signal.aborted) return;
       retry = 0;
+      app.newChats.delete(chat.id);
       applyUpdate(chat, update);
       continue;
     } catch (error) {
       if (chat.abort.signal.aborted) return;
-      retry = nextRetry(retry);
-      if (error.status === 404) {
-        element("chat-status").textContent = "Waiting for this chat to open on the Mac...";
-      } else if (error instanceof RequestError) {
-        showError(error);
+      const createdAt = app.newChats.get(chat.id);
+      if (error.status === 404 && createdAt !== undefined && Date.now() - createdAt < NEW_CHAT_GRACE_MS) {
+        element("chat-status").textContent = "Starting the chat...";
+        wait = NEW_CHAT_RETRY_MS;
       } else {
-        element("chat-status").textContent = "Can't reach the Mac, retrying...";
+        retry = nextRetry(retry);
+        wait = retry;
+        if (error.status === 404 && createdAt !== undefined) {
+          app.newChats.delete(chat.id);
+          showError(error);
+        }
+        if (error.status === 404) {
+          element("chat-status").textContent = "Waiting for this chat to open on the Mac...";
+        } else if (error instanceof RequestError) {
+          showError(error);
+        } else {
+          element("chat-status").textContent = "Can't reach the Mac, retrying...";
+        }
       }
     }
-    await delay(retry, chat.abort.signal);
+    await delay(wait, chat.abort.signal);
   }
 }
 
 function applyUpdate(chat, update) {
   const transcript = element("transcript");
-  const stickToBottom = isNearBottom();
+  const stickToBottom = !chat.loaded || isNearBottom();
   const dirty = new Set();
   if (update.reset) {
     chat.entries = [];
     chat.nodes = [];
+    chat.tools = [];
     chat.toolIndexes = new Map();
+    for (const fold of chat.folds) fold.remove();
+    chat.folds = [];
     transcript.replaceChildren();
   }
   for (const change of update.changes || []) {
@@ -626,6 +983,7 @@ function applyUpdate(chat, update) {
   }
   chat.entries.length = length;
   chat.nodes.length = Math.min(chat.nodes.length, length);
+  chat.tools.length = Math.min(chat.tools.length, length);
 
   const permissions = new Map();
   for (const request of update.permissions || []) {
@@ -650,15 +1008,61 @@ function applyUpdate(chat, update) {
     }
     chat.nodes[index] = node;
   }
+  applyFolds(chat);
 
   chat.cursor = update.cursor;
   chat.generating = Boolean(update.generating);
   chat.plan = update.plan || [];
+  chat.loaded = true;
   renderUnplacedPrompts(chat);
   renderPlan(chat);
   element("chat-status").textContent = chat.generating ? "Working..." : "";
   element("stop").disabled = !chat.generating;
   if (stickToBottom) scrollToBottom();
+}
+
+// Runs of tool calls fold into one line. A call waiting on permission is
+// never folded, so it splits the run around it.
+function applyFolds(chat) {
+  const transcript = element("transcript");
+  for (const fold of chat.folds) fold.remove();
+  chat.folds = [];
+  let run = [];
+  const flush = () => {
+    if (!run.length) return;
+    const key = run[0].tool.id;
+    const expanded = chat.expandedFolds.has(key);
+    const failed = run.filter((item) => item.tool.status === "failed").length;
+    let label = run.length === 1 ? run[0].tool.title || "1 tool call" : run.length + " tool calls";
+    if (failed) label += ", " + failed + " failed";
+    const fold = make("button", "fold", (expanded ? "▾ " : "▸ ") + label);
+    fold.addEventListener("click", () => {
+      if (chat.expandedFolds.has(key)) {
+        chat.expandedFolds.delete(key);
+      } else {
+        chat.expandedFolds.add(key);
+      }
+      applyFolds(chat);
+    });
+    transcript.insertBefore(fold, run[0].node);
+    chat.folds.push(fold);
+    for (const item of run) item.node.classList.toggle("hidden", !expanded);
+    run = [];
+  };
+  for (let index = 0; index < chat.nodes.length; index++) {
+    const node = chat.nodes[index];
+    const tool = chat.tools[index];
+    if (!node) continue;
+    if (tool && !chat.permissions.has(tool.id)) {
+      run.push({ node, tool });
+      continue;
+    }
+    // An entry that shows nothing doesn't break a run.
+    if (!tool && !node.hasChildNodes()) continue;
+    flush();
+    node.classList.remove("hidden");
+  }
+  flush();
 }
 
 function isNearBottom() {
@@ -727,6 +1131,7 @@ function rebuildEntry(updates) {
 
 function renderEntry(chat, index, entry) {
   const node = make("div");
+  chat.tools[index] = null;
   if (!entry) return node;
   if (entry.kind === "completed_plan") {
     node.appendChild(renderPlanBox("Plan done", entry.entries || []));
@@ -740,6 +1145,7 @@ function renderEntry(chat, index, entry) {
   const built = rebuildEntry(entry.updates || []);
   if (built.tool) {
     chat.toolIndexes.set(built.tool.id, index);
+    chat.tools[index] = built.tool;
     renderTool(node, chat, built.tool);
     return node;
   }
@@ -845,22 +1251,26 @@ async function answer(chat, toolCallId, optionId, row) {
   }
 }
 
-async function sendMessage() {
-  if (!app.chat) return;
-  const input = element("message");
-  const text = input.value;
-  if (!text.trim()) return;
-  const button = element("send");
-  button.disabled = true;
+async function sendText(text, buttons) {
+  if (!app.chat || !text.trim()) return false;
+  for (const button of buttons) button.disabled = true;
   try {
     await post("/v1/chats/" + encodeURIComponent(app.chat.id) + "/message", { text });
-    input.value = "";
-    resizeComposer();
     scrollToBottom();
+    return true;
   } catch (error) {
     showError(error);
+    return false;
   } finally {
-    button.disabled = false;
+    for (const button of buttons) button.disabled = false;
+  }
+}
+
+async function sendMessage() {
+  const input = element("message");
+  if (await sendText(input.value, [element("send")])) {
+    input.value = "";
+    resizeComposer();
   }
 }
 
@@ -873,18 +1283,24 @@ async function stopChat() {
   }
 }
 
-async function showDiff() {
-  if (!app.chat) return;
+function currentWorkspace() {
+  if (!app.chat) return null;
   const found = findChat(app.chat.id);
   if (!found) {
     showError(new RequestError("This chat's workspace isn't in the list yet"));
-    return;
+    return null;
   }
+  return found.workspace;
+}
+
+async function showDiff() {
+  const workspace = currentWorkspace();
+  if (!workspace) return;
   const text = element("diff-text");
   text.textContent = "Loading...";
   element("diff-sheet").classList.remove("hidden");
   try {
-    const response = await fetch("/v1/workspaces/" + encodeURIComponent(found.workspace.id) + "/diff", { cache: "no-store" });
+    const response = await fetch("/v1/workspaces/" + encodeURIComponent(workspace.id) + "/diff", { cache: "no-store" });
     if (!response.ok) throw await readError(response);
     const diff = await response.text();
     text.textContent = diff.trim() ? diff : "No changes";
@@ -898,24 +1314,35 @@ async function chooseAgent(workspaceId) {
   const list = element("agent-list");
   list.replaceChildren(make("div", "muted", "Loading..."));
   element("agent-sheet").classList.remove("hidden");
+  let agents;
   try {
-    if (!app.agents || !app.agents.length) {
-      app.agents = (await getJson("/v1/agents")).agents || [];
-    }
+    agents = await loadAgents();
   } catch (error) {
     element("agent-sheet").classList.add("hidden");
     showError(error);
     return;
   }
   list.replaceChildren();
-  if (!app.agents.length) {
+  if (!agents.length) {
     list.appendChild(make("div", "muted", "No agents are enabled on the Mac"));
   }
-  for (const agent of app.agents) {
+  for (const agent of agents) {
     const button = make("button", "", agent.label);
     button.addEventListener("click", () => startNewChat(workspaceId, agent.id, list));
     list.appendChild(button);
   }
+}
+
+// The agents may change on the Mac, so every picker asks again.
+async function loadAgents() {
+  return (await getJson("/v1/agents")).agents || [];
+}
+
+function openNewChat(chatId) {
+  app.newChats.set(chatId, Date.now());
+  openChat(chatId);
+  loadWorkspaces();
+  setTimeout(loadWorkspaces, NEW_CHAT_GRACE_MS / 2);
 }
 
 async function startNewChat(workspaceId, agentId, list) {
@@ -923,12 +1350,11 @@ async function startNewChat(workspaceId, agentId, list) {
   try {
     const outcome = await post("/v1/workspaces/" + encodeURIComponent(workspaceId) + "/chats", { agent: agentId });
     element("agent-sheet").classList.add("hidden");
-    // The agents may change on the Mac, so the next picker asks again.
-    app.agents = null;
     if (outcome.chat_id) {
-      openChat(outcome.chat_id);
+      openNewChat(outcome.chat_id);
+    } else {
+      loadWorkspaces();
     }
-    loadWorkspaces();
   } catch (error) {
     for (const button of list.querySelectorAll("button")) button.disabled = false;
     showError(error);
@@ -936,19 +1362,228 @@ async function startNewChat(workspaceId, agentId, list) {
 }
 
 function newChatFromChat() {
-  if (!app.chat) return;
-  const found = findChat(app.chat.id);
-  if (!found) {
-    showError(new RequestError("This chat's workspace isn't in the list yet"));
+  const workspace = currentWorkspace();
+  if (workspace) chooseAgent(workspace.id);
+}
+
+function fillSelect(select, items, label) {
+  const previous = select.value;
+  select.replaceChildren();
+  for (const item of items) {
+    const option = make("option", "", label(item));
+    option.value = item.id;
+    select.appendChild(option);
+  }
+  if (items.some((item) => item.id === previous)) select.value = previous;
+}
+
+async function showNewTask() {
+  const start = element("task-start");
+  start.disabled = true;
+  try {
+    const [repositories, agents] = await Promise.all([
+      getJson("/v1/repositories").then((list) => list.repositories || []),
+      loadAgents(),
+    ]);
+    fillSelect(element("task-repository"), repositories, (repository) => repository.name);
+    fillSelect(element("task-agent"), agents, (agent) => agent.label);
+    if (!repositories.length) {
+      showError(new RequestError("No repositories are added in Mnemonic on the Mac"));
+    } else if (!agents.length) {
+      showError(new RequestError("No agents are enabled on the Mac"));
+    }
+    start.disabled = !repositories.length || !agents.length;
+  } catch (error) {
+    showError(error);
+  }
+}
+
+async function startTask() {
+  const text = element("task-text").value;
+  const repositoryId = element("task-repository").value;
+  const agent = element("task-agent").value;
+  if (!text.trim()) {
+    element("task-text").focus();
     return;
   }
-  chooseAgent(found.workspace.id);
+  if (!repositoryId || !agent) return;
+  const start = element("task-start");
+  start.disabled = true;
+  start.textContent = "Starting...";
+  try {
+    const outcome = await post("/v1/tasks", { repository_id: repositoryId, agent, text });
+    element("task-text").value = "";
+    hideError();
+    if (outcome.chat_id) {
+      history.replaceState(null, "", location.pathname + location.search);
+      openNewChat(outcome.chat_id);
+    } else {
+      location.hash = "";
+    }
+  } catch (error) {
+    showError(error);
+  } finally {
+    start.disabled = false;
+    start.textContent = "Start";
+  }
+}
+
+async function loadPr(workspaceId, key) {
+  const generation = ++app.prGeneration;
+  const previous = app.pr && app.pr.workspaceId === workspaceId ? app.pr.status : null;
+  app.pr = { workspaceId, key, status: previous, loading: true, error: null };
+  renderPrButton();
+  let status = null;
+  let failure = null;
+  try {
+    status = await getJson("/v1/workspaces/" + encodeURIComponent(workspaceId) + "/pr");
+  } catch (error) {
+    failure = error;
+  }
+  if (generation !== app.prGeneration || !app.pr) return;
+  app.pr = { workspaceId, key, status, loading: false, error: failure };
+  renderPrButton();
+}
+
+function prAction() {
+  const pr = app.pr;
+  if (!pr || (pr.loading && !pr.status)) return { kind: "loading", label: "PR" };
+  if (pr.error) return { kind: "retry", label: "PR" };
+  const status = pr.status;
+  const state = (status.state || "").toUpperCase();
+  if (!status.found || !status.number || state === "CLOSED") {
+    return { kind: "create", label: "Create PR" };
+  }
+  const name = "PR #" + status.number;
+  if (status.can_merge) return { kind: "merge", label: name + ": Merge", primary: true };
+  let description;
+  if (state === "MERGED") {
+    description = "merged";
+  } else if (status.is_draft) {
+    description = "draft";
+  } else {
+    const workspace = findWorkspace(pr.workspaceId);
+    description = (workspace && workspace.pr_state) || state.toLowerCase();
+  }
+  return { kind: "open", label: description ? name + " " + description : name };
+}
+
+function renderPrButton() {
+  const button = element("pr");
+  const action = prAction();
+  button.textContent = action.label;
+  button.classList.toggle("primary", Boolean(action.primary));
+  button.disabled = action.kind === "loading" || Boolean(app.pr && app.pr.busy);
+}
+
+async function prClicked() {
+  const pr = app.pr;
+  if (!pr) return;
+  const action = prAction();
+  const status = pr.status;
+  const workspacePath = "/v1/workspaces/" + encodeURIComponent(pr.workspaceId);
+  if (action.kind === "retry") {
+    await loadPr(pr.workspaceId, pr.key);
+    if (app.pr && app.pr.error) showError(app.pr.error);
+    return;
+  }
+  if (action.kind === "open") {
+    if (status.url && isWebUrl(status.url)) window.open(status.url, "_blank", "noopener");
+    return;
+  }
+  if (action.kind === "merge") {
+    const question = "Merge PR #" + status.number + "?\n\n" + (status.title || "") +
+      "\n\nMerge method: " + (status.merge_method || "default") +
+      "\nHead commit: " + (status.head_ref_oid || "").slice(0, 7);
+    if (!confirm(question)) return;
+  }
+  pr.busy = true;
+  renderPrButton();
+  try {
+    if (action.kind === "create") {
+      await post(workspacePath + "/pr", {});
+      scrollToBottom();
+    } else if (action.kind === "merge") {
+      const outcome = await post(workspacePath + "/merge", { head: status.head_ref_oid });
+      showNotice(outcome.message || "Merged PR #" + status.number);
+    }
+  } catch (error) {
+    showError(error);
+  } finally {
+    pr.busy = false;
+    if (app.pr && app.pr.workspaceId === pr.workspaceId) {
+      if (action.kind === "merge") {
+        loadPr(pr.workspaceId, app.pr.key);
+      } else {
+        renderPrButton();
+      }
+    }
+  }
 }
 
 function resizeComposer() {
   const input = element("message");
   input.style.height = "auto";
   input.style.height = Math.min(input.scrollHeight, 160) + "px";
+}
+
+// Speech only fills the box; the owner reads it and sends it.
+function attachMic(button, input) {
+  if (!SpeechRecognitionClass) return;
+  button.classList.remove("hidden");
+  let recognition = null;
+  const reset = () => {
+    recognition = null;
+    button.textContent = "Mic";
+    button.classList.remove("listening");
+  };
+  button.addEventListener("click", () => {
+    if (recognition) {
+      recognition.stop();
+      return;
+    }
+    recognition = new SpeechRecognitionClass();
+    recognition.lang = navigator.language || "en-US";
+    recognition.interimResults = false;
+    recognition.continuous = false;
+    recognition.addEventListener("result", (event) => {
+      let heard = "";
+      for (let index = event.resultIndex; index < event.results.length; index++) {
+        if (event.results[index].isFinal) heard += event.results[index][0].transcript;
+      }
+      heard = heard.trim();
+      if (!heard) return;
+      const existing = input.value;
+      input.value = existing && !/\s$/.test(existing) ? existing + " " + heard : existing + heard;
+      input.dispatchEvent(new Event("input"));
+    });
+    recognition.addEventListener("error", (event) => {
+      if (event.error !== "no-speech" && event.error !== "aborted") {
+        showError(new RequestError("Voice input stopped: " + event.error));
+      }
+    });
+    recognition.addEventListener("end", reset);
+    try {
+      recognition.start();
+      button.textContent = "Listening";
+      button.classList.add("listening");
+    } catch (error) {
+      reset();
+      showError(new RequestError("Voice input stopped: " + error.message));
+    }
+  });
+}
+
+for (const reply of QUICK_REPLIES) {
+  const button = make("button", "", reply);
+  button.addEventListener("click", () => {
+    sendText(reply, element("quick-replies").querySelectorAll("button"));
+  });
+  element("quick-replies").appendChild(button);
+}
+
+if (!readStoredNumber(INSTALLED_AT_KEY)) {
+  writeStoredNumber(INSTALLED_AT_KEY, Date.now());
 }
 
 element("banner-close").addEventListener("click", hideError);
@@ -959,13 +1594,20 @@ element("refresh").addEventListener("click", () => {
   hideError();
   loadWorkspaces();
 });
+element("new-task").addEventListener("click", () => {
+  location.hash = "new";
+});
+element("task-start").addEventListener("click", startTask);
 element("send").addEventListener("click", sendMessage);
 element("stop").addEventListener("click", stopChat);
 element("diff").addEventListener("click", showDiff);
 element("new-chat").addEventListener("click", newChatFromChat);
+element("pr").addEventListener("click", prClicked);
 element("diff-close").addEventListener("click", () => element("diff-sheet").classList.add("hidden"));
 element("agent-close").addEventListener("click", () => element("agent-sheet").classList.add("hidden"));
 element("message").addEventListener("input", resizeComposer);
+attachMic(element("message-mic"), element("message"));
+attachMic(element("task-mic"), element("task-text"));
 window.addEventListener("hashchange", route);
 document.addEventListener("visibilitychange", () => {
   if (document.visibilityState === "visible") loadWorkspaces();
