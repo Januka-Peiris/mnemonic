@@ -15,8 +15,11 @@ use std::time::Duration;
 
 use tiny_http::{Header, Method, Request, Response, Server};
 
+use crate::services::mcp_http::{
+    McpReply, accepts_event_stream, mcp_request_method, write_event_stream,
+};
 use crate::services::team_agent_tools::{
-    AgentToolContext, GitAuthor, McpReply, RunningCommands, handle_mcp_message,
+    AgentToolContext, GitAuthor, RunningCommands, handle_mcp_message,
 };
 use crate::services::team_files_service::{SkipList, TeamFileKind, safe_relative_path};
 use crate::services::team_share_service::{
@@ -500,13 +503,11 @@ fn handle_agent(
         .as_deref()
         .and_then(parse_git_author);
     let session = header_value(MCP_SESSION_HEADER).unwrap_or_default();
-    let accepts_event_stream = header_value("Accept").is_some_and(|accept| {
-        accept.split(',').any(|media_type| {
-            media_type.split(';').next().is_some_and(|media_type| {
-                media_type.trim().eq_ignore_ascii_case("text/event-stream")
-            })
-        })
-    }) && *request.http_version() >= (1, 1);
+    let http_version = request.http_version();
+    let accepts_event_stream = accepts_event_stream(
+        header_value("Accept").as_deref(),
+        (http_version.0, http_version.1),
+    );
     if request
         .body_length()
         .is_some_and(|length| length > MAX_AGENT_BODY_BYTES)
@@ -525,16 +526,9 @@ fn handle_agent(
         return refuse(413, "The request is too long");
     }
 
-    let message = serde_json::from_slice::<serde_json::Value>(&body).ok();
-    let method = message
-        .as_ref()
-        .and_then(|message| message.get("method"))
-        .and_then(|method| method.as_str());
-    let is_initialize = method == Some("initialize");
-    let is_tool_call = method == Some("tools/call")
-        && message
-            .as_ref()
-            .is_some_and(|message| message.get("id").is_some());
+    let (method, has_id) = mcp_request_method(&body);
+    let is_initialize = method.as_deref() == Some("initialize");
+    let is_tool_call = method.as_deref() == Some("tools/call") && has_id;
     let session = if is_initialize {
         uuid::Uuid::new_v4().to_string()
     } else {
@@ -583,45 +577,6 @@ fn handle_agent(
         }
     }
     AgentReply::Response(response)
-}
-
-/// Writes a chunked server-sent event response by hand, since tiny_http
-/// buffers a streamed body and would hold back the headers and the
-/// keep-alive comments.
-fn write_event_stream(
-    writer: &mut dyn std::io::Write,
-    reply: &std::sync::mpsc::Receiver<String>,
-    keep_alive: Duration,
-) -> std::io::Result<()> {
-    use std::sync::mpsc::RecvTimeoutError;
-
-    writer.write_all(
-        b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\n\
-          Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
-    )?;
-    writer.flush()?;
-    loop {
-        match reply.recv_timeout(keep_alive) {
-            Ok(json) => {
-                write_chunk(
-                    writer,
-                    format!("event: message\ndata: {json}\n\n").as_bytes(),
-                )?;
-                break;
-            }
-            Err(RecvTimeoutError::Timeout) => write_chunk(writer, b": keep-alive\n\n")?,
-            Err(RecvTimeoutError::Disconnected) => break,
-        }
-    }
-    writer.write_all(b"0\r\n\r\n")?;
-    writer.flush()
-}
-
-fn write_chunk(writer: &mut dyn std::io::Write, data: &[u8]) -> std::io::Result<()> {
-    write!(writer, "{:x}\r\n", data.len())?;
-    writer.write_all(data)?;
-    writer.write_all(b"\r\n")?;
-    writer.flush()
 }
 
 fn parse_git_author(value: &str) -> Option<GitAuthor> {
@@ -1167,36 +1122,6 @@ mod tests {
             .as_str()
             .unwrap_or_default();
         assert!(text.contains("slept"), "{text}");
-        Ok(())
-    }
-
-    #[test]
-    fn an_event_stream_sends_keep_alives_until_the_reply() -> Result<(), String> {
-        let (sender, receiver) = std::sync::mpsc::channel();
-        let reply = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(300));
-            sender.send(r#"{"jsonrpc":"2.0","id":1,"result":{}}"#.to_string())
-        });
-        let mut written = Vec::new();
-
-        write_event_stream(&mut written, &receiver, Duration::from_millis(50))
-            .map_err(|err| err.to_string())?;
-
-        reply
-            .join()
-            .map_err(|_| "The reply thread panicked".to_string())?
-            .map_err(|err| err.to_string())?;
-        let written = String::from_utf8(written).map_err(|err| err.to_string())?;
-        let (head, body) = written
-            .split_once("\r\n\r\n")
-            .ok_or_else(|| format!("No end of headers in {written:?}"))?;
-        assert!(head.contains("Transfer-Encoding: chunked"), "{head}");
-        assert!(body.contains(": keep-alive\n\n"), "{body}");
-        assert!(
-            body.contains("event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\n\n"),
-            "{body}"
-        );
-        assert!(body.ends_with("0\r\n\r\n"), "{body}");
         Ok(())
     }
 

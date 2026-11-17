@@ -8,6 +8,7 @@ use globset::Glob;
 use ignore::WalkBuilder;
 use regex::RegexBuilder;
 
+use super::mcp_http::{self, McpReply, McpTools, flag, optional_str, optional_u64, required_str};
 use super::team_files_service::safe_relative_path;
 
 const DEFAULT_READ_LIMIT: usize = 2000;
@@ -536,13 +537,6 @@ pub fn bash(
 
 pub const AGENT_MCP_SERVER_NAME: &str = "teammate_workspace";
 
-const MCP_DEFAULT_PROTOCOL_VERSION: &str = "2025-06-18";
-
-pub enum McpReply {
-    Json(String),
-    Accepted,
-}
-
 fn mcp_tool_definitions() -> serde_json::Value {
     use serde_json::json;
     json!([
@@ -630,51 +624,8 @@ fn mcp_tool_definitions() -> serde_json::Value {
     ])
 }
 
-fn mcp_error_reply(id: serde_json::Value, code: i64, message: &str) -> McpReply {
-    McpReply::Json(
-        serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "error": {"code": code, "message": message}
-        })
-        .to_string(),
-    )
-}
-
-fn mcp_result_reply(id: serde_json::Value, result: serde_json::Value) -> McpReply {
-    McpReply::Json(serde_json::json!({"jsonrpc": "2.0", "id": id, "result": result}).to_string())
-}
-
-fn mcp_request_id_text(id: &serde_json::Value) -> String {
-    match id {
-        serde_json::Value::String(text) => text.clone(),
-        other => other.to_string(),
-    }
-}
-
-fn mcp_required_str<'a>(arguments: &'a serde_json::Value, key: &str) -> Result<&'a str, String> {
-    arguments
-        .get(key)
-        .and_then(|value| value.as_str())
-        .ok_or_else(|| format!("missing or invalid argument: {key}"))
-}
-
 fn mcp_optional_usize(arguments: &serde_json::Value, key: &str) -> Option<usize> {
-    arguments
-        .get(key)
-        .and_then(|value| value.as_u64())
-        .and_then(|value| usize::try_from(value).ok())
-}
-
-fn mcp_optional_str<'a>(arguments: &'a serde_json::Value, key: &str) -> Option<&'a str> {
-    arguments.get(key).and_then(|value| value.as_str())
-}
-
-fn mcp_flag(arguments: &serde_json::Value, key: &str) -> bool {
-    arguments
-        .get(key)
-        .and_then(|value| value.as_bool())
-        .unwrap_or(false)
+    optional_u64(arguments, key).and_then(|value| usize::try_from(value).ok())
 }
 
 fn mcp_run_tool(
@@ -687,29 +638,29 @@ fn mcp_run_tool(
     match name {
         "Read" => read(
             context,
-            mcp_required_str(arguments, "file_path")?,
+            required_str(arguments, "file_path")?,
             mcp_optional_usize(arguments, "offset"),
             mcp_optional_usize(arguments, "limit"),
         ),
         "Write" => write(
             context,
-            mcp_required_str(arguments, "file_path")?,
-            mcp_required_str(arguments, "content")?,
+            required_str(arguments, "file_path")?,
+            required_str(arguments, "content")?,
         ),
         "Edit" => edit(
             context,
-            mcp_required_str(arguments, "file_path")?,
-            mcp_required_str(arguments, "old_string")?,
-            mcp_required_str(arguments, "new_string")?,
-            mcp_flag(arguments, "replace_all"),
+            required_str(arguments, "file_path")?,
+            required_str(arguments, "old_string")?,
+            required_str(arguments, "new_string")?,
+            flag(arguments, "replace_all"),
         ),
         "Glob" => glob(
             context,
-            mcp_required_str(arguments, "pattern")?,
-            mcp_optional_str(arguments, "path"),
+            required_str(arguments, "pattern")?,
+            optional_str(arguments, "path"),
         ),
         "Grep" => {
-            let output_mode = match mcp_optional_str(arguments, "output_mode") {
+            let output_mode = match optional_str(arguments, "output_mode") {
                 None | Some("files_with_matches") => GrepOutputMode::FilesWithMatches,
                 Some("content") => GrepOutputMode::Content,
                 Some("count") => GrepOutputMode::Count,
@@ -718,12 +669,12 @@ fn mcp_run_tool(
             grep(
                 context,
                 &GrepRequest {
-                    pattern: mcp_required_str(arguments, "pattern")?.to_string(),
-                    path: mcp_optional_str(arguments, "path").map(str::to_string),
-                    glob: mcp_optional_str(arguments, "glob").map(str::to_string),
+                    pattern: required_str(arguments, "pattern")?.to_string(),
+                    path: optional_str(arguments, "path").map(str::to_string),
+                    glob: optional_str(arguments, "glob").map(str::to_string),
                     output_mode,
-                    case_insensitive: mcp_flag(arguments, "-i"),
-                    line_numbers: mcp_flag(arguments, "-n"),
+                    case_insensitive: flag(arguments, "-i"),
+                    line_numbers: flag(arguments, "-n"),
                     head_limit: mcp_optional_usize(arguments, "head_limit"),
                 },
             )
@@ -735,13 +686,41 @@ fn mcp_run_tool(
                 .map(Duration::from_millis);
             bash(
                 context,
-                mcp_required_str(arguments, "command")?,
+                required_str(arguments, "command")?,
                 timeout,
                 running,
                 call_key,
             )
         }
         other => Err(format!("unknown tool: {other}")),
+    }
+}
+
+struct TeammateTools<'a> {
+    context: &'a AgentToolContext,
+    running: &'a RunningCommands,
+}
+
+impl McpTools for TeammateTools<'_> {
+    fn server_name(&self) -> &str {
+        AGENT_MCP_SERVER_NAME
+    }
+
+    fn definitions(&self) -> serde_json::Value {
+        mcp_tool_definitions()
+    }
+
+    fn call(
+        &self,
+        call_key: &str,
+        name: &str,
+        arguments: &serde_json::Value,
+    ) -> Result<String, String> {
+        mcp_run_tool(self.context, self.running, call_key, name, arguments)
+    }
+
+    fn cancel(&self, call_key: &str) {
+        self.running.kill(call_key);
     }
 }
 
@@ -754,63 +733,7 @@ pub fn handle_mcp_message(
     caller_key: &str,
     body: &[u8],
 ) -> McpReply {
-    use serde_json::{Value, json};
-
-    let message: Value = match serde_json::from_slice(body) {
-        Ok(message) => message,
-        Err(error) => {
-            return mcp_error_reply(Value::Null, -32700, &format!("parse error: {error}"));
-        }
-    };
-    let method = message
-        .get("method")
-        .and_then(|method| method.as_str())
-        .unwrap_or("");
-    let Some(id) = message.get("id").cloned() else {
-        if method == "notifications/cancelled" {
-            if let Some(request_id) = message.pointer("/params/requestId") {
-                running.kill(&format!("{caller_key}:{}", mcp_request_id_text(request_id)));
-            }
-        }
-        return McpReply::Accepted;
-    };
-    let params = message.get("params").cloned().unwrap_or(Value::Null);
-
-    match method {
-        "initialize" => {
-            let protocol_version = params
-                .get("protocolVersion")
-                .and_then(|version| version.as_str())
-                .unwrap_or(MCP_DEFAULT_PROTOCOL_VERSION);
-            mcp_result_reply(
-                id,
-                json!({
-                    "protocolVersion": protocol_version,
-                    "capabilities": {"tools": {}},
-                    "serverInfo": {"name": AGENT_MCP_SERVER_NAME, "version": "1"}
-                }),
-            )
-        }
-        "ping" => mcp_result_reply(id, json!({})),
-        "tools/list" => mcp_result_reply(id, json!({"tools": mcp_tool_definitions()})),
-        "tools/call" => {
-            let Some(name) = params.get("name").and_then(|name| name.as_str()) else {
-                return mcp_error_reply(id, -32602, "tools/call requires a tool name");
-            };
-            let arguments = params.get("arguments").cloned().unwrap_or(json!({}));
-            let call_key = format!("{caller_key}:{}", mcp_request_id_text(&id));
-            let (text, is_error) = match mcp_run_tool(context, running, &call_key, name, &arguments)
-            {
-                Ok(text) => (text, false),
-                Err(error) => (error, true),
-            };
-            mcp_result_reply(
-                id,
-                json!({"content": [{"type": "text", "text": text}], "isError": is_error}),
-            )
-        }
-        other => mcp_error_reply(id, -32601, &format!("method not found: {other}")),
-    }
+    mcp_http::handle_mcp_message(&TeammateTools { context, running }, caller_key, body)
 }
 
 #[cfg(test)]
