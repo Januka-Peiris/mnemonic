@@ -8,7 +8,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 
-use tiny_http::{Method, Request, Response, Server};
+use tiny_http::{Header, Method, Request, Response, Server};
 
 use crate::services::team_share_server::{
     DiffSource, accept_requests, chat_update_response, has_json_body, header_value,
@@ -21,6 +21,8 @@ use crate::services::team_share_service::{
 /// Sent by the page on every POST. A page on another site can't add it
 /// without a CORS preflight, which this server never answers.
 pub const PHONE_REQUEST_HEADER: &str = "X-Mnemonic-Phone";
+
+const PAGE: &str = include_str!("phone_page.html");
 
 const MAX_MESSAGE_BYTES: usize = 16 * 1024;
 /// Room for a message of `MAX_MESSAGE_BYTES` whose characters JSON escapes.
@@ -65,10 +67,26 @@ pub struct PhoneActionOutcome {
 pub type PhoneActionHandler =
     Arc<dyn Fn(PhoneAction) -> Result<PhoneActionOutcome, TeamActionError> + Send + Sync>;
 
+/// An agent the Mac lets new chats use.
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+pub struct PhoneAgent {
+    /// What a new chat request names it by.
+    pub id: String,
+    pub label: String,
+}
+
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+pub struct PhoneAgentList {
+    pub agents: Vec<PhoneAgent>,
+}
+
+pub type PhoneAgentSource = Arc<dyn Fn() -> Vec<PhoneAgent> + Send + Sync>;
+
 struct Shared {
     hub: TeamShareHub,
     identity: Arc<dyn CallerIdentity>,
     diff_source: DiffSource,
+    agent_source: PhoneAgentSource,
     action_handler: PhoneActionHandler,
     owner_login: String,
     own_addresses: Vec<IpAddr>,
@@ -87,6 +105,7 @@ impl PhoneServer {
         hub: TeamShareHub,
         identity: Arc<dyn CallerIdentity>,
         diff_source: DiffSource,
+        agent_source: PhoneAgentSource,
         action_handler: PhoneActionHandler,
     ) -> Result<Self, String> {
         let server = Server::http((config.bind, config.port))
@@ -99,6 +118,7 @@ impl PhoneServer {
             hub,
             identity,
             diff_source,
+            agent_source,
             action_handler,
             owner_login: config.owner_login.trim().to_lowercase(),
             own_addresses: config
@@ -204,6 +224,16 @@ fn handle(mut request: Request, shared: &Shared) {
         return;
     }
     let response = match segments.as_slice() {
+        [""] => page_response(),
+        ["v1", "agents"] => {
+            let list = PhoneAgentList {
+                agents: (shared.agent_source)(),
+            };
+            match serde_json::to_string(&list) {
+                Ok(body) => json_response(200, body),
+                Err(err) => text_response(500, &err.to_string()),
+            }
+        }
         ["v1", "workspaces"] => {
             let list = TeamWorkspaceList {
                 workspaces: shared.hub.workspaces(),
@@ -229,6 +259,19 @@ fn handle(mut request: Request, shared: &Shared) {
         _ => text_response(404, "Not found"),
     };
     respond(request, response);
+}
+
+fn page_response() -> Response<std::io::Cursor<Vec<u8>>> {
+    let mut response = Response::from_string(PAGE);
+    for (name, value) in [
+        ("Content-Type", "text/html; charset=utf-8"),
+        ("Cache-Control", "no-store"),
+    ] {
+        if let Ok(header) = Header::from_bytes(name.as_bytes(), value.as_bytes()) {
+            response.add_header(header);
+        }
+    }
+    response
 }
 
 /// The page is served by this server, so its requests are same-origin.
@@ -401,6 +444,7 @@ mod tests {
             hub,
             Arc::new(FixedLogin(login)),
             Arc::new(|workspace_id: &str| Ok(format!("diff of {workspace_id}"))),
+            Arc::new(Vec::new),
             handler,
         )?;
         Ok((server, recorded))
@@ -527,6 +571,31 @@ mod tests {
                 text: "hi".to_string(),
             }]
         );
+        Ok(())
+    }
+
+    #[test]
+    fn serves_the_page() -> Result<(), String> {
+        let (server, _recorded) = start("jay@example.com", Vec::new(), TeamShareHub::new())?;
+        let address = server.address();
+
+        let mut stream = TcpStream::connect(address).map_err(|err| err.to_string())?;
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .map_err(|err| err.to_string())?;
+        stream
+            .write_all(get(address, "/").as_bytes())
+            .map_err(|err| err.to_string())?;
+        let mut response = String::new();
+        std::io::Read::read_to_string(&mut stream, &mut response).map_err(|err| err.to_string())?;
+        let (head, body) = response
+            .split_once("\r\n\r\n")
+            .ok_or_else(|| format!("No end of headers in {response:?}"))?;
+        let head = head.to_ascii_lowercase();
+
+        assert!(head.starts_with("http/1.1 200"), "answered {head}");
+        assert!(head.contains("content-type: text/html"), "answered {head}");
+        assert!(body.contains(PHONE_REQUEST_HEADER));
         Ok(())
     }
 

@@ -1466,8 +1466,11 @@ fn all_options(options: &PermissionOptions) -> Vec<acp::PermissionOption> {
     offered
 }
 
-/// Only requests for permission are shared. An action choice, such as
-/// saving or discarding a file's unsaved changes, is the owner's to make.
+/// Only requests for permission are shared with teammates. An action
+/// choice, such as saving or discarding a file's unsaved changes, is the
+/// owner's to make: with `All` it is listed without options, since the
+/// wire can't otherwise tell a tool call waiting on the Mac from one that
+/// hasn't started, and the phone shows it as one to answer on the Mac.
 pub(crate) fn thread_permissions(
     thread: &AcpThread,
     scope: PermissionScope,
@@ -1478,22 +1481,25 @@ pub(crate) fn thread_permissions(
         .filter_map(|entry| {
             let AgentThreadEntry::ToolCall(ToolCall {
                 id,
-                status:
-                    ToolCallStatus::WaitingForConfirmation {
-                        options,
-                        kind: AuthorizationKind::PermissionGrant,
-                        ..
-                    },
+                status: ToolCallStatus::WaitingForConfirmation { options, kind, .. },
                 ..
             }) = entry
             else {
                 return None;
             };
-            let options = match scope {
-                PermissionScope::StepInOnceOnly => once_only_options(options),
-                PermissionScope::All => all_options(options),
+            let options = match (scope, kind) {
+                (PermissionScope::StepInOnceOnly, AuthorizationKind::PermissionGrant) => {
+                    let options = once_only_options(options);
+                    if options.is_empty() {
+                        return None;
+                    }
+                    options
+                }
+                (PermissionScope::StepInOnceOnly, AuthorizationKind::ActionChoice) => return None,
+                (PermissionScope::All, AuthorizationKind::PermissionGrant) => all_options(options),
+                (PermissionScope::All, AuthorizationKind::ActionChoice) => Vec::new(),
             };
-            (!options.is_empty()).then(|| TeamPermissionRequest {
+            Some(TeamPermissionRequest {
                 tool_call_id: id.0.to_string(),
                 options,
             })

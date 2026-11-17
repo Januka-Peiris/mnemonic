@@ -209,7 +209,7 @@ impl ChatAgent {
 
     /// The agents offered for new chats: those listed under `agent_servers`
     /// in the settings.
-    fn enabled(cx: &App) -> Vec<Self> {
+    pub(crate) fn enabled(cx: &App) -> Vec<Self> {
         let servers = AllAgentServersSettings::get_global(cx);
         Self::ALL
             .into_iter()

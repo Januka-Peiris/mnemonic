@@ -4,8 +4,8 @@
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use acp_thread::ThreadStatus;
@@ -17,7 +17,7 @@ use mnemonic_core::services::ntfy_service::{
     self, Notice, NoticeKind, NtfyRequest, mac_idle_seconds, ntfy_request, should_notify,
 };
 use mnemonic_core::services::phone_server::{
-    PhoneAction, PhoneActionHandler, PhoneActionOutcome, PhoneServer, PhoneServerConfig,
+    PhoneAction, PhoneActionHandler, PhoneActionOutcome, PhoneAgent, PhoneServer, PhoneServerConfig,
 };
 use mnemonic_core::services::team_share_service::{
     DEFAULT_TEAM_PORT, TailscaleSelf, TailscaleWhois, TeamActionError, TeamShareHub, tailscale_self,
@@ -104,6 +104,9 @@ pub(crate) struct PhoneShare {
     action_task: Option<Task<()>>,
     /// When each chat's last alert of each kind went out.
     last_notified: HashMap<(String, NoticeKind), Instant>,
+    /// The agents new chats may use, kept here for the server's request
+    /// threads, which can't read the settings.
+    enabled_agents: Arc<Mutex<Vec<PhoneAgent>>>,
     _feed_subscription: Subscription,
 }
 
@@ -155,6 +158,7 @@ impl PhoneShare {
             tailscale_watch: None,
             action_task: None,
             last_notified: HashMap::new(),
+            enabled_agents: Arc::default(),
             _feed_subscription: feed_subscription,
         }
     }
@@ -283,6 +287,7 @@ impl PhoneShare {
         self.stop(cx);
         self.port = Some(port);
         let hub = self.feed.read(cx).hub().clone();
+        let enabled_agents = self.enabled_agents.clone();
         let (action_sender, mut action_receiver) = mpsc::unbounded::<PendingPhoneAction>();
         self.action_task = Some(cx.spawn(async move |_, cx| {
             while let Some(pending) = action_receiver.next().await {
@@ -302,8 +307,9 @@ impl PhoneShare {
                 let attempt = cx
                     .background_spawn({
                         let hub = hub.clone();
+                        let enabled_agents = enabled_agents.clone();
                         let action_sender = action_sender.clone();
-                        async move { start_server(port, hub, action_sender) }
+                        async move { start_server(port, hub, enabled_agents, action_sender) }
                     })
                     .await;
                 let started = this.update(cx, |this, cx| {
@@ -418,6 +424,16 @@ impl PhoneShare {
         if self.server.is_none() {
             return Vec::new();
         }
+        *self
+            .enabled_agents
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = ChatAgent::enabled(cx)
+            .into_iter()
+            .map(|agent| PhoneAgent {
+                id: agent.agent_id().to_string(),
+                label: agent.label().to_string(),
+            })
+            .collect();
         self.feed.update(cx, |feed, cx| {
             feed.publish(records, &|_| WorkspaceFlags::default(), cx)
         })
@@ -436,6 +452,7 @@ fn page_url(me: &TailscaleSelf, port: u16) -> String {
 fn start_server(
     port: u16,
     hub: TeamShareHub,
+    enabled_agents: Arc<Mutex<Vec<PhoneAgent>>>,
     action_sender: mpsc::UnboundedSender<PendingPhoneAction>,
 ) -> Result<(PhoneServer, TailscaleSelf), String> {
     let me = tailscale_self()?;
@@ -475,6 +492,12 @@ fn start_server(
         hub,
         Arc::new(TailscaleWhois::default()),
         workspace_diff_source(),
+        Arc::new(move || {
+            enabled_agents
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone()
+        }),
         action_handler,
     )
     .map(|server| (server, me))
@@ -560,6 +583,12 @@ fn run_phone_action(
         } => {
             let agent = chat_agent(&agent)
                 .ok_or_else(|| TeamActionError::Invalid(format!("Unknown agent {agent}")))?;
+            if !ChatAgent::enabled(cx).contains(&agent) {
+                return Err(TeamActionError::Invalid(format!(
+                    "{} isn't enabled on this Mac",
+                    agent.label()
+                )));
+            }
             let window =
                 find_workspace_window(&workspace_id, cx).ok_or(TeamActionError::NotLoaded)?;
             let view = WorkspaceHost::view_in(window.read(cx), &workspace_id, cx)

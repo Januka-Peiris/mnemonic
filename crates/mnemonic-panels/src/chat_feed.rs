@@ -678,4 +678,17 @@ mod tests {
         assert!(!once_only.is_empty());
         assert!(!once_only.contains(&acp::PermissionOptionKind::AllowAlways));
     }
+
+    #[gpui::test]
+    async fn all_scope_lists_an_action_choice_without_options(cx: &mut TestAppContext) {
+        let (thread, _answer) = thread_waiting_on(
+            save_or_discard_options(),
+            AuthorizationKind::ActionChoice,
+            cx,
+        )
+        .await;
+
+        let all = published_option_kinds(PermissionScope::All, &thread, cx);
+        assert!(all.is_empty());
+    }
 }
