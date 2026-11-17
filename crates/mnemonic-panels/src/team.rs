@@ -327,6 +327,13 @@ pub fn init(cx: &mut App) {
     let team = cx.new(|cx| {
         let mut team = TeamShare::new();
         team.apply_settings(cx);
+        // Teammates' commands run in their own process group, so they would
+        // outlive this app unless the server is stopped first.
+        cx.on_app_quit(|team, _| {
+            team.stop_sharing();
+            async {}
+        })
+        .detach();
         team
     });
     cx.set_global(GlobalTeamShare(team.clone()));
@@ -646,7 +653,7 @@ impl TeamShare {
             if self.agent_workspaces.remove(workspace_id) {
                 save_workspace_ids(AGENT_WORKSPACES_KEY, &self.agent_workspaces, cx);
             }
-            lock_agent_roots(&self.agent_roots).remove(workspace_id);
+            self.stop_agents(workspace_id);
             self.stop_sharing_files(workspace_id, cx);
         }
         self.update_sharing(cx);
@@ -687,12 +694,21 @@ impl TeamShare {
         }
         save_workspace_ids(AGENT_WORKSPACES_KEY, &self.agent_workspaces, cx);
         if !allowed {
-            lock_agent_roots(&self.agent_roots).remove(workspace_id);
+            self.stop_agents(workspace_id);
         }
         if self.server.is_some() {
             self.start_publishing(cx);
         }
         cx.notify();
+    }
+
+    /// Takes the workspace's folder away from teammates' agents and kills
+    /// the commands they are running there.
+    fn stop_agents(&mut self, workspace_id: &str) {
+        lock_agent_roots(&self.agent_roots).remove(workspace_id);
+        if let Some(server) = &self.server {
+            server.kill_workspace_commands(workspace_id);
+        }
     }
 
     fn set_workspace_share_files(

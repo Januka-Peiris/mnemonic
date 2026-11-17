@@ -87,11 +87,13 @@ struct Shared {
     active_requests: AtomicUsize,
 }
 
-/// A running share server. Dropping it stops the server.
+/// A running share server. Dropping it stops the server and kills the
+/// commands teammates' agents are running.
 pub struct TeamShareServer {
     server: Arc<Server>,
     address: SocketAddr,
     accept_thread: Option<JoinHandle<()>>,
+    running_commands: RunningCommands,
 }
 
 impl TeamShareServer {
@@ -114,6 +116,7 @@ impl TeamShareServer {
             acp_crate: TEAM_ACP_CRATE_VERSION.to_string(),
         })
         .map_err(|err| err.to_string())?;
+        let running_commands = RunningCommands::default();
         let shared = Arc::new(Shared {
             hub,
             identity,
@@ -125,7 +128,7 @@ impl TeamShareServer {
             batch_handler: config.batch_handler,
             agent_roots: config.agent_roots,
             agent_write_check: config.agent_write_check,
-            running_commands: RunningCommands::default(),
+            running_commands: running_commands.clone(),
             hello,
             allowed_logins: config
                 .allowed_logins
@@ -148,16 +151,23 @@ impl TeamShareServer {
             server,
             address,
             accept_thread: Some(accept_thread),
+            running_commands,
         })
     }
 
     pub fn address(&self) -> SocketAddr {
         self.address
     }
+
+    /// Kills the commands teammates' agents are running in the workspace.
+    pub fn kill_workspace_commands(&self, workspace_id: &str) {
+        self.running_commands.kill_workspace(workspace_id);
+    }
 }
 
 impl Drop for TeamShareServer {
     fn drop(&mut self) {
+        self.running_commands.kill_all();
         self.server.unblock();
         if let Some(thread) = self.accept_thread.take() {
             if thread.join().is_err() {
@@ -494,6 +504,7 @@ fn handle_agent(
     };
 
     let context = AgentToolContext {
+        workspace_id: workspace_id.to_string(),
         root,
         git_author,
         can_write: Arc::new({
@@ -1020,6 +1031,50 @@ mod tests {
             answer.to_lowercase().contains("mcp-session-id:"),
             "{answer}"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn dropping_the_server_kills_running_commands() -> Result<(), String> {
+        let root = tempfile::tempdir().map_err(|err| err.to_string())?;
+        let pid_file = root.path().join("pid");
+        let server = start_agents(
+            root.path().to_path_buf(),
+            true,
+            "bob@example.com",
+            Arc::new(|_, _| Ok(())),
+        )?;
+        let body = call_body(
+            1,
+            "Bash",
+            serde_json::json!({"command": format!("echo $$ > {}; sleep 30", pid_file.display())}),
+        );
+        let address = server.address();
+        std::thread::spawn(move || raw_agent_post(address, TEAM_HEADER, &body));
+        let started = std::time::Instant::now();
+        let process_group = loop {
+            if let Some(pid) = std::fs::read_to_string(&pid_file)
+                .ok()
+                .and_then(|text| text.trim().parse::<i32>().ok())
+            {
+                break pid;
+            }
+            if started.elapsed() > Duration::from_secs(10) {
+                return Err("The command didn't start".to_string());
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        };
+
+        drop(server);
+
+        let dropped = std::time::Instant::now();
+        // SAFETY: signal 0 only checks whether the process group still exists.
+        while unsafe { libc::killpg(process_group, 0) } == 0 {
+            if dropped.elapsed() > Duration::from_secs(3) {
+                return Err("The command outlived the server".to_string());
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
         Ok(())
     }
 

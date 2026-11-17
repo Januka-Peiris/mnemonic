@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use globset::Glob;
@@ -29,6 +29,7 @@ pub type WriteGuard = Arc<dyn Fn(&Path) -> Result<(), String> + Send + Sync>;
 
 #[derive(Clone)]
 pub struct AgentToolContext {
+    pub workspace_id: String,
     pub root: PathBuf,
     pub git_author: Option<GitAuthor>,
     pub can_write: WriteGuard,
@@ -55,16 +56,35 @@ pub struct GrepRequest {
 
 #[derive(Clone, Default)]
 pub struct RunningCommands {
-    process_groups: Arc<Mutex<HashMap<String, i32>>>,
+    state: Arc<Mutex<RunningState>>,
+}
+
+#[derive(Default)]
+struct RunningState {
+    commands: HashMap<String, RunningCommand>,
+    /// Set once sharing stops, so a command starting on a request thread
+    /// that was already past its checks is killed as it registers.
+    stopped: bool,
+}
+
+struct RunningCommand {
+    workspace_id: String,
+    process_group: i32,
 }
 
 impl RunningCommands {
+    fn lock(&self) -> MutexGuard<'_, RunningState> {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     pub fn kill(&self, call_key: &str) -> bool {
         let process_group = self
-            .process_groups
             .lock()
-            .ok()
-            .and_then(|groups| groups.get(call_key).copied());
+            .commands
+            .get(call_key)
+            .map(|command| command.process_group);
         match process_group {
             Some(process_group) => {
                 kill_process_group(process_group);
@@ -74,16 +94,39 @@ impl RunningCommands {
         }
     }
 
-    fn register(&self, call_key: &str, process_group: i32) {
-        if let Ok(mut groups) = self.process_groups.lock() {
-            groups.insert(call_key.to_string(), process_group);
+    pub fn kill_workspace(&self, workspace_id: &str) {
+        let state = self.lock();
+        for command in state.commands.values() {
+            if command.workspace_id == workspace_id {
+                kill_process_group(command.process_group);
+            }
         }
     }
 
-    fn unregister(&self, call_key: &str) {
-        if let Ok(mut groups) = self.process_groups.lock() {
-            groups.remove(call_key);
+    pub fn kill_all(&self) {
+        let mut state = self.lock();
+        state.stopped = true;
+        for command in state.commands.values() {
+            kill_process_group(command.process_group);
         }
+    }
+
+    fn register(&self, call_key: &str, workspace_id: &str, process_group: i32) {
+        let mut state = self.lock();
+        if state.stopped {
+            kill_process_group(process_group);
+        }
+        state.commands.insert(
+            call_key.to_string(),
+            RunningCommand {
+                workspace_id: workspace_id.to_string(),
+                process_group,
+            },
+        );
+    }
+
+    fn unregister(&self, call_key: &str) {
+        self.lock().commands.remove(call_key);
     }
 }
 
@@ -362,7 +405,12 @@ fn drain<R: std::io::Read + Send + 'static>(
         let mut chunk = [0u8; 8192];
         loop {
             match stream.read(&mut chunk) {
-                Ok(0) | Err(_) => break,
+                Ok(0) => break,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) => {
+                    log::warn!("Couldn't read a teammate's command output: {error}");
+                    break;
+                }
                 Ok(count) => {
                     let room = BASH_STREAM_BYTE_LIMIT.saturating_sub(bytes.len());
                     if count > room {
@@ -372,7 +420,9 @@ fn drain<R: std::io::Read + Send + 'static>(
                 }
             }
         }
-        sender.send(StreamOutput { index, bytes, cut }).ok();
+        if sender.send(StreamOutput { index, bytes, cut }).is_err() {
+            log::debug!("A teammate's command output arrived after its call stopped waiting");
+        }
     });
 }
 
@@ -410,7 +460,7 @@ pub fn bash(
         .spawn()
         .map_err(|error| format!("could not start the shell: {error}"))?;
     let process_group = child.id() as i32;
-    running.register(call_key, process_group);
+    running.register(call_key, &context.workspace_id, process_group);
 
     let (sender, receiver) = std::sync::mpsc::channel();
     let mut expected_streams = 0;
@@ -433,7 +483,9 @@ pub fn bash(
         }
         if started.elapsed() >= timeout {
             kill_process_group(process_group);
-            child.wait().ok();
+            if let Err(error) = child.wait() {
+                log::warn!("Couldn't wait for a timed-out teammate's command: {error}");
+            }
             running.unregister(call_key);
             return Err(format!(
                 "command timed out after {:.1}s and was killed",
@@ -454,7 +506,10 @@ pub fn bash(
         let remaining = deadline.saturating_duration_since(Instant::now());
         match receiver.recv_timeout(remaining) {
             Ok(stream) => streams.push(stream),
-            Err(_) => break,
+            Err(error) => {
+                log::debug!("Stopped waiting for a teammate's command output: {error}");
+                break;
+            }
         }
     }
     streams.sort_by_key(|stream| stream.index);
@@ -773,6 +828,7 @@ mod tests {
 
     fn context(root: &Path) -> AgentToolContext {
         AgentToolContext {
+            workspace_id: "ws-1".to_string(),
             root: root.to_path_buf(),
             git_author: None,
             can_write: Arc::new(|_| Ok(())),
@@ -949,6 +1005,42 @@ mod tests {
         let result = handle.join().expect("thread");
         assert!(started.elapsed() < Duration::from_secs(2));
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn killing_a_workspace_stops_only_its_commands() {
+        let root = temp_root("kill-workspace");
+        let running = RunningCommands::default();
+        let start = |workspace_id: &str, call_key: &str| {
+            let mut context = context(&root);
+            context.workspace_id = workspace_id.to_string();
+            let running = running.clone();
+            let call_key = call_key.to_string();
+            std::thread::spawn(move || {
+                bash(&context, "sleep 2; echo done", None, &running, &call_key)
+            })
+        };
+        let killed = start("ws-1", "a");
+        let kept = start("ws-2", "b");
+        std::thread::sleep(Duration::from_millis(300));
+
+        running.kill_workspace("ws-1");
+
+        let killed = killed.join().expect("thread");
+        assert!(killed.is_err(), "{killed:?}");
+        let kept = kept.join().expect("thread").expect("bash");
+        assert!(kept.contains("done"), "{kept}");
+    }
+
+    #[test]
+    fn a_command_starting_after_kill_all_is_killed() {
+        let root = temp_root("kill-all");
+        let running = RunningCommands::default();
+        running.kill_all();
+        let started = Instant::now();
+        let result = bash(&context(&root), "sleep 30", None, &running, "k");
+        assert!(result.is_err(), "{result:?}");
+        assert!(started.elapsed() < Duration::from_secs(3));
     }
 
     fn mcp_json(

@@ -1128,6 +1128,11 @@ impl TeammateWorkspaceView {
                 (chat.record.id.clone(), chat.view.clone())
             };
             if let Some(view) = view {
+                // Cancelling the turn first makes Claude tell the share server
+                // to kill the commands it is running for this chat.
+                if let Some(thread) = view.read(cx).root_thread(cx) {
+                    thread.update(cx, |thread, cx| thread.cancel(cx)).detach();
+                }
                 let close_task = view.update(cx, |view, cx| {
                     view.as_connected()
                         .map(|connected| connected.close_all_sessions(cx))
