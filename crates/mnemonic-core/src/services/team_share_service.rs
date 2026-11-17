@@ -4,7 +4,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -764,6 +764,61 @@ fn parse_tailscale_status(output: &[u8]) -> Result<TailscaleSelf, String> {
             .unwrap_or_default(),
         dns_name: node.dns_name.trim_end_matches('.').to_string(),
     })
+}
+
+/// A certificate and its private key, both PEM.
+#[derive(Clone, PartialEq)]
+pub struct TlsFiles {
+    pub certificate: Vec<u8>,
+    pub private_key: Vec<u8>,
+}
+
+/// This machine's HTTPS certificate from Tailscale, written into `directory`.
+/// Tailscale reuses the certificate it has until it nears expiry, so running
+/// this again is how it gets renewed.
+pub fn tailscale_cert(dns_name: &str, directory: &Path) -> Result<TlsFiles, String> {
+    tailscale_cert_with(dns_name, directory, run_tailscale)
+}
+
+fn tailscale_cert_with(
+    dns_name: &str,
+    directory: &Path,
+    run: impl FnOnce(&[&str]) -> Result<Vec<u8>, String>,
+) -> Result<TlsFiles, String> {
+    std::fs::create_dir_all(directory)
+        .map_err(|err| format!("Couldn't create {}: {err}", directory.display()))?;
+    let certificate_path = directory.join("phone.crt");
+    let key_path = directory.join("phone.key");
+    let certificate_arg = certificate_path.to_string_lossy();
+    let key_arg = key_path.to_string_lossy();
+    run(&[
+        "cert",
+        "--cert-file",
+        &certificate_arg,
+        "--key-file",
+        &key_arg,
+        dns_name,
+    ])?;
+    set_owner_only(&key_path)?;
+    let read = |path: &Path| {
+        std::fs::read(path).map_err(|err| format!("Couldn't read {}: {err}", path.display()))
+    };
+    Ok(TlsFiles {
+        certificate: read(&certificate_path)?,
+        private_key: read(&key_path)?,
+    })
+}
+
+#[cfg(unix)]
+fn set_owner_only(path: &Path) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+        .map_err(|err| format!("Couldn't make {} private: {err}", path.display()))
+}
+
+#[cfg(not(unix))]
+fn set_owner_only(_path: &Path) -> Result<(), String> {
+    Ok(())
 }
 
 /// A machine on the tailnet that could run Mnemonic.
@@ -1700,5 +1755,46 @@ mod tests {
                 ),
             ]
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tailscale_cert_keeps_the_key_private() -> Result<(), String> {
+        use std::os::unix::fs::PermissionsExt as _;
+        let directory = tempfile::tempdir().map_err(|err| err.to_string())?;
+        let phone_directory = directory.path().join("phone");
+        let files = tailscale_cert_with("mac.example.ts.net", &phone_directory, |args| {
+            let [
+                "cert",
+                "--cert-file",
+                certificate,
+                "--key-file",
+                key,
+                "mac.example.ts.net",
+            ] = args
+            else {
+                return Err(format!("unexpected arguments {args:?}"));
+            };
+            std::fs::write(certificate, "certificate").map_err(|err| err.to_string())?;
+            std::fs::write(key, "key").map_err(|err| err.to_string())?;
+            std::fs::set_permissions(key, std::fs::Permissions::from_mode(0o644))
+                .map_err(|err| err.to_string())?;
+            Ok(Vec::new())
+        })?;
+        assert!(files.certificate == b"certificate" && files.private_key == b"key");
+        let mode = std::fs::metadata(phone_directory.join("phone.key"))
+            .map_err(|err| err.to_string())?
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
+
+        let failed = tailscale_cert_with("mac.example.ts.net", &phone_directory, |_| {
+            Err("HTTPS is not enabled for this tailnet".to_string())
+        });
+        assert!(
+            failed.is_err_and(|err| err == "HTTPS is not enabled for this tailnet"),
+            "the error is tailscale's own words"
+        );
+        Ok(())
     }
 }

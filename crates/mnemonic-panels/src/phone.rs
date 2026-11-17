@@ -4,9 +4,10 @@
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use acp_thread::ThreadStatus;
 use agent_client_protocol::schema as acp;
@@ -25,7 +26,8 @@ use mnemonic_core::services::phone_server::{
 };
 use mnemonic_core::services::pr_draft_service;
 use mnemonic_core::services::team_share_service::{
-    DEFAULT_TEAM_PORT, TailscaleSelf, TailscaleWhois, TeamActionError, TeamShareHub, tailscale_self,
+    DEFAULT_TEAM_PORT, TailscaleSelf, TailscaleWhois, TeamActionError, TeamShareHub, TlsFiles,
+    tailscale_cert, tailscale_self,
 };
 use settings::{RegisterSetting, Settings, SettingsStore};
 use workspace::Workspace;
@@ -51,6 +53,9 @@ const RETRY_START_AFTER: Duration = Duration::from_secs(30);
 /// How often the running server checks Tailscale is still on the address
 /// and account it started with.
 const CHECK_TAILSCALE_EVERY: Duration = Duration::from_secs(15);
+/// How often the running server re-runs `tailscale cert`, which renews the
+/// certificate by itself once it nears expiry.
+const CHECK_CERTIFICATE_EVERY: Duration = Duration::from_secs(24 * 60 * 60);
 /// A chat's repeated alert of one kind within this long is sent once.
 const NOTIFY_COLLAPSE_WITHIN: Duration = Duration::from_secs(30);
 /// How long the phone's request waits for the app to carry out its action.
@@ -107,6 +112,8 @@ pub(crate) struct PhoneShare {
     page_url: Option<String>,
     /// Why the server last failed to start, until it starts or is turned off.
     start_error: Option<String>,
+    /// Why the running server serves plain HTTP rather than HTTPS.
+    https_error: Option<String>,
     /// Publishes every workspace and its chats into the hub the server
     /// serves. Kept for as long as the app runs, so its events can be
     /// followed across restarts of the server.
@@ -114,7 +121,8 @@ pub(crate) struct PhoneShare {
     start_task: Option<Task<()>>,
     publish_task: Option<Task<()>>,
     /// Restarts the server when this Mac's Tailscale address or account
-    /// changes, since it stays bound to the address it started on.
+    /// changes, since it stays bound to the address it started on, or when
+    /// its HTTPS certificate is renewed.
     tailscale_watch: Option<Task<()>>,
     /// Carries out the phone's actions on the main thread.
     action_task: Option<Task<()>>,
@@ -163,6 +171,11 @@ pub(crate) fn phone_start_error(cx: &App) -> Option<String> {
     phone_share(cx)?.read(cx).start_error.clone()
 }
 
+/// Why the running phone server couldn't get an HTTPS certificate.
+pub(crate) fn phone_https_error(cx: &App) -> Option<String> {
+    phone_share(cx)?.read(cx).https_error.clone()
+}
+
 impl PhoneShare {
     fn new(cx: &mut Context<Self>) -> Self {
         let feed = cx.new(|_| ChatFeed::new(TeamShareHub::new(), PermissionScope::All));
@@ -174,6 +187,7 @@ impl PhoneShare {
             server: None,
             page_url: None,
             start_error: None,
+            https_error: None,
             feed,
             start_task: None,
             publish_task: None,
@@ -346,13 +360,23 @@ impl PhoneShare {
                         return true;
                     }
                     let started = match attempt {
-                        Ok((server, started_as)) => {
-                            this.page_url = Some(page_url(&started_as, server.address().port()));
+                        Ok(StartedServer {
+                            server,
+                            started_as,
+                            certificate,
+                            https_error,
+                        }) => {
+                            this.page_url = Some(page_url(
+                                &started_as,
+                                server.address().port(),
+                                certificate.is_some(),
+                            ));
                             this.start_error = None;
+                            this.https_error = https_error;
                             this.server = Some(server);
                             this.start_publishing(cx);
                             this.tailscale_watch =
-                                Some(Self::watch_tailscale(port, started_as, cx));
+                                Some(Self::watch_tailscale(port, started_as, certificate, cx));
                             true
                         }
                         Err(err) => {
@@ -373,8 +397,14 @@ impl PhoneShare {
         }));
     }
 
-    fn watch_tailscale(port: u16, started_as: TailscaleSelf, cx: &mut Context<Self>) -> Task<()> {
+    fn watch_tailscale(
+        port: u16,
+        started_as: TailscaleSelf,
+        certificate: Option<Vec<u8>>,
+        cx: &mut Context<Self>,
+    ) -> Task<()> {
         cx.spawn(async move |this, cx| {
+            let mut certificate_checked = SystemTime::now();
             loop {
                 cx.background_executor().timer(CHECK_TAILSCALE_EVERY).await;
                 let now = cx.background_spawn(async move { tailscale_self() }).await;
@@ -382,13 +412,36 @@ impl PhoneShare {
                     Ok(now) => Self::needs_restart(&started_as, now),
                     Err(_) => true,
                 };
-                if !moved {
+                // Wall-clock time, since a Mac asleep overnight doesn't count
+                // that time on a monotonic clock.
+                let certificate_due = certificate_checked
+                    .elapsed()
+                    .map_or(true, |elapsed| elapsed >= CHECK_CERTIFICATE_EVERY);
+                let reason = if moved {
+                    "Tailscale changed"
+                } else if certificate_due {
+                    certificate_checked = SystemTime::now();
+                    let me = started_as.clone();
+                    let fetched = cx
+                        .background_spawn(async move {
+                            https_certificate(
+                                &me,
+                                certificate_directory().as_deref(),
+                                tailscale_cert,
+                            )
+                        })
+                        .await;
+                    if !certificate_changed(certificate.as_deref(), &fetched) {
+                        continue;
+                    }
+                    "The HTTPS certificate changed"
+                } else {
                     continue;
-                }
+                };
                 this.update(cx, |this, cx| {
                     if this.port == Some(port) {
                         log::info!(
-                            "Tailscale changed since the phone server started on {}; restarting it",
+                            "{reason} since the phone server started on {}; restarting it",
                             started_as.ip
                         );
                         this.start(port, cx);
@@ -410,6 +463,7 @@ impl PhoneShare {
         self.port = None;
         self.page_url = None;
         self.start_error = None;
+        self.https_error = None;
         self.feed.update(cx, |feed, _| feed.clear());
     }
 
@@ -472,13 +526,52 @@ impl PhoneShare {
     }
 }
 
-fn page_url(me: &TailscaleSelf, port: u16) -> String {
+fn page_url(me: &TailscaleSelf, port: u16, https: bool) -> String {
     let host = if me.dns_name.is_empty() {
         me.ip.to_string()
     } else {
         me.dns_name.clone()
     };
-    format!("http://{host}:{port}/")
+    let scheme = if https { "https" } else { "http" };
+    format!("{scheme}://{host}:{port}/")
+}
+
+fn certificate_directory() -> Option<PathBuf> {
+    mnemonic_bridge::mnemonic_state_cloned().map(|state| state.data_dir.join("phone"))
+}
+
+/// The certificate to serve the page over HTTPS with, or why it can't be.
+fn https_certificate(
+    me: &TailscaleSelf,
+    directory: Option<&Path>,
+    fetch: impl FnOnce(&str, &Path) -> Result<TlsFiles, String>,
+) -> Result<TlsFiles, String> {
+    if me.dns_name.is_empty() {
+        return Err("MagicDNS is off in this tailnet, so there's no name to certify".into());
+    }
+    let directory = directory.ok_or_else(|| "Mnemonic's data folder isn't ready".to_string())?;
+    fetch(&me.dns_name, directory)
+}
+
+/// Whether a renewal check found a certificate other than the one being
+/// served. A failed check keeps what is running.
+fn certificate_changed(running: Option<&[u8]>, fetched: &Result<TlsFiles, String>) -> bool {
+    match fetched {
+        Ok(files) => running != Some(files.certificate.as_slice()),
+        Err(err) => {
+            log::warn!("Couldn't renew the phone page's HTTPS certificate: {err}");
+            false
+        }
+    }
+}
+
+struct StartedServer {
+    server: PhoneServer,
+    started_as: TailscaleSelf,
+    /// The certificate served, None when serving plain HTTP.
+    certificate: Option<Vec<u8>>,
+    /// Why plain HTTP.
+    https_error: Option<String>,
 }
 
 fn start_server(
@@ -486,7 +579,7 @@ fn start_server(
     hub: TeamShareHub,
     enabled_agents: Arc<Mutex<Vec<PhoneAgent>>>,
     action_sender: mpsc::UnboundedSender<PendingPhoneAction>,
-) -> Result<(PhoneServer, TailscaleSelf), String> {
+) -> Result<StartedServer, String> {
     let me = tailscale_self()?;
     if me.login.trim().is_empty() {
         return Err(
@@ -511,33 +604,56 @@ fn start_server(
         }
         wait_for_reply(&reply_receiver, &claimed, timeout)
     });
-    PhoneServer::start(
-        PhoneServerConfig {
-            bind: IpAddr::V4(me.ip),
-            port,
-            owner_login: me.login.clone(),
-            own_addresses: vec![
-                IpAddr::V4(me.ip),
-                IpAddr::V4(Ipv4Addr::LOCALHOST),
-                IpAddr::V6(Ipv6Addr::LOCALHOST),
-            ],
-        },
-        hub,
-        Arc::new(TailscaleWhois::default()),
-        PhoneSources {
-            diff: workspace_diff_source(),
-            agents: Arc::new(move || {
-                enabled_agents
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .clone()
-            }),
-            repositories: Arc::new(phone_repositories),
-            pr_status: Arc::new(phone_pr_status),
-        },
-        action_handler,
-    )
-    .map(|server| (server, me))
+    let start = |tls: Option<TlsFiles>| {
+        let enabled_agents = enabled_agents.clone();
+        PhoneServer::start(
+            PhoneServerConfig {
+                bind: IpAddr::V4(me.ip),
+                port,
+                owner_login: me.login.clone(),
+                own_addresses: vec![
+                    IpAddr::V4(me.ip),
+                    IpAddr::V4(Ipv4Addr::LOCALHOST),
+                    IpAddr::V6(Ipv6Addr::LOCALHOST),
+                ],
+                tls,
+            },
+            hub.clone(),
+            Arc::new(TailscaleWhois::default()),
+            PhoneSources {
+                diff: workspace_diff_source(),
+                agents: Arc::new(move || {
+                    enabled_agents
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .clone()
+                }),
+                repositories: Arc::new(phone_repositories),
+                pr_status: Arc::new(phone_pr_status),
+            },
+            action_handler.clone(),
+        )
+    };
+    let served_over_https =
+        https_certificate(&me, certificate_directory().as_deref(), tailscale_cert).and_then(
+            |tls| {
+                let certificate = tls.certificate.clone();
+                start(Some(tls)).map(|server| (server, certificate))
+            },
+        );
+    let (server, certificate, https_error) = match served_over_https {
+        Ok((server, certificate)) => (server, Some(certificate), None),
+        Err(err) => {
+            log::warn!("Serving the phone page over plain HTTP: {err}");
+            (start(None)?, None, Some(err))
+        }
+    };
+    Ok(StartedServer {
+        server,
+        started_as: me,
+        certificate,
+        https_error,
+    })
 }
 
 /// The repositories, those with the newest workspace first. Workspaces carry
@@ -1358,5 +1474,58 @@ mod tests {
             ..running.clone()
         };
         assert!(PhoneShare::needs_restart(&running, &switched_account));
+    }
+
+    #[test]
+    fn a_failed_certificate_serves_http_and_says_why() {
+        let me = TailscaleSelf {
+            ip: Ipv4Addr::new(100, 64, 0, 1),
+            login: "jay@example.com".into(),
+            display_name: "Jay".into(),
+            dns_name: "jay-mbp.tail1234.ts.net".into(),
+        };
+        let directory = Path::new("/data/phone");
+        let failed = https_certificate(&me, Some(directory), |dns_name, directory| {
+            assert_eq!(
+                (dns_name, directory),
+                ("jay-mbp.tail1234.ts.net", Path::new("/data/phone"))
+            );
+            Err("HTTPS is not enabled for this tailnet".to_string())
+        });
+        assert!(failed.is_err_and(|err| err == "HTTPS is not enabled for this tailnet"));
+        assert_eq!(
+            page_url(&me, 47232, false),
+            "http://jay-mbp.tail1234.ts.net:47232/"
+        );
+        assert_eq!(
+            page_url(&me, 47232, true),
+            "https://jay-mbp.tail1234.ts.net:47232/"
+        );
+
+        let without_magic_dns = TailscaleSelf {
+            dns_name: String::new(),
+            ..me
+        };
+        let skipped = https_certificate(&without_magic_dns, Some(directory), |_, _| {
+            Err("tailscale cert ran without a name".to_string())
+        });
+        assert!(skipped.is_err_and(|err| err.contains("MagicDNS")));
+    }
+
+    #[test]
+    fn renewal_restarts_only_for_a_new_certificate() {
+        let files = |certificate: &[u8]| -> Result<TlsFiles, String> {
+            Ok(TlsFiles {
+                certificate: certificate.to_vec(),
+                private_key: b"key".to_vec(),
+            })
+        };
+        assert!(!certificate_changed(Some(b"old"), &files(b"old")));
+        assert!(certificate_changed(Some(b"old"), &files(b"new")));
+        assert!(certificate_changed(None, &files(b"new")));
+        assert!(!certificate_changed(
+            Some(b"old"),
+            &Err("tailscale is offline".to_string())
+        ));
     }
 }

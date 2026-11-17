@@ -8,14 +8,14 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 
-use tiny_http::{Header, Method, Request, Response, Server};
+use tiny_http::{Header, Method, Request, Response, Server, SslConfig};
 
 use crate::services::team_share_server::{
     DiffSource, accept_requests, chat_update_response, has_json_body, header_value,
     is_allowed_host, json_response, respond, text_response, truncate_diff,
 };
 use crate::services::team_share_service::{
-    CallerIdentity, TeamActionError, TeamShareHub, TeamWorkspaceList, is_plain_id,
+    CallerIdentity, TeamActionError, TeamShareHub, TeamWorkspaceList, TlsFiles, is_plain_id,
 };
 
 /// Sent by the page on every POST. A page on another site can't add it
@@ -36,6 +36,8 @@ pub struct PhoneServerConfig {
     /// Requests from these are refused, so a program on the Mac (an agent's
     /// shell command included) can't pass as the phone.
     pub own_addresses: Vec<IpAddr>,
+    /// Serves HTTPS only when set, plain HTTP otherwise.
+    pub tls: Option<TlsFiles>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -150,6 +152,7 @@ struct Shared {
     action_handler: PhoneActionHandler,
     owner_login: String,
     own_addresses: Vec<IpAddr>,
+    https: bool,
 }
 
 /// A running phone server. Dropping it stops the server.
@@ -167,8 +170,18 @@ impl PhoneServer {
         sources: PhoneSources,
         action_handler: PhoneActionHandler,
     ) -> Result<Self, String> {
-        let server = Server::http((config.bind, config.port))
-            .map_err(|err| format!("Couldn't listen on {}:{}: {err}", config.bind, config.port))?;
+        let https = config.tls.is_some();
+        let server = match config.tls {
+            Some(tls) => Server::https(
+                (config.bind, config.port),
+                SslConfig {
+                    certificate: tls.certificate,
+                    private_key: pkcs8_private_key(&tls.private_key)?,
+                },
+            ),
+            None => Server::http((config.bind, config.port)),
+        }
+        .map_err(|err| format!("Couldn't listen on {}:{}: {err}", config.bind, config.port))?;
         let address = server
             .server_addr()
             .to_ip()
@@ -184,6 +197,7 @@ impl PhoneServer {
                 .iter()
                 .map(IpAddr::to_canonical)
                 .collect(),
+            https,
         });
         let server = Arc::new(server);
         let accept_thread = std::thread::Builder::new()
@@ -219,7 +233,7 @@ impl Drop for PhoneServer {
 }
 
 fn handle(mut request: Request, shared: &Shared) {
-    if let Err((status, reason)) = check_request(&request) {
+    if let Err((status, reason)) = check_request(&request, shared.https) {
         respond(request, text_response(status, reason));
         return;
     }
@@ -374,14 +388,13 @@ fn page_response() -> Response<std::io::Cursor<Vec<u8>>> {
 /// rebinding, a foreign `Origin` means another site, and a POST must carry
 /// a JSON body and the phone header, which make a browser ask first with a
 /// CORS preflight that this server never answers.
-fn check_request(request: &Request) -> Result<(), (u16, &'static str)> {
+fn check_request(request: &Request, https: bool) -> Result<(), (u16, &'static str)> {
     let Some(host) = header_value(request, "Host").filter(|host| is_allowed_host(host)) else {
         return Err((403, "Unexpected host name"));
     };
-    let is_same_origin = |origin: &str| origin == format!("http://{host}");
     let is_post = *request.method() == Method::Post;
     match header_value(request, "Origin") {
-        Some(origin) if !is_same_origin(origin) => {
+        Some(origin) if !is_same_origin(origin, host, https) => {
             return Err((403, "Requests from other web pages are refused"));
         }
         None if is_post => return Err((403, "Requests from other web pages are refused")),
@@ -396,6 +409,67 @@ fn check_request(request: &Request) -> Result<(), (u16, &'static str)> {
         }
     }
     Ok(())
+}
+
+/// The 'id-ecPublicKey with prime256v1' algorithm, DER encoded: the only
+/// kind of key `tailscale cert` makes.
+const P256_KEY_ALGORITHM: &[u8] = &[
+    0x30, 0x13, 0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01, 0x06, 0x08, 0x2a, 0x86, 0x48,
+    0xce, 0x3d, 0x03, 0x01, 0x07,
+];
+
+/// The private key as a PKCS#8 PEM block. tiny_http's TLS reads only PKCS#8
+/// and RSA keys, and panics on anything else, while `tailscale cert` writes
+/// a SEC1 "EC PRIVATE KEY". Re-encoding it here also means tiny_http never
+/// sees a PEM block it could fail to parse.
+fn pkcs8_private_key(pem: &[u8]) -> Result<Vec<u8>, String> {
+    use base64::Engine as _;
+    let unreadable = || "The HTTPS private key couldn't be read".to_string();
+    let text = std::str::from_utf8(pem).map_err(|_| unreadable())?;
+    let (_, block) = text.split_once("-----BEGIN ").ok_or_else(unreadable)?;
+    let (label, block) = block.split_once("-----").ok_or_else(unreadable)?;
+    let (body, _) = block
+        .split_once(&format!("-----END {label}-----"))
+        .ok_or_else(unreadable)?;
+    let der = base64::engine::general_purpose::STANDARD
+        .decode(body.split_whitespace().collect::<String>())
+        .map_err(|_| unreadable())?;
+    let pkcs8 = match label {
+        "PRIVATE KEY" => der,
+        "EC PRIVATE KEY" => {
+            let mut info = vec![0x02, 0x01, 0x00];
+            info.extend_from_slice(P256_KEY_ALGORITHM);
+            info.extend(der_element(0x04, &der)?);
+            der_element(0x30, &info)?
+        }
+        _ => return Err(format!("The HTTPS private key is an unsupported {label}")),
+    };
+    Ok(format!(
+        "-----BEGIN PRIVATE KEY-----\n{}\n-----END PRIVATE KEY-----\n",
+        base64::engine::general_purpose::STANDARD.encode(pkcs8)
+    )
+    .into_bytes())
+}
+
+fn der_element(tag: u8, contents: &[u8]) -> Result<Vec<u8>, String> {
+    let mut element = vec![tag];
+    match u8::try_from(contents.len()) {
+        Ok(length) if length < 0x80 => element.push(length),
+        Ok(length) => element.extend_from_slice(&[0x81, length]),
+        Err(_) => {
+            let length = u16::try_from(contents.len())
+                .map_err(|_| "The HTTPS private key is too long".to_string())?;
+            element.push(0x82);
+            element.extend_from_slice(&length.to_be_bytes());
+        }
+    }
+    element.extend_from_slice(contents);
+    Ok(element)
+}
+
+fn is_same_origin(origin: &str, host: &str, https: bool) -> bool {
+    let scheme = if https { "https" } else { "http" };
+    origin == format!("{scheme}://{host}")
 }
 
 fn handle_action(
@@ -564,6 +638,15 @@ mod tests {
         own_addresses: Vec<IpAddr>,
         hub: TeamShareHub,
     ) -> Result<(PhoneServer, Recorded), String> {
+        start_with_tls(login, own_addresses, hub, None)
+    }
+
+    fn start_with_tls(
+        login: &'static str,
+        own_addresses: Vec<IpAddr>,
+        hub: TeamShareHub,
+        tls: Option<TlsFiles>,
+    ) -> Result<(PhoneServer, Recorded), String> {
         let recorded = Recorded::default();
         let handler: PhoneActionHandler = Arc::new({
             let recorded = recorded.clone();
@@ -581,6 +664,7 @@ mod tests {
                 port: 0,
                 owner_login: "Jay@Example.com".to_string(),
                 own_addresses,
+                tls,
             },
             hub,
             Arc::new(FixedLogin(login)),
@@ -863,5 +947,80 @@ mod tests {
             404
         );
         Ok(())
+    }
+
+    #[test]
+    fn origin_must_match_the_scheme() {
+        let host = "mac.example.ts.net:47232";
+        assert!(is_same_origin(
+            "https://mac.example.ts.net:47232",
+            host,
+            true
+        ));
+        assert!(!is_same_origin(
+            "http://mac.example.ts.net:47232",
+            host,
+            true
+        ));
+        assert!(is_same_origin(
+            "http://mac.example.ts.net:47232",
+            host,
+            false
+        ));
+        assert!(!is_same_origin(
+            "https://mac.example.ts.net:47232",
+            host,
+            false
+        ));
+    }
+
+    const TEST_ONLY_CERTIFICATE: &str = "-----BEGIN CERTIFICATE-----
+MIIBcDCCARagAwIBAgIUQ6yTV6qISGnc9CH+UfTTsP7fChcwCgYIKoZIzj0EAwIw
+HTEbMBkGA1UEAwwSbWFjLmV4YW1wbGUudHMubmV0MCAXDTI2MTExNzIyMTQzOFoY
+DzIxMjYxMDI0MjIxNDM4WjAdMRswGQYDVQQDDBJtYWMuZXhhbXBsZS50cy5uZXQw
+WTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAAR1/rdlSJPyi502yA5RhYs8hzUSjh9F
+vqKM1y3nIqhcH3hj5xb1yHWIE0YZjV/rQPaX+8VoZgjy2w44B62B4nytozIwMDAd
+BgNVHQ4EFgQUpMNeRtP7OS7eCjHcLPQOvjWSHLcwDwYDVR0TAQH/BAUwAwEB/zAK
+BggqhkjOPQQDAgNIADBFAiEAiYqmwDSyNeHydMvTvePsYRpwS4mutHnOFhYwi9SE
+m8QCIDzNuasX+UoiDg6f2Ye75bRYtCXUav2z0T9pivbEFjlG
+-----END CERTIFICATE-----
+";
+
+    /// In the SEC1 "EC PRIVATE KEY" form `tailscale cert` writes.
+    const TEST_ONLY_PRIVATE_KEY: &str = "-----BEGIN EC PRIVATE KEY-----
+MHcCAQEEIDhUdshKgImfYeIMfnGOJ5ZYEuR5P7ghCqyMM14rwsHEoAoGCCqGSM49
+AwEHoUQDQgAEdf63ZUiT8oudNsgOUYWLPIc1Eo4fRb6ijNct5yKoXB94Y+cW9ch1
+iBNGGY1f60D2l/vFaGYI8tsOOAetgeJ8rQ==
+-----END EC PRIVATE KEY-----
+";
+
+    #[test]
+    fn serves_https_with_a_tailscale_key() -> Result<(), String> {
+        let (server, _recorded) = start_with_tls(
+            "jay@example.com",
+            Vec::new(),
+            TeamShareHub::new(),
+            Some(TlsFiles {
+                certificate: TEST_ONLY_CERTIFICATE.as_bytes().to_vec(),
+                private_key: TEST_ONLY_PRIVATE_KEY.as_bytes().to_vec(),
+            }),
+        )?;
+        assert_ne!(server.address().port(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn refuses_a_key_it_cannot_read() {
+        let started = start_with_tls(
+            "jay@example.com",
+            Vec::new(),
+            TeamShareHub::new(),
+            Some(TlsFiles {
+                certificate: TEST_ONLY_CERTIFICATE.as_bytes().to_vec(),
+                private_key:
+                    b"-----BEGIN EC PRIVATE KEY-----\nAAAA\n-----END EC PRIVATE KEY-----\n".to_vec(),
+            }),
+        );
+        assert!(started.is_err());
     }
 }
