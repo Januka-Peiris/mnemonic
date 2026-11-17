@@ -261,14 +261,29 @@ fn handle(mut request: Request, shared: &Shared) {
     respond(request, response);
 }
 
+/// The frame headers stop another site showing the page in a frame and
+/// tricking a tap on its buttons, since the framed page's own requests
+/// would pass as the phone's.
+const PAGE_HEADERS: [(&str, &str); 4] = [
+    ("Content-Type", "text/html; charset=utf-8"),
+    ("Cache-Control", "no-store"),
+    ("X-Frame-Options", "DENY"),
+    (
+        "Content-Security-Policy",
+        "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; \
+         connect-src 'self'; frame-ancestors 'none'",
+    ),
+];
+
 fn page_response() -> Response<std::io::Cursor<Vec<u8>>> {
     let mut response = Response::from_string(PAGE);
-    for (name, value) in [
-        ("Content-Type", "text/html; charset=utf-8"),
-        ("Cache-Control", "no-store"),
-    ] {
-        if let Ok(header) = Header::from_bytes(name.as_bytes(), value.as_bytes()) {
-            response.add_header(header);
+    for (name, value) in PAGE_HEADERS {
+        match Header::from_bytes(name.as_bytes(), value.as_bytes()) {
+            Ok(header) => response.add_header(header),
+            Err(()) => {
+                log::error!(target: "mnemonic_lib", "The phone page's {name} header is invalid");
+                return text_response(500, "The page couldn't be served");
+            }
         }
     }
     response
@@ -595,6 +610,9 @@ mod tests {
 
         assert!(head.starts_with("http/1.1 200"), "answered {head}");
         assert!(head.contains("content-type: text/html"), "answered {head}");
+        assert!(head.contains("cache-control: no-store"), "answered {head}");
+        assert!(head.contains("x-frame-options: deny"), "answered {head}");
+        assert!(head.contains("frame-ancestors 'none'"), "answered {head}");
         assert!(body.contains(PHONE_REQUEST_HEADER));
         Ok(())
     }
