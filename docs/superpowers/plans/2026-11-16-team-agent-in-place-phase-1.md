@@ -263,4 +263,9 @@ Your own Tailscale login is always allowed, so one Mac can follow itself.
 - [ ] **Step 3:** With the file open and unsaved in the editor, ask for an edit to it. Expected: the tool result says it has unsaved changes; the disk file is unchanged.
 - [ ] **Step 4:** Ask for `sleep 300`, press Stop. Expected: the `sleep` process is gone (`pgrep -f "sleep 300"` prints nothing).
 - [ ] **Step 5:** Turn "Teammates' agents can work here" off and ask for a read. Expected: a readable refusal, the chat stays usable.
-- [ ] **Step 6:** Record the results in the PR description.
+- [ ] **Step 6:** Restart Mnemonic and reopen the live chat. Expected: Claude's built-in Bash is absent and tool calls are `mcp__teammate_workspace__*`.
+- [ ] **Step 7:** Start a chat while the sharer is offline or has the switch off, then turn the switch on (or bring the sharer back). Expected: the chat's tools work without opening a new chat.
+- [ ] **Step 8:** Ask for `sleep 330`. Expected: the call finishes with exit 0 rather than timing out on the teammate's side.
+- [ ] **Step 9:** Ask for `sleep 300` and close the chat tab while it runs; ask again and turn the switch off while it runs. Expected: each time `pgrep -f "sleep 300"` prints nothing within a few seconds.
+- [ ] **Step 10:** Ask the agent to run `pwd` through a subagent. Expected: it prints the shared workspace folder, through `mcp__teammate_workspace__Bash`.
+- [ ] **Step 11:** Record the results in the PR description.
