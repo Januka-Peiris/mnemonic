@@ -17,3 +17,14 @@ pub struct ChatSessionRecord {
     pub is_primary: bool,
     pub position: i64,
 }
+
+/// Records that an agent, rather than the user, started a chat. Kept after
+/// the chat closes so limits and cleanup rights can still be worked out.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentStartedChat {
+    pub chat_id: String,
+    pub started_by_chat_id: String,
+    pub workspace_id: String,
+    /// True when the agent created the workspace for this chat.
+    pub made_workspace: bool,
+}

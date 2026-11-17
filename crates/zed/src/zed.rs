@@ -751,8 +751,6 @@ fn initialize_panels(window: &mut Window, cx: &mut Context<Workspace>) -> Task<a
             mnemonic_panels::WorkspacePanel::load(workspace_handle.clone(), cx.clone());
         let mnemonic_command_panel =
             mnemonic_panels::CommandApprovalPanel::load(workspace_handle.clone(), cx.clone());
-        let mnemonic_coordinator_panel =
-            mnemonic_panels::CoordinatorPanel::load(workspace_handle.clone(), cx.clone());
         let mnemonic_detail_panel =
             mnemonic_panels::WorkspaceDetailPanel::load(workspace_handle.clone(), cx.clone());
         let mnemonic_tools_panel =
@@ -779,7 +777,6 @@ fn initialize_panels(window: &mut Window, cx: &mut Context<Workspace>) -> Task<a
             add_panel_when_ready(outline_panel, workspace_handle.clone(), cx.clone()),
             add_panel_when_ready(mnemonic_workspace_panel, workspace_handle.clone(), cx.clone()),
             add_panel_when_ready(mnemonic_command_panel, workspace_handle.clone(), cx.clone()),
-            add_panel_when_ready(mnemonic_coordinator_panel, workspace_handle.clone(), cx.clone()),
             add_panel_when_ready(mnemonic_detail_panel, workspace_handle.clone(), cx.clone()),
             add_panel_when_ready(mnemonic_tools_panel, workspace_handle.clone(), cx.clone()),
             initialize_agent_panel(workspace_handle.clone(), cx.clone()).map(|r| r.log_err()),
@@ -1273,14 +1270,6 @@ fn register_actions(
              window: &mut Window,
              cx: &mut Context<Workspace>| {
                 workspace.toggle_panel_focus::<mnemonic_panels::CommandApprovalPanel>(window, cx);
-            },
-        )
-        .register_action(
-            |workspace: &mut Workspace,
-             _: &mnemonic_panels::ToggleCoordinatorFocus,
-             window: &mut Window,
-             cx: &mut Context<Workspace>| {
-                workspace.toggle_panel_focus::<mnemonic_panels::CoordinatorPanel>(window, cx);
             },
         )
         .register_action(

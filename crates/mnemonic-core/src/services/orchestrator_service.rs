@@ -8,7 +8,7 @@ use crate::repositories::{
     terminal_repository, workspace_repository,
 };
 use crate::services::{
-    conflict_detection_service, coordinator_service, task_lifecycle_service, terminal_service,
+    conflict_detection_service, task_lifecycle_service, terminal_service,
     workspace_health_service,
 };
 use crate::state::AppState;
@@ -57,9 +57,6 @@ pub fn start_orchestrator_loop(state: AppState) {
                 let execute_result = match job.kind.as_str() {
                     "workspace_health_check" => {
                         run_workspace_health_check_job(&state, &job.workspace_id)
-                    }
-                    "coordinator_autostep_watch" => {
-                        run_coordinator_autostep_watch_job(&state, &job.workspace_id)
                     }
                     "review_reminder" => {
                         if state.orchestrator_enabled.load(Ordering::Relaxed) {
@@ -558,7 +555,6 @@ fn ensure_default_scheduler_jobs(state: &AppState) -> Result<(), String> {
         for workspace_id in active {
             for (kind, interval_seconds, jitter_pct) in [
                 ("workspace_health_check", 300i64, 10i64),
-                ("coordinator_autostep_watch", 120i64, 0i64),
                 ("review_reminder", ORCHESTRATOR_INTERVAL_SECS as i64, 10i64),
             ] {
                 let id = format!("job-{workspace_id}-{kind}");
@@ -629,43 +625,6 @@ fn run_workspace_health_check_job(state: &AppState, workspace_id: &str) -> Resul
             "warning",
             Some("Workspace health needs attention."),
         );
-    }
-    Ok(())
-}
-
-fn run_coordinator_autostep_watch_job(state: &AppState, workspace_id: &str) -> Result<(), String> {
-    let status = coordinator_service::get_workspace_coordinator_status(state, workspace_id)?;
-    let has_active = status.active_run.is_some();
-    let running_workers = status
-        .workers
-        .iter()
-        .filter(|worker| worker.status == "running")
-        .count();
-    if has_active && running_workers == 0 {
-        match coordinator_service::step_workspace_coordinator(
-            state,
-            crate::models::StepWorkspaceCoordinatorInput {
-                workspace_id: workspace_id.to_string(),
-                instruction: "Continue coordinator execution".to_string(),
-                brain_profile_id: None,
-                coder_profile_id: None,
-                brain_provider: None,
-                coder_provider: None,
-                brain_model: None,
-                coder_model: None,
-                brain_reasoning: None,
-                coder_reasoning: None,
-            },
-        ) {
-            Ok(_) => {}
-            Err(err) if err.starts_with("COORDINATOR_STEP_IN_PROGRESS:") => {
-                log::debug!(target: "mnemonic_lib", "coordinator autostep already running for {workspace_id}");
-            }
-            Err(err) => {
-                log::warn!(target: "mnemonic_lib", "coordinator autostep failed for {workspace_id}: {err}");
-                return Err(err);
-            }
-        }
     }
     Ok(())
 }

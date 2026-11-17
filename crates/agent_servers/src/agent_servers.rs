@@ -24,8 +24,9 @@ pub use acp::test_support::{
 };
 pub use acp::{
     AcpConnection, AcpDebugMessage, AcpDebugMessageContent, AcpDebugMessageDirection,
-    GEMINI_TERMINAL_AUTH_METHOD_ID, SessionExtras, clear_session_extras,
+    GEMINI_TERMINAL_AUTH_METHOD_ID, SessionExtras, SessionToolProvider, clear_session_extras,
     require_session_extras_under, requires_session_extras, set_session_extras,
+    set_session_tool_provider,
 };
 
 pub struct AgentServerDelegate {

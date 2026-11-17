@@ -8,7 +8,8 @@ use crate::models::{
     WorkspaceSummary,
 };
 use crate::repositories::{
-    activity_repository, repository_repository, settings_repository, workspace_repository,
+    activity_repository, repository_repository, repository_settings_repository,
+    settings_repository, workspace_repository,
 };
 use crate::services::{git_review_service, git_worktree_service, repo_scanner_service};
 use crate::state::AppState;
@@ -96,6 +97,121 @@ pub fn get_repository_workspace_options(
     Ok(RepositoryWorkspaceOptions {
         repository,
         branches,
+    })
+}
+
+const PROJECT_BASE_BRANCH_KEY: &str = "base_branch";
+
+/// Branch prefix fallback: the OS username, sanitized for git ref syntax.
+fn default_branch_prefix() -> String {
+    std::env::var("USER")
+        .ok()
+        .map(|user| {
+            user.trim()
+                .to_lowercase()
+                .chars()
+                .map(|ch| {
+                    if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_') {
+                        ch
+                    } else {
+                        '-'
+                    }
+                })
+                .collect::<String>()
+        })
+        .filter(|user| !user.is_empty())
+        .unwrap_or_else(|| "mnemonic".to_string())
+}
+
+/// The base a new workspace branches from: the project's base_branch
+/// setting, else default_base_branch, else main.
+pub fn default_base_branch(state: &AppState, repository_id: &str) -> String {
+    let project_base_branch = match repository_settings_repository::get_value(
+        &state.db,
+        repository_id,
+        PROJECT_BASE_BRANCH_KEY,
+    ) {
+        Ok(value) => value
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty()),
+        Err(err) => {
+            log::error!("Failed to read the base branch of {repository_id}: {err}");
+            None
+        }
+    };
+    project_base_branch
+        .or_else(|| {
+            settings_repository::get_value(&state.db, "default_base_branch")
+                .ok()
+                .flatten()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+        })
+        .unwrap_or_else(|| "main".to_string())
+}
+
+fn branch_exists(repository_path: &Path, branch: &str) -> bool {
+    [
+        format!("refs/heads/{branch}"),
+        format!("refs/remotes/origin/{branch}"),
+    ]
+    .iter()
+    .any(|reference| {
+        run_git(
+            repository_path,
+            &["rev-parse", "--verify", "--quiet", reference],
+        )
+        .is_ok()
+    })
+}
+
+/// Builds the input for a workspace on `repo`. Settings keys (DB):
+/// branch_prefix (default: OS username) and default_base_branch (default:
+/// main), overridden per project by base_branch. A `branch` that already
+/// exists is checked out; a new one is created from the base.
+pub fn new_workspace_input(
+    state: &AppState,
+    repo: &DiscoveredRepository,
+    name: String,
+    branch: Option<String>,
+    base: Option<String>,
+) -> Result<CreateWorkspaceInput, String> {
+    let branch_prefix = settings_repository::get_value(&state.db, "branch_prefix")
+        .ok()
+        .flatten()
+        .map(|value| value.trim().trim_matches('/').to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(default_branch_prefix);
+    let base_branch = base
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| default_base_branch(state, &repo.id));
+    let branch_name = branch
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| format!("{branch_prefix}/{name}"));
+    let (branch, selected_branch) = if branch_exists(Path::new(&repo.path), &branch_name) {
+        (None, Some(branch_name))
+    } else {
+        (Some(branch_name), None)
+    };
+    Ok(CreateWorkspaceInput {
+        name,
+        repo: repo.name.clone(),
+        base_branch,
+        branch,
+        agent: "claude".to_string(),
+        task_prompt: String::new(),
+        open_in_cursor: false,
+        run_tests: false,
+        create_pr: true,
+        repository_id: Some(repo.id.clone()),
+        selected_worktree_id: None,
+        selected_branch,
+        parent_workspace_id: None,
+        source_workspace_id: None,
+        derived_from_branch: None,
+        workspace_source: None,
     })
 }
 
@@ -504,7 +620,7 @@ pub fn pull_workspace_branch(state: &AppState, workspace_id: &str) -> Result<Str
     ))
 }
 
-fn run_git(root: &Path, args: &[&str]) -> Result<String, String> {
+pub(crate) fn run_git(root: &Path, args: &[&str]) -> Result<String, String> {
     let output = Command::new("git")
         .args(super::environment_service::git_credential_args())
         .arg("-C")
@@ -572,7 +688,10 @@ mod tests {
             ("frontend".to_string(), "backend".to_string()),
             ("docs".to_string(), "frontend".to_string()),
         ];
-        assert_eq!(linked_workspace_ids(&links, "frontend"), ["backend", "docs"]);
+        assert_eq!(
+            linked_workspace_ids(&links, "frontend"),
+            ["backend", "docs"]
+        );
         assert_eq!(linked_workspace_ids(&links, "backend"), ["frontend"]);
         assert!(linked_workspace_ids(&links, "unrelated").is_empty());
     }
