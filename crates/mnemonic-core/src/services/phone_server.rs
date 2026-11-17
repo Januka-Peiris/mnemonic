@@ -1,4 +1,4 @@
-//! The HTTP side of the phone page: Jay's own phone, over Tailscale, reads
+//! The HTTP side of the phone page: the owner's phone, over Tailscale, reads
 //! every workspace and acts on its chats. Only the Mac's own Tailscale login
 //! is let in, never from the Mac itself, and never on behalf of another web
 //! page.
@@ -6,26 +6,22 @@
 use std::io::Read as _;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread::JoinHandle;
-use std::time::Duration;
 
 use tiny_http::{Method, Request, Response, Server};
 
 use crate::services::team_share_server::{
-    DiffSource, is_allowed_host, json_response, query_value, respond, text_response, truncate_diff,
+    DiffSource, accept_requests, chat_update_response, has_json_body, header_value,
+    is_allowed_host, json_response, respond, text_response, truncate_diff,
 };
 use crate::services::team_share_service::{
-    CallerIdentity, MAX_CHAT_WAIT, TeamActionError, TeamShareHub, TeamWorkspaceList, is_plain_id,
+    CallerIdentity, TeamActionError, TeamShareHub, TeamWorkspaceList, is_plain_id,
 };
 
 /// Sent by the page on every POST. A page on another site can't add it
 /// without a CORS preflight, which this server never answers.
 pub const PHONE_REQUEST_HEADER: &str = "X-Mnemonic-Phone";
 
-/// Long-polls hold a thread each, so this caps what a misbehaving caller
-/// can tie up.
-const MAX_ACTIVE_REQUESTS: usize = 64;
 const MAX_MESSAGE_BYTES: usize = 16 * 1024;
 /// Room for a message of `MAX_MESSAGE_BYTES` whose characters JSON escapes.
 const MAX_ACTION_BODY_BYTES: usize = MAX_MESSAGE_BYTES * 4;
@@ -76,7 +72,6 @@ struct Shared {
     action_handler: PhoneActionHandler,
     owner_login: String,
     own_addresses: Vec<IpAddr>,
-    active_requests: AtomicUsize,
 }
 
 /// A running phone server. Dropping it stops the server.
@@ -111,14 +106,13 @@ impl PhoneServer {
                 .iter()
                 .map(IpAddr::to_canonical)
                 .collect(),
-            active_requests: AtomicUsize::new(0),
         });
         let server = Arc::new(server);
         let accept_thread = std::thread::Builder::new()
             .name("mnemonic-phone".into())
             .spawn({
                 let server = server.clone();
-                move || accept_requests(&server, &shared)
+                move || accept_requests(&server, &shared, "mnemonic-phone-request", handle)
             })
             .map_err(|err| format!("Couldn't start the phone server: {err}"))?;
         log::info!(target: "mnemonic_lib", "Serving the phone page on {address}");
@@ -143,34 +137,6 @@ impl Drop for PhoneServer {
             }
         }
         log::info!(target: "mnemonic_lib", "Stopped serving the phone page on {}", self.address);
-    }
-}
-
-fn accept_requests(server: &Server, shared: &Arc<Shared>) {
-    loop {
-        let request = match server.recv() {
-            Ok(request) => request,
-            // `unblock` makes `recv` fail, which is how the server stops.
-            Err(_) => break,
-        };
-        if shared.active_requests.fetch_add(1, Ordering::SeqCst) >= MAX_ACTIVE_REQUESTS {
-            shared.active_requests.fetch_sub(1, Ordering::SeqCst);
-            respond(request, text_response(503, "Too many requests"));
-            continue;
-        }
-        let shared_for_request = shared.clone();
-        let spawned = std::thread::Builder::new()
-            .name("mnemonic-phone-request".into())
-            .spawn(move || {
-                handle(request, &shared_for_request);
-                shared_for_request
-                    .active_requests
-                    .fetch_sub(1, Ordering::SeqCst);
-            });
-        if let Err(err) = spawned {
-            shared.active_requests.fetch_sub(1, Ordering::SeqCst);
-            log::error!(target: "mnemonic_lib", "Couldn't handle a phone request: {err}");
-        }
     }
 }
 
@@ -258,19 +224,7 @@ fn handle(mut request: Request, shared: &Shared) {
             }
         }
         ["v1", "chats", chat_id] if is_plain_id(chat_id) => {
-            let cursor = query_value(query, "cursor");
-            let wait = query_value(query, "wait")
-                .and_then(|wait| wait.parse::<u64>().ok())
-                .map(Duration::from_secs)
-                .unwrap_or_default()
-                .min(MAX_CHAT_WAIT);
-            match shared.hub.wait_chat_update(chat_id, cursor, wait) {
-                Some(update) => match serde_json::to_string(&update) {
-                    Ok(body) => json_response(200, body),
-                    Err(err) => text_response(500, &err.to_string()),
-                },
-                None => text_response(404, "Not open"),
-            }
+            chat_update_response(&shared.hub, chat_id, query)
         }
         _ => text_response(404, "Not found"),
     };
@@ -283,19 +237,12 @@ fn handle(mut request: Request, shared: &Shared) {
 /// a JSON body and the phone header, which make a browser ask first with a
 /// CORS preflight that this server never answers.
 fn check_request(request: &Request) -> Result<(), (u16, &'static str)> {
-    let header_value = |name: &'static str| {
-        request
-            .headers()
-            .iter()
-            .find(|header| header.field.equiv(name))
-            .map(|header| header.value.as_str())
-    };
-    let Some(host) = header_value("Host").filter(|host| is_allowed_host(host)) else {
+    let Some(host) = header_value(request, "Host").filter(|host| is_allowed_host(host)) else {
         return Err((403, "Unexpected host name"));
     };
     let is_same_origin = |origin: &str| origin == format!("http://{host}");
     let is_post = *request.method() == Method::Post;
-    match header_value("Origin") {
+    match header_value(request, "Origin") {
         Some(origin) if !is_same_origin(origin) => {
             return Err((403, "Requests from other web pages are refused"));
         }
@@ -303,15 +250,10 @@ fn check_request(request: &Request) -> Result<(), (u16, &'static str)> {
         _ => {}
     }
     if is_post {
-        let is_json = header_value("Content-Type").is_some_and(|value| {
-            value.split(';').next().is_some_and(|media_type| {
-                media_type.trim().eq_ignore_ascii_case("application/json")
-            })
-        });
-        if !is_json {
+        if !has_json_body(request) {
             return Err((400, "Expected a JSON body"));
         }
-        if header_value(PHONE_REQUEST_HEADER).is_none_or(|value| value.trim().is_empty()) {
+        if header_value(request, PHONE_REQUEST_HEADER).is_none_or(|value| value.trim().is_empty()) {
             return Err((400, "Not a request from the phone page"));
         }
     }
@@ -531,6 +473,20 @@ mod tests {
                 "Origin: http://evil.example\r\nContent-Type: application/json\r\n\
                  {PHONE_REQUEST_HEADER}: 1\r\n"
             ),
+        );
+        assert_eq!(raw_status(address, &request)?, 403);
+        assert!(recorded.lock().map_err(|err| err.to_string())?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn refuses_a_post_without_an_origin() -> Result<(), String> {
+        let (server, recorded) = start("jay@example.com", Vec::new(), TeamShareHub::new())?;
+        let address = server.address();
+
+        let request = post_hi_message(
+            address,
+            &format!("Content-Type: application/json\r\n{PHONE_REQUEST_HEADER}: 1\r\n"),
         );
         assert_eq!(raw_status(address, &request)?, 403);
         assert!(recorded.lock().map_err(|err| err.to_string())?.is_empty());
