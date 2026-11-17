@@ -59,7 +59,6 @@ pub(crate) struct TranscriptToRead {
     pub modified: SystemTime,
 }
 
-#[allow(dead_code)]
 pub(crate) enum ChatFeedEvent {
     PermissionRequested {
         workspace_id: String,

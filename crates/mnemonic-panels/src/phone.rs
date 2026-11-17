@@ -2,16 +2,20 @@
 //! workspace's chats and acts on them. Runs while `phone.enabled` is on,
 //! whether or not anything is shared with teammates.
 
+use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use acp_thread::ThreadStatus;
 use agent_client_protocol::schema as acp;
 use futures::StreamExt as _;
 use futures::channel::mpsc;
-use gpui::{App, AppContext as _, Context, Entity, Global, Task};
+use gpui::{App, AppContext as _, Context, Entity, Global, Subscription, Task};
+use mnemonic_core::services::ntfy_service::{
+    self, Notice, NoticeKind, NtfyRequest, mac_idle_seconds, ntfy_request, should_notify,
+};
 use mnemonic_core::services::phone_server::{
     PhoneAction, PhoneActionHandler, PhoneActionOutcome, PhoneServer, PhoneServerConfig,
 };
@@ -22,8 +26,8 @@ use settings::{RegisterSetting, Settings, SettingsStore};
 use workspace::Workspace;
 
 use crate::chat_feed::{
-    ChatFeed, PermissionScope, SharedRecords, TranscriptToRead, WorkspaceFlags, load_records,
-    read_saved_transcripts,
+    ChatFeed, ChatFeedEvent, PermissionScope, SharedRecords, TranscriptToRead, WorkspaceFlags,
+    load_records, read_saved_transcripts,
 };
 use crate::team::{answer_permission, show_step_in_notice, wait_for_reply, workspace_diff_source};
 use crate::workspace_view::{ChatAgent, WorkspaceHost, find_open_chat, find_workspace_window};
@@ -37,6 +41,8 @@ const RETRY_START_AFTER: Duration = Duration::from_secs(30);
 /// How often the running server checks Tailscale is still on the address
 /// and account it started with.
 const CHECK_TAILSCALE_EVERY: Duration = Duration::from_secs(15);
+/// A chat's repeated alert of one kind within this long is sent once.
+const NOTIFY_COLLAPSE_WITHIN: Duration = Duration::from_secs(30);
 /// How long the phone's request waits for the app to carry out its action.
 const ACTION_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -96,6 +102,9 @@ pub(crate) struct PhoneShare {
     tailscale_watch: Option<Task<()>>,
     /// Carries out the phone's actions on the main thread.
     action_task: Option<Task<()>>,
+    /// When each chat's last alert of each kind went out.
+    last_notified: HashMap<(String, NoticeKind), Instant>,
+    _feed_subscription: Subscription,
 }
 
 struct GlobalPhoneShare(Entity<PhoneShare>);
@@ -132,16 +141,123 @@ pub(crate) fn phone_page_url(cx: &App) -> Option<String> {
 
 impl PhoneShare {
     fn new(cx: &mut Context<Self>) -> Self {
+        let feed = cx.new(|_| ChatFeed::new(TeamShareHub::new(), PermissionScope::All));
+        let feed_subscription = cx.subscribe(&feed, |this, _, event: &ChatFeedEvent, cx| {
+            this.notify_idle_phone(event, cx);
+        });
         Self {
             port: None,
             server: None,
             page_url: None,
-            feed: cx.new(|_| ChatFeed::new(TeamShareHub::new(), PermissionScope::All)),
+            feed,
             start_task: None,
             publish_task: None,
             tailscale_watch: None,
             action_task: None,
+            last_notified: HashMap::new(),
+            _feed_subscription: feed_subscription,
         }
+    }
+
+    /// Sends an ntfy alert for what happened in a chat, when the Mac has
+    /// been left alone long enough that nobody is watching it.
+    fn notify_idle_phone(&mut self, event: &ChatFeedEvent, cx: &mut Context<Self>) {
+        let settings = PhoneSettings::get_global(cx);
+        if settings.ntfy_url.is_empty() {
+            return;
+        }
+        let Some(page_url) = self.page_url.clone() else {
+            return;
+        };
+        let (workspace_id, notice, stop_reason) = match event {
+            ChatFeedEvent::PermissionRequested {
+                workspace_id,
+                chat_id,
+                tool_kind,
+            } => (
+                workspace_id,
+                (
+                    NoticeKind::Permission,
+                    chat_id,
+                    String::new(),
+                    Some(*tool_kind),
+                ),
+                None,
+            ),
+            ChatFeedEvent::TurnEnded {
+                workspace_id,
+                chat_id,
+                chat_title,
+                stop_reason,
+            } => (
+                workspace_id,
+                (NoticeKind::Finished, chat_id, chat_title.clone(), None),
+                Some(*stop_reason),
+            ),
+            ChatFeedEvent::Errored {
+                workspace_id,
+                chat_id,
+                chat_title,
+            } => (
+                workspace_id,
+                (NoticeKind::Error, chat_id, chat_title.clone(), None),
+                None,
+            ),
+        };
+        let (kind, chat_id, chat_title, tool_kind) = notice;
+        let workspace_name = self
+            .feed
+            .read(cx)
+            .hub()
+            .workspaces()
+            .into_iter()
+            .find(|workspace| &workspace.id == workspace_id)
+            .map(|workspace| workspace.name)
+            .unwrap_or_else(|| workspace_id.clone());
+        let notice = Notice {
+            kind,
+            workspace_name,
+            chat_id: chat_id.clone(),
+            chat_title,
+            tool_kind,
+        };
+        let ntfy_url = settings.ntfy_url.clone();
+        let token = settings.ntfy_token.clone();
+        let threshold_minutes = settings.notify_after_idle_minutes;
+        cx.spawn(async move |this, cx| {
+            let idle_seconds = cx.background_spawn(async move { mac_idle_seconds() }).await;
+            if !should_notify(&notice.kind, idle_seconds, threshold_minutes, stop_reason) {
+                return;
+            }
+            let Ok(collapsed) = this.update(cx, |this, _| {
+                let now = Instant::now();
+                let key = (notice.chat_id.clone(), notice.kind);
+                let collapsed = this
+                    .last_notified
+                    .get(&key)
+                    .is_some_and(|sent| now.duration_since(*sent) < NOTIFY_COLLAPSE_WITHIN);
+                if !collapsed {
+                    this.last_notified
+                        .retain(|_, sent| now.duration_since(*sent) < NOTIFY_COLLAPSE_WITHIN);
+                    this.last_notified.insert(key, now);
+                }
+                collapsed
+            }) else {
+                return;
+            };
+            if collapsed {
+                return;
+            }
+            let request: NtfyRequest =
+                ntfy_request(&ntfy_url, token.as_deref(), &page_url, &notice);
+            let sent = cx
+                .background_spawn(async move { ntfy_service::send(&request) })
+                .await;
+            if let Err(err) = sent {
+                log::warn!("Couldn't send the phone alert: {err}");
+            }
+        })
+        .detach();
     }
 
     fn apply_settings(&mut self, cx: &mut Context<Self>) {
