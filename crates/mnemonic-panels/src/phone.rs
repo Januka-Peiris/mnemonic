@@ -13,12 +13,16 @@ use agent_client_protocol::schema as acp;
 use futures::StreamExt as _;
 use futures::channel::mpsc;
 use gpui::{App, AppContext as _, Context, Entity, Global, Subscription, Task};
+use mnemonic_core::models::DiscoveredRepository;
+use mnemonic_core::repositories::{repository_repository, workspace_repository};
 use mnemonic_core::services::ntfy_service::{
     self, Notice, NoticeKind, NtfyRequest, mac_idle_seconds, ntfy_request, should_notify,
 };
 use mnemonic_core::services::phone_server::{
-    PhoneAction, PhoneActionHandler, PhoneActionOutcome, PhoneAgent, PhoneServer, PhoneServerConfig,
+    PhoneAction, PhoneActionHandler, PhoneActionOutcome, PhoneAgent, PhonePrStatus,
+    PhoneRepository, PhoneServer, PhoneServerConfig, PhoneSources,
 };
+use mnemonic_core::services::pr_draft_service;
 use mnemonic_core::services::team_share_service::{
     DEFAULT_TEAM_PORT, TailscaleSelf, TailscaleWhois, TeamActionError, TeamShareHub, tailscale_self,
 };
@@ -502,16 +506,73 @@ fn start_server(
         },
         hub,
         Arc::new(TailscaleWhois::default()),
-        workspace_diff_source(),
-        Arc::new(move || {
-            enabled_agents
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .clone()
-        }),
+        PhoneSources {
+            diff: workspace_diff_source(),
+            agents: Arc::new(move || {
+                enabled_agents
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .clone()
+            }),
+            repositories: Arc::new(phone_repositories),
+            pr_status: Arc::new(phone_pr_status),
+        },
         action_handler,
     )
     .map(|server| (server, me))
+}
+
+/// The repositories, those with the newest workspace first. Workspaces carry
+/// no creation date, so their newest-first listing order stands in for it.
+fn phone_repositories() -> Result<Vec<PhoneRepository>, String> {
+    let state = mnemonic_bridge::mnemonic_state_cloned()
+        .ok_or_else(|| "Mnemonic isn't ready".to_string())?;
+    let repositories = repository_repository::list(&state.db)?;
+    let workspaces = workspace_repository::list(&state.db)?;
+    let recency = |repository: &DiscoveredRepository| {
+        workspaces.iter().position(|workspace| {
+            workspace.repository_id.as_deref() == Some(repository.id.as_str())
+        })
+    };
+    let mut ranked: Vec<(Option<usize>, DiscoveredRepository)> = repositories
+        .into_iter()
+        .map(|repository| (recency(&repository), repository))
+        .collect();
+    ranked.sort_by(|(left_rank, left), (right_rank, right)| {
+        match (left_rank, right_rank) {
+            (Some(left_rank), Some(right_rank)) => left_rank.cmp(right_rank),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => std::cmp::Ordering::Equal,
+        }
+        .then_with(|| left.name.cmp(&right.name))
+    });
+    Ok(ranked
+        .into_iter()
+        .map(|(_, repository)| PhoneRepository {
+            id: repository.id,
+            name: repository.name,
+        })
+        .collect())
+}
+
+fn phone_pr_status(workspace_id: &str) -> Result<PhonePrStatus, String> {
+    let state = mnemonic_bridge::mnemonic_state_cloned()
+        .ok_or_else(|| "Mnemonic isn't ready".to_string())?;
+    let status = pr_draft_service::get_workspace_pr_status(&state, workspace_id)?;
+    Ok(PhonePrStatus {
+        can_merge: status.can_merge(),
+        found: status.found,
+        number: status.number,
+        title: status.title,
+        url: status.url,
+        state: status.state,
+        is_draft: status.is_draft,
+        merge_state_status: status.merge_state_status,
+        head_ref_oid: status.head_ref_oid,
+        checks_summary: status.checks_summary,
+        merge_method: pr_draft_service::configured_merge_method(&state),
+    })
 }
 
 /// The agent the phone named, by its label or its id.

@@ -82,11 +82,51 @@ pub struct PhoneAgentList {
 
 pub type PhoneAgentSource = Arc<dyn Fn() -> Vec<PhoneAgent> + Send + Sync>;
 
+/// A repository a new workspace can be started in.
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+pub struct PhoneRepository {
+    pub id: String,
+    pub name: String,
+}
+
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+pub struct PhoneRepositoryList {
+    pub repositories: Vec<PhoneRepository>,
+}
+
+/// A workspace's pull request as the phone shows it.
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize)]
+pub struct PhonePrStatus {
+    pub found: bool,
+    pub number: Option<i64>,
+    pub title: Option<String>,
+    pub url: Option<String>,
+    pub state: Option<String>,
+    pub is_draft: bool,
+    pub merge_state_status: Option<String>,
+    pub head_ref_oid: Option<String>,
+    pub checks_summary: String,
+    pub can_merge: bool,
+    pub merge_method: String,
+}
+
+pub type PhoneRepositorySource =
+    Arc<dyn Fn() -> Result<Vec<PhoneRepository>, String> + Send + Sync>;
+pub type PhonePrStatusSource = Arc<dyn Fn(&str) -> Result<PhonePrStatus, String> + Send + Sync>;
+
+/// What the Mac reads for the phone beyond the hub's workspaces and chats.
+pub struct PhoneSources {
+    pub diff: DiffSource,
+    pub agents: PhoneAgentSource,
+    /// Most recently used first.
+    pub repositories: PhoneRepositorySource,
+    pub pr_status: PhonePrStatusSource,
+}
+
 struct Shared {
     hub: TeamShareHub,
     identity: Arc<dyn CallerIdentity>,
-    diff_source: DiffSource,
-    agent_source: PhoneAgentSource,
+    sources: PhoneSources,
     action_handler: PhoneActionHandler,
     owner_login: String,
     own_addresses: Vec<IpAddr>,
@@ -104,8 +144,7 @@ impl PhoneServer {
         config: PhoneServerConfig,
         hub: TeamShareHub,
         identity: Arc<dyn CallerIdentity>,
-        diff_source: DiffSource,
-        agent_source: PhoneAgentSource,
+        sources: PhoneSources,
         action_handler: PhoneActionHandler,
     ) -> Result<Self, String> {
         let server = Server::http((config.bind, config.port))
@@ -117,8 +156,7 @@ impl PhoneServer {
         let shared = Arc::new(Shared {
             hub,
             identity,
-            diff_source,
-            agent_source,
+            sources,
             action_handler,
             owner_login: config.owner_login.trim().to_lowercase(),
             own_addresses: config
@@ -227,13 +265,22 @@ fn handle(mut request: Request, shared: &Shared) {
         [""] => page_response(),
         ["v1", "agents"] => {
             let list = PhoneAgentList {
-                agents: (shared.agent_source)(),
+                agents: (shared.sources.agents)(),
             };
             match serde_json::to_string(&list) {
                 Ok(body) => json_response(200, body),
                 Err(err) => text_response(500, &err.to_string()),
             }
         }
+        ["v1", "repositories"] => match (shared.sources.repositories)() {
+            Ok(repositories) => {
+                match serde_json::to_string(&PhoneRepositoryList { repositories }) {
+                    Ok(body) => json_response(200, body),
+                    Err(err) => text_response(500, &err.to_string()),
+                }
+            }
+            Err(err) => text_response(500, &err),
+        },
         ["v1", "workspaces"] => {
             let list = TeamWorkspaceList {
                 workspaces: shared.hub.workspaces(),
@@ -245,8 +292,21 @@ fn handle(mut request: Request, shared: &Shared) {
         }
         ["v1", "workspaces", workspace_id, "diff"] if is_plain_id(workspace_id) => {
             if shared.hub.has_workspace(workspace_id) {
-                match (shared.diff_source)(workspace_id) {
+                match (shared.sources.diff)(workspace_id) {
                     Ok(diff) => text_response(200, &truncate_diff(diff)),
+                    Err(err) => text_response(500, &err),
+                }
+            } else {
+                text_response(404, "No such workspace")
+            }
+        }
+        ["v1", "workspaces", workspace_id, "pr"] if is_plain_id(workspace_id) => {
+            if shared.hub.has_workspace(workspace_id) {
+                match (shared.sources.pr_status)(workspace_id) {
+                    Ok(status) => match serde_json::to_string(&status) {
+                        Ok(body) => json_response(200, body),
+                        Err(err) => text_response(500, &err.to_string()),
+                    },
                     Err(err) => text_response(500, &err),
                 }
             } else {
@@ -458,8 +518,23 @@ mod tests {
             },
             hub,
             Arc::new(FixedLogin(login)),
-            Arc::new(|workspace_id: &str| Ok(format!("diff of {workspace_id}"))),
-            Arc::new(Vec::new),
+            PhoneSources {
+                diff: Arc::new(|workspace_id: &str| Ok(format!("diff of {workspace_id}"))),
+                agents: Arc::new(Vec::new),
+                repositories: Arc::new(|| {
+                    Ok(vec![
+                        PhoneRepository {
+                            id: "repo-1".to_string(),
+                            name: "alpha-repo".to_string(),
+                        },
+                        PhoneRepository {
+                            id: "repo-2".to_string(),
+                            name: "beta-repo".to_string(),
+                        },
+                    ])
+                }),
+                pr_status: Arc::new(|_| Ok(PhonePrStatus::default())),
+            },
             handler,
         )?;
         Ok((server, recorded))
@@ -624,6 +699,39 @@ mod tests {
 
         assert_eq!(
             raw_status(address, &get(address, "/v1/workspaces/ws-x/diff"))?,
+            404
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn lists_repositories() -> Result<(), String> {
+        let (server, _recorded) = start("jay@example.com", Vec::new(), TeamShareHub::new())?;
+        let address = server.address();
+
+        let mut stream = TcpStream::connect(address).map_err(|err| err.to_string())?;
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .map_err(|err| err.to_string())?;
+        stream
+            .write_all(get(address, "/v1/repositories").as_bytes())
+            .map_err(|err| err.to_string())?;
+        let mut response = String::new();
+        std::io::Read::read_to_string(&mut stream, &mut response).map_err(|err| err.to_string())?;
+
+        assert!(response.starts_with("HTTP/1.1 200"), "answered {response}");
+        assert!(response.contains("alpha-repo"), "answered {response}");
+        assert!(response.contains("beta-repo"), "answered {response}");
+        Ok(())
+    }
+
+    #[test]
+    fn unknown_workspace_pr_is_404() -> Result<(), String> {
+        let (server, _recorded) = start("jay@example.com", Vec::new(), TeamShareHub::new())?;
+        let address = server.address();
+
+        assert_eq!(
+            raw_status(address, &get(address, "/v1/workspaces/ws-x/pr"))?,
             404
         );
         Ok(())

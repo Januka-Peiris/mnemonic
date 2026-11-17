@@ -565,15 +565,6 @@ impl WorkspaceDetailPanel {
         }));
     }
 
-    fn can_merge(status: &WorkspacePrStatus) -> bool {
-        status.found
-            && status.state.as_deref() == Some("OPEN")
-            && !status.is_draft
-            && status.merge_state_status.as_deref() == Some("CLEAN")
-            && status.number.is_some()
-            && status.head_ref_oid.is_some()
-    }
-
     /// Confirms, then merges the PR pinned to the head commit the panel last
     /// saw, so a push after the user looked makes GitHub refuse the merge.
     fn merge_pr(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -586,7 +577,7 @@ impl WorkspaceDetailPanel {
         let Some(status) = self
             .pr_status
             .as_ref()
-            .filter(|status| status.workspace_id == workspace_id && Self::can_merge(status))
+            .filter(|status| status.workspace_id == workspace_id && status.can_merge())
         else {
             return;
         };
@@ -1265,7 +1256,7 @@ impl WorkspaceDetailPanel {
                             .child(self.render_pr_button(cx))
                             .when(
                                 self.pr_status.as_ref().is_some_and(|status| {
-                                    status.workspace_id == ws.id && Self::can_merge(status)
+                                    status.workspace_id == ws.id && status.can_merge()
                                 }),
                                 |el| {
                                     el.child(

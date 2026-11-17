@@ -63,6 +63,19 @@ pub struct TeamChat {
     /// teammate can stop it or message it.
     #[serde(default)]
     pub live: bool,
+    /// When the chat's last turn ended, in unix milliseconds. Only the phone
+    /// feed sets it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_turn_ended_at: Option<u64>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub last_turn_errored: bool,
+    /// Whether a permission prompt is pending. Only the phone feed sets it.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub waiting: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
