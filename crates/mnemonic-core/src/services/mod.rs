@@ -35,6 +35,7 @@ pub mod worktree_discovery_service;
 
 pub mod conflict_detection_service;
 pub mod orchestrator_service;
+pub mod phone_server;
 // pub mod rebase_service;
 pub mod terminal_service;
 pub mod terminal_ws_server;

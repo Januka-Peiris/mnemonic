@@ -404,7 +404,7 @@ fn check_request(request: &Request) -> Result<(), (u16, &'static str)> {
 
 /// The names a teammate reaches this machine by: an address, a Tailscale
 /// MagicDNS name, or a bare machine name.
-fn is_allowed_host(host: &str) -> bool {
+pub(crate) fn is_allowed_host(host: &str) -> bool {
     let host = host.trim();
     if let Some(bracketed) = host.strip_prefix('[') {
         return bracketed
@@ -819,7 +819,7 @@ fn parse_action(action: &str, body: &[u8]) -> Result<TeamActionKind, String> {
     }
 }
 
-fn query_value<'a>(query: &'a str, key: &str) -> Option<&'a str> {
+pub(crate) fn query_value<'a>(query: &'a str, key: &str) -> Option<&'a str> {
     query
         .split('&')
         .filter_map(|pair| pair.split_once('='))
@@ -827,7 +827,7 @@ fn query_value<'a>(query: &'a str, key: &str) -> Option<&'a str> {
         .map(|(_, value)| value)
 }
 
-fn truncate_diff(mut diff: String) -> String {
+pub(crate) fn truncate_diff(mut diff: String) -> String {
     if diff.len() <= MAX_DIFF_BYTES {
         return diff;
     }
@@ -844,7 +844,7 @@ fn header(name: &str, value: &str) -> Option<Header> {
     Header::from_bytes(name.as_bytes(), value.as_bytes()).ok()
 }
 
-fn json_response(status: u16, body: String) -> Response<std::io::Cursor<Vec<u8>>> {
+pub(crate) fn json_response(status: u16, body: String) -> Response<std::io::Cursor<Vec<u8>>> {
     let mut response = Response::from_string(body).with_status_code(status);
     if let Some(header) = header("Content-Type", "application/json") {
         response.add_header(header);
@@ -852,7 +852,7 @@ fn json_response(status: u16, body: String) -> Response<std::io::Cursor<Vec<u8>>
     response
 }
 
-fn text_response(status: u16, body: &str) -> Response<std::io::Cursor<Vec<u8>>> {
+pub(crate) fn text_response(status: u16, body: &str) -> Response<std::io::Cursor<Vec<u8>>> {
     let mut response = Response::from_string(body).with_status_code(status);
     if let Some(header) = header("Content-Type", "text/plain; charset=utf-8") {
         response.add_header(header);
@@ -860,7 +860,7 @@ fn text_response(status: u16, body: &str) -> Response<std::io::Cursor<Vec<u8>>> 
     response
 }
 
-fn respond<R: std::io::Read>(request: Request, response: Response<R>) {
+pub(crate) fn respond<R: std::io::Read>(request: Request, response: Response<R>) {
     if let Err(err) = request.respond(response) {
         log::debug!(target: "mnemonic_lib", "A team request ended early: {err}");
     }
