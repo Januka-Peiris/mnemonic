@@ -11,7 +11,8 @@ use std::time::{Duration, Instant};
 use acp_thread::ThreadStatus;
 use agent_client_protocol::schema as acp;
 use futures::StreamExt as _;
-use futures::channel::mpsc;
+use futures::channel::{mpsc, oneshot};
+use futures::future::{self, Either};
 use gpui::{AnyWindowHandle, App, AppContext as _, Context, Entity, Global, Subscription, Task};
 use mnemonic_core::models::{DiscoveredRepository, WorkspaceDetail, WorkspacePrStatus};
 use mnemonic_core::repositories::{repository_repository, workspace_repository};
@@ -317,7 +318,9 @@ impl PhoneShare {
                     continue;
                 }
                 let PendingPhoneAction { action, reply, .. } = pending;
-                let outcome = cx.update(|cx| run_phone_action(action, cx));
+                let timeout = action_timeout(&action);
+                let outcome =
+                    cx.update(|cx| within_timeout(run_phone_action(action, cx), timeout, cx));
                 // Awaited on its own, so a task being started or a merge
                 // doesn't hold up a Stop or a permission answer behind it.
                 cx.spawn(async move |_| {
@@ -495,10 +498,7 @@ fn start_server(
     // Runs on a request thread, which waits here while the main thread
     // carries the action out.
     let action_handler: PhoneActionHandler = Arc::new(move |action| {
-        let timeout = match action {
-            PhoneAction::StartTask { .. } | PhoneAction::Merge { .. } => LONG_ACTION_TIMEOUT,
-            _ => ACTION_TIMEOUT,
-        };
+        let timeout = action_timeout(&action);
         let (reply_sender, reply_receiver) = std::sync::mpsc::channel();
         let claimed = Arc::new(AtomicBool::new(false));
         let pending = PendingPhoneAction {
@@ -590,6 +590,40 @@ fn phone_pr_status(workspace_id: &str) -> Result<PhonePrStatus, String> {
         head_ref_oid: status.head_ref_oid,
         checks_summary: status.checks_summary,
         merge_method: pr_draft_service::configured_merge_method(&state),
+    })
+}
+
+fn action_timeout(action: &PhoneAction) -> Duration {
+    match action {
+        PhoneAction::StartTask { .. } | PhoneAction::Merge { .. } => LONG_ACTION_TIMEOUT,
+        _ => ACTION_TIMEOUT,
+    }
+}
+
+/// The action's outcome, or "Timed out" once it has run for `timeout`, so
+/// a hung `git` or `gh` can't hold the phone's request open forever. The
+/// action itself carries on, so a half-made workspace isn't abandoned.
+fn within_timeout(
+    action: Task<Result<PhoneActionOutcome, TeamActionError>>,
+    timeout: Duration,
+    cx: &mut App,
+) -> Task<Result<PhoneActionOutcome, TeamActionError>> {
+    let (outcome_sender, outcome_receiver) = oneshot::channel();
+    cx.spawn(async move |_| {
+        if outcome_sender.send(action.await).is_err() {
+            log::info!("A phone action finished after it timed out");
+        }
+    })
+    .detach();
+    let timer = cx.background_executor().timer(timeout);
+    cx.background_spawn(async move {
+        match future::select(outcome_receiver, timer).await {
+            Either::Left((Ok(outcome), _)) => outcome,
+            Either::Left((Err(oneshot::Canceled), _)) => Err(TeamActionError::Failed(
+                "The action stopped before it finished".to_string(),
+            )),
+            Either::Right(_) => Err(TeamActionError::Failed("Timed out".to_string())),
+        }
     })
 }
 
@@ -1272,6 +1306,28 @@ mod tests {
                 "This PR can't be merged right now".to_string()
             ))
         );
+    }
+
+    #[gpui::test]
+    async fn a_hung_action_times_out(cx: &mut TestAppContext) {
+        let hung: Task<Result<PhoneActionOutcome, TeamActionError>> =
+            cx.update(|cx| cx.spawn(async move |_| futures::future::pending().await));
+        let reply = cx.update(|cx| within_timeout(hung, LONG_ACTION_TIMEOUT, cx));
+        cx.executor().advance_clock(LONG_ACTION_TIMEOUT);
+
+        assert_eq!(
+            reply.await,
+            Err(TeamActionError::Failed("Timed out".to_string()))
+        );
+
+        let quick = cx.update(|cx| {
+            within_timeout(
+                Task::ready(Ok(PhoneActionOutcome::default())),
+                ACTION_TIMEOUT,
+                cx,
+            )
+        });
+        assert_eq!(quick.await, Ok(PhoneActionOutcome::default()));
     }
 
     #[test]
