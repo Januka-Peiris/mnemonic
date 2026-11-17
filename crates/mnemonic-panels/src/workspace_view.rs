@@ -5981,7 +5981,9 @@ impl WorkspaceHost {
 
     /// Creates the workspace's view if needed (via `ensure_view`, without
     /// activating it) and opens a new chat tab in it without activating the
-    /// tab. Returns the new chat record id.
+    /// tab. A `primary` chat is saved before a new view is built, so the
+    /// view opens it in place of the main CLI, as for a workspace made in
+    /// the sidebar. Returns the new chat record id.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn open_chat_in_background(
         workspace: &mut Workspace,
@@ -5990,69 +5992,55 @@ impl WorkspaceHost {
         title: String,
         prompt: String,
         started_by: Option<String>,
+        primary: bool,
         window: &mut Window,
         cx: &mut Context<Workspace>,
     ) -> Result<String, String> {
-        let this_window = cx.entity_id();
-        let hosted_elsewhere = open_windows(cx)
-            .into_iter()
-            .filter(|other| other.entity_id() != this_window)
-            .any(|other| Self::hosts(other.read(cx), workspace_id, cx));
-        if hosted_elsewhere {
-            // A second view would connect a second copy of its chats.
-            return Err("That workspace is open in another window.".to_string());
-        }
-        let host = workspace
-            .panes()
-            .iter()
-            .find_map(|pane| {
-                pane.read(cx)
-                    .items()
-                    .find_map(|item| item.downcast::<WorkspaceHost>())
-            })
-            .ok_or_else(|| "This window shows no workspaces.".to_string())?;
         let state = mnemonic_bridge::mnemonic_state(cx);
-        let view = match host.read(cx).views.get(workspace_id).cloned() {
-            Some(view) => view,
-            None => {
-                let summary = workspace_repository::list(&state.db)?
-                    .into_iter()
-                    .find(|summary| summary.id == workspace_id)
-                    .ok_or_else(|| format!("There is no workspace {workspace_id}."))?;
-                let workspace_handle = workspace.weak_handle();
-                let project = workspace.project().clone();
-                let database_id = workspace.database_id();
-                host.update(cx, |host, cx| {
-                    host.ensure_view(
-                        &summary,
-                        workspace_handle,
-                        project,
-                        database_id,
-                        true,
-                        window,
-                        cx,
-                    );
-                    host.views.get(workspace_id).cloned()
-                })
-                .ok_or_else(|| "Couldn't open the workspace.".to_string())?
-            }
-        };
-        view.update(cx, |view, cx| {
+        let host = Self::host_for_background_view(workspace, workspace_id, cx)?;
+        let saved_primary = if primary && !host.read(cx).views.contains_key(workspace_id) {
             let record = ChatSessionRecord {
                 id: uuid::Uuid::new_v4().to_string(),
-                workspace_id: view.workspace_id.clone(),
+                workspace_id: workspace_id.to_string(),
                 agent: agent.agent_id().to_string(),
-                title,
+                title: title.clone(),
                 acp_session_id: None,
                 is_review: false,
-                is_primary: false,
-                position: view.next_chat_position(cx),
+                is_primary: true,
+                position: 0,
             };
             chat_session_repository::insert(&state.db, &record)?;
-            let record_id = record.id.clone();
-            if !view.open_chat(record, Some(prompt), false, window, cx) {
-                return Err("Couldn't start the chat.".to_string());
-            }
+            Some(record.id)
+        } else {
+            None
+        };
+        let view = Self::ensure_background_view(workspace, workspace_id, window, cx)?;
+        view.update(cx, |view, cx| {
+            let record_id = match saved_primary {
+                // The view opened the saved chat, without a prompt.
+                Some(record_id) => {
+                    view.queue_agent_message(&record_id, prompt, cx)?;
+                    record_id
+                }
+                None => {
+                    let record = ChatSessionRecord {
+                        id: uuid::Uuid::new_v4().to_string(),
+                        workspace_id: view.workspace_id.clone(),
+                        agent: agent.agent_id().to_string(),
+                        title,
+                        acp_session_id: None,
+                        is_review: false,
+                        is_primary: false,
+                        position: view.next_chat_position(cx),
+                    };
+                    chat_session_repository::insert(&state.db, &record)?;
+                    let record_id = record.id.clone();
+                    if !view.open_chat(record, Some(prompt), false, window, cx) {
+                        return Err("Couldn't start the chat.".to_string());
+                    }
+                    record_id
+                }
+            };
             // The hub records the starter only after this returns, so the
             // read when the tab opened found nothing.
             let item = view
@@ -6069,6 +6057,67 @@ impl WorkspaceHost {
             }
             Ok(record_id)
         })
+    }
+
+    /// This window's host, unless another window shows the workspace.
+    fn host_for_background_view(
+        workspace: &Workspace,
+        workspace_id: &str,
+        cx: &App,
+    ) -> Result<Entity<WorkspaceHost>, String> {
+        let this_window = workspace.weak_handle().entity_id();
+        let hosted_elsewhere = open_windows(cx)
+            .into_iter()
+            .filter(|other| other.entity_id() != this_window)
+            .any(|other| Self::hosts(other.read(cx), workspace_id, cx));
+        if hosted_elsewhere {
+            // A second view would connect a second copy of its chats.
+            return Err("That workspace is open in another window.".to_string());
+        }
+        workspace
+            .panes()
+            .iter()
+            .find_map(|pane| {
+                pane.read(cx)
+                    .items()
+                    .find_map(|item| item.downcast::<WorkspaceHost>())
+            })
+            .ok_or_else(|| "This window shows no workspaces.".to_string())
+    }
+
+    /// The workspace's view in this window, built without showing it or
+    /// moving the focus if it isn't loaded yet.
+    pub(crate) fn ensure_background_view(
+        workspace: &mut Workspace,
+        workspace_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
+    ) -> Result<Entity<WorkspaceView>, String> {
+        let host = Self::host_for_background_view(workspace, workspace_id, cx)?;
+        if let Some(view) = host.read(cx).views.get(workspace_id).cloned() {
+            return Ok(view);
+        }
+        let state = mnemonic_bridge::mnemonic_state(cx);
+        let summary = workspace_repository::list(&state.db)?
+            .into_iter()
+            .find(|summary| summary.id == workspace_id)
+            .ok_or_else(|| format!("There is no workspace {workspace_id}."))?;
+        let workspace_handle = workspace.weak_handle();
+        let project = workspace.project().clone();
+        let database_id = workspace.database_id();
+        host.update(cx, |host, cx| {
+            host.ensure_view(
+                &summary,
+                workspace_handle,
+                project,
+                database_id,
+                true,
+                window,
+                cx,
+            );
+            host.views.get(workspace_id).cloned()
+        })
+        .ok_or_else(|| "Couldn't open the workspace.".to_string())
     }
 
     /// Sends an instruction to the agent terminal of the given workspace, if
@@ -6419,6 +6468,26 @@ pub(crate) mod tests {
         })
     }
 
+    /// The titles of the workspace's terminal tabs; None while its view
+    /// isn't built.
+    pub(crate) fn terminal_tabs(
+        workspace: &Workspace,
+        workspace_id: &str,
+        cx: &App,
+    ) -> Option<Vec<String>> {
+        let view = host_of(workspace, cx)?
+            .read(cx)
+            .views
+            .get(workspace_id)?
+            .clone();
+        Some(
+            view.read(cx)
+                .terminal_titles()
+                .map(|title| title.to_string())
+                .collect(),
+        )
+    }
+
     pub(crate) struct StubServer(pub(crate) acp_thread::StubAgentConnection);
 
     /// Makes every chat opened from now on run on this server.
@@ -6522,6 +6591,7 @@ pub(crate) mod tests {
                     "Helper".to_string(),
                     "Look at the tests".to_string(),
                     Some("ws-a-primary".to_string()),
+                    false,
                     window,
                     cx,
                 )
@@ -6574,6 +6644,7 @@ pub(crate) mod tests {
                     "Helper".to_string(),
                     "Look at the docs".to_string(),
                     None,
+                    false,
                     window,
                     cx,
                 )

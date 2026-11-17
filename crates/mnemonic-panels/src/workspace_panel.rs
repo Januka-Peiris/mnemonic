@@ -4,9 +4,9 @@ use std::time::Duration;
 
 use editor::Editor;
 use gpui::{
-    Action, AnyElement, App, AppContext as _, ClipboardItem, Context, DismissEvent, Entity,
-    EventEmitter, FocusHandle, Focusable, IntoElement, PathPromptOptions, Pixels, PromptLevel,
-    Render, SharedString, Subscription, Task, WeakEntity, Window, actions, px,
+    Action, AnyElement, AnyWindowHandle, App, AppContext as _, AsyncApp, ClipboardItem, Context,
+    DismissEvent, Entity, EventEmitter, FocusHandle, Focusable, IntoElement, PathPromptOptions,
+    Pixels, PromptLevel, Render, SharedString, Subscription, Task, WeakEntity, Window, actions, px,
 };
 use mnemonic_bridge::AgentAttention;
 use mnemonic_core::models::{
@@ -733,6 +733,7 @@ impl WorkspacePanel {
             crate::team_copy::delete_copy(ws_id, window, cx);
             return;
         }
+        let panel_window = self.workspace.clone();
         cx.spawn_in(window, async move |this, cx| {
             let Some(state) = mnemonic_bridge::mnemonic_state_cloned() else {
                 return;
@@ -766,70 +767,35 @@ impl WorkspacePanel {
                     }
                 }
             }
-            let teardown = {
-                let state = state.clone();
-                let ws_id = ws_id.clone();
-                cx.background_spawn(async move {
-                    workspace_script_service::prepare_workspace_teardown_commands(&state, &ws_id)
-                })
-                .await
-            };
-            match teardown {
-                Ok((root, plans)) if !plans.is_empty() => {
-                    let teardown_task = this
-                        .update_in(cx, |this, window, cx| {
-                            this.select_workspace(ws_id.clone(), window, cx);
-                            let workspace = this.workspace.upgrade()?;
-                            workspace.update(cx, |workspace, cx| {
-                                WorkspaceHost::run_teardown_for_workspace(
-                                    workspace, &ws_id, root, plans, window, cx,
-                                )
-                            })
+            let window_handle = cx.window_handle();
+            let result = archive_own_workspace(
+                panel_window,
+                window_handle,
+                ws_id.clone(),
+                state,
+                {
+                    let this = this.clone();
+                    let ws_id = ws_id.clone();
+                    move |window, cx| {
+                        this.update(cx, |this, cx| this.select_workspace(ws_id, window, cx))
+                            .log_err();
+                    }
+                },
+                {
+                    let this = this.clone();
+                    move |err, cx| {
+                        this.update(cx, |this, cx| {
+                            this.show_archive_toast(
+                                format!("{ws_name}: teardown not run: {err}; archiving anyway"),
+                                cx,
+                            );
                         })
-                        .ok()
-                        .flatten();
-                    match teardown_task {
-                        Some(task) => task.await,
-                        None => log::warn!("Archive {ws_id}: no open view to run teardown in"),
+                        .log_err();
                     }
-                }
-                Ok(_) => {}
-                Err(err) => {
-                    this.update(cx, |this, cx| {
-                        this.show_archive_toast(
-                            format!("{ws_name}: teardown not run: {err}; archiving anyway"),
-                            cx,
-                        );
-                    })
-                    .log_err();
-                }
-            }
-            this.update(cx, |this, cx| {
-                if let Some(workspace) = this.workspace.upgrade() {
-                    workspace.update(cx, |workspace, cx| {
-                        WorkspaceHost::kill_run_commands_for_workspace(workspace, &ws_id, cx);
-                    });
-                }
-            })
-            .ok();
-            let result = {
-                let ws_id = ws_id.clone();
-                cx.background_spawn(async move {
-                    // Ports are matched by process cwd, so they must be freed
-                    // before the worktree moves into the archive folder.
-                    for warning in free_workspace_ports(&state, &ws_id) {
-                        log::warn!("Archive {ws_id}: {warning}");
-                    }
-                    workspace_service::archive_workspace(&state, &ws_id)?;
-                    if let Err(err) =
-                        chat_session_repository::delete_for_workspace(&state.db, &ws_id)
-                    {
-                        log::error!("Failed to delete chat sessions for {ws_id}: {err}");
-                    }
-                    Ok::<(), String>(())
-                })
-                .await
-            };
+                },
+                cx,
+            )
+            .await;
 
             this.update_in(cx, |this, window, cx| {
                 match result {
@@ -3251,6 +3217,78 @@ impl Render for WorkspacePanel {
 
         content.child(self.render_footer(cx))
     }
+}
+
+/// Archives one of your own workspaces, as the sidebar and the agent tools
+/// both do: runs its teardown commands in its view in `window`, stops its run
+/// commands, frees its ports, moves the worktree into the archive folder and
+/// drops its chat records. `prepare_view` makes sure the view exists in
+/// `window` before the teardown runs, and is only called when there is one.
+/// A teardown that can't be prepared goes to `teardown_failed` and the
+/// archive goes ahead.
+pub(crate) async fn archive_own_workspace(
+    window: WeakEntity<Workspace>,
+    window_handle: AnyWindowHandle,
+    ws_id: String,
+    state: mnemonic_core::state::AppState,
+    prepare_view: impl FnOnce(&mut Window, &mut App),
+    teardown_failed: impl FnOnce(String, &mut App),
+    cx: &mut AsyncApp,
+) -> Result<(), String> {
+    let teardown = {
+        let state = state.clone();
+        let ws_id = ws_id.clone();
+        cx.background_spawn(async move {
+            workspace_script_service::prepare_workspace_teardown_commands(&state, &ws_id)
+        })
+        .await
+    };
+    match teardown {
+        Ok((root, plans)) if !plans.is_empty() => {
+            let teardown_task = cx
+                .update_window(window_handle, |_, window_context, cx| {
+                    prepare_view(window_context, cx);
+                    window.upgrade()?.update(cx, |workspace, cx| {
+                        WorkspaceHost::run_teardown_for_workspace(
+                            workspace,
+                            &ws_id,
+                            root,
+                            plans,
+                            window_context,
+                            cx,
+                        )
+                    })
+                })
+                .ok()
+                .flatten();
+            match teardown_task {
+                Some(task) => task.await,
+                None => log::warn!("Archive {ws_id}: no open view to run teardown in"),
+            }
+        }
+        Ok(_) => {}
+        Err(err) => cx.update(|cx| teardown_failed(err, cx)),
+    }
+    if let Some(workspace) = window.upgrade() {
+        cx.update(|cx| {
+            workspace.update(cx, |workspace, cx| {
+                WorkspaceHost::kill_run_commands_for_workspace(workspace, &ws_id, cx);
+            })
+        });
+    }
+    cx.background_spawn(async move {
+        // Ports are matched by process cwd, so they must be freed before the
+        // worktree moves into the archive folder.
+        for warning in free_workspace_ports(&state, &ws_id) {
+            log::warn!("Archive {ws_id}: {warning}");
+        }
+        workspace_service::archive_workspace(&state, &ws_id)?;
+        if let Err(err) = chat_session_repository::delete_for_workspace(&state.db, &ws_id) {
+            log::error!("Failed to delete chat sessions for {ws_id}: {err}");
+        }
+        Ok::<(), String>(())
+    })
+    .await
 }
 
 /// Kills every process listening on a port from inside the workspace's

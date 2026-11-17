@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 use agent_client_protocol::schema as acp;
 use agent_servers::SessionToolProvider;
 use futures::StreamExt;
-use futures::channel::mpsc;
+use futures::channel::{mpsc, oneshot};
 use gpui::{App, AppContext as _, AsyncApp, Global, Task};
 use mnemonic_core::models::{AgentStartedChat, WorkspaceSummary};
 use mnemonic_core::repositories::{
@@ -35,12 +35,13 @@ use mnemonic_core::state::AppState;
 
 use crate::team::workspace_root;
 use crate::workspace_panel::{
-    WorkspacePanel, branch_slug_from_message, generate_workspace_name, unique_workspace_name,
+    WorkspacePanel, archive_own_workspace, branch_slug_from_message, generate_workspace_name,
+    unique_workspace_name,
 };
 use crate::workspace_view::{
     ChatAgent, WorkspaceHost, chat_agent_label, chat_record_for_session, chat_state,
-    clean_chat_title, find_open_chat, latest_reply, open_windows, send_to_chat,
-    take_typed_messages, window_handle_of,
+    clean_chat_title, find_open_chat, find_workspace_window, latest_reply, open_windows,
+    send_to_chat, take_typed_messages, window_handle_of,
 };
 
 /// How long a request waits for the main thread to take up a call other than
@@ -51,7 +52,8 @@ const WAIT_MARGIN: Duration = Duration::from_secs(30);
 const DEFINITIONS_TIMEOUT: Duration = Duration::from_secs(10);
 const FIRST_CHECK_INTERVAL: Duration = Duration::from_millis(500);
 const MAX_CHECK_INTERVAL: Duration = Duration::from_secs(5);
-/// How often a wait notices that its call was cancelled.
+/// How often a wait notices that its call was cancelled or that the user
+/// wrote to the waiting chat.
 const CANCEL_CHECK_INTERVAL: Duration = Duration::from_millis(500);
 
 struct AgentHub {
@@ -195,9 +197,19 @@ impl AgentHubHandler for HubHandler {
     }
 }
 
+/// A `start_chat` still running, and the identical calls waiting for its
+/// outcome: an agent retrying a call that timed out gets the chat the first
+/// call starts rather than a second one.
+struct StartInFlight {
+    caller_chat: String,
+    request: StartChatRequest,
+    waiters: Vec<oneshot::Sender<Result<String, String>>>,
+}
+
 #[derive(Default)]
 struct HubState {
     recent_starts: RefCell<RecentStarts>,
+    starts_in_flight: RefCell<Vec<StartInFlight>>,
 }
 
 async fn serve_calls(mut receiver: mpsc::UnboundedReceiver<PendingHubWork>, cx: &mut AsyncApp) {
@@ -267,7 +279,7 @@ async fn run_tool(
         "wait" => wait(&caller_chat, &arguments, &cancelled, cx).await,
         "list" => cx.update(|cx| list(&caller_chat, cx)),
         "stop_chat" => cx.update(|cx| stop_chat(&arguments, cx)),
-        "archive_workspace" => archive_workspace(&arguments, cx).await,
+        "archive_workspace" => archive_workspace(&caller_chat, &arguments, cx).await,
         other => Err(format!("Unknown tool: {other}")),
     }
 }
@@ -356,13 +368,63 @@ async fn start_chat(
     if let Some(chat_id) = earlier {
         return describe_started(&state, &chat_id);
     }
+    let first_start = {
+        let mut starts_in_flight = hub.starts_in_flight.borrow_mut();
+        let running = starts_in_flight
+            .iter_mut()
+            .find(|start| start.caller_chat == caller_chat && start.request == request);
+        match running {
+            Some(start) => {
+                let (sender, receiver) = oneshot::channel();
+                start.waiters.push(sender);
+                Some(receiver)
+            }
+            None => {
+                starts_in_flight.push(StartInFlight {
+                    caller_chat: caller_chat.to_string(),
+                    request: request.clone(),
+                    waiters: Vec::new(),
+                });
+                None
+            }
+        }
+    };
+    if let Some(first_start) = first_start {
+        return first_start.await.unwrap_or_else(|_| {
+            Err("The same chat was being started and that stopped.".to_string())
+        });
+    }
+    let outcome = start_new_chat(hub, caller_chat, &request, &state, cx).await;
+    let waiters = {
+        let mut starts_in_flight = hub.starts_in_flight.borrow_mut();
+        starts_in_flight
+            .iter()
+            .position(|start| start.caller_chat == caller_chat && start.request == request)
+            .map(|index| starts_in_flight.remove(index).waiters)
+            .unwrap_or_default()
+    };
+    for waiter in waiters {
+        if waiter.send(outcome.clone()).is_err() {
+            log::info!("A repeated start_chat gave up before the first one finished");
+        }
+    }
+    outcome
+}
+
+async fn start_new_chat(
+    hub: &HubState,
+    caller_chat: &str,
+    request: &StartChatRequest,
+    state: &AppState,
+    cx: &mut AsyncApp,
+) -> Result<String, String> {
     let (caller_window, window_handle) = cx.update(|cx| {
         let busy_children = agent_started_chat_repository::started_by(&state.db, caller_chat)?
             .iter()
             .filter(|child| {
                 matches!(
                     chat_state(&child.chat_id, cx),
-                    ChatState::Starting | ChatState::Replying
+                    ChatState::Starting | ChatState::Replying | ChatState::WaitingForApproval
                 )
             })
             .count();
@@ -382,7 +444,7 @@ async fn start_chat(
         }
         ChatPlace::New { repo, branch, base } => {
             let workspace_id =
-                create_workspace(&state, &request, repo, branch.clone(), base.clone(), cx).await?;
+                create_workspace(state, request, repo, branch.clone(), base.clone(), cx).await?;
             (workspace_id, true)
         }
     };
@@ -403,6 +465,7 @@ async fn start_chat(
                     title,
                     request.task.clone(),
                     Some(caller_chat.to_string()),
+                    made_workspace,
                     window,
                     cx,
                 )
@@ -420,8 +483,8 @@ async fn start_chat(
     }
     hub.recent_starts
         .borrow_mut()
-        .remember(caller_chat, &request, &chat_id, Instant::now());
-    describe_started(&state, &chat_id)
+        .remember(caller_chat, request, &chat_id, Instant::now());
+    describe_started(state, &chat_id)
 }
 
 async fn create_workspace(
@@ -545,6 +608,9 @@ async fn wait(
             ChatState::Replied | ChatState::Stopped | ChatState::Closed
         )
     };
+    // Only the user can answer an approval prompt, so the agent is told at
+    // once and can ask them, whatever the other chats are doing.
+    let needs_approval = |report: &ChatReport| report.state == ChatState::WaitingForApproval;
     let mut waited = Duration::ZERO;
     let mut next_check = Duration::ZERO;
     let mut interval = FIRST_CHECK_INTERVAL;
@@ -552,18 +618,16 @@ async fn wait(
         if cancelled.load(Ordering::SeqCst) {
             return Err("The wait was cancelled.".to_string());
         }
-        if waited >= next_check {
-            let (typed, reports) = cx.update(|cx| {
-                let typed = take_typed_messages(caller_chat, cx);
-                let reports: Vec<ChatReport> =
-                    targets.iter().map(|chat| report(chat, cx)).collect();
-                (typed, reports)
-            });
-            let done = if request.any {
-                reports.iter().any(finished)
-            } else {
-                reports.iter().all(finished)
-            };
+        let typed = cx.update(|cx| take_typed_messages(caller_chat, cx));
+        if !typed.is_empty() || waited >= next_check {
+            let reports: Vec<ChatReport> =
+                cx.update(|cx| targets.iter().map(|chat| report(chat, cx)).collect());
+            let done = reports.iter().any(needs_approval)
+                || if request.any {
+                    reports.iter().any(finished)
+                } else {
+                    reports.iter().all(finished)
+                };
             if !typed.is_empty() || done {
                 return Ok(render_wait(&reports, false, &typed));
             }
@@ -640,6 +704,7 @@ fn stop_chat(arguments: &serde_json::Value, cx: &mut App) -> Result<String, Stri
 }
 
 async fn archive_workspace(
+    caller_chat: &str,
     arguments: &serde_json::Value,
     cx: &mut AsyncApp,
 ) -> Result<String, String> {
@@ -655,28 +720,41 @@ async fn archive_workspace(
         async move { check_can_archive(&state.db, &workspace_id, &root) }
     })
     .await?;
-    // Its chats and run commands work in the worktree that is about to move.
-    cx.update(|cx| {
-        for window in open_windows(cx) {
-            window.update(cx, |window, cx| {
-                WorkspaceHost::kill_run_commands_for_workspace(window, &workspace.id, cx);
-                WorkspaceHost::remove_workspace_view(window, &workspace.id, cx);
-            });
-        }
-    });
-    cx.background_spawn({
-        let state = state.clone();
-        let workspace_id = workspace.id.clone();
-        async move {
-            workspace_service::archive_workspace(&state, &workspace_id)?;
-            if let Err(err) =
-                chat_session_repository::delete_for_workspace(&state.db, &workspace_id)
-            {
-                log::error!("Failed to delete chat sessions for {workspace_id}: {err}");
+    // The teardown runs in the workspace's view: the window showing it, else
+    // the caller's, where it is built without being shown.
+    let (window, window_handle) = cx.update(|cx| {
+        let window = find_workspace_window(&workspace.id, cx)
+            .or_else(|| find_open_chat(caller_chat, cx).map(|chat| chat.window))
+            .ok_or_else(|| "This chat isn't open in Mnemonic.".to_string())?;
+        let handle = window_handle_of(&window, cx)
+            .ok_or_else(|| "This chat's window is closed.".to_string())?;
+        Ok::<_, String>((window, handle))
+    })?;
+    archive_own_workspace(
+        window.downgrade(),
+        window_handle,
+        workspace.id.clone(),
+        state,
+        {
+            let window = window.clone();
+            let workspace_id = workspace.id.clone();
+            move |window_context, cx| {
+                let built = window.update(cx, |window, cx| {
+                    WorkspaceHost::ensure_background_view(window, &workspace_id, window_context, cx)
+                });
+                if let Err(err) = built {
+                    log::warn!("Archive {workspace_id}: couldn't open its view: {err}");
+                }
             }
-            Ok::<(), String>(())
-        }
-    })
+        },
+        {
+            let workspace_id = workspace.id.clone();
+            move |err, _| {
+                log::warn!("Archive {workspace_id}: teardown not run: {err}; archiving anyway");
+            }
+        },
+        cx,
+    )
     .await?;
     cx.update(|cx| {
         for window in open_windows(cx) {
@@ -694,11 +772,17 @@ async fn archive_workspace(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::workspace_view::tests::{StubServer, TestChatServer, window_showing_workspace_a};
-    use crate::workspace_view::{ChatAgent, WorkspaceHost, find_open_chat};
-    use agent_client_protocol::schema as acp;
-    use mnemonic_core::repositories::agent_started_chat_repository;
+    use crate::workspace_view::tests::{
+        StubServer, TestChatServer, terminal_tabs, window_showing_workspace_a,
+    };
+    use acp_thread::{PermissionOptions, StubAgentConnection};
+    use gpui::{Entity, VisualTestContext};
+    use mnemonic_core::models::DiscoveredRepository;
+    use mnemonic_core::repositories::settings_repository;
     use serde_json::json;
+    use workspace::Workspace;
+
+    const APPROVAL_TOOL_CALL: &str = "needs-approval";
 
     fn echo(text: &str) -> Vec<acp::SessionUpdate> {
         vec![acp::SessionUpdate::AgentMessageChunk(
@@ -706,23 +790,22 @@ mod tests {
         )]
     }
 
+    /// Spawns the call without running it, so calls can overlap.
     fn spawn_call(
         hub: &Rc<HubState>,
         caller: &HubCaller,
         tool: &str,
         arguments: serde_json::Value,
-        cx: &mut gpui::VisualTestContext,
+        cx: &mut VisualTestContext,
     ) -> Task<Result<String, String>> {
-        let task = cx.cx.spawn({
+        cx.cx.spawn({
             let hub = hub.clone();
             let caller = caller.clone();
             let tool = tool.to_string();
             move |mut cx| async move {
                 run_tool(hub, caller, tool, arguments, Arc::default(), &mut cx).await
             }
-        });
-        cx.run_until_parked();
-        task
+        })
     }
 
     async fn call(
@@ -730,21 +813,42 @@ mod tests {
         caller: &HubCaller,
         tool: &str,
         arguments: serde_json::Value,
-        cx: &mut gpui::VisualTestContext,
+        cx: &mut VisualTestContext,
     ) -> Result<String, String> {
-        spawn_call(hub, caller, tool, arguments, cx).await
+        let task = spawn_call(hub, caller, tool, arguments, cx);
+        cx.run_until_parked();
+        task.await
     }
 
-    #[gpui::test]
-    async fn start_send_wait_round_trip(cx: &mut gpui::TestAppContext) {
-        let (workspace, state, _data_dir, cx) = window_showing_workspace_a(cx).await;
-        let connection = acp_thread::StubAgentConnection::new();
+    struct Hub {
+        workspace: Entity<Workspace>,
+        state: AppState,
+        _data_dir: tempfile::TempDir,
+        connection: StubAgentConnection,
+        hub: Rc<HubState>,
+        caller: HubCaller,
+        caller_chat: String,
+    }
+
+    /// Workspace A shown with a calling chat in it, and every chat opened
+    /// from then on running on one stub agent. The calling chat is mid-turn,
+    /// as a real one is while it calls tools: the stub holds a turn open
+    /// when no reply is set.
+    async fn hub_with_caller(cx: &mut gpui::TestAppContext) -> (Hub, &mut VisualTestContext) {
+        let (workspace, state, data_dir, cx) = window_showing_workspace_a(cx).await;
+        let approval_options = PermissionOptions::Flat(vec![acp::PermissionOption::new(
+            "allow",
+            "Allow",
+            acp::PermissionOptionKind::AllowOnce,
+        )]);
+        let connection = StubAgentConnection::new().with_permission_requests(
+            [(acp::ToolCallId::new(APPROVAL_TOOL_CALL), approval_options)]
+                .into_iter()
+                .collect(),
+        );
         cx.update(|_, cx| {
             cx.set_global(TestChatServer(Rc::new(StubServer(connection.clone()))));
         });
-
-        // The calling chat is mid-turn while it calls tools; the stub holds
-        // a turn open when no reply is set.
         let caller_chat = workspace
             .update_in(cx, |workspace, window, cx| {
                 WorkspaceHost::open_chat_in_background(
@@ -754,6 +858,7 @@ mod tests {
                     "Lead".to_string(),
                     "Split the work".to_string(),
                     None,
+                    false,
                     window,
                     cx,
                 )
@@ -766,20 +871,41 @@ mod tests {
                 Some(thread.read(cx).session_id().0.to_string())
             })
             .expect("the calling chat is connected");
-        let caller = HubCaller { session_id };
-        let hub = Rc::new(HubState::default());
+        let hub = Hub {
+            workspace,
+            state,
+            _data_dir: data_dir,
+            connection,
+            hub: Rc::new(HubState::default()),
+            caller: HubCaller { session_id },
+            caller_chat,
+        };
+        (hub, cx)
+    }
+
+    #[gpui::test]
+    async fn start_send_wait_round_trip(cx: &mut gpui::TestAppContext) {
+        let (fixture, cx) = hub_with_caller(cx).await;
+        let Hub {
+            state,
+            connection,
+            hub,
+            caller,
+            caller_chat,
+            ..
+        } = &fixture;
 
         connection.set_next_prompt_updates(echo("Look at the tests"));
         let started = call(
-            &hub,
-            &caller,
+            hub,
+            caller,
             "start_chat",
             json!({"task": "Look at the tests", "workspace": "ws-b", "title": "Helper"}),
             cx,
         )
         .await
         .expect("the chat starts");
-        let started_chat = agent_started_chat_repository::started_by(&state.db, &caller_chat)
+        let started_chat = agent_started_chat_repository::started_by(&state.db, caller_chat)
             .expect("started chats are listed")
             .into_iter()
             .next()
@@ -789,8 +915,8 @@ mod tests {
         assert!(started.contains(&started_chat.chat_id), "{started}");
 
         let report = call(
-            &hub,
-            &caller,
+            hub,
+            caller,
             "wait",
             json!({"chats": [started_chat.chat_id]}),
             cx,
@@ -803,15 +929,15 @@ mod tests {
 
         connection.set_next_prompt_updates(echo("again"));
         call(
-            &hub,
-            &caller,
+            hub,
+            caller,
             "send",
             json!({"chat": "Helper", "text": "again"}),
             cx,
         )
         .await
         .expect("the message is sent");
-        let report = call(&hub, &caller, "wait", json!({"chats": ["Helper"]}), cx)
+        let report = call(hub, caller, "wait", json!({"chats": ["Helper"]}), cx)
             .await
             .expect("the wait returns");
         assert!(report.contains(": replied"), "{report}");
@@ -819,8 +945,8 @@ mod tests {
         assert!(!report.contains("echo: Look at the tests"), "{report}");
 
         let refused = call(
-            &hub,
-            &caller,
+            hub,
+            caller,
             "stop_chat",
             json!({"chat": "ws-b-primary"}),
             cx,
@@ -828,10 +954,9 @@ mod tests {
         .await;
         assert!(refused.is_err(), "a chat the user opened can't be stopped");
 
-        // With no reply set, the stub holds the turn open.
         call(
-            &hub,
-            &caller,
+            hub,
+            caller,
             "send",
             json!({"chat": "Helper", "text": "hold"}),
             cx,
@@ -839,16 +964,148 @@ mod tests {
         .await
         .expect("the message is sent");
         let waiting = spawn_call(
-            &hub,
-            &caller,
+            hub,
+            caller,
             "wait",
             json!({"chats": ["Helper"], "timeout_seconds": 1}),
             cx,
         );
+        cx.run_until_parked();
         cx.executor().advance_clock(Duration::from_secs(2));
         cx.run_until_parked();
         let report = waiting.await.expect("the wait returns");
         assert!(report.contains(": replying"), "{report}");
         assert!(report.contains("Timed out."), "{report}");
+    }
+
+    #[gpui::test]
+    async fn wait_returns_when_a_chat_needs_approval(cx: &mut gpui::TestAppContext) {
+        let (fixture, cx) = hub_with_caller(cx).await;
+        let Hub {
+            connection,
+            hub,
+            caller,
+            ..
+        } = &fixture;
+
+        connection.set_next_prompt_updates(echo("Done"));
+        call(
+            hub,
+            caller,
+            "start_chat",
+            json!({"task": "Write the docs", "workspace": "ws-b", "title": "Docs"}),
+            cx,
+        )
+        .await
+        .expect("the first chat starts");
+        connection.set_next_prompt_updates(vec![acp::SessionUpdate::ToolCall(
+            acp::ToolCall::new(acp::ToolCallId::new(APPROVAL_TOOL_CALL), "Edit a file")
+                .kind(acp::ToolKind::Edit),
+        )]);
+        call(
+            hub,
+            caller,
+            "start_chat",
+            json!({"task": "Fix the tests", "workspace": "ws-b", "title": "Fixer"}),
+            cx,
+        )
+        .await
+        .expect("the second chat starts");
+
+        // Without `any`, the wait would otherwise go on until both chats
+        // were done.
+        let report = call(hub, caller, "wait", json!({"chats": ["Docs", "Fixer"]}), cx)
+            .await
+            .expect("the wait returns");
+        assert!(
+            report.contains("\"Fixer\" (Claude): waiting for approval from the user"),
+            "{report}"
+        );
+        assert!(!report.contains("Timed out."), "{report}");
+    }
+
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the test scheduler rejects a child process awaited on another thread"
+    )]
+    fn git(directory: &Path, arguments: &[&str]) {
+        let status = util::command::new_std_command("git")
+            .arg("-C")
+            .arg(directory)
+            .args(["-c", "user.name=Test", "-c", "user.email=test@example.com"])
+            .args(arguments)
+            .status()
+            .expect("git runs");
+        assert!(status.success(), "git {arguments:?} failed");
+    }
+
+    #[gpui::test]
+    async fn new_workspace_chat_is_primary_and_a_retry_while_starting_reuses_it(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (fixture, cx) = hub_with_caller(cx).await;
+        let Hub {
+            workspace,
+            state,
+            _data_dir: data_dir,
+            hub,
+            caller,
+            caller_chat,
+            ..
+        } = &fixture;
+        let repository_path = data_dir.path().join("demo");
+        std::fs::create_dir_all(&repository_path).expect("the repository folder is made");
+        git(&repository_path, &["init", "-q", "-b", "main"]);
+        git(
+            &repository_path,
+            &["commit", "-q", "--allow-empty", "-m", "init"],
+        );
+        repository_repository::upsert(
+            &state.db,
+            &DiscoveredRepository {
+                id: "repo-demo".to_string(),
+                name: "demo".to_string(),
+                path: repository_path.display().to_string(),
+                current_branch: Some("main".to_string()),
+                head: None,
+                is_dirty: false,
+                worktrees: Vec::new(),
+                last_scanned_at: String::new(),
+            },
+        )
+        .expect("the repository is saved");
+        settings_repository::save_managed_workspaces_root(
+            &state.db,
+            &data_dir.path().join("workspaces").display().to_string(),
+        )
+        .expect("the workspaces folder is set");
+
+        let arguments = json!({"task": "Add a readme", "repo": "demo", "branch": "add-readme"});
+        let first = spawn_call(hub, caller, "start_chat", arguments.clone(), cx);
+        let retry = spawn_call(hub, caller, "start_chat", arguments, cx);
+        cx.run_until_parked();
+        let first = first.await.expect("the chat starts");
+        let retry = retry.await.expect("the retry gets the same chat");
+        assert_eq!(first, retry);
+
+        let started = agent_started_chat_repository::started_by(&state.db, caller_chat)
+            .expect("started chats are listed");
+        assert_eq!(started.len(), 1, "one chat was started");
+        let started = &started[0];
+        assert!(started.made_workspace);
+        let records = chat_session_repository::list_for_workspace(&state.db, &started.workspace_id)
+            .expect("the new workspace's chats are listed");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].id, started.chat_id);
+        assert!(
+            records[0].is_primary,
+            "the started chat is the primary chat"
+        );
+        let terminals = workspace
+            .read_with(cx, |workspace, cx| {
+                terminal_tabs(workspace, &started.workspace_id, cx)
+            })
+            .expect("the new workspace's view is built");
+        assert_eq!(terminals, Vec::<String>::new(), "no CLI is started");
     }
 }
