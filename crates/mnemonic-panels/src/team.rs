@@ -49,6 +49,7 @@ use workspace::notifications::NotificationId;
 use workspace::{Toast, Workspace};
 
 use crate::team_copy::{CopyFollow, resume_copies};
+use crate::team_live_chat::live_chats_root;
 use crate::team_settings::open_team_window;
 use crate::team_workspace_view::teammate_workspace_key;
 use crate::workspace_panel::WorkspacePanel;
@@ -311,6 +312,12 @@ fn open_team_window_from(workspace: &Workspace, cx: &mut App) {
 }
 
 pub fn init(cx: &mut App) {
+    if let Some(app) = mnemonic_bridge::mnemonic_state_cloned() {
+        // A live chat opened any other way, such as from imported thread
+        // history, would run without the share server's tools and with
+        // Claude's built-in ones acting on this Mac.
+        agent_servers::require_session_extras_under(live_chats_root(&app.data_dir), cx);
+    }
     cx.observe_new(|workspace: &mut Workspace, _, _| {
         workspace.register_action(|workspace, _: &OpenTeamSettings, _window, cx| {
             open_team_window_from(workspace, cx);

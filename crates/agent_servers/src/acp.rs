@@ -1501,9 +1501,44 @@ fn session_extras_for_cwd(cwd: &Path, cx: &App) -> Option<SessionExtras> {
     cx.try_global::<SessionExtrasByCwd>()?.0.get(cwd).cloned()
 }
 
-fn session_extras_for_work_dirs(work_dirs: &PathList, cx: &App) -> Option<SessionExtras> {
-    let cwd = work_dirs.ordered_paths().next()?;
-    session_extras_for_cwd(cwd, cx)
+#[derive(Default)]
+struct SessionExtrasRequiredUnder(Vec<PathBuf>);
+
+impl gpui::Global for SessionExtrasRequiredUnder {}
+
+/// Sessions working under `prefix` are refused unless their session extras
+/// are in place, since without them they would run with settings that must
+/// not apply there.
+pub fn require_session_extras_under(prefix: PathBuf, cx: &mut App) {
+    let prefixes = &mut cx.default_global::<SessionExtrasRequiredUnder>().0;
+    if !prefixes.contains(&prefix) {
+        prefixes.push(prefix);
+    }
+}
+
+pub fn requires_session_extras(cwd: &Path, cx: &App) -> bool {
+    cx.try_global::<SessionExtrasRequiredUnder>()
+        .is_some_and(|required| required.0.iter().any(|prefix| cwd.starts_with(prefix)))
+}
+
+fn required_session_extras_for_cwd(cwd: &Path, cx: &App) -> Result<Option<SessionExtras>> {
+    let extras = session_extras_for_cwd(cwd, cx);
+    if extras.is_none() && requires_session_extras(cwd, cx) {
+        return Err(anyhow!(LoadError::Other(
+            "This chat can only be opened from the workspace it was started in.".into()
+        )));
+    }
+    Ok(extras)
+}
+
+fn required_session_extras_for_work_dirs(
+    work_dirs: &PathList,
+    cx: &App,
+) -> Result<Option<SessionExtras>> {
+    match work_dirs.ordered_paths().next() {
+        Some(cwd) => required_session_extras_for_cwd(cwd, cx),
+        None => Ok(None),
+    }
 }
 
 fn split_session_extras(
@@ -1710,9 +1745,12 @@ impl AgentConnection for AcpConnection {
             Ok(directories) => directories,
             Err(error) => return Task::ready(Err(error)),
         };
+        let extras = match required_session_extras_for_cwd(&directories.cwd, cx) {
+            Ok(extras) => extras,
+            Err(error) => return Task::ready(Err(error)),
+        };
         let name = self.id.0.clone();
         let mcp_servers = mcp_servers_for_project(&project, cx);
-        let extras = session_extras_for_cwd(&directories.cwd, cx);
 
         cx.spawn(async move |cx| {
             let response = into_foreground_future(
@@ -1849,8 +1887,11 @@ impl AgentConnection for AcpConnection {
             ))));
         }
 
+        let extras = match required_session_extras_for_work_dirs(&work_dirs, cx) {
+            Ok(extras) => extras,
+            Err(error) => return Task::ready(Err(error)),
+        };
         let mcp_servers = mcp_servers_for_project(&project, cx);
-        let extras = session_extras_for_work_dirs(&work_dirs, cx);
         self.open_or_create_session(
             session_id,
             project,
@@ -1896,8 +1937,11 @@ impl AgentConnection for AcpConnection {
             ))));
         }
 
+        let extras = match required_session_extras_for_work_dirs(&work_dirs, cx) {
+            Ok(extras) => extras,
+            Err(error) => return Task::ready(Err(error)),
+        };
         let mcp_servers = mcp_servers_for_project(&project, cx);
-        let extras = session_extras_for_work_dirs(&work_dirs, cx);
         self.open_or_create_session(
             session_id,
             project,
@@ -1943,6 +1987,10 @@ impl AgentConnection for AcpConnection {
             Ok(directories) => directories,
             Err(error) => return Task::ready(Err(error)),
         };
+        let extras = match required_session_extras_for_cwd(&directories.cwd, cx) {
+            Ok(extras) => extras,
+            Err(error) => return Task::ready(Err(error)),
+        };
         let mcp_servers = self
             .sessions
             .borrow()
@@ -1950,7 +1998,6 @@ impl AgentConnection for AcpConnection {
             .and_then(|session| session.thread.upgrade())
             .map(|thread| mcp_servers_for_project(thread.read(cx).project(), cx))
             .unwrap_or_default();
-        let extras = session_extras_for_cwd(&directories.cwd, cx);
         let request = directories.into_fork_session_request(session_id, mcp_servers, extras);
         let connection = self.connection.clone();
         cx.foreground_executor().spawn(async move {
@@ -3235,6 +3282,103 @@ mod tests {
             })
             .await;
         assert!(result.is_err(), "fork_session should fail without the capability");
+    }
+
+    #[gpui::test]
+    async fn sessions_under_a_guarded_folder_need_their_extras(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            let store = settings::SettingsStore::test(cx);
+            cx.set_global(store);
+        });
+
+        let fs = fs::FakeFs::new(cx.executor());
+        fs.insert_tree(
+            "/",
+            serde_json::json!({ "a": {}, "guarded": { "chat": {} } }),
+        )
+        .await;
+        let project = project::Project::test(fs, [std::path::Path::new("/a")], cx).await;
+        let mut harness = test_support::connect_fake_acp_connection(project.clone(), cx).await;
+        Rc::get_mut(&mut harness.connection)
+            .expect("test harness should own the only ACP connection handle")
+            .agent_capabilities
+            .session_capabilities
+            .fork = Some(acp::SessionForkCapabilities::new());
+        cx.update(|cx| require_session_extras_under("/guarded".into(), cx));
+        let connection = harness.connection.clone();
+        let guarded = PathList::new(&[std::path::PathBuf::from("/guarded/chat")]);
+
+        let new_result = cx
+            .update(|cx| {
+                connection
+                    .clone()
+                    .new_session(project.clone(), guarded.clone(), cx)
+            })
+            .await;
+        assert!(
+            new_result.is_err(),
+            "a new session without extras is refused"
+        );
+        let load_result = cx
+            .update(|cx| {
+                connection.clone().load_session(
+                    acp::SessionId::new("guarded"),
+                    project.clone(),
+                    guarded.clone(),
+                    None,
+                    cx,
+                )
+            })
+            .await;
+        assert!(
+            load_result.is_err(),
+            "loading a session without extras is refused"
+        );
+        assert_eq!(harness.load_session_count.load(Ordering::SeqCst), 0);
+        let fork_result = cx
+            .update(|cx| {
+                connection.clone().fork_session(
+                    acp::SessionId::new("original"),
+                    guarded.clone(),
+                    cx,
+                )
+            })
+            .await;
+        assert!(fork_result.is_err(), "forking without extras is refused");
+
+        cx.update(|cx| {
+            set_session_extras(
+                "/guarded/chat".into(),
+                SessionExtras {
+                    mcp_servers: Vec::new(),
+                    meta: acp::Meta::new(),
+                },
+                cx,
+            )
+        });
+        let forked = cx
+            .update(|cx| {
+                connection.clone().fork_session(
+                    acp::SessionId::new("original"),
+                    guarded.clone(),
+                    cx,
+                )
+            })
+            .await
+            .expect("forking with extras proceeds");
+        assert_eq!(forked, acp::SessionId::new("original-fork"));
+        cx.update(|cx| {
+            connection.clone().load_session(
+                acp::SessionId::new("guarded"),
+                project.clone(),
+                guarded.clone(),
+                None,
+                cx,
+            )
+        })
+        .await
+        .expect("loading with extras proceeds");
+        assert_eq!(harness.load_session_count.load(Ordering::SeqCst), 1);
     }
 
     async fn connect_session_delete_test_agent(

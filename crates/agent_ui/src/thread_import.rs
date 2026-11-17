@@ -758,6 +758,21 @@ fn fetch_sessions_for_agent(
             }
         }
 
+        // These sessions only open with their session extras, which an
+        // imported thread would not have.
+        cx.update(|cx| {
+            for sessions in &mut sessions_by_agent {
+                sessions.sessions.retain(|session| {
+                    !session.work_dirs.as_ref().is_some_and(|work_dirs| {
+                        work_dirs
+                            .ordered_paths()
+                            .next()
+                            .is_some_and(|cwd| agent_servers::requires_session_extras(cwd, cx))
+                    })
+                });
+            }
+        });
+
         let importable_counts_by_agent =
             count_importable_threads_by_agent(&sessions_by_agent, &existing_sessions);
         let status = if stats.successful_attempt_count > 0 {

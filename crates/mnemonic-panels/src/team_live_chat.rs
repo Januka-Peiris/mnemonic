@@ -146,12 +146,15 @@ fn path_slug(value: &str) -> String {
     }
 }
 
+pub(crate) fn live_chats_root(data_dir: &Path) -> PathBuf {
+    data_dir.join("team_live")
+}
+
 /// The chat's working directory on this Mac: an empty folder, so Claude loads
 /// none of the sharer's project settings here, and a stable one, so the
 /// transcript resumes. The caller creates it.
 pub(crate) fn live_chat_dir(data_dir: &Path, host: &str, workspace_id: &str) -> PathBuf {
-    data_dir
-        .join("team_live")
+    live_chats_root(data_dir)
         .join(path_slug(host))
         .join(path_slug(workspace_id))
 }
