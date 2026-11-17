@@ -1650,14 +1650,15 @@ fn check_agent_write(
     display_name: &str,
     cx: &App,
 ) -> Result<(), TeamActionError> {
-    let Some(relative) = path
-        .strip_prefix(root)
-        .ok()
-        .and_then(|relative| relative.to_str())
-        .map(|relative| relative.replace('\\', "/"))
-    else {
-        return Ok(());
-    };
+    let relative = path.strip_prefix(root).map_err(|_| {
+        TeamActionError::NotAllowed(format!("{} is outside the workspace", path.display()))
+    })?;
+    let relative = relative
+        .to_str()
+        .ok_or_else(|| {
+            TeamActionError::NotAllowed(format!("{} isn't a UTF-8 path", relative.display()))
+        })?
+        .replace('\\', "/");
     if unsaved_paths(root, cx).contains(&relative) {
         return Err(TeamActionError::Failed(format!(
             "{relative} has unsaved changes in {display_name}'s editor"
@@ -2975,6 +2976,18 @@ mod tests {
             assert!(!team.allows_agents("workspace"));
             team.set_workspace_shared("workspace", true, cx);
             assert!(team.allows_agents("workspace"));
+        });
+    }
+
+    #[gpui::test]
+    fn agent_writes_outside_the_root_or_not_utf8_are_refused(cx: &mut TestAppContext) {
+        use std::os::unix::ffi::OsStrExt as _;
+        let root = Path::new("/work/root");
+        cx.update(|cx| {
+            assert!(check_agent_write(root, &root.join("src/main.rs"), "Jay", cx).is_ok());
+            assert!(check_agent_write(root, Path::new("/elsewhere/main.rs"), "Jay", cx).is_err());
+            let not_utf8 = root.join(std::ffi::OsStr::from_bytes(b"bad\xff.rs"));
+            assert!(check_agent_write(root, &not_utf8, "Jay", cx).is_err());
         });
     }
 
