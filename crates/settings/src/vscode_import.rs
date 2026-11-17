@@ -197,6 +197,7 @@ impl VsCodeSettings {
             journal: None,
             workspaces: None,
             team: None,
+            phone: None,
             language_models: None,
             line_indicator_format: None,
             log: None,

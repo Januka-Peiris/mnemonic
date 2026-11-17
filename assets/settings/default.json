@@ -1798,6 +1798,20 @@
     // { "name": "Alice", "host": "alice-mbp" }.
     "peers": [],
   },
+  // Reaching your agent chats from your phone over Tailscale.
+  "phone": {
+    // Whether the phone page is served from this Mac.
+    "enabled": false,
+    // The port the phone page is served on.
+    "port": 47232,
+    // The ntfy topic URL notifications are posted to. When empty, no
+    // notifications are sent.
+    "ntfy_url": "",
+    // An access token sent to ntfy, for topics that need one.
+    "ntfy_token": "",
+    // Minutes a chat must wait for you before a notification is sent.
+    "notify_after_idle_minutes": 5,
+  },
   // Settings specific to journaling
   "journal": {
     // The path of the directory where journal entries are stored

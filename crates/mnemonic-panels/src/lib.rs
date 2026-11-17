@@ -1,5 +1,6 @@
 mod command_approval_panel;
 mod coordinator_panel;
+mod phone;
 mod team;
 mod team_connection;
 mod team_copy;

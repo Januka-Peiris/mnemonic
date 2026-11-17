@@ -199,6 +199,8 @@ pub struct SettingsContent {
 
     /// Sharing workspaces and agent chats with teammates over Tailscale.
     pub team: Option<TeamSettingsContent>,
+    /// Reaching your agent chats from your phone over Tailscale.
+    pub phone: Option<PhoneSettingsContent>,
 
     /// A map of log scopes to the desired log level.
     /// Useful for filtering out noisy logs or enabling more verbose logging.
@@ -1036,6 +1038,34 @@ pub struct TeamSettingsContent {
     ///
     /// Default: []
     pub peers: Option<Vec<TeamPeerContent>>,
+}
+
+/// Settings for the phone page served over Tailscale.
+#[with_fallible_options]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema, MergeFrom, PartialEq)]
+pub struct PhoneSettingsContent {
+    /// Whether the phone page is served from this Mac.
+    ///
+    /// Default: false
+    pub enabled: Option<bool>,
+    /// The port the phone page is served on.
+    ///
+    /// Default: 47232
+    pub port: Option<u16>,
+    /// The ntfy topic URL notifications are posted to, such as
+    /// "https://ntfy.sh/my-topic". When empty, no notifications are sent.
+    ///
+    /// Default: ""
+    pub ntfy_url: Option<String>,
+    /// An access token sent to ntfy, for topics that need one.
+    ///
+    /// Default: ""
+    pub ntfy_token: Option<String>,
+    /// How many minutes a chat must wait for you before a notification is
+    /// sent.
+    ///
+    /// Default: 5
+    pub notify_after_idle_minutes: Option<u32>,
 }
 
 #[with_fallible_options]
