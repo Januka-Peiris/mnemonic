@@ -1271,7 +1271,7 @@ impl ThreadMetadataStore {
         let view = conversation_view.read(cx);
         // A read-only view mirrors someone else's chat, which isn't this
         // machine's to record.
-        if view.read_only().is_some() {
+        if view.read_only().is_some() || view.is_excluded_from_thread_history() {
             return;
         }
         let thread_id = view.thread_id;

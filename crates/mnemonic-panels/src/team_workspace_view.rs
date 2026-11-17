@@ -465,6 +465,24 @@ impl TeammateWorkspaceView {
         !self.live_chats.is_empty()
     }
 
+    /// The teammate was removed, or is online and no longer shares this
+    /// workspace. An offline teammate's workspace isn't gone.
+    pub(crate) fn is_gone(&self, cx: &App) -> bool {
+        let Some(team) = team_share(cx) else {
+            return true;
+        };
+        match team.read(cx).peer(&self.host) {
+            None => true,
+            Some(peer) => {
+                matches!(peer.status, PeerStatus::Online)
+                    && !peer
+                        .workspaces
+                        .iter()
+                        .any(|workspace| workspace.id == self.workspace_id)
+            }
+        }
+    }
+
     pub(crate) fn files(&self) -> &[TeamFileDiff] {
         &self.files
     }
@@ -1012,6 +1030,8 @@ impl TeammateWorkspaceView {
                 cx,
             );
             view.suppress_notifications();
+            // Resumed from history it would run without the session extras.
+            view.exclude_from_thread_history();
             view
         })
     }

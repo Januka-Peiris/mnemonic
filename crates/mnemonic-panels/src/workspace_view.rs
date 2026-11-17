@@ -4982,6 +4982,8 @@ pub struct WorkspaceHost {
     /// Moves tabs opened in the window's own pane into the selected
     /// workspace, so they switch with it.
     _window_items: Subscription,
+    /// Releases cached teammates' workspaces that are gone.
+    _team_share: Option<Subscription>,
 }
 
 impl WorkspaceHost {
@@ -5065,6 +5067,11 @@ impl WorkspaceHost {
                         window,
                         Self::handle_window_event,
                     ),
+                    _team_share: crate::team::team_share(cx).map(|team| {
+                        cx.observe(&team, |host: &mut WorkspaceHost, _, cx| {
+                            host.release_inactive_teammates(cx);
+                        })
+                    }),
                 });
                 workspace.add_item_to_active_pane(Box::new(host.clone()), None, true, window, cx);
                 (host, true)
@@ -5360,15 +5367,16 @@ impl WorkspaceHost {
         }
     }
 
-    /// Drops the teammates' workspaces that aren't shown and have none of
-    /// your own chats running in them.
+    /// Drops the teammates' workspaces that aren't shown and either have
+    /// none of your own chats running in them or are gone.
     fn release_inactive_teammates(&mut self, cx: &App) {
         let active_key = match &self.active {
             Some(ActiveView::Teammate(key)) => Some(key.clone()),
             Some(ActiveView::Local(_)) | None => None,
         };
         self.teammates.retain(|key, view| {
-            active_key.as_ref() == Some(key) || view.read(cx).has_live_chats()
+            let view = view.read(cx);
+            active_key.as_ref() == Some(key) || (view.has_live_chats() && !view.is_gone(cx))
         });
     }
 
