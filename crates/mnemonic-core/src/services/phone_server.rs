@@ -56,12 +56,32 @@ pub enum PhoneAction {
         workspace_id: String,
         agent: String,
     },
+    /// Creates a workspace in the repository and sends `text` to its chat
+    /// as the user's first message.
+    StartTask {
+        repository_id: String,
+        agent: String,
+        text: String,
+    },
+    CreatePr {
+        workspace_id: String,
+    },
+    /// Merges the workspace's PR at `head`, the commit the phone saw.
+    Merge {
+        workspace_id: String,
+        head: String,
+    },
 }
 
 #[derive(Clone, Debug, Default, PartialEq, serde::Serialize)]
 pub struct PhoneActionOutcome {
-    /// The new chat's id, for `PhoneAction::NewChat`.
+    /// The new chat's id, for `PhoneAction::NewChat` and
+    /// `PhoneAction::StartTask`.
     pub chat_id: Option<String>,
+    /// The new workspace's id, for `PhoneAction::StartTask`.
+    pub workspace_id: Option<String>,
+    /// What GitHub said, for `PhoneAction::Merge`.
+    pub message: Option<String>,
 }
 
 pub type PhoneActionHandler =
@@ -427,6 +447,25 @@ fn parse_action(segments: &[&str], body: &[u8]) -> Result<PhoneAction, (u16, Str
     struct NewChatBody {
         agent: String,
     }
+    #[derive(serde::Deserialize)]
+    struct TaskBody {
+        repository_id: String,
+        agent: String,
+        text: String,
+    }
+    #[derive(serde::Deserialize)]
+    struct MergeBody {
+        head: String,
+    }
+    fn check_message(text: &str) -> Result<(), (u16, String)> {
+        if text.trim().is_empty() {
+            return Err((400, "The message is empty".to_string()));
+        }
+        if text.len() > MAX_MESSAGE_BYTES {
+            return Err((413, "The message is too long".to_string()));
+        }
+        Ok(())
+    }
     fn read<T: serde::de::DeserializeOwned>(body: &[u8]) -> Result<T, (u16, String)> {
         serde_json::from_slice(body)
             .map_err(|err| (400, format!("Couldn't read the request: {err}")))
@@ -445,12 +484,7 @@ fn parse_action(segments: &[&str], body: &[u8]) -> Result<PhoneAction, (u16, Str
         }
         ["v1", "chats", chat_id, "message"] if is_plain_id(chat_id) => {
             let message: MessageBody = read(body)?;
-            if message.text.trim().is_empty() {
-                return Err((400, "The message is empty".to_string()));
-            }
-            if message.text.len() > MAX_MESSAGE_BYTES {
-                return Err((413, "The message is too long".to_string()));
-            }
+            check_message(&message.text)?;
             Ok(PhoneAction::Message {
                 chat_id: chat_id.to_string(),
                 text: message.text,
@@ -465,6 +499,38 @@ fn parse_action(segments: &[&str], body: &[u8]) -> Result<PhoneAction, (u16, Str
             Ok(PhoneAction::NewChat {
                 workspace_id: workspace_id.to_string(),
                 agent: agent.to_string(),
+            })
+        }
+        ["v1", "tasks"] => {
+            let task: TaskBody = read(body)?;
+            if !is_plain_id(&task.repository_id) {
+                return Err((400, "No repository given".to_string()));
+            }
+            let agent = task.agent.trim();
+            if agent.is_empty() {
+                return Err((400, "No agent given".to_string()));
+            }
+            check_message(&task.text)?;
+            Ok(PhoneAction::StartTask {
+                repository_id: task.repository_id,
+                agent: agent.to_string(),
+                text: task.text,
+            })
+        }
+        ["v1", "workspaces", workspace_id, "pr"] if is_plain_id(workspace_id) => {
+            Ok(PhoneAction::CreatePr {
+                workspace_id: workspace_id.to_string(),
+            })
+        }
+        ["v1", "workspaces", workspace_id, "merge"] if is_plain_id(workspace_id) => {
+            let merge: MergeBody = read(body)?;
+            let head = merge.head.trim();
+            if head.is_empty() {
+                return Err((400, "No head commit given".to_string()));
+            }
+            Ok(PhoneAction::Merge {
+                workspace_id: workspace_id.to_string(),
+                head: head.to_string(),
             })
         }
         _ => Err((404, "Not found".to_string())),
@@ -506,7 +572,7 @@ mod tests {
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
                     .push(action);
-                Ok(PhoneActionOutcome { chat_id: None })
+                Ok(PhoneActionOutcome::default())
             }
         });
         let server = PhoneServer::start(
@@ -723,6 +789,68 @@ mod tests {
         assert!(response.contains("alpha-repo"), "answered {response}");
         assert!(response.contains("beta-repo"), "answered {response}");
         Ok(())
+    }
+
+    #[test]
+    fn refuses_a_task_from_another_origin() -> Result<(), String> {
+        let (server, recorded) = start("jay@example.com", Vec::new(), TeamShareHub::new())?;
+        let address = server.address();
+
+        let body = r#"{"repository_id":"repo-1","agent":"claude","text":"Fix the login page"}"#;
+        let request = format!(
+            "POST /v1/tasks HTTP/1.1\r\nHost: {address}\r\nOrigin: http://evil.example\r\n\
+             Content-Type: application/json\r\n{PHONE_REQUEST_HEADER}: 1\r\n\
+             Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        assert_eq!(raw_status(address, &request)?, 403);
+        assert!(recorded.lock().map_err(|err| err.to_string())?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn parses_new_actions() {
+        assert_eq!(
+            parse_action(
+                &["v1", "tasks"],
+                br#"{"repository_id":"repo-1","agent":"codex","text":"Fix the login page"}"#
+            ),
+            Ok(PhoneAction::StartTask {
+                repository_id: "repo-1".to_string(),
+                agent: "codex".to_string(),
+                text: "Fix the login page".to_string(),
+            })
+        );
+        assert_eq!(
+            parse_action(&["v1", "workspaces", "ws-1", "pr"], b"{}"),
+            Ok(PhoneAction::CreatePr {
+                workspace_id: "ws-1".to_string(),
+            })
+        );
+        assert_eq!(
+            parse_action(
+                &["v1", "workspaces", "ws-1", "merge"],
+                br#"{"head":"0123abc"}"#
+            ),
+            Ok(PhoneAction::Merge {
+                workspace_id: "ws-1".to_string(),
+                head: "0123abc".to_string(),
+            })
+        );
+        let status = |segments: &[&str], body: &[u8]| {
+            parse_action(segments, body).map_err(|(status, _reason)| status)
+        };
+        assert_eq!(
+            status(
+                &["v1", "tasks"],
+                br#"{"repository_id":"repo-1","agent":"codex","text":"  "}"#
+            ),
+            Err(400)
+        );
+        assert_eq!(
+            status(&["v1", "workspaces", "ws-1", "merge"], br#"{"head":""}"#),
+            Err(400)
+        );
     }
 
     #[test]

@@ -4798,7 +4798,7 @@ pub(crate) fn open_windows(cx: &App) -> Vec<Entity<Workspace>> {
         .collect()
 }
 
-fn open_window_handles(cx: &App) -> Vec<(Entity<Workspace>, AnyWindowHandle)> {
+pub(crate) fn open_window_handles(cx: &App) -> Vec<(Entity<Workspace>, AnyWindowHandle)> {
     cx.try_global::<OpenWindows>()
         .map(|windows| {
             windows
