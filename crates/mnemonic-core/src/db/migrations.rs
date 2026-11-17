@@ -758,6 +758,22 @@ pub fn run(connection: &Connection) -> Result<(), String> {
         "INTEGER NOT NULL DEFAULT 0",
     )?;
 
+    connection
+        .execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS agent_started_chats (
+                chat_id TEXT PRIMARY KEY,
+                started_by_chat_id TEXT NOT NULL,
+                workspace_id TEXT NOT NULL,
+                made_workspace INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE INDEX IF NOT EXISTS idx_agent_started_chats_started_by
+                ON agent_started_chats(started_by_chat_id);
+            "#,
+        )
+        .map_err(|err| format!("Failed to create agent_started_chats table: {err}"))?;
+
     // Drop deprecated agent_chat tables (child table first to respect FK).
     // Idempotent: IF EXISTS means this is safe on fresh installs too.
     connection

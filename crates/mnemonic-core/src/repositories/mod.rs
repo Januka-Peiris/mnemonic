@@ -1,5 +1,6 @@
 pub mod activity_repository;
 pub mod agent_memory_repository;
+pub mod agent_started_chat_repository;
 pub mod agent_run_repository;
 pub mod chat_session_repository;
 pub mod coordination_artifact_repository;

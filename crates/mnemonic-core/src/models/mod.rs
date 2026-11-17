@@ -42,7 +42,7 @@ pub use agent_context::{
 pub use agent_memory::{AgentMemory, SetAgentMemoryInput};
 pub use agent_profile::AgentProfile;
 pub use agent_run::WorkspaceRun;
-pub use chat_session::ChatSessionRecord;
+pub use chat_session::{AgentStartedChat, ChatSessionRecord};
 pub use checkpoint::{
     WorkspaceCheckpoint, WorkspaceCheckpointBranchResult, WorkspaceCheckpointDeleteResult,
     WorkspaceCheckpointDiff, WorkspaceCheckpointRestorePlan, WorkspaceCheckpointRestoreResult,
