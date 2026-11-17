@@ -862,11 +862,9 @@ mod tests {
         run(&connection).expect("run migrations");
         let action_columns = table_columns(&connection, "workspace_coordinator_actions");
         assert!(action_columns.iter().any(|name| name == "replay_kind"));
-        assert!(
-            action_columns
-                .iter()
-                .any(|name| name == "replayed_from_action_id")
-        );
+        assert!(action_columns
+            .iter()
+            .any(|name| name == "replayed_from_action_id"));
         let worker_columns = table_columns(&connection, "workspace_coordinator_workers");
         assert!(worker_columns.iter().any(|name| name == "notified_status"));
     }

@@ -535,16 +535,12 @@ mod tests {
 
         let nodes = list_nodes_in_dir(&root, &root, None, 1, &ignore).expect("list files");
 
-        assert!(
-            nodes
-                .iter()
-                .any(|node| node.path == "src" && node.kind == "dir")
-        );
-        assert!(
-            !nodes
-                .iter()
-                .any(|node| node.path.starts_with("node_modules"))
-        );
+        assert!(nodes
+            .iter()
+            .any(|node| node.path == "src" && node.kind == "dir"));
+        assert!(!nodes
+            .iter()
+            .any(|node| node.path.starts_with("node_modules")));
         assert!(!nodes.iter().any(|node| node.path.starts_with(".git")));
 
         let _ = fs::remove_dir_all(root);
@@ -565,11 +561,9 @@ mod tests {
         assert_eq!(src.kind, "dir");
         assert!(src.has_children);
         let src_children = src.children.as_ref().expect("src children");
-        assert!(
-            src_children
-                .iter()
-                .any(|node| node.path == "src/index.ts" && node.kind == "file")
-        );
+        assert!(src_children
+            .iter()
+            .any(|node| node.path == "src/index.ts" && node.kind == "file"));
 
         let _ = fs::remove_dir_all(root);
     }
@@ -596,16 +590,12 @@ mod tests {
         )
         .expect("list nested");
 
-        assert!(
-            nested
-                .iter()
-                .any(|node| node.path == "src/components/Tree.tsx")
-        );
-        assert!(
-            nested
-                .iter()
-                .any(|node| node.path == "src/components/Node.tsx")
-        );
+        assert!(nested
+            .iter()
+            .any(|node| node.path == "src/components/Tree.tsx"));
+        assert!(nested
+            .iter()
+            .any(|node| node.path == "src/components/Node.tsx"));
 
         let _ = fs::remove_dir_all(root);
     }

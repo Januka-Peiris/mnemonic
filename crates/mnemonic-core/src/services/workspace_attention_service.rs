@@ -1,4 +1,4 @@
-use rusqlite::{OptionalExtension, params};
+use rusqlite::{params, OptionalExtension};
 
 use crate::models::WorkspaceAttention;
 use crate::repositories::{terminal_repository, workspace_repository};

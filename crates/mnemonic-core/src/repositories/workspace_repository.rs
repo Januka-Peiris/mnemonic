@@ -1,4 +1,4 @@
-use rusqlite::{OptionalExtension, Row, params};
+use rusqlite::{params, OptionalExtension, Row};
 
 use crate::db::Database;
 use crate::models::{

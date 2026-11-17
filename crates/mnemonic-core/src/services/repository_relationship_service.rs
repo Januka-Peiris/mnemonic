@@ -665,11 +665,9 @@ mod tests {
         assert_eq!(updated.notes.as_deref(), Some("Runtime dependency"));
 
         repository_relationship_repository::delete(&db, "rel-1").expect("delete");
-        assert!(
-            repository_relationship_repository::list(&db)
-                .expect("list")
-                .is_empty()
-        );
+        assert!(repository_relationship_repository::list(&db)
+            .expect("list")
+            .is_empty());
     }
 
     #[test]
@@ -746,17 +744,13 @@ mod tests {
             .find(|suggestion| suggestion.repo_id == backend.id)
             .expect("backend suggestion");
         assert!(backend_suggestion.selected_by_default);
-        assert!(
-            backend_suggestion
-                .relationship_kinds
-                .contains(&"frontend_backend".to_string())
-        );
-        assert!(
-            backend_suggestion
-                .reasons
-                .iter()
-                .any(|reason| reason.contains("Task keywords match"))
-        );
+        assert!(backend_suggestion
+            .relationship_kinds
+            .contains(&"frontend_backend".to_string()));
+        assert!(backend_suggestion
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("Task keywords match")));
     }
 
     #[test]
@@ -777,11 +771,9 @@ mod tests {
             .find(|suggestion| suggestion.repo_id == docs.id)
             .expect("docs suggestion");
         assert!(docs_suggestion.selected_by_default);
-        assert!(
-            docs_suggestion
-                .reasons
-                .iter()
-                .any(|reason| reason.contains("explicitly mentions"))
-        );
+        assert!(docs_suggestion
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("explicitly mentions")));
     }
 }

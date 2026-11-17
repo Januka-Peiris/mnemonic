@@ -93,10 +93,7 @@ fn ensure_mnemonic_gitignored(repo_path: &Path) {
     let content = fs::read_to_string(&gitignore).unwrap_or_default();
     let already_ignored = content.lines().any(|line| {
         let trimmed = line.trim();
-        trimmed == ".mnemonic/"
-            || trimmed == ".mnemonic"
-            || trimmed == "/.mnemonic/"
-            || trimmed == "/.mnemonic"
+        trimmed == ".mnemonic/" || trimmed == ".mnemonic" || trimmed == "/.mnemonic/" || trimmed == "/.mnemonic"
     });
     if already_ignored {
         return;

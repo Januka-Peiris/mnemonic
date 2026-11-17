@@ -1,4 +1,4 @@
-use rusqlite::{OptionalExtension, params};
+use rusqlite::{params, OptionalExtension};
 use serde::Serialize;
 
 use crate::db::Database;
@@ -448,11 +448,9 @@ mod tests {
 
         mark_closed(&db, "term-1", "2").expect("close session");
 
-        assert!(
-            latest_for_workspace_role(&db, "ws-1", "agent")
-                .expect("latest")
-                .is_none()
-        );
+        assert!(latest_for_workspace_role(&db, "ws-1", "agent")
+            .expect("latest")
+            .is_none());
         let history = list_for_workspace(&db, "ws-1").expect("history");
         assert_eq!(history.len(), 1);
         assert_eq!(history[0].id, "term-1");

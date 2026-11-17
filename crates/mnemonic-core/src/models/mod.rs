@@ -49,9 +49,9 @@ pub use checkpoint::{
     WorkspaceCheckpointDiff, WorkspaceCheckpointRestorePlan, WorkspaceCheckpointRestoreResult,
 };
 pub use coordination_artifact::{
+    is_valid_coordination_artifact_kind, is_valid_coordination_artifact_status,
     CoordinationArtifact, CreateCoordinationArtifactInput, UpdateCoordinationArtifactInput,
-    UpdateCoordinationArtifactStatusInput, is_valid_coordination_artifact_kind,
-    is_valid_coordination_artifact_status,
+    UpdateCoordinationArtifactStatusInput,
 };
 pub use coordinator::{
     CoordinatorAction, CoordinatorActionLog, CoordinatorResultArtifact, CoordinatorResultPayload,
@@ -104,7 +104,5 @@ pub use workspace_health::{
 };
 pub use workspace_port::WorkspacePort;
 pub use workspace_readiness::WorkspaceReadiness;
-pub use workspace_script::{
-    MnemonicMcpServerConfig, MnemonicWorkspaceConfig, MnemonicWorkspaceHooks,
-};
+pub use workspace_script::{MnemonicMcpServerConfig, MnemonicWorkspaceConfig, MnemonicWorkspaceHooks};
 pub use workspace_template::WorkspaceTemplate;

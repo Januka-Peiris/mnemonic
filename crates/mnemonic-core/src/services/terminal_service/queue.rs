@@ -9,7 +9,7 @@ use crate::services::{agent_profile_service, checkpoint_service, hook_service, t
 use crate::state::{ActiveTerminal, AppState};
 
 use super::output::{append_log_line, unique_suffix};
-use super::prompts::{PromptPayload, terminal_prompt_payload_for_session};
+use super::prompts::{terminal_prompt_payload_for_session, PromptPayload};
 use super::runtime::{active_for_session, active_for_workspace, ensure_agent_session_for_prompt};
 
 /// How long PTY output must stay quiet before a freshly spawned TUI is

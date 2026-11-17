@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 
-use crate::models::AgentProfile;
 use crate::models::agent_profile::RawAgentProfile;
+use crate::models::AgentProfile;
 use crate::repositories::settings_repository;
 use crate::services::workspace_script_service;
 use crate::state::AppState;

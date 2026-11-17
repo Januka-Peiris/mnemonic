@@ -1134,18 +1134,14 @@ mod tests {
         let changed = vec!["lib.rs".to_string()];
 
         set_workspace_file_viewed(&state, "ws", "lib.rs", true).expect("mark viewed");
-        assert!(
-            list_workspace_viewed_files(&state, "ws", &changed)
-                .expect("viewed")
-                .contains("lib.rs")
-        );
+        assert!(list_workspace_viewed_files(&state, "ws", &changed)
+            .expect("viewed")
+            .contains("lib.rs"));
 
         std::fs::write(worktree.join("lib.rs"), "fn second() {}").expect("rewrite");
-        assert!(
-            list_workspace_viewed_files(&state, "ws", &changed)
-                .expect("viewed")
-                .is_empty()
-        );
+        assert!(list_workspace_viewed_files(&state, "ws", &changed)
+            .expect("viewed")
+            .is_empty());
 
         if let Err(error) = std::fs::remove_dir_all(&root) {
             log::warn!("failed to remove {}: {error}", root.display());

@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex};
 
-use portable_pty::{CommandBuilder, PtySize, native_pty_system};
+use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 
 use crate::models::{
     AgentPromptEntry, AttachWorkspaceTerminalInput, CommandApprovalEvent,
@@ -33,8 +33,8 @@ use activity::{
     record_terminal_start_activity,
 };
 use launch::{
-    SessionResume, TerminalCommandSpec, TerminalProfile, default_terminal_title,
-    normalize_terminal_kind, resolve_session_role, workspace_root_path,
+    default_terminal_title, normalize_terminal_kind, resolve_session_role, workspace_root_path,
+    SessionResume, TerminalCommandSpec, TerminalProfile,
 };
 use output::{
     append_log_line, append_output, enriched_path as enriched_path_impl,
@@ -46,9 +46,9 @@ use queue::{
     queue_workspace_agent_prompt as queue_workspace_agent_prompt_impl,
 };
 use runtime::{
-    TerminalReaderConfig, active_for_session, active_for_workspace, detach_active_terminal,
+    active_for_session, active_for_workspace, detach_active_terminal,
     reconcile_orphan_running_session, send_interrupt_to_session, spawn_terminal_monitor,
-    spawn_terminal_reader,
+    spawn_terminal_reader, TerminalReaderConfig,
 };
 
 fn agent_effective_model(

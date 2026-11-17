@@ -2,9 +2,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::db::Database;
 use crate::models::{
+    is_valid_coordination_artifact_kind, is_valid_coordination_artifact_status,
     CoordinationArtifact, CreateCoordinationArtifactInput, UpdateCoordinationArtifactInput,
-    UpdateCoordinationArtifactStatusInput, is_valid_coordination_artifact_kind,
-    is_valid_coordination_artifact_status,
+    UpdateCoordinationArtifactStatusInput,
 };
 use crate::repositories::{coordination_artifact_repository, workspace_repository};
 use crate::state::AppState;
