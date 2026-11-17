@@ -32,6 +32,7 @@ pub mod team_agent_tools;
 pub mod team_files_service;
 pub mod team_share_server;
 pub mod team_share_service;
+pub mod web_push_service;
 pub mod worktree_discovery_service;
 
 pub mod conflict_detection_service;

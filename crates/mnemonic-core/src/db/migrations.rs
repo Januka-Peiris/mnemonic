@@ -769,6 +769,19 @@ pub fn run(connection: &Connection) -> Result<(), String> {
         )
         .map_err(|err| format!("Failed to drop deprecated agent_chat tables: {err}"))?;
 
+    connection
+        .execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS phone_push_subscriptions (
+                endpoint TEXT PRIMARY KEY,
+                p256dh TEXT NOT NULL,
+                auth TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            "#,
+        )
+        .map_err(|err| format!("Failed to create phone_push_subscriptions table: {err}"))?;
+
     Ok(())
 }
 
