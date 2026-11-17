@@ -3,6 +3,7 @@ mod coordinator_panel;
 mod team;
 mod team_connection;
 mod team_copy;
+mod team_live_chat;
 mod team_settings;
 mod team_workspace_view;
 mod workspace_detail_panel;

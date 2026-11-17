@@ -1895,6 +1895,7 @@ impl WorkspacePanel {
         let merged_color = pr_color.filter(|_| pr_state.as_deref() == Some("merged"));
         let shared = crate::team::is_workspace_shared(&ws.id, cx);
         let step_in = crate::team::workspace_allows_step_in(&ws.id, cx);
+        let agents = crate::team::workspace_allows_agents(&ws.id, cx);
         let share_files = crate::team::workspace_shares_files(&ws.id, cx);
         let edit_files = crate::team::workspace_allows_file_edits(&ws.id, cx);
         let shared_indicator = crate::team::render_shared_indicator(&ws.id, cx);
@@ -2068,6 +2069,18 @@ impl WorkspacePanel {
                             None,
                             move |_, cx| {
                                 crate::team::set_workspace_step_in(&workspace_id, !step_in, cx);
+                            },
+                        )
+                    })
+                    .when(shared, |menu| {
+                        let workspace_id = workspace_id.clone();
+                        menu.toggleable_entry(
+                            "Teammates' agents can work here",
+                            agents,
+                            IconPosition::Start,
+                            None,
+                            move |_, cx| {
+                                crate::team::set_workspace_agents(&workspace_id, !agents, cx);
                             },
                         )
                     })

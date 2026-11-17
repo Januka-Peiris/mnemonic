@@ -1,36 +1,44 @@
 //! A teammate's shared workspace, shown in the main window like one of your
 //! own: a header with its name, branch and PR, then one read-only tab per
-//! chat, each a real chat view following the teammate's chat.
+//! chat, each a real chat view following the teammate's chat, plus your own
+//! chats run in their folder when they let teammates' agents work there.
 
 use std::any::Any;
 use std::cell::Cell;
 use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
 
+use acp_thread::{AcpThreadEvent, ThreadStatus};
 use agent_client_protocol::schema as acp;
-use agent_servers::AgentServer;
+use agent_servers::{AgentServer, set_session_extras};
 use agent_ui::{
     Agent, AgentConnectionStore, AgentThreadSource, ConversationView, ReadOnlyAction,
 };
 use editor::Editor;
 use gpui::{
-    Action as _, App, AppContext as _, Context, Entity, EventEmitter, FocusHandle, Focusable,
-    IntoElement, NoAction, Render, SharedString, Subscription, Task, WeakEntity, Window,
+    Action as _, App, AppContext as _, Context, Entity, EntityId, EventEmitter, FocusHandle,
+    Focusable, IntoElement, NoAction, Render, SharedString, Subscription, Task, WeakEntity, Window,
 };
 use language::Buffer;
 use mnemonic_core::services::team_share_service::{
     split_unified_diff, TeamChat, TeamClient, TeamClientError, TeamFileDiff, TeamWorkspace,
 };
-use project::Project;
+use project::{AgentId, Project};
 use ui::prelude::*;
 use util::ResultExt as _;
+use util::path_list::PathList;
 use workspace::item::{Item, ItemEvent};
 use workspace::{DraggedTab, Pane, Workspace, pane};
 
 use crate::team::{PeerStatus, render_agent_state, show_step_in_notice, team_share};
 use crate::team_connection::TeamAgentServer;
 use crate::team_copy::{existing_copy, open_teammate_copy};
+use crate::team_live_chat::{
+    LiveChatRecord, answer_edit_in_accept_edits, load_live_chats, prepare_live_session,
+    update_live_chats, upsert_live_chat,
+};
 use crate::workspace_view::WorkspaceHost;
 use zed_actions::mnemonic::AgentSessionKind;
 
@@ -100,6 +108,165 @@ impl Render for TeammateChatItem {
                 .child(
                     Label::new(format!(
                         "This chat isn't open on {}'s machine. It appears here once they open it.",
+                        self.peer_name
+                    ))
+                    .size(LabelSize::Small)
+                    .color(Color::Muted),
+                )
+                .into_any_element(),
+        }
+    }
+}
+
+/// One of your own chats in the teammate's workspace: your agent, working in
+/// their folder through their share server.
+pub(crate) struct LiveChatItem {
+    record: LiveChatRecord,
+    peer_name: SharedString,
+    /// None until the session setup is ready, which needs the teammate
+    /// online.
+    view: Option<Entity<ConversationView>>,
+    /// The view's session started while the share server's tools were out
+    /// of reach, so Claude gave up on them for the session and it is
+    /// reloaded once they are back.
+    started_without_tools: bool,
+    /// The view was dropped to reload its session, which is still closing.
+    reloading: bool,
+    observed_thread: Option<EntityId>,
+    focus_handle: FocusHandle,
+    _view_subscription: Option<Subscription>,
+    _thread_subscription: Option<Subscription>,
+}
+
+impl LiveChatItem {
+    fn drop_view_for_reload(&mut self, cx: &mut Context<Self>) {
+        self.view = None;
+        self.reloading = true;
+        self.started_without_tools = false;
+        self.observed_thread = None;
+        self._view_subscription = None;
+        self._thread_subscription = None;
+        cx.notify();
+    }
+
+    fn set_view(&mut self, view: Entity<ConversationView>, cx: &mut Context<Self>) {
+        self._view_subscription = Some(cx.observe(&view, |this, _, cx| {
+            this.handle_view_changed(cx);
+        }));
+        self.view = Some(view);
+        self.handle_view_changed(cx);
+        cx.notify();
+    }
+
+    /// Saves the agent's session id once it exists, so the chat resumes, and
+    /// starts watching its thread.
+    fn handle_view_changed(&mut self, cx: &mut Context<Self>) {
+        let Some(thread) = self
+            .view
+            .as_ref()
+            .and_then(|view| view.read(cx).root_thread(cx))
+        else {
+            return;
+        };
+        if self.observed_thread != Some(thread.entity_id()) {
+            self.observed_thread = Some(thread.entity_id());
+            self._thread_subscription =
+                Some(
+                    cx.subscribe(&thread, |this, thread, event, cx| match event {
+                        AcpThreadEvent::ToolAuthorizationRequested(tool_call_id) => {
+                            answer_edit_in_accept_edits(&thread, tool_call_id, cx);
+                        }
+                        AcpThreadEvent::TitleUpdated => {
+                            let Some(title) = thread.read(cx).title() else {
+                                return;
+                            };
+                            if title.as_ref() != this.record.title {
+                                this.record.title = title.to_string();
+                                save_live_chat(this.record.clone(), cx);
+                                cx.emit(ItemEvent::UpdateTab);
+                                cx.notify();
+                            }
+                        }
+                        _ => {}
+                    }),
+                );
+        }
+        let session_id = thread.read(cx).session_id().0.to_string();
+        if self.record.acp_session_id.as_deref() != Some(session_id.as_str()) {
+            self.record.acp_session_id = Some(session_id);
+            save_live_chat(self.record.clone(), cx);
+        }
+    }
+}
+
+fn save_live_chat(record: LiveChatRecord, cx: &mut App) {
+    let Some(app) = mnemonic_bridge::mnemonic_state_cloned() else {
+        return;
+    };
+    cx.background_spawn(async move {
+        if let Err(err) =
+            update_live_chats(&app.data_dir, |records| upsert_live_chat(records, record))
+        {
+            log::error!("Couldn't save a chat in a teammate's workspace: {err}");
+        }
+    })
+    .detach();
+}
+
+fn delete_live_chat(record_id: String, cx: &mut App) {
+    let Some(app) = mnemonic_bridge::mnemonic_state_cloned() else {
+        return;
+    };
+    cx.background_spawn(async move {
+        if let Err(err) = update_live_chats(&app.data_dir, |records| {
+            records.retain(|record| record.id != record_id)
+        }) {
+            log::error!("Couldn't delete a chat in a teammate's workspace: {err}");
+        }
+    })
+    .detach();
+}
+
+impl EventEmitter<ItemEvent> for LiveChatItem {}
+
+impl Focusable for LiveChatItem {
+    fn focus_handle(&self, cx: &App) -> FocusHandle {
+        match &self.view {
+            Some(view) => view.focus_handle(cx),
+            None => self.focus_handle.clone(),
+        }
+    }
+}
+
+impl Item for LiveChatItem {
+    type Event = ItemEvent;
+
+    fn tab_content_text(&self, _detail: usize, _cx: &App) -> SharedString {
+        SharedString::from(self.record.title.clone())
+    }
+
+    fn tab_icon(&self, _window: &Window, _cx: &App) -> Option<Icon> {
+        Some(Icon::new(IconName::Chat))
+    }
+
+    fn to_item_events(event: &Self::Event, f: &mut dyn FnMut(ItemEvent)) {
+        f(*event)
+    }
+}
+
+impl Render for LiveChatItem {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        match &self.view {
+            Some(view) => div().size_full().child(view.clone()).into_any_element(),
+            None => v_flex()
+                .size_full()
+                .items_center()
+                .justify_center()
+                .p_4()
+                .track_focus(&self.focus_handle)
+                .child(
+                    Label::new(format!(
+                        "This chat opens once {} is online and lets teammates' agents work here.",
                         self.peer_name
                     ))
                     .size(LabelSize::Small)
@@ -198,6 +365,19 @@ pub(crate) struct TeammateWorkspaceView {
     last_known: Option<TeamWorkspace>,
     /// Set while "Work on this in your copy" is opening the copy.
     copy_in_flight: Rc<Cell<bool>>,
+    /// Your own chats in this workspace.
+    live_chats: Vec<Entity<LiveChatItem>>,
+    /// Kept apart from the teammate chats' store, which is dropped when the
+    /// teammate's address changes.
+    live_connection_store: Option<Entity<AgentConnectionStore>>,
+    /// The live chats' working directory, set once their session extras
+    /// are in place.
+    live_dir: Option<PathBuf>,
+    /// The session extras were built while the sharer was unreachable, so
+    /// they lack the sharer's instruction files and are built again once
+    /// the sharer is back.
+    live_setup_offline: bool,
+    live_setup_task: Option<Task<()>>,
     files: Vec<TeamFileDiff>,
     diff_state: TeammateDiffState,
     /// Replacing it cancels a load still in flight.
@@ -235,6 +415,11 @@ impl TeammateWorkspaceView {
             available: false,
             last_known: None,
             copy_in_flight: Rc::new(Cell::new(false)),
+            live_chats: Vec::new(),
+            live_connection_store: None,
+            live_dir: None,
+            live_setup_offline: false,
+            live_setup_task: None,
             files: Vec::new(),
             diff_state: TeammateDiffState::Loading,
             diff_task: None,
@@ -242,6 +427,7 @@ impl TeammateWorkspaceView {
             _subscriptions: subscriptions,
         };
         view.sync_chats(window, cx);
+        view.load_live_chats(window, cx);
         if view.diff_task.is_none() {
             view.reload_diff(window, cx);
         }
@@ -294,6 +480,28 @@ impl TeammateWorkspaceView {
             pane.set_render_tab_bar_buttons(cx, |_, _, _| (None, None));
             pane
         })
+    }
+
+    pub(crate) fn has_live_chats(&self) -> bool {
+        !self.live_chats.is_empty()
+    }
+
+    /// The teammate was removed, or is online and no longer shares this
+    /// workspace. An offline teammate's workspace isn't gone.
+    pub(crate) fn is_gone(&self, cx: &App) -> bool {
+        let Some(team) = team_share(cx) else {
+            return true;
+        };
+        match team.read(cx).peer(&self.host) {
+            None => true,
+            Some(peer) => {
+                matches!(peer.status, PeerStatus::Online)
+                    && !peer
+                        .workspaces
+                        .iter()
+                        .any(|workspace| workspace.id == self.workspace_id)
+            }
+        }
     }
 
     pub(crate) fn files(&self) -> &[TeamFileDiff] {
@@ -478,6 +686,7 @@ impl TeammateWorkspaceView {
         if address_changed {
             if self.client_url.is_some() {
                 self.restart_chat_views(cx);
+                self.live_dir = None;
             }
             self.client_url = client_url;
         }
@@ -571,7 +780,7 @@ impl TeammateWorkspaceView {
                     .chats
                     .iter()
                     .any(|chat| chat.id == chat_id && chat.open);
-            let (notice, action) = self.read_only_presentation(&peer_name, &live);
+            let (notice, action) = self.read_only_presentation(&peer_name, &live, cx);
             view.update(cx, |view, cx| {
                 view.set_read_only(notice, cx);
                 view.set_read_only_action(action, cx);
@@ -592,6 +801,7 @@ impl TeammateWorkspaceView {
             cx,
         );
         self.last_known = Some(live);
+        self.start_live_chats(window, cx);
         cx.notify();
     }
 
@@ -599,7 +809,22 @@ impl TeammateWorkspaceView {
         &self,
         peer_name: &SharedString,
         live: &TeamWorkspace,
+        cx: &Context<Self>,
     ) -> (SharedString, Option<ReadOnlyAction>) {
+        if live.agents {
+            let this = cx.weak_entity();
+            let on_click = Rc::new(move |window: &mut Window, cx: &mut App| {
+                this.update(cx, |this, cx| this.new_live_chat(window, cx))
+                    .log_err();
+            });
+            return (
+                format!("{peer_name}'s agent. Read-only.").into(),
+                Some((
+                    format!("New chat in {peer_name}'s workspace").into(),
+                    on_click,
+                )),
+            );
+        }
         if !live.share_files {
             let notice = format!(
                 "{peer_name}'s agent. Read-only. {peer_name} hasn't shared this workspace's files."
@@ -624,6 +849,287 @@ impl TeammateWorkspaceView {
             format!("{peer_name}'s agent. Read-only.").into(),
             Some(("Work on this in your copy".into(), on_click)),
         )
+    }
+
+    fn load_live_chats(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(app) = mnemonic_bridge::mnemonic_state_cloned() else {
+            return;
+        };
+        let host = self.host.clone();
+        let workspace_id = self.workspace_id.clone();
+        cx.spawn_in(window, async move |this, cx| {
+            let records = cx
+                .background_spawn(async move {
+                    load_live_chats(&app.data_dir)
+                        .into_iter()
+                        .filter(|record| record.host == host && record.workspace_id == workspace_id)
+                        .collect::<Vec<_>>()
+                })
+                .await;
+            this.update_in(cx, |this, window, cx| {
+                for record in records {
+                    let shown = this
+                        .live_chats
+                        .iter()
+                        .any(|item| item.read(cx).record.id == record.id);
+                    if !shown {
+                        this.add_live_chat_item(record, false, window, cx);
+                    }
+                }
+                this.start_live_chats(window, cx);
+            })
+            .log_err();
+        })
+        .detach();
+    }
+
+    fn add_live_chat_item(
+        &mut self,
+        record: LiveChatRecord,
+        activate: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Entity<LiveChatItem> {
+        let peer_name = SharedString::from(self.peer_name(cx));
+        let item = cx.new(|cx| LiveChatItem {
+            record,
+            peer_name,
+            view: None,
+            started_without_tools: false,
+            reloading: false,
+            observed_thread: None,
+            focus_handle: cx.focus_handle(),
+            _view_subscription: None,
+            _thread_subscription: None,
+        });
+        self.pane.update(cx, |pane, cx| {
+            pane.add_item(Box::new(item.clone()), activate, activate, None, window, cx);
+        });
+        self.live_chats.push(item.clone());
+        cx.notify();
+        item
+    }
+
+    fn new_live_chat(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let peer_name = self.peer_name(cx);
+        let agents_allowed = self
+            .last_known
+            .as_ref()
+            .is_some_and(|shared| shared.agents && shared.root_path.is_some());
+        if !self.available || !agents_allowed {
+            show_notice(&self.workspace, format!("Can't reach {peer_name}"), cx);
+            return;
+        }
+        let record = LiveChatRecord {
+            id: uuid::Uuid::new_v4().to_string(),
+            host: self.host.clone(),
+            workspace_id: self.workspace_id.clone(),
+            title: "New chat".to_string(),
+            acp_session_id: None,
+        };
+        save_live_chat(record.clone(), cx);
+        self.add_live_chat_item(record, true, window, cx);
+        self.start_live_chats(window, cx);
+    }
+
+    /// Whether a session starting now would reach the share server's tools.
+    fn live_tools_reachable(&self) -> bool {
+        self.available
+            && self
+                .last_known
+                .as_ref()
+                .is_some_and(|shared| shared.agents && shared.root_path.is_some())
+    }
+
+    /// Puts the session extras in place, again once the sharer is back if
+    /// they were built while the sharer was away, then builds a view for
+    /// every live chat waiting for one and reloads the sessions that started
+    /// without the tools.
+    fn start_live_chats(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let waiting: Vec<Entity<LiveChatItem>> = self
+            .live_chats
+            .iter()
+            .filter(|item| {
+                let item = item.read(cx);
+                item.view.is_none() && !item.reloading
+            })
+            .cloned()
+            .collect();
+        let needs_setup = (self.live_dir.is_none() && !waiting.is_empty())
+            || (self.live_setup_offline && self.live_tools_reachable());
+        if needs_setup {
+            self.set_up_live_session(window, cx);
+        }
+        let Some(dir) = self.live_dir.clone() else {
+            return;
+        };
+        let started_without_tools = self.live_setup_offline || !self.live_tools_reachable();
+        for item in waiting {
+            let record = item.read(cx).record.clone();
+            let view = self.build_live_chat_view(&record, &dir, window, cx);
+            item.update(cx, |item, cx| {
+                item.started_without_tools = started_without_tools;
+                item.set_view(view, cx);
+            });
+        }
+        if !started_without_tools {
+            self.reload_live_chats_started_without_tools(window, cx);
+        }
+    }
+
+    fn set_up_live_session(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.live_setup_task.is_some() {
+            return;
+        }
+        let Some(shared) = self
+            .last_known
+            .clone()
+            .filter(|shared| shared.agents && shared.root_path.is_some())
+        else {
+            return;
+        };
+        let client = team_share(cx).and_then(|team| {
+            team.read(cx)
+                .peer(&self.host)
+                .and_then(|peer| peer.client.clone())
+        });
+        let Some(client) = client else {
+            return;
+        };
+        let Some(app) = mnemonic_bridge::mnemonic_state_cloned() else {
+            return;
+        };
+        let host = self.host.clone();
+        let sharer_name = self.peer_name(cx);
+        // While the sharer is offline the chats still start, so their
+        // transcripts load; tool calls fail until the sharer is back.
+        let sharer_reachable = self.available;
+        self.live_setup_task = Some(cx.spawn_in(window, async move |this, cx| {
+            let data_dir = app.data_dir.clone();
+            let prepared = cx
+                .background_spawn(async move {
+                    prepare_live_session(
+                        &data_dir,
+                        &host,
+                        &client,
+                        &shared,
+                        &sharer_name,
+                        sharer_reachable,
+                    )
+                })
+                .await;
+            this.update_in(cx, |this, window, cx| {
+                this.live_setup_task = None;
+                match prepared {
+                    Ok(Some((dir, extras))) => {
+                        set_session_extras(dir.clone(), extras, cx);
+                        this.live_dir = Some(dir);
+                        this.live_setup_offline = !sharer_reachable;
+                        this.start_live_chats(window, cx);
+                    }
+                    Ok(None) => {}
+                    Err(err) => show_notice(&this.workspace, err, cx),
+                }
+            })
+            .log_err();
+        }));
+    }
+
+    /// Claude gives up on an MCP server it can't reach when a session
+    /// starts, so those sessions are closed and loaded again. A chat in the
+    /// middle of a turn is left for a later sync.
+    fn reload_live_chats_started_without_tools(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        for item in self.live_chats.clone() {
+            let Some(view) = item
+                .read(cx)
+                .view
+                .clone()
+                .filter(|_| item.read(cx).started_without_tools)
+            else {
+                continue;
+            };
+            let busy = view.read(cx).is_loading()
+                || view
+                    .read(cx)
+                    .root_thread(cx)
+                    .is_some_and(|thread| thread.read(cx).status() == ThreadStatus::Generating);
+            if busy {
+                continue;
+            }
+            let close_task = view.update(cx, |view, cx| {
+                view.as_connected()
+                    .map(|connected| connected.close_all_sessions(cx))
+            });
+            item.update(cx, |item, cx| item.drop_view_for_reload(cx));
+            cx.spawn_in(window, async move |this, cx| {
+                if let Some(close_task) = close_task {
+                    close_task.await;
+                }
+                this.update_in(cx, |this, window, cx| {
+                    item.update(cx, |item, _| item.reloading = false);
+                    if this.live_chats.contains(&item) {
+                        this.start_live_chats(window, cx);
+                    }
+                })
+                .log_err();
+            })
+            .detach();
+        }
+    }
+
+    fn build_live_chat_view(
+        &mut self,
+        record: &LiveChatRecord,
+        dir: &Path,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Entity<ConversationView> {
+        let connection_store = match &self.live_connection_store {
+            Some(store) => store.clone(),
+            None => {
+                let project = self.project.clone();
+                let store = cx.new(|cx| AgentConnectionStore::new(project, cx));
+                self.live_connection_store = Some(store.clone());
+                store
+            }
+        };
+        let agent = Agent::Custom {
+            id: AgentId(SharedString::from("claude-acp")),
+        };
+        let fs = self.project.read(cx).fs().clone();
+        let server = agent.server(fs, agent::ThreadStore::global(cx));
+        let resume_session_id = record.acp_session_id.clone().map(acp::SessionId::new);
+        // The session extras are looked up by this exact path.
+        let work_dirs = Some(PathList::new(&[dir]));
+        let title = SharedString::from(record.title.clone());
+        let workspace = self.workspace.clone();
+        let project = self.project.clone();
+        cx.new(|cx| {
+            let mut view = ConversationView::new(
+                server,
+                connection_store,
+                agent,
+                resume_session_id,
+                None,
+                work_dirs,
+                Some(title),
+                None,
+                workspace,
+                project,
+                None,
+                AgentThreadSource::AgentPanel,
+                window,
+                cx,
+            );
+            view.suppress_notifications();
+            // Resumed from history it would run without the session extras.
+            view.exclude_from_thread_history();
+            view
+        })
     }
 
     /// Drops every chat view and the connection they share, so the open
@@ -708,6 +1214,34 @@ impl TeammateWorkspaceView {
         let item_id = item.item_id();
         self.diff_items.retain(|(_, diff)| diff.entity_id() != item_id);
         if let Some(index) = self
+            .live_chats
+            .iter()
+            .position(|chat| chat.entity_id() == item_id)
+        {
+            let chat = self.live_chats.remove(index);
+            let (record_id, view) = {
+                let chat = chat.read(cx);
+                (chat.record.id.clone(), chat.view.clone())
+            };
+            if let Some(view) = view {
+                // Cancelling the turn first makes Claude tell the share server
+                // to kill the commands it is running for this chat.
+                if let Some(thread) = view.read(cx).root_thread(cx) {
+                    thread.update(cx, |thread, cx| thread.cancel(cx)).detach();
+                }
+                let close_task = view.update(cx, |view, cx| {
+                    view.as_connected()
+                        .map(|connected| connected.close_all_sessions(cx))
+                });
+                if let Some(close_task) = close_task {
+                    close_task.detach();
+                }
+            }
+            delete_live_chat(record_id, cx);
+            cx.notify();
+            return;
+        }
+        if let Some(index) = self
             .chats
             .iter()
             .position(|chat| chat.entity_id() == item_id)
@@ -756,6 +1290,27 @@ impl TeammateWorkspaceView {
 
     fn render_header(&self, peer_name: &str, cx: &mut Context<Self>) -> impl IntoElement {
         let shared = self.last_known.as_ref();
+        let agents = shared.is_some_and(|shared| shared.agents);
+        // The read-only bar's one action becomes "New chat" when agents may
+        // work here, so the copy is offered here instead.
+        let copy_action = shared
+            .filter(|shared| shared.agents && shared.share_files)
+            .map(|shared| {
+                let host = self.host.clone();
+                let shared = shared.clone();
+                let workspace = self.workspace.clone();
+                let in_flight = self.copy_in_flight.clone();
+                move |_: &gpui::ClickEvent, window: &mut Window, cx: &mut App| {
+                    work_in_copy(
+                        host.clone(),
+                        shared.clone(),
+                        workspace.clone(),
+                        in_flight.clone(),
+                        window,
+                        cx,
+                    );
+                }
+            });
         let colors = cx.theme().colors();
         h_flex()
             .w_full()
@@ -817,6 +1372,27 @@ impl TeammateWorkspaceView {
                                 .color(Color::Deleted),
                         )
                     })
+            })
+            .when(agents || copy_action.is_some(), |row| {
+                row.child(div().flex_1())
+            })
+            .when_some(copy_action, |row, on_click| {
+                row.child(
+                    Button::new("teammate-work-in-copy", "Work on this in your copy")
+                        .label_size(LabelSize::Small)
+                        .on_click(on_click),
+                )
+            })
+            .when(agents, |row| {
+                row.child(
+                    Button::new(
+                        "teammate-new-live-chat",
+                        format!("New chat in {peer_name}'s workspace"),
+                    )
+                    .label_size(LabelSize::Small)
+                    .style(ButtonStyle::Filled)
+                    .on_click(cx.listener(|this, _, window, cx| this.new_live_chat(window, cx))),
+                )
             })
     }
 }
@@ -895,6 +1471,7 @@ impl Render for TeammateWorkspaceView {
         let body = if self.chats.is_empty()
             && self.dismissed.is_empty()
             && self.diff_items.is_empty()
+            && self.live_chats.is_empty()
         {
             v_flex()
                 .size_full()

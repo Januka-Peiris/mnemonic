@@ -562,6 +562,13 @@ pub struct ConversationView {
     thread_store: Option<Entity<ThreadStore>>,
     pub(crate) thread_id: ThreadId,
     pub(crate) root_session_id: Option<acp::SessionId>,
+    /// The folders the view was given. A reset uses them ahead of the
+    /// thread's or the stored metadata's, so the session doesn't fall back
+    /// to the project's folders.
+    work_dirs: Option<PathList>,
+    /// Set by hosts whose chats can't be resumed from thread history, as
+    /// they need setup only the host provides.
+    excluded_from_thread_history: bool,
     server_state: ServerState,
     focus_handle: FocusHandle,
     notifications: Vec<WindowHandle<AgentNotification>>,
@@ -742,7 +749,17 @@ impl ConversationView {
         cx.notify();
     }
 
+    /// Keeps this view's chats out of thread history.
+    pub fn exclude_from_thread_history(&mut self) {
+        self.excluded_from_thread_history = true;
+    }
+
+    pub(crate) fn is_excluded_from_thread_history(&self) -> bool {
+        self.excluded_from_thread_history
+    }
+
     pub fn set_work_dirs(&mut self, work_dirs: PathList, cx: &mut Context<Self>) {
+        self.work_dirs = Some(work_dirs.clone());
         if let Some(connected) = self.as_connected() {
             connected.conversation.update(cx, |conversation, cx| {
                 conversation.set_work_dirs(work_dirs.clone(), cx);
@@ -891,6 +908,8 @@ impl ConversationView {
             thread_store,
             thread_id,
             root_session_id: resume_session_id.clone(),
+            work_dirs: work_dirs.clone(),
+            excluded_from_thread_history: false,
             server_state: Self::initial_state(
                 agent.clone(),
                 connection_store,
@@ -959,6 +978,7 @@ impl ConversationView {
                     .unwrap_or((None, None));
                 (session_id, work_dirs, title)
             });
+        let work_dirs = self.work_dirs.clone().or(work_dirs);
 
         self.loading_status = None;
 
@@ -4272,6 +4292,150 @@ pub(crate) mod tests {
                 thread_session, resume_session_id,
                 "the live AcpThread should hold the resumed session id"
             );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_reset_keeps_the_given_work_dirs_over_stored_metadata(cx: &mut TestAppContext) {
+        use crate::thread_metadata_store::{ThreadId, ThreadMetadata};
+        use chrono::Utc;
+        use project::{AgentId as ProjectAgentId, WorktreePaths};
+
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree("/project", json!({})).await;
+        let project = Project::test(fs, [Path::new("/project")], cx).await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+
+        let thread_store = cx.update(|_window, cx| cx.new(|cx| ThreadStore::new(cx)));
+        let connection_store =
+            cx.update(|_window, cx| cx.new(|cx| AgentConnectionStore::new(project.clone(), cx)));
+
+        // An earlier run recorded the session under the project's folders.
+        let resume_session_id = acp::SessionId::new("live-session");
+        cx.update(|_window, cx| {
+            ThreadMetadataStore::global(cx).update(cx, |store, cx| {
+                store.save(
+                    ThreadMetadata {
+                        thread_id: ThreadId::new(),
+                        session_id: Some(resume_session_id.clone()),
+                        agent_id: ProjectAgentId::new("Flaky"),
+                        title: Some("Live chat".into()),
+                        title_override: None,
+                        updated_at: Utc::now(),
+                        created_at: Some(Utc::now()),
+                        interacted_at: None,
+                        worktree_paths: WorktreePaths::from_folder_paths(&PathList::new(&[
+                            Path::new("/project"),
+                        ])),
+                        remote_connection: None,
+                        archived: false,
+                    },
+                    cx,
+                );
+            });
+        });
+
+        let connection = StubAgentConnection::new().with_supports_load_session(true);
+        let (server, fail) = FlakyAgentServer::new(connection);
+        let work_dirs = PathList::new(&[Path::new("/scratch")]);
+
+        let conversation_view = cx.update(|window, cx| {
+            cx.new(|cx| {
+                ConversationView::new(
+                    Rc::new(server),
+                    connection_store,
+                    Agent::Custom { id: "Flaky".into() },
+                    Some(resume_session_id.clone()),
+                    None,
+                    Some(work_dirs.clone()),
+                    None,
+                    None,
+                    workspace.downgrade(),
+                    project.clone(),
+                    Some(thread_store),
+                    AgentThreadSource::AgentPanel,
+                    window,
+                    cx,
+                )
+            })
+        });
+        cx.run_until_parked();
+
+        fail.store(false, std::sync::atomic::Ordering::SeqCst);
+        project.update(cx, |project, cx| {
+            project
+                .agent_server_store()
+                .update(cx, |_store, cx| cx.emit(project::AgentServersUpdated));
+        });
+        cx.run_until_parked();
+
+        conversation_view.read_with(cx, |view, cx| {
+            let thread_view = view
+                .active_thread()
+                .expect("should have an active thread view after the retry");
+            let thread = thread_view.read(cx).thread.read(cx);
+            assert_eq!(thread.session_id(), &resume_session_id);
+            assert_eq!(
+                thread.work_dirs(),
+                Some(&work_dirs),
+                "the retried session must keep the folders the view was given"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_a_view_excluded_from_thread_history_is_not_recorded(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+
+        let thread_store = cx.update(|_window, cx| cx.new(|cx| ThreadStore::new(cx)));
+        let connection_store =
+            cx.update(|_window, cx| cx.new(|cx| AgentConnectionStore::new(project.clone(), cx)));
+        let session_id = acp::SessionId::new("excluded-session");
+        let connection = StubAgentConnection::new().with_supports_load_session(true);
+
+        let conversation_view = cx.update(|window, cx| {
+            cx.new(|cx| {
+                let mut view = ConversationView::new(
+                    Rc::new(StubAgentServer::new(connection)),
+                    connection_store,
+                    Agent::Custom { id: "Test".into() },
+                    Some(session_id.clone()),
+                    None,
+                    Some(PathList::new(&[Path::new("/scratch")])),
+                    None,
+                    None,
+                    workspace.downgrade(),
+                    project,
+                    Some(thread_store),
+                    AgentThreadSource::AgentPanel,
+                    window,
+                    cx,
+                );
+                view.exclude_from_thread_history();
+                view
+            })
+        });
+        cx.run_until_parked();
+
+        conversation_view.read_with(cx, |view, cx| {
+            assert!(
+                view.root_thread(cx).is_some(),
+                "the session should be loaded"
+            );
+            let store = ThreadMetadataStore::global(cx);
+            let store = store.read(cx);
+            assert!(store.entry(view.thread_id).is_none());
+            assert!(store.entry_by_session(&session_id).is_none());
         });
     }
 

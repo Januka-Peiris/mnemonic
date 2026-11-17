@@ -1,6 +1,9 @@
-//! The HTTP side of team sharing. Reads are GETs. The only writes are two
-//! POSTs on a chat (stop, permission), each handed to the app's
-//! action handler and only for chats the sharer has opened to step-in.
+//! The HTTP side of team sharing. Reads are GETs. Writes are POSTs: stop and
+//! permission on a chat, each handed to the app's action handler and only for
+//! chats the sharer has opened to step-in; a batch of file changes, only for
+//! workspaces that allow editing; and MCP messages from a teammate's agent,
+//! which can write files and run commands in the workspace folder, only for
+//! workspaces whose agents switch is on.
 
 use std::io::Read as _;
 use std::path::PathBuf;
@@ -12,10 +15,13 @@ use std::time::Duration;
 
 use tiny_http::{Header, Method, Request, Response, Server};
 
+use crate::services::team_agent_tools::{
+    AgentToolContext, GitAuthor, McpReply, RunningCommands, handle_mcp_message,
+};
 use crate::services::team_files_service::{SkipList, TeamFileKind, safe_relative_path};
 use crate::services::team_share_service::{
     ActionHandler, BatchHandler, CallerIdentity, MAX_CHAT_WAIT, TEAM_ACP_CRATE_VERSION, TEAM_PROTOCOL_VERSION,
-    TEAM_REQUEST_HEADER, TeamAction, TeamActionError, TeamActionKind, TeamBatchRequest, TeamCaller, TeamHello,
+    TEAM_GIT_AUTHOR_HEADER, TEAM_REQUEST_HEADER, TeamAction, TeamActionError, TeamActionKind, TeamBatchRequest, TeamCaller, TeamHello,
     TeamShareHub, TeamWorkspaceList, is_plain_id, percent_decode,
 };
 
@@ -32,6 +38,12 @@ pub type BundleSource = Arc<dyn Fn(&str, &[String]) -> Result<Vec<u8>, String> +
 /// The files a workspace never serves or accepts.
 pub type SkipListSource = Arc<dyn Fn(&str) -> SkipList + Send + Sync>;
 
+/// A workspace's root, or None unless its agents switch is on.
+pub type AgentRootSource = Arc<dyn Fn(&str) -> Option<PathBuf> + Send + Sync>;
+
+/// Whether a teammate's agent may write the absolute path in the workspace.
+pub type AgentWriteCheck = Arc<dyn Fn(&str, &std::path::Path) -> Result<(), String> + Send + Sync>;
+
 pub struct TeamServerConfig {
     pub bind: IpAddr,
     pub port: u16,
@@ -42,6 +54,8 @@ pub struct TeamServerConfig {
     pub bundle_source: BundleSource,
     pub skip_list: SkipListSource,
     pub batch_handler: BatchHandler,
+    pub agent_roots: AgentRootSource,
+    pub agent_write_check: AgentWriteCheck,
 }
 
 /// Long-polls hold a thread each, so this caps what a misbehaving caller
@@ -50,6 +64,14 @@ const MAX_ACTIVE_REQUESTS: usize = 64;
 /// Diffs past this are cut, so a vendored directory can't stall a viewer.
 const MAX_DIFF_BYTES: usize = 2 * 1024 * 1024;
 const MAX_ACTION_BODY_BYTES: usize = 16 * 1024;
+/// Write carries whole files.
+const MAX_AGENT_BODY_BYTES: usize = MAX_ACTION_BODY_BYTES * 64;
+const MCP_SESSION_HEADER: &str = "Mcp-Session-Id";
+/// Claude's MCP client is Node's fetch, which gives up on a response whose
+/// headers take over 300 seconds and on a body that goes quiet as long, so
+/// a tool call answers as an event stream that starts at once and sends a
+/// comment this often until the tool finishes.
+const MCP_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(15);
 const MAX_BATCH_BODY_BYTES: usize = 512 * 1024 * 1024;
 pub const MAX_BUNDLE_HAVE: usize = 64;
 
@@ -62,16 +84,21 @@ struct Shared {
     bundle_source: BundleSource,
     skip_list: SkipListSource,
     batch_handler: BatchHandler,
+    agent_roots: AgentRootSource,
+    agent_write_check: AgentWriteCheck,
+    running_commands: RunningCommands,
     hello: String,
     allowed_logins: Vec<String>,
     active_requests: AtomicUsize,
 }
 
-/// A running share server. Dropping it stops the server.
+/// A running share server. Dropping it stops the server and kills the
+/// commands teammates' agents are running.
 pub struct TeamShareServer {
     server: Arc<Server>,
     address: SocketAddr,
     accept_thread: Option<JoinHandle<()>>,
+    running_commands: RunningCommands,
 }
 
 impl TeamShareServer {
@@ -94,6 +121,7 @@ impl TeamShareServer {
             acp_crate: TEAM_ACP_CRATE_VERSION.to_string(),
         })
         .map_err(|err| err.to_string())?;
+        let running_commands = RunningCommands::default();
         let shared = Arc::new(Shared {
             hub,
             identity,
@@ -103,6 +131,9 @@ impl TeamShareServer {
             bundle_source: config.bundle_source,
             skip_list: config.skip_list,
             batch_handler: config.batch_handler,
+            agent_roots: config.agent_roots,
+            agent_write_check: config.agent_write_check,
+            running_commands: running_commands.clone(),
             hello,
             allowed_logins: config
                 .allowed_logins
@@ -125,16 +156,23 @@ impl TeamShareServer {
             server,
             address,
             accept_thread: Some(accept_thread),
+            running_commands,
         })
     }
 
     pub fn address(&self) -> SocketAddr {
         self.address
     }
+
+    /// Kills the commands teammates' agents are running in the workspace.
+    pub fn kill_workspace_commands(&self, workspace_id: &str) {
+        self.running_commands.kill_workspace(workspace_id);
+    }
 }
 
 impl Drop for TeamShareServer {
     fn drop(&mut self) {
+        self.running_commands.kill_all();
         self.server.unblock();
         if let Some(thread) = self.accept_thread.take() {
             if thread.join().is_err() {
@@ -225,6 +263,23 @@ fn handle(mut request: Request, shared: &Shared) {
             ["v1", "workspaces", workspace_id, "changes"] if is_plain_id(workspace_id) => {
                 handle_changes(&mut request, shared, &caller, workspace_id)
             }
+            ["v1", "workspaces", workspace_id, "agent"] if is_plain_id(workspace_id) => {
+                match handle_agent(&mut request, shared, &caller, workspace_id) {
+                    AgentReply::Response(response) => response,
+                    AgentReply::EventStream(reply) => {
+                        let mut writer = request.into_writer();
+                        if let Err(err) =
+                            write_event_stream(&mut writer, &reply, MCP_KEEP_ALIVE_INTERVAL)
+                        {
+                            log::debug!(
+                                target: "mnemonic_lib",
+                                "A teammate's agent stopped listening: {err}"
+                            );
+                        }
+                        return;
+                    }
+                }
+            }
             _ => text_response(404, "Not found"),
         };
         respond(request, response);
@@ -245,6 +300,9 @@ fn handle(mut request: Request, shared: &Shared) {
                 Err(err) => text_response(500, &err.to_string()),
             }
         }
+        // Claude's streamable HTTP client takes a 405 to mean there is no
+        // server-sent event stream and goes on with plain POSTs.
+        ["v1", "workspaces", _, "agent"] => text_response(405, "Use POST"),
         ["v1", "workspaces", workspace_id, "diff"] if is_plain_id(workspace_id) => {
             if shared.hub.has_workspace(workspace_id) {
                 match (shared.diff_source)(workspace_id) {
@@ -401,6 +459,178 @@ fn handle_action(
         kind,
     });
     outcome_response(outcome)
+}
+
+enum AgentReply {
+    Response(Response<std::io::Cursor<Vec<u8>>>),
+    /// The JSON-RPC reply arrives on the channel once the tool finishes.
+    EventStream(std::sync::mpsc::Receiver<String>),
+}
+
+fn handle_agent(
+    request: &mut Request,
+    shared: &Shared,
+    caller: &TeamCaller,
+    workspace_id: &str,
+) -> AgentReply {
+    let refuse = |status: u16, reason: &str| AgentReply::Response(text_response(status, reason));
+    let Some(workspace) = shared
+        .hub
+        .workspaces()
+        .into_iter()
+        .find(|workspace| workspace.id == workspace_id)
+    else {
+        return refuse(404, "No such workspace");
+    };
+    let root = workspace
+        .agents
+        .then(|| (shared.agent_roots)(workspace_id))
+        .flatten();
+    let Some(root) = root else {
+        return refuse(403, "Teammates' agents can't work in this workspace");
+    };
+    let header_value = |name: &'static str| {
+        request
+            .headers()
+            .iter()
+            .find(|header| header.field.equiv(name))
+            .map(|header| header.value.as_str().to_string())
+    };
+    let git_author = header_value(TEAM_GIT_AUTHOR_HEADER)
+        .as_deref()
+        .and_then(parse_git_author);
+    let session = header_value(MCP_SESSION_HEADER).unwrap_or_default();
+    let accepts_event_stream = header_value("Accept").is_some_and(|accept| {
+        accept.split(',').any(|media_type| {
+            media_type.split(';').next().is_some_and(|media_type| {
+                media_type.trim().eq_ignore_ascii_case("text/event-stream")
+            })
+        })
+    }) && *request.http_version() >= (1, 1);
+    if request
+        .body_length()
+        .is_some_and(|length| length > MAX_AGENT_BODY_BYTES)
+    {
+        return refuse(413, "The request is too long");
+    }
+    let mut body = Vec::new();
+    let read = request
+        .as_reader()
+        .take(MAX_AGENT_BODY_BYTES as u64 + 1)
+        .read_to_end(&mut body);
+    if let Err(err) = read {
+        return refuse(400, &format!("Couldn't read the request: {err}"));
+    }
+    if body.len() > MAX_AGENT_BODY_BYTES {
+        return refuse(413, "The request is too long");
+    }
+
+    let message = serde_json::from_slice::<serde_json::Value>(&body).ok();
+    let method = message
+        .as_ref()
+        .and_then(|message| message.get("method"))
+        .and_then(|method| method.as_str());
+    let is_initialize = method == Some("initialize");
+    let is_tool_call = method == Some("tools/call")
+        && message
+            .as_ref()
+            .is_some_and(|message| message.get("id").is_some());
+    let session = if is_initialize {
+        uuid::Uuid::new_v4().to_string()
+    } else {
+        session
+    };
+
+    let context = AgentToolContext {
+        workspace_id: workspace_id.to_string(),
+        root,
+        git_author,
+        can_write: Arc::new({
+            let write_check = shared.agent_write_check.clone();
+            let workspace_id = workspace_id.to_string();
+            move |path| write_check(&workspace_id, path)
+        }),
+    };
+    let caller_key = format!("{}:{session}", caller.login);
+
+    if is_tool_call && accepts_event_stream {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let running_commands = shared.running_commands.clone();
+        let spawned = std::thread::Builder::new()
+            .name("mnemonic-team-agent-tool".into())
+            .spawn(move || {
+                let reply = handle_mcp_message(&context, &running_commands, &caller_key, &body);
+                if let McpReply::Json(text) = reply {
+                    if sender.send(text).is_err() {
+                        log::debug!(target: "mnemonic_lib", "A tool finished after its caller left");
+                    }
+                }
+            });
+        return match spawned {
+            Ok(_) => AgentReply::EventStream(receiver),
+            Err(err) => refuse(503, &format!("Couldn't run the tool: {err}")),
+        };
+    }
+
+    let mut response =
+        match handle_mcp_message(&context, &shared.running_commands, &caller_key, &body) {
+            McpReply::Json(text) => json_response(200, text),
+            McpReply::Accepted => Response::from_string("").with_status_code(202),
+        };
+    if is_initialize {
+        if let Some(header) = header(MCP_SESSION_HEADER, &session) {
+            response.add_header(header);
+        }
+    }
+    AgentReply::Response(response)
+}
+
+/// Writes a chunked server-sent event response by hand, since tiny_http
+/// buffers a streamed body and would hold back the headers and the
+/// keep-alive comments.
+fn write_event_stream(
+    writer: &mut dyn std::io::Write,
+    reply: &std::sync::mpsc::Receiver<String>,
+    keep_alive: Duration,
+) -> std::io::Result<()> {
+    use std::sync::mpsc::RecvTimeoutError;
+
+    writer.write_all(
+        b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\n\
+          Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+    )?;
+    writer.flush()?;
+    loop {
+        match reply.recv_timeout(keep_alive) {
+            Ok(json) => {
+                write_chunk(
+                    writer,
+                    format!("event: message\ndata: {json}\n\n").as_bytes(),
+                )?;
+                break;
+            }
+            Err(RecvTimeoutError::Timeout) => write_chunk(writer, b": keep-alive\n\n")?,
+            Err(RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    writer.write_all(b"0\r\n\r\n")?;
+    writer.flush()
+}
+
+fn write_chunk(writer: &mut dyn std::io::Write, data: &[u8]) -> std::io::Result<()> {
+    write!(writer, "{:x}\r\n", data.len())?;
+    writer.write_all(data)?;
+    writer.write_all(b"\r\n")?;
+    writer.flush()
+}
+
+fn parse_git_author(value: &str) -> Option<GitAuthor> {
+    let (name, email) = value.trim().strip_suffix('>')?.split_once('<')?;
+    let (name, email) = (name.trim(), email.trim());
+    (!name.is_empty() && !email.is_empty()).then(|| GitAuthor {
+        name: name.to_string(),
+        email: email.to_string(),
+    })
 }
 
 fn outcome_response<T: serde::Serialize>(
@@ -639,6 +869,7 @@ fn respond<R: std::io::Read>(request: Request, response: Response<R>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::services::team_agent_tools::AGENT_MCP_SERVER_NAME;
     use agent_client_protocol::schema as acp;
     use crate::services::team_share_service::{
         TeamActionOutcome, TeamCaller, TeamClient, TeamClientError, TeamEntry, TeamWorkspace,
@@ -694,6 +925,8 @@ mod tests {
                 bundle_source: Arc::new(|_, _| Err("No bundles".to_string())),
                 skip_list: Arc::new(|_| SkipList::default()),
                 batch_handler: Arc::new(|_| Err(TeamActionError::Failed("Unused".to_string()))),
+                agent_roots: Arc::new(|_| None),
+                agent_write_check: Arc::new(|_, _| Ok(())),
             },
             hub,
             Arc::new(FixedLogin(login)),
@@ -770,6 +1003,8 @@ mod tests {
             remote_url: None,
             base_branch: None,
             skip_patterns: Vec::new(),
+            agents: false,
+            root_path: None,
         }
     }
 
@@ -794,12 +1029,389 @@ mod tests {
                 bundle_source: Arc::new(|_, _| Ok(b"bundle".to_vec())),
                 skip_list: Arc::new(|_| SkipList::default()),
                 batch_handler: Arc::new(|_| Err(TeamActionError::Failed("Unused".to_string()))),
+                agent_roots: Arc::new(|_| None),
+                agent_write_check: Arc::new(|_, _| Ok(())),
             },
             hub,
             Arc::new(FixedLogin(Some("bob@example.com"))),
             Arc::new(|_: &str| Ok(String::new())),
             Arc::new(|_| Ok(TeamActionOutcome {})),
         )
+    }
+
+    fn start_agents(
+        root: PathBuf,
+        agents: bool,
+        login: &'static str,
+        write_check: AgentWriteCheck,
+    ) -> Result<TeamShareServer, String> {
+        let hub = TeamShareHub::new();
+        hub.set_workspaces(vec![TeamWorkspace {
+            agents,
+            root_path: agents.then(|| root.to_string_lossy().into_owned()),
+            ..workspace("ws-1")
+        }]);
+        TeamShareServer::start(
+            TeamServerConfig {
+                bind: IpAddr::V4(Ipv4Addr::LOCALHOST),
+                port: 0,
+                display_name: "Alice".to_string(),
+                allowed_logins: vec!["bob@example.com".to_string()],
+                files: Arc::new(|_| None),
+                bundle_source: Arc::new(|_, _| Err("No bundles".to_string())),
+                skip_list: Arc::new(|_| SkipList::default()),
+                batch_handler: Arc::new(|_| Err(TeamActionError::Failed("Unused".to_string()))),
+                agent_roots: Arc::new(move |_| Some(root.clone())),
+                agent_write_check: write_check,
+            },
+            hub,
+            Arc::new(FixedLogin(Some(login))),
+            Arc::new(|_: &str| Ok(String::new())),
+            Arc::new(|_| Ok(TeamActionOutcome {})),
+        )
+    }
+
+    /// Posts `body` to the agent endpoint and returns the status and the
+    /// whole answer, headers included.
+    fn raw_agent_post(
+        address: SocketAddr,
+        extra_headers: &str,
+        body: &str,
+    ) -> Result<(u16, String), String> {
+        let request = format!(
+            "POST /v1/workspaces/ws-1/agent HTTP/1.1\r\nHost: {address}\r\n\
+             Content-Type: application/json\r\n{extra_headers}\
+             Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let mut stream = TcpStream::connect(address).map_err(|err| err.to_string())?;
+        stream
+            .set_read_timeout(Some(Duration::from_secs(20)))
+            .map_err(|err| err.to_string())?;
+        stream
+            .write_all(request.as_bytes())
+            .map_err(|err| err.to_string())?;
+        let mut answer = String::new();
+        stream
+            .read_to_string(&mut answer)
+            .map_err(|err| err.to_string())?;
+        let status = answer
+            .split_whitespace()
+            .nth(1)
+            .and_then(|code| code.parse().ok())
+            .ok_or_else(|| format!("No status in {answer:?}"))?;
+        Ok((status, answer))
+    }
+
+    const TEAM_HEADER: &str = "X-Mnemonic-Team: 5\r\n";
+
+    fn call_body(id: u32, name: &str, arguments: serde_json::Value) -> String {
+        serde_json::json!({"jsonrpc":"2.0","id":id,"method":"tools/call","params":{"name":name,"arguments":arguments}}).to_string()
+    }
+
+    #[test]
+    fn agent_endpoint_answers_mcp_when_agents_are_on() -> Result<(), String> {
+        let root = tempfile::tempdir().map_err(|err| err.to_string())?;
+        let server = start_agents(
+            root.path().to_path_buf(),
+            true,
+            "bob@example.com",
+            Arc::new(|_, _| Ok(())),
+        )?;
+        let body = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26"}}"#;
+
+        let (status, answer) = raw_agent_post(server.address(), TEAM_HEADER, body)?;
+
+        assert_eq!(status, 200);
+        assert!(answer.contains(AGENT_MCP_SERVER_NAME), "{answer}");
+        assert!(
+            answer.to_lowercase().contains("mcp-session-id:"),
+            "{answer}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_tool_call_accepting_an_event_stream_is_answered_as_one() -> Result<(), String> {
+        let root = tempfile::tempdir().map_err(|err| err.to_string())?;
+        let server = start_agents(
+            root.path().to_path_buf(),
+            true,
+            "bob@example.com",
+            Arc::new(|_, _| Ok(())),
+        )?;
+        let body = call_body(
+            1,
+            "Bash",
+            serde_json::json!({"command": "sleep 1; echo slept"}),
+        );
+        let headers = format!("{TEAM_HEADER}Accept: application/json, text/event-stream\r\n");
+
+        let (status, answer) = raw_agent_post(server.address(), &headers, &body)?;
+
+        assert_eq!(status, 200);
+        assert!(
+            answer
+                .to_lowercase()
+                .contains("content-type: text/event-stream"),
+            "{answer}"
+        );
+        let data = answer
+            .lines()
+            .find_map(|line| line.strip_prefix("data: "))
+            .ok_or_else(|| format!("No data line in {answer:?}"))?;
+        let reply: serde_json::Value = serde_json::from_str(data).map_err(|err| err.to_string())?;
+        assert_eq!(reply["id"], 1);
+        assert_eq!(reply["result"]["isError"], false);
+        let text = reply["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(text.contains("slept"), "{text}");
+        Ok(())
+    }
+
+    #[test]
+    fn an_event_stream_sends_keep_alives_until_the_reply() -> Result<(), String> {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let reply = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            sender.send(r#"{"jsonrpc":"2.0","id":1,"result":{}}"#.to_string())
+        });
+        let mut written = Vec::new();
+
+        write_event_stream(&mut written, &receiver, Duration::from_millis(50))
+            .map_err(|err| err.to_string())?;
+
+        reply
+            .join()
+            .map_err(|_| "The reply thread panicked".to_string())?
+            .map_err(|err| err.to_string())?;
+        let written = String::from_utf8(written).map_err(|err| err.to_string())?;
+        let (head, body) = written
+            .split_once("\r\n\r\n")
+            .ok_or_else(|| format!("No end of headers in {written:?}"))?;
+        assert!(head.contains("Transfer-Encoding: chunked"), "{head}");
+        assert!(body.contains(": keep-alive\n\n"), "{body}");
+        assert!(
+            body.contains("event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\n\n"),
+            "{body}"
+        );
+        assert!(body.ends_with("0\r\n\r\n"), "{body}");
+        Ok(())
+    }
+
+    #[test]
+    fn dropping_the_server_kills_running_commands() -> Result<(), String> {
+        let root = tempfile::tempdir().map_err(|err| err.to_string())?;
+        let pid_file = root.path().join("pid");
+        let server = start_agents(
+            root.path().to_path_buf(),
+            true,
+            "bob@example.com",
+            Arc::new(|_, _| Ok(())),
+        )?;
+        let body = call_body(
+            1,
+            "Bash",
+            serde_json::json!({"command": format!("echo $$ > {}; sleep 30", pid_file.display())}),
+        );
+        let address = server.address();
+        std::thread::spawn(move || raw_agent_post(address, TEAM_HEADER, &body));
+        let started = std::time::Instant::now();
+        let process_group = loop {
+            if let Some(pid) = std::fs::read_to_string(&pid_file)
+                .ok()
+                .and_then(|text| text.trim().parse::<i32>().ok())
+            {
+                break pid;
+            }
+            if started.elapsed() > Duration::from_secs(10) {
+                return Err("The command didn't start".to_string());
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        };
+
+        drop(server);
+
+        let dropped = std::time::Instant::now();
+        // SAFETY: signal 0 only checks whether the process group still exists.
+        while unsafe { libc::killpg(process_group, 0) } == 0 {
+            if dropped.elapsed() > Duration::from_secs(3) {
+                return Err("The command outlived the server".to_string());
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn agent_endpoint_refuses_when_agents_are_off() -> Result<(), String> {
+        let root = tempfile::tempdir().map_err(|err| err.to_string())?;
+        let server = start_agents(
+            root.path().to_path_buf(),
+            false,
+            "bob@example.com",
+            Arc::new(|_, _| Ok(())),
+        )?;
+
+        let (status, _) = raw_agent_post(
+            server.address(),
+            TEAM_HEADER,
+            &call_body(1, "Bash", serde_json::json!({"command": "echo hi"})),
+        )?;
+
+        assert_eq!(status, 403);
+        Ok(())
+    }
+
+    #[test]
+    fn agent_endpoint_refuses_browser_requests() -> Result<(), String> {
+        let root = tempfile::tempdir().map_err(|err| err.to_string())?;
+        let server = start_agents(
+            root.path().to_path_buf(),
+            true,
+            "bob@example.com",
+            Arc::new(|_, _| Ok(())),
+        )?;
+        let body = call_body(1, "Bash", serde_json::json!({"command": "echo hi"}));
+
+        let (with_origin, _) = raw_agent_post(
+            server.address(),
+            &format!("{TEAM_HEADER}Origin: https://evil.example\r\n"),
+            &body,
+        )?;
+        let (without_header, _) = raw_agent_post(server.address(), "", &body)?;
+
+        assert_eq!(with_origin, 403);
+        assert_eq!(without_header, 400);
+        Ok(())
+    }
+
+    #[test]
+    fn agent_endpoint_refuses_callers_off_the_allow_list() -> Result<(), String> {
+        let root = tempfile::tempdir().map_err(|err| err.to_string())?;
+        let server = start_agents(
+            root.path().to_path_buf(),
+            true,
+            "stranger",
+            Arc::new(|_, _| Ok(())),
+        )?;
+
+        let (status, _) = raw_agent_post(
+            server.address(),
+            TEAM_HEADER,
+            &call_body(1, "Bash", serde_json::json!({"command": "echo hi"})),
+        )?;
+
+        assert_eq!(status, 403);
+        Ok(())
+    }
+
+    #[test]
+    fn agent_writes_ask_the_write_check() -> Result<(), String> {
+        let root = tempfile::tempdir().map_err(|err| err.to_string())?;
+        let server = start_agents(
+            root.path().to_path_buf(),
+            true,
+            "bob@example.com",
+            Arc::new(|_, _| Err("unsaved".to_string())),
+        )?;
+        let target = root.path().join("new.txt");
+        let body = call_body(
+            1,
+            "Write",
+            serde_json::json!({"file_path": target.to_string_lossy(), "content": "x"}),
+        );
+
+        let (status, answer) = raw_agent_post(server.address(), TEAM_HEADER, &body)?;
+
+        assert_eq!(status, 200);
+        assert!(answer.contains(r#""isError":true"#), "{answer}");
+        assert!(answer.contains("unsaved"), "{answer}");
+        assert!(!target.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn agent_get_is_405_and_commands_of_two_sessions_do_not_cancel_each_other() -> Result<(), String>
+    {
+        let root = tempfile::tempdir().map_err(|err| err.to_string())?;
+        let server = start_agents(
+            root.path().to_path_buf(),
+            true,
+            "bob@example.com",
+            Arc::new(|_, _| Ok(())),
+        )?;
+        let address = server.address();
+        let get = format!(
+            "GET /v1/workspaces/ws-1/agent HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n"
+        );
+        assert_eq!(raw_status(address, &get)?, 405);
+
+        let running = std::thread::spawn(move || {
+            raw_agent_post(
+                address,
+                &format!("{TEAM_HEADER}Mcp-Session-Id: one\r\n"),
+                &call_body(
+                    7,
+                    "Bash",
+                    serde_json::json!({"command": "sleep 2; echo finished"}),
+                ),
+            )
+        });
+        std::thread::sleep(Duration::from_millis(500));
+        let cancel =
+            r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":7}}"#;
+        let (status, _) = raw_agent_post(
+            address,
+            &format!("{TEAM_HEADER}Mcp-Session-Id: two\r\n"),
+            cancel,
+        )?;
+        assert_eq!(status, 202);
+
+        let (_, answer) = running
+            .join()
+            .map_err(|_| "thread panicked".to_string())??;
+        assert!(answer.contains(r#""isError":false"#), "{answer}");
+        assert!(answer.contains("finished"), "{answer}");
+        Ok(())
+    }
+
+    #[test]
+    fn agent_read_maps_a_missing_file_to_none() -> Result<(), String> {
+        let root = tempfile::tempdir().map_err(|err| err.to_string())?;
+        std::fs::write(root.path().join("a.txt"), "first\n\tsecond\n").map_err(|err| err.to_string())?;
+        let server = start_agents(
+            root.path().to_path_buf(),
+            true,
+            "bob@example.com",
+            Arc::new(|_, _| Ok(())),
+        )?;
+        let client =
+            TeamClient::new(&server.address().to_string(), 0).map_err(|err| err.to_string())?;
+        let present = root.path().join("a.txt");
+        let missing = root.path().join("missing.txt");
+
+        let text = client
+            .agent_read("ws-1", &present.to_string_lossy())
+            .map_err(|err| err.to_string())?
+            .ok_or("file should exist")?;
+        assert_eq!(text, "first\n\tsecond");
+        assert_eq!(
+            client.agent_read("ws-1", &missing.to_string_lossy()),
+            Ok(None)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn git_author_header_is_parsed() {
+        let author = parse_git_author("Bob Smith <bob@example.com>").expect("author");
+        assert_eq!(
+            (author.name.as_str(), author.email.as_str()),
+            ("Bob Smith", "bob@example.com")
+        );
+        assert!(parse_git_author("nobody").is_none());
     }
 
     fn manifest_of(path: &str, bytes: &[u8]) -> TeamFileManifest {

@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use crate::services::team_files_service::{TeamBatchOutcome, TeamChangeBatch, TeamFileManifest};
 
 /// Bumped whenever a change to the wire types would break an older peer.
-pub const TEAM_PROTOCOL_VERSION: u32 = 4;
+pub const TEAM_PROTOCOL_VERSION: u32 = 5;
 /// Chats travel as the ACP crate's own types, so peers on different crate
 /// versions are treated as speaking different protocols.
 pub const TEAM_ACP_CRATE_VERSION: &str = "0.14.0";
@@ -22,6 +22,14 @@ pub const DEFAULT_TEAM_PORT: u16 = 47231;
 /// Sent on every action, so a web page can't post one without a CORS
 /// preflight the share server never answers.
 pub const TEAM_REQUEST_HEADER: &str = "X-Mnemonic-Team";
+/// The teammate's git identity as `Name <email>`, sent with agent requests
+/// so commits their agent makes in the sharer's workspace carry their name.
+pub const TEAM_GIT_AUTHOR_HEADER: &str = "X-Mnemonic-Git-Author";
+
+/// The MCP endpoint a teammate's agent uses to work in a shared workspace.
+pub fn agent_mcp_url(base_url: &str, workspace_id: &str) -> String {
+    format!("{base_url}/v1/workspaces/{workspace_id}/agent")
+}
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct TeamHello {
@@ -97,6 +105,12 @@ pub struct TeamWorkspace {
     /// The sharer's skip list for the workspace's files.
     #[serde(default)]
     pub skip_patterns: Vec<String>,
+    /// Whether teammates' agents may work in this workspace's folder.
+    #[serde(default)]
+    pub agents: bool,
+    /// The workspace's folder on the sharer's machine. Set only when `agents`.
+    #[serde(default)]
+    pub root_path: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1173,6 +1187,54 @@ impl TeamClient {
             .map_err(|err| TeamClientError::Unreachable(err.to_string()))?;
         serde_json::from_slice(&bytes)
             .map_err(|err| TeamClientError::Other(format!("Unexpected answer: {err}")))
+    }
+
+    /// Reads one file through the workspace's agent endpoint, as the raw
+    /// text of at most its first 2000 lines, each cut at 2000 characters.
+    /// A trailing newline is not kept. None when the file doesn't exist.
+    pub fn agent_read(
+        &self,
+        workspace_id: &str,
+        absolute_path: &str,
+    ) -> Result<Option<String>, TeamClientError> {
+        let path = format!("/v1/workspaces/{}/agent", path_segment(workspace_id)?);
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {"name": "Read", "arguments": {"file_path": absolute_path}},
+        });
+        let response = self.post_json(&path, &body, FILE_TIMEOUT)?;
+        let bytes = response
+            .bytes()
+            .map_err(|err| TeamClientError::Unreachable(err.to_string()))?;
+        let reply: serde_json::Value = serde_json::from_slice(&bytes)
+            .map_err(|err| TeamClientError::Other(format!("Unexpected answer: {err}")))?;
+        if let Some(message) = reply
+            .pointer("/error/message")
+            .and_then(|message| message.as_str())
+        {
+            return Err(TeamClientError::Other(message.to_string()));
+        }
+        let text = reply
+            .pointer("/result/content/0/text")
+            .and_then(|text| text.as_str())
+            .unwrap_or_default();
+        if reply
+            .pointer("/result/isError")
+            .and_then(|flag| flag.as_bool())
+            == Some(true)
+        {
+            if text == format!("{absolute_path} doesn't exist") {
+                return Ok(None);
+            }
+            return Err(TeamClientError::Other(text.to_string()));
+        }
+        let lines: Vec<&str> = text
+            .lines()
+            .map(|line| line.split_once('\t').map_or(line, |(_, content)| content))
+            .collect();
+        Ok(Some(lines.join("\n")))
     }
 
     /// Waits up to `wait` for the chat to change after `cursor`. None when
