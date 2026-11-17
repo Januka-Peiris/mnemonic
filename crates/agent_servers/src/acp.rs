@@ -472,9 +472,7 @@ impl AcpConnectionDefaults {
             let current_value = select.current_value.clone();
             let is_shown = |option: &acp::SessionConfigSelectOption| {
                 option.value == current_value
-                    || allowed
-                        .iter()
-                        .any(|value| value.as_str() == option.value.0.as_ref())
+                    || allowed.iter().any(|value| value.as_str() == option.value.0.as_ref())
             };
             match &mut select.options {
                 acp::SessionConfigSelectOptions::Ungrouped(options) => {
@@ -2591,10 +2589,9 @@ pub mod test_support {
             )
             .on_receive_request(
                 async move |req: acp::ForkSessionRequest, responder, _cx| {
-                    responder.respond(acp::ForkSessionResponse::new(acp::SessionId::new(format!(
-                        "{}-fork",
-                        req.session_id
-                    ))))
+                    responder.respond(acp::ForkSessionResponse::new(acp::SessionId::new(
+                        format!("{}-fork", req.session_id),
+                    )))
                 },
                 agent_client_protocol::on_receive_request!(),
             )
@@ -3237,10 +3234,7 @@ mod tests {
                 )
             })
             .await;
-        assert!(
-            result.is_err(),
-            "fork_session should fail without the capability"
-        );
+        assert!(result.is_err(), "fork_session should fail without the capability");
     }
 
     async fn connect_session_delete_test_agent(
