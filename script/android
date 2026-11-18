@@ -12,13 +12,16 @@ ensure_release_signing() {
     if [ ! -f "$keystore" ]; then
         mkdir -p "$(dirname "$keystore")"
         local password
-        password="$(openssl rand -hex 24)"
-        security add-generic-password -a "$USER" -s "$keychain_service" -w "$password"
+        password="$(security find-generic-password -s "$keychain_service" -w 2>/dev/null || true)"
+        if [ -z "$password" ]; then
+            password="$(openssl rand -hex 24)"
+        fi
         "$JAVA_HOME/bin/keytool" -genkeypair -keystore "$keystore" \
             -storepass "$password" -keypass "$password" \
             -alias mnemonic -keyalg RSA -keysize 4096 -validity 10000 \
             -dname "CN=Mnemonic"
         chmod 600 "$keystore"
+        security add-generic-password -U -a "$USER" -s "$keychain_service" -w "$password"
     fi
     MNEMONIC_KEYSTORE="$keystore"
     MNEMONIC_KEYSTORE_PASSWORD="$(security find-generic-password -s "$keychain_service" -w)"
