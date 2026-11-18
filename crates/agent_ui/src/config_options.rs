@@ -359,7 +359,7 @@ impl ConfigOptionSelector {
         match &option.kind {
             acp::SessionConfigKind::Select(select) => {
                 find_option_name(&select.options, &select.current_value)
-                    .unwrap_or_else(|| "Unknown".to_string())
+                    .unwrap_or_else(|| select.current_value.0.to_string())
             }
             _ => "Unknown".to_string(),
         }

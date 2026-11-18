@@ -577,6 +577,7 @@ fn render_registry_agent_button(
                         default_config_options: HashMap::default(),
                         favorite_config_option_values: HashMap::default(),
                         allowed_config_option_values: HashMap::default(),
+                        hidden_config_option_values: HashMap::default(),
                     }
                 });
             });

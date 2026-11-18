@@ -236,6 +236,7 @@ impl AgentServerStore {
                     default_config_options: HashMap::default(),
                     favorite_config_option_values: HashMap::default(),
                     allowed_config_option_values: HashMap::default(),
+                    hidden_config_option_values: HashMap::default(),
                 }),
             );
         });
@@ -1805,6 +1806,8 @@ pub enum CustomAgentServerSettings {
         ///
         /// Default: {}
         allowed_config_option_values: HashMap<String, Vec<String>>,
+        /// Session config value IDs to hide. Unlisted values, including new models, stay visible.
+        hidden_config_option_values: HashMap<String, Vec<String>>,
     },
     Registry {
         /// Additional environment variables to pass to the agent.
@@ -1835,6 +1838,8 @@ pub enum CustomAgentServerSettings {
         ///
         /// Default: {}
         allowed_config_option_values: HashMap<String, Vec<String>>,
+        /// Session config value IDs to hide. Unlisted values, including new models, stay visible.
+        hidden_config_option_values: HashMap<String, Vec<String>>,
     },
 }
 
@@ -1879,6 +1884,19 @@ impl CustomAgentServerSettings {
         }
     }
 
+    pub fn hidden_config_option_values(&self) -> &HashMap<String, Vec<String>> {
+        match self {
+            Self::Custom {
+                hidden_config_option_values,
+                ..
+            }
+            | Self::Registry {
+                hidden_config_option_values,
+                ..
+            } => hidden_config_option_values,
+        }
+    }
+
     pub fn favorite_config_option_values(&self, config_id: &str) -> Option<&[String]> {
         match self {
             CustomAgentServerSettings::Custom {
@@ -1906,6 +1924,7 @@ impl From<settings::CustomAgentServerSettings> for CustomAgentServerSettings {
                 default_config_options,
                 favorite_config_option_values,
                 allowed_config_option_values,
+                hidden_config_option_values,
             } => CustomAgentServerSettings::Custom {
                 command: AgentServerCommand {
                     path: PathBuf::from(shellexpand::tilde(&path.to_string_lossy()).as_ref()),
@@ -1916,6 +1935,7 @@ impl From<settings::CustomAgentServerSettings> for CustomAgentServerSettings {
                 default_config_options,
                 favorite_config_option_values,
                 allowed_config_option_values,
+                hidden_config_option_values,
             },
             settings::CustomAgentServerSettings::Registry {
                 env,
@@ -1923,12 +1943,14 @@ impl From<settings::CustomAgentServerSettings> for CustomAgentServerSettings {
                 default_config_options,
                 favorite_config_option_values,
                 allowed_config_option_values,
+                hidden_config_option_values,
             } => CustomAgentServerSettings::Registry {
                 env,
                 default_mode,
                 default_config_options,
                 favorite_config_option_values,
                 allowed_config_option_values,
+                hidden_config_option_values,
             },
         }
     }
@@ -2013,6 +2035,7 @@ mod tests {
                                     default_config_options: HashMap::default(),
                                     favorite_config_option_values: HashMap::default(),
                                     allowed_config_option_values: HashMap::default(),
+                                    hidden_config_option_values: HashMap::default(),
                                 }
                                 .into(),
                             )

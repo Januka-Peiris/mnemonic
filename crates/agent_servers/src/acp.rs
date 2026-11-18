@@ -441,6 +441,7 @@ struct AcpConnectionDefaults {
     mode: Rc<RefCell<Option<acp::SessionModeId>>>,
     config_options: Rc<RefCell<HashMap<String, String>>>,
     allowed_config_option_values: Rc<RefCell<HashMap<String, Vec<String>>>>,
+    hidden_config_option_values: Rc<RefCell<HashMap<String, Vec<String>>>>,
 }
 
 impl AcpConnectionDefaults {
@@ -449,30 +450,36 @@ impl AcpConnectionDefaults {
             mode: Rc::new(RefCell::new(mode)),
             config_options: Rc::new(RefCell::new(config_options)),
             allowed_config_option_values: Rc::default(),
+            hidden_config_option_values: Rc::default(),
         }
     }
 
-    /// Hides select values the user has not allowed. The current value is
-    /// always kept so the dropdown still shows what the agent is using.
+    /// An allowlist retains the current selection; explicit exclusions hide
+    /// its menu entry too, without changing what the agent is using.
     fn filter_config_options(
         &self,
         mut config_options: Vec<acp::SessionConfigOption>,
     ) -> Vec<acp::SessionConfigOption> {
         let allowed_values = self.allowed_config_option_values.borrow();
-        if allowed_values.is_empty() {
+        let hidden_values = self.hidden_config_option_values.borrow();
+        if allowed_values.is_empty() && hidden_values.is_empty() {
             return config_options;
         }
         for config_option in &mut config_options {
-            let Some(allowed) = allowed_values.get(config_option.id.0.as_ref()) else {
+            let allowed = allowed_values.get(config_option.id.0.as_ref());
+            let hidden = hidden_values.get(config_option.id.0.as_ref());
+            if allowed.is_none() && hidden.is_none() {
                 continue;
-            };
+            }
             let acp::SessionConfigKind::Select(select) = &mut config_option.kind else {
                 continue;
             };
             let current_value = select.current_value.clone();
             let is_shown = |option: &acp::SessionConfigSelectOption| {
-                option.value == current_value
-                    || allowed.iter().any(|value| value.as_str() == option.value.0.as_ref())
+                let value = option.value.0.as_ref();
+                !hidden.is_some_and(|hidden| hidden.iter().any(|item| item == value))
+                    && (option.value == current_value
+                        || allowed.is_none_or(|allowed| allowed.iter().any(|item| item == value)))
             };
             match &mut select.options {
                 acp::SessionConfigSelectOptions::Ungrouped(options) => {
@@ -512,10 +519,13 @@ impl AcpConnectionDefaults {
         let Some(agent_settings) = settings.get(agent_id.as_ref()) else {
             self.set(None, HashMap::default());
             self.allowed_config_option_values.borrow_mut().clear();
+            self.hidden_config_option_values.borrow_mut().clear();
             return;
         };
         *self.allowed_config_option_values.borrow_mut() =
             agent_settings.allowed_config_option_values().clone();
+        *self.hidden_config_option_values.borrow_mut() =
+            agent_settings.hidden_config_option_values().clone();
 
         let default_config_options = match agent_settings {
             CustomAgentServerSettings::Custom {
@@ -533,7 +543,12 @@ impl AcpConnectionDefaults {
         );
     }
 
-    fn observe_settings(&self, agent_id: AgentId, cx: &mut App) -> Subscription {
+    fn observe_settings(
+        &self,
+        agent_id: AgentId,
+        sessions: Rc<RefCell<HashMap<acp::SessionId, AcpSession>>>,
+        cx: &mut App,
+    ) -> Subscription {
         if cx.try_global::<SettingsStore>().is_none() {
             return Subscription::new(|| {});
         }
@@ -541,7 +556,18 @@ impl AcpConnectionDefaults {
         self.refresh_from_settings(&agent_id, cx);
         let defaults = self.clone();
         cx.observe_global::<SettingsStore>(move |cx| {
+            let old_allowed = defaults.allowed_config_option_values.borrow().clone();
+            let old_hidden = defaults.hidden_config_option_values.borrow().clone();
             defaults.refresh_from_settings(&agent_id, cx);
+            if old_allowed != *defaults.allowed_config_option_values.borrow()
+                || old_hidden != *defaults.hidden_config_option_values.borrow()
+            {
+                for session in sessions.borrow().values() {
+                    if let Some(options) = &session.config_options {
+                        options.tx.borrow_mut().send(()).log_err();
+                    }
+                }
+            }
         })
     }
 }
@@ -1108,7 +1134,8 @@ impl AcpConnection {
         let settings_subscription = cx.update({
             let agent_id = agent_id.clone();
             let defaults = defaults.clone();
-            move |cx| defaults.observe_settings(agent_id, cx)
+            let sessions = sessions.clone();
+            move |cx| defaults.observe_settings(agent_id, sessions, cx)
         });
 
         Ok(Self {
@@ -1149,7 +1176,8 @@ impl AcpConnection {
     ) -> Self {
         let agent_id = AgentId::new("test");
         let defaults = AcpConnectionDefaults::default();
-        let settings_subscription = defaults.observe_settings(agent_id.clone(), cx);
+        let settings_subscription =
+            defaults.observe_settings(agent_id.clone(), sessions.clone(), cx);
 
         Self {
             id: agent_id,
@@ -2874,6 +2902,81 @@ mod tests {
     use settings::Settings as _;
 
     #[test]
+    fn hidden_model_choices_do_not_pin_the_catalog_or_change_the_selected_model() {
+        let defaults = AcpConnectionDefaults::new(None, HashMap::default());
+        defaults.hidden_config_option_values.borrow_mut().insert(
+            "model".into(),
+            vec![
+                "gpt-5.6-sol".into(),
+                "gpt-6-sol".into(),
+                "gpt-6.1-sol".into(),
+            ],
+        );
+        let model_options = vec![
+            acp::SessionConfigSelectOption::new("gpt-5.6-sol", "Legacy Sol"),
+            acp::SessionConfigSelectOption::new("gpt-6-sol", "Old Sol"),
+            acp::SessionConfigSelectOption::new("gpt-6.1-sol", "Current session's Sol"),
+            acp::SessionConfigSelectOption::new("gpt-6.2-sol", "Sol"),
+            acp::SessionConfigSelectOption::new("gpt-6.2-astra", "Astra"),
+            acp::SessionConfigSelectOption::new("gpt-6.1-terra", "Terra"),
+            acp::SessionConfigSelectOption::new("future-model", "A future release"),
+        ];
+        for grouped in [false, true] {
+            let options = if grouped {
+                acp::SessionConfigSelectOptions::Grouped(vec![
+                    acp::SessionConfigSelectGroup::new(
+                        "legacy",
+                        "Legacy",
+                        model_options[..3].to_vec(),
+                    ),
+                    acp::SessionConfigSelectGroup::new(
+                        "available",
+                        "Available",
+                        model_options[3..].to_vec(),
+                    ),
+                ])
+            } else {
+                acp::SessionConfigSelectOptions::Ungrouped(model_options.clone())
+            };
+            let option = acp::SessionConfigOption::select("model", "Model", "gpt-6.1-sol", options);
+            let filtered = defaults.filter_config_options(vec![option]);
+            let model = filtered.first().expect("model config remains available");
+            let acp::SessionConfigKind::Select(select) = &model.kind else {
+                panic!("model select")
+            };
+            assert_eq!(
+                select.current_value.0.as_ref(),
+                "gpt-6.1-sol",
+                "hiding a menu entry must not switch a running session"
+            );
+            let visible: Vec<_> = match &select.options {
+                acp::SessionConfigSelectOptions::Ungrouped(options) => options
+                    .iter()
+                    .map(|option| option.value.0.as_ref())
+                    .collect(),
+                acp::SessionConfigSelectOptions::Grouped(groups) => {
+                    assert_eq!(groups.len(), 1, "empty hidden groups should disappear");
+                    groups
+                        .iter()
+                        .flat_map(|group| &group.options)
+                        .map(|option| option.value.0.as_ref())
+                        .collect()
+                }
+                _ => panic!("model options"),
+            };
+            assert_eq!(
+                visible,
+                [
+                    "gpt-6.2-sol",
+                    "gpt-6.2-astra",
+                    "gpt-6.1-terra",
+                    "future-model"
+                ]
+            );
+        }
+    }
+
+    #[test]
     fn session_requests_carry_extras_for_their_cwd() {
         let extras = SessionExtras {
             mcp_servers: vec![acp::McpServer::Http(acp::McpServerHttp::new(
@@ -3387,7 +3490,10 @@ mod tests {
                 )
             })
             .await;
-        assert!(result.is_err(), "fork_session should fail without the capability");
+        assert!(
+            result.is_err(),
+            "fork_session should fail without the capability"
+        );
     }
 
     #[gpui::test]
@@ -3739,7 +3845,48 @@ mod tests {
         let fs = fs::FakeFs::new(cx.executor());
         fs.insert_tree("/", serde_json::json!({ "a": {} })).await;
         let project = project::Project::test(fs, [std::path::Path::new("/a")], cx).await;
-        let harness = test_support::connect_fake_acp_connection(project, cx).await;
+        let harness = test_support::connect_fake_acp_connection(project.clone(), cx).await;
+
+        let offered_models = || {
+            vec![acp::SessionConfigOption::select(
+                "model",
+                "Model",
+                "future",
+                vec![
+                    acp::SessionConfigSelectOption::new("legacy", "Legacy"),
+                    acp::SessionConfigSelectOption::new("future", "A new release"),
+                ],
+            )]
+        };
+        let thread = cx
+            .update(|cx| {
+                harness.connection.clone().new_session(
+                    project,
+                    PathList::new(&[std::path::Path::new("/a")]),
+                    cx,
+                )
+            })
+            .await
+            .expect("load a session with model configuration");
+        let session_id = thread.read_with(cx, |thread, _| thread.session_id().clone());
+        harness
+            .connection
+            .sessions
+            .borrow_mut()
+            .get_mut(&session_id)
+            .expect("live session")
+            .config_options = Some(ConfigOptions::new(Rc::new(RefCell::new(offered_models()))));
+        let options = cx.update(|cx| {
+            harness
+                .connection
+                .session_config_options(&session_id, cx)
+                .expect("model options")
+        });
+        let mut updates = cx.update(|cx| {
+            options
+                .watch(cx)
+                .expect("picker watches configuration changes")
+        });
 
         cx.update(|cx| {
             AllAgentServersSettings::override_global(
@@ -3756,6 +3903,10 @@ mod tests {
                         )]),
                         favorite_config_option_values: HashMap::default(),
                         allowed_config_option_values: HashMap::default(),
+                        hidden_config_option_values: HashMap::from_iter([(
+                            "model".into(),
+                            vec!["legacy".into()],
+                        )]),
                     }
                     .into(),
                 )])),
@@ -3773,6 +3924,32 @@ mod tests {
             Some("manual")
         );
 
+        assert!(
+            matches!(updates.recv().now_or_never(), Some(Ok(()))),
+            "open pickers must be notified when exclusions change"
+        );
+        let filtered = options.config_options();
+        let acp::SessionConfigKind::Select(select) = &filtered.first().expect("models").kind else {
+            panic!("select")
+        };
+        let acp::SessionConfigSelectOptions::Ungrouped(models) = &select.options else {
+            panic!("model list")
+        };
+        assert_eq!(
+            models.len(),
+            1,
+            "settings changes must apply exclusions to live connection options"
+        );
+        assert_eq!(
+            models
+                .first()
+                .expect("future model remains")
+                .value
+                .0
+                .as_ref(),
+            "future"
+        );
+
         cx.update(|cx| {
             AllAgentServersSettings::override_global(
                 AllAgentServersSettings(HashMap::default()),
@@ -3783,6 +3960,22 @@ mod tests {
 
         assert_eq!(harness.connection.defaults.mode(), None);
         assert_eq!(harness.connection.defaults.config_option("mode"), None);
+        assert!(
+            matches!(updates.recv().now_or_never(), Some(Ok(()))),
+            "open pickers must be notified when exclusions change"
+        );
+        let filtered = options.config_options();
+        let acp::SessionConfigKind::Select(select) = &filtered.first().expect("models").kind else {
+            panic!("select")
+        };
+        let acp::SessionConfigSelectOptions::Ungrouped(models) = &select.options else {
+            panic!("model list")
+        };
+        assert_eq!(
+            models.len(),
+            2,
+            "removing the settings must clear the exclusion"
+        );
     }
 
     #[gpui::test]
