@@ -1,0 +1,43 @@
+{
+  "workspaces": [
+    {
+      "id": "ws-1",
+      "project": "alpha-repo",
+      "name": "login-fix",
+      "branch": "jay/login-fix",
+      "pr_number": 42,
+      "pr_state": "ready",
+      "changed_files": 3,
+      "additions": 20,
+      "deletions": 4,
+      "agent_state": "waiting_for_approval",
+      "idle_seconds": 12,
+      "chats": [
+        {
+          "id": "chat-1",
+          "title": "Fix the login page",
+          "agent": "claude",
+          "open": true,
+          "live": true,
+          "waiting": true
+        },
+        {
+          "id": "chat-2",
+          "title": "Write the docs",
+          "agent": "claude",
+          "open": true,
+          "live": true,
+          "last_turn_ended_at": 1700000100000
+        }
+      ],
+      "step_in": true,
+      "share_files": false,
+      "edit_files": false,
+      "remote_url": null,
+      "base_branch": "main",
+      "skip_patterns": [],
+      "agents": false,
+      "root_path": null
+    }
+  ]
+}

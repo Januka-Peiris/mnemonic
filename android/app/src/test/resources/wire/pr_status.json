@@ -1,0 +1,13 @@
+{
+  "found": true,
+  "number": 42,
+  "title": "Fix the login page",
+  "url": "https://github.com/example/alpha-repo/pull/42",
+  "state": "OPEN",
+  "is_draft": false,
+  "merge_state_status": "CLEAN",
+  "head_ref_oid": "0123abcd",
+  "checks_summary": "3 of 3 checks passed",
+  "can_merge": true,
+  "merge_method": "squash"
+}

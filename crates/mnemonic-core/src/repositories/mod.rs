@@ -10,6 +10,7 @@ pub mod workspace_repository;
 
 pub mod merge_readiness_repository;
 pub mod pr_draft_repository;
+pub mod push_device_repository;
 pub mod push_subscription_repository;
 pub mod repo_intelligence_repository;
 pub mod repository_relationship_repository;

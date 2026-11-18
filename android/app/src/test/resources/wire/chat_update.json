@@ -1,0 +1,124 @@
+{
+  "cursor": "cursor-5",
+  "reset": true,
+  "len": 5,
+  "changes": [
+    {
+      "index": 0,
+      "entry": {
+        "kind": "updates",
+        "updates": [
+          {
+            "sessionUpdate": "user_message_chunk",
+            "content": {
+              "type": "text",
+              "text": "Fix the login page"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "index": 1,
+      "entry": {
+        "kind": "updates",
+        "updates": [
+          {
+            "sessionUpdate": "agent_message_chunk",
+            "content": {
+              "type": "text",
+              "text": "Looking at the form handler"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "index": 2,
+      "entry": {
+        "kind": "updates",
+        "updates": [
+          {
+            "sessionUpdate": "tool_call",
+            "toolCallId": "tool-1",
+            "title": "Read login.rs",
+            "kind": "read"
+          },
+          {
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": "tool-1",
+            "status": "completed"
+          }
+        ]
+      }
+    },
+    {
+      "index": 3,
+      "entry": {
+        "kind": "updates",
+        "updates": [
+          {
+            "sessionUpdate": "tool_call",
+            "toolCallId": "tool-2",
+            "title": "Run cargo test",
+            "kind": "execute"
+          },
+          {
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": "tool-2",
+            "status": "pending"
+          }
+        ]
+      }
+    },
+    {
+      "index": 4,
+      "entry": {
+        "kind": "updates",
+        "updates": [
+          {
+            "sessionUpdate": "tool_call",
+            "toolCallId": "tool-3",
+            "title": "Edit login.rs",
+            "kind": "edit"
+          },
+          {
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": "tool-3",
+            "status": "in_progress"
+          }
+        ]
+      }
+    }
+  ],
+  "plan": [
+    {
+      "content": "Reproduce the bug",
+      "priority": "high",
+      "status": "completed"
+    },
+    {
+      "content": "Fix the handler",
+      "priority": "medium",
+      "status": "in_progress"
+    }
+  ],
+  "generating": true,
+  "permissions": [
+    {
+      "tool_call_id": "tool-2",
+      "options": [
+        {
+          "optionId": "allow",
+          "name": "Allow",
+          "kind": "allow_once"
+        },
+        {
+          "optionId": "reject",
+          "name": "Deny",
+          "kind": "reject_once"
+        }
+      ]
+    }
+  ]
+}

@@ -17,8 +17,10 @@ use futures::future::{self, Either};
 use gpui::{AnyWindowHandle, App, AppContext as _, Context, Entity, Global, Subscription, Task};
 use mnemonic_core::models::{DiscoveredRepository, WorkspaceDetail, WorkspacePrStatus};
 use mnemonic_core::repositories::{
-    push_subscription_repository, repository_repository, workspace_repository,
+    push_device_repository, push_subscription_repository, repository_repository,
+    workspace_repository,
 };
+use mnemonic_core::services::fcm_service::{self, AccessTokenCache, FcmOutcome, ServiceAccount};
 use mnemonic_core::services::ntfy_service::{
     self, Notice, NoticeKind, NtfyRequest, mac_idle_seconds, notice_body, ntfy_request,
     should_notify,
@@ -33,7 +35,7 @@ use mnemonic_core::services::team_share_service::{
     tailscale_cert, tailscale_self,
 };
 use mnemonic_core::services::web_push_service::{
-    self, PushOutcome, PushSubscription, load_or_create_vapid_keys,
+    self, PushDevice, PushOutcome, PushSubscription, load_or_create_vapid_keys,
 };
 use settings::{RegisterSetting, Settings, SettingsStore};
 use workspace::Workspace;
@@ -79,6 +81,7 @@ pub(crate) struct PhoneSettings {
     pub ntfy_url: String,
     pub ntfy_token: Option<String>,
     pub notify_after_idle_minutes: u32,
+    pub fcm_service_account: Option<PathBuf>,
 }
 
 impl Settings for PhoneSettings {
@@ -95,6 +98,14 @@ impl Settings for PhoneSettings {
             notify_after_idle_minutes: phone
                 .notify_after_idle_minutes
                 .unwrap_or(DEFAULT_NOTIFY_AFTER_IDLE_MINUTES),
+            fcm_service_account: phone
+                .fcm_service_account
+                .map(|path| path.trim().to_string())
+                .filter(|path| !path.is_empty())
+                .map(|path| match path.strip_prefix('~') {
+                    Some(rest) => util::paths::home_dir().join(rest.trim_start_matches('/')),
+                    None => PathBuf::from(path),
+                }),
         }
     }
 }
@@ -108,6 +119,76 @@ struct PendingPhoneAction {
     /// must not run later.
     claimed: Arc<AtomicBool>,
     reply: std::sync::mpsc::Sender<Result<PhoneActionOutcome, TeamActionError>>,
+}
+
+/// What the Team window says about app alerts, kept here so rendering never
+/// has to touch the database.
+#[derive(Clone, Debug, Default, PartialEq)]
+struct AppAlertStatus {
+    has_devices: bool,
+    key_error: Option<String>,
+    /// Why the last Google sign-in failed, until one succeeds.
+    sign_in_error: Option<String>,
+    /// Why Firebase refused every send in the last attempt, until one is delivered.
+    send_error: Option<String>,
+}
+
+impl AppAlertStatus {
+    fn error(&self) -> Option<String> {
+        self.key_error
+            .clone()
+            .or_else(|| self.sign_in_error.clone())
+            .or_else(|| self.send_error.clone())
+            .filter(|_| self.has_devices)
+    }
+
+    /// A device Firebase dropped counts as neither delivered nor failed.
+    fn record_sends(&mut self, delivered: usize, errors: &[String]) {
+        if delivered > 0 {
+            self.send_error = None;
+        } else if let Some(first) = errors.first() {
+            self.send_error = Some(first.clone());
+        }
+    }
+}
+
+/// State the server's request threads and the alert sender share, since
+/// neither can read the settings or the app's entities.
+struct AppAlerts {
+    key_path: Mutex<Option<PathBuf>>,
+    page_url: Mutex<Option<String>>,
+    status: Mutex<AppAlertStatus>,
+    changed: mpsc::UnboundedSender<()>,
+}
+
+impl AppAlerts {
+    fn refresh_status(&self) {
+        let has_devices = match mnemonic_bridge::mnemonic_state_cloned() {
+            Some(state) => match push_device_repository::list(&state.db) {
+                Ok(devices) => !devices.is_empty(),
+                Err(err) => {
+                    log::warn!("Couldn't list the app devices: {err}");
+                    false
+                }
+            },
+            None => false,
+        };
+        let key_path = lock(&self.key_path).clone();
+        let key_error = fcm_service::fcm_status(key_path.as_deref()).err();
+        {
+            let mut status = lock(&self.status);
+            status.has_devices = has_devices;
+            status.key_error = key_error;
+        }
+        // The receiver only goes away when the app is quitting.
+        self.changed.unbounded_send(()).ok();
+    }
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 pub(crate) struct PhoneShare {
@@ -137,6 +218,8 @@ pub(crate) struct PhoneShare {
     /// The agents new chats may use, kept here for the server's request
     /// threads, which can't read the settings.
     enabled_agents: Arc<Mutex<Vec<PhoneAgent>>>,
+    app_alerts: Arc<AppAlerts>,
+    _app_alerts_task: Task<()>,
     _feed_subscription: Subscription,
 }
 
@@ -182,11 +265,24 @@ pub(crate) fn phone_https_error(cx: &App) -> Option<String> {
     phone_share(cx)?.read(cx).https_error.clone()
 }
 
+/// Why app alerts can't be sent, when an app is registered to get them.
+pub(crate) fn phone_app_alerts_error(cx: &App) -> Option<String> {
+    lock(&phone_share(cx)?.read(cx).app_alerts.status).error()
+}
+
 impl PhoneShare {
     fn new(cx: &mut Context<Self>) -> Self {
         let feed = cx.new(|_| ChatFeed::new(TeamShareHub::new(), PermissionScope::All));
         let feed_subscription = cx.subscribe(&feed, |this, _, event: &ChatFeedEvent, cx| {
             this.notify_idle_phone(event, cx);
+        });
+        let (changed, mut changed_receiver) = mpsc::unbounded::<()>();
+        let app_alerts_task = cx.spawn(async move |this, cx| {
+            while changed_receiver.next().await.is_some() {
+                if this.update(cx, |_, cx| cx.notify()).is_err() {
+                    break;
+                }
+            }
         });
         Self {
             port: None,
@@ -201,6 +297,13 @@ impl PhoneShare {
             action_task: None,
             last_notified: HashMap::new(),
             enabled_agents: Arc::default(),
+            app_alerts: Arc::new(AppAlerts {
+                key_path: Mutex::new(None),
+                page_url: Mutex::new(None),
+                status: Mutex::new(AppAlertStatus::default()),
+                changed,
+            }),
+            _app_alerts_task: app_alerts_task,
             _feed_subscription: feed_subscription,
         }
     }
@@ -282,6 +385,7 @@ impl PhoneShare {
         let ntfy_url = Some(settings.ntfy_url.clone()).filter(|url| !url.is_empty());
         let token = settings.ntfy_token.clone();
         let threshold_minutes = settings.notify_after_idle_minutes;
+        let app_alerts = self.app_alerts.clone();
         cx.spawn(async move |this, cx| {
             let idle_seconds = cx.background_spawn(async move { mac_idle_seconds() }).await;
             if !should_notify(&notice.kind, idle_seconds, threshold_minutes, stop_reason) {
@@ -305,6 +409,7 @@ impl PhoneShare {
                     }
                 }
                 send_web_push(&payload);
+                send_app_push(&payload, &app_alerts);
             })
             .await;
         })
@@ -314,6 +419,14 @@ impl PhoneShare {
     fn apply_settings(&mut self, cx: &mut Context<Self>) {
         let settings = PhoneSettings::get_global(cx);
         let port = settings.enabled.then_some(settings.port);
+        let key_path = settings.fcm_service_account.clone();
+        if *lock(&self.app_alerts.key_path) != key_path {
+            *lock(&self.app_alerts.key_path) = key_path;
+            lock(&self.app_alerts.status).sign_in_error = None;
+            let app_alerts = self.app_alerts.clone();
+            cx.background_spawn(async move { app_alerts.refresh_status() })
+                .detach();
+        }
         if port == self.port {
             return;
         }
@@ -338,6 +451,7 @@ impl PhoneShare {
         self.port = Some(port);
         let hub = self.feed.read(cx).hub().clone();
         let enabled_agents = self.enabled_agents.clone();
+        let app_alerts = self.app_alerts.clone();
         let (action_sender, mut action_receiver) = mpsc::unbounded::<PendingPhoneAction>();
         self.action_task = Some(cx.spawn(async move |_, cx| {
             while let Some(pending) = action_receiver.next().await {
@@ -368,7 +482,10 @@ impl PhoneShare {
                         let hub = hub.clone();
                         let enabled_agents = enabled_agents.clone();
                         let action_sender = action_sender.clone();
-                        async move { start_server(port, hub, enabled_agents, action_sender) }
+                        let app_alerts = app_alerts.clone();
+                        async move {
+                            start_server(port, hub, enabled_agents, app_alerts, action_sender)
+                        }
                     })
                     .await;
                 let started = this.update(cx, |this, cx| {
@@ -382,11 +499,16 @@ impl PhoneShare {
                             certificate,
                             https_error,
                         }) => {
-                            this.page_url = Some(page_url(
+                            let page_url = page_url(
                                 &started_as,
                                 server.address().port(),
                                 certificate.is_some(),
-                            ));
+                            );
+                            *lock(&this.app_alerts.page_url) = Some(page_url.clone());
+                            this.page_url = Some(page_url);
+                            let app_alerts = this.app_alerts.clone();
+                            cx.background_spawn(async move { app_alerts.refresh_status() })
+                                .detach();
                             this.start_error = None;
                             this.https_error = https_error;
                             this.server = Some(server);
@@ -480,6 +602,7 @@ impl PhoneShare {
         self.server = None;
         self.port = None;
         self.page_url = None;
+        *lock(&self.app_alerts.page_url) = None;
         self.start_error = None;
         self.https_error = None;
     }
@@ -595,6 +718,7 @@ fn start_server(
     port: u16,
     hub: TeamShareHub,
     enabled_agents: Arc<Mutex<Vec<PhoneAgent>>>,
+    app_alerts: Arc<AppAlerts>,
     action_sender: mpsc::UnboundedSender<PendingPhoneAction>,
 ) -> Result<StartedServer, String> {
     let me = tailscale_self()?;
@@ -623,6 +747,7 @@ fn start_server(
     });
     let start = |tls: Option<TlsFiles>| {
         let enabled_agents = enabled_agents.clone();
+        let app_alerts = app_alerts.clone();
         PhoneServer::start(
             PhoneServerConfig {
                 bind: IpAddr::V4(me.ip),
@@ -649,6 +774,15 @@ fn start_server(
                 pr_status: Arc::new(phone_pr_status),
                 push_key: Arc::new(phone_push_key),
                 save_push_subscription: Arc::new(save_push_subscription),
+                save_push_device: Arc::new({
+                    let app_alerts = app_alerts.clone();
+                    move |device| {
+                        save_push_device(device)?;
+                        app_alerts.refresh_status();
+                        Ok(())
+                    }
+                }),
+                send_test_alert: Arc::new(move || send_test_alert(&app_alerts)),
             },
             action_handler.clone(),
         )
@@ -783,6 +917,65 @@ fn try_send_web_push(payload: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn send_app_push(payload: &str, app_alerts: &AppAlerts) {
+    if let Err(err) = try_send_app_push(payload, app_alerts) {
+        log::warn!("Couldn't send the phone's app alert: {err}");
+    }
+}
+
+/// Tries every device even when one fails, and reports what went wrong.
+fn try_send_app_push(payload: &str, app_alerts: &AppAlerts) -> Result<(), String> {
+    let result = send_to_devices(payload, app_alerts);
+    app_alerts.refresh_status();
+    result
+}
+
+fn send_to_devices(payload: &str, app_alerts: &AppAlerts) -> Result<(), String> {
+    let state = mnemonic_bridge::mnemonic_state_cloned()
+        .ok_or_else(|| "Mnemonic isn't ready".to_string())?;
+    let devices = push_device_repository::list(&state.db)?;
+    if devices.is_empty() {
+        return Ok(());
+    }
+    let key_path = lock(&app_alerts.key_path).clone();
+    let key_path = key_path.ok_or_else(|| "No Firebase key file is set".to_string())?;
+    let account = ServiceAccount::load(&key_path)?;
+    let access_token = match AccessTokenCache::shared().token(&account) {
+        Ok(access_token) => {
+            lock(&app_alerts.status).sign_in_error = None;
+            access_token
+        }
+        Err(err) => {
+            lock(&app_alerts.status).sign_in_error = Some(err.clone());
+            return Err(err);
+        }
+    };
+    let mut failures = Vec::new();
+    let mut errors = Vec::new();
+    let mut delivered = 0;
+    for device in devices {
+        match fcm_service::send(&account, &access_token, &device, payload.as_bytes()) {
+            Ok(FcmOutcome::Delivered) => delivered += 1,
+            Ok(FcmOutcome::Unregistered) => {
+                if let Err(err) = push_device_repository::delete(&state.db, &device.install_id) {
+                    log::warn!("Couldn't forget an app device Firebase dropped: {err}");
+                }
+            }
+            Err(err) => {
+                log::warn!("Couldn't send an app alert to {}: {err}", device.name);
+                failures.push(format!("{}: {err}", device.name));
+                errors.push(err);
+            }
+        }
+    }
+    lock(&app_alerts.status).record_sends(delivered, &errors);
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(failures.join("; "))
+    }
+}
+
 fn phone_push_key() -> Result<String, String> {
     let state = mnemonic_bridge::mnemonic_state_cloned()
         .ok_or_else(|| "Mnemonic isn't ready".to_string())?;
@@ -793,6 +986,36 @@ fn save_push_subscription(subscription: PushSubscription) -> Result<(), String> 
     let state = mnemonic_bridge::mnemonic_state_cloned()
         .ok_or_else(|| "Mnemonic isn't ready".to_string())?;
     push_subscription_repository::upsert(&state.db, &subscription)
+}
+
+fn save_push_device(device: PushDevice) -> Result<(), String> {
+    let state = mnemonic_bridge::mnemonic_state_cloned()
+        .ok_or_else(|| "Mnemonic isn't ready".to_string())?;
+    push_device_repository::upsert(&state.db, &device)
+}
+
+/// Goes to every browser and app regardless of how long the Mac has been
+/// idle, so the owner can check alerts reach the phone.
+fn send_test_alert(app_alerts: &AppAlerts) -> Result<(), String> {
+    let page_url = lock(&app_alerts.page_url)
+        .clone()
+        .ok_or_else(|| "The phone page isn't running".to_string())?;
+    let payload = serde_json::json!({
+        "title": "Mnemonic",
+        "body": "Test alert from your Mac",
+        "chat_id": "",
+        "url": page_url,
+        "permission": null,
+    })
+    .to_string();
+    let web = try_send_web_push(&payload);
+    let app = try_send_app_push(&payload, app_alerts);
+    let errors: Vec<String> = [web, app].into_iter().filter_map(Result::err).collect();
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; "))
+    }
 }
 
 /// The repositories, those with the newest workspace first. Workspaces carry
@@ -1302,6 +1525,26 @@ mod tests {
     use gpui::TestAppContext;
     use mnemonic_core::models::WorkspacePrStatus;
     use mnemonic_core::services::team_share_service::TeamWorkspace;
+
+    #[test]
+    fn app_alert_error_reports_firebase_refusing_every_send_until_one_lands() {
+        let mut status = AppAlertStatus {
+            has_devices: true,
+            ..Default::default()
+        };
+        status.record_sends(0, &["404 project not found".to_string()]);
+        assert_eq!(status.error().as_deref(), Some("404 project not found"));
+
+        status.sign_in_error = Some("sign in failed".to_string());
+        assert_eq!(status.error().as_deref(), Some("sign in failed"));
+        status.key_error = Some("key missing".to_string());
+        assert_eq!(status.error().as_deref(), Some("key missing"));
+
+        status.record_sends(0, &[]);
+        assert_eq!(status.send_error.as_deref(), Some("404 project not found"));
+        status.record_sends(1, &["403 mismatch".to_string()]);
+        assert_eq!(status.send_error, None);
+    }
 
     #[gpui::test]
     async fn phone_can_answer_with_an_always_option(cx: &mut TestAppContext) {

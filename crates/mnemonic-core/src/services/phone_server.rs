@@ -17,7 +17,7 @@ use crate::services::team_share_server::{
 use crate::services::team_share_service::{
     CallerIdentity, TeamActionError, TeamShareHub, TeamWorkspaceList, TlsFiles, is_plain_id,
 };
-use crate::services::web_push_service::PushSubscription;
+use crate::services::web_push_service::{PushDevice, PushSubscription};
 
 /// Sent by the page on every POST. A page on another site can't add it
 /// without a CORS preflight, which this server never answers.
@@ -151,6 +151,8 @@ pub struct PhoneSources {
     /// The public VAPID key, base64url, that browsers subscribe with.
     pub push_key: Arc<dyn Fn() -> Result<String, String> + Send + Sync>,
     pub save_push_subscription: Arc<dyn Fn(PushSubscription) -> Result<(), String> + Send + Sync>,
+    pub save_push_device: Arc<dyn Fn(PushDevice) -> Result<(), String> + Send + Sync>,
+    pub send_test_alert: Arc<dyn Fn() -> Result<(), String> + Send + Sync>,
 }
 
 struct Shared {
@@ -539,6 +541,21 @@ fn handle_action(
             Err(reason) => text_response(400, &reason),
         };
     }
+    if let ["v1", "push", "devices"] = segments {
+        return match parse_push_device(&body) {
+            Ok(device) => match (shared.sources.save_push_device)(device) {
+                Ok(()) => json_response(200, "{}".to_string()),
+                Err(err) => text_response(500, &err),
+            },
+            Err(reason) => text_response(400, &reason),
+        };
+    }
+    if let ["v1", "push", "test"] = segments {
+        return match (shared.sources.send_test_alert)() {
+            Ok(()) => json_response(200, "{}".to_string()),
+            Err(err) => text_response(500, &err),
+        };
+    }
     let action = match parse_action(segments, &body) {
         Ok(action) => action,
         Err((status, reason)) => return text_response(status, &reason),
@@ -582,6 +599,13 @@ fn parse_push_subscription(body: &[u8]) -> Result<PushSubscription, String> {
     };
     subscription.check_keys()?;
     Ok(subscription)
+}
+
+fn parse_push_device(body: &[u8]) -> Result<PushDevice, String> {
+    let device: PushDevice =
+        serde_json::from_slice(body).map_err(|err| format!("Couldn't read the request: {err}"))?;
+    device.check()?;
+    Ok(device)
 }
 
 fn parse_action(segments: &[&str], body: &[u8]) -> Result<PhoneAction, (u16, String)> {
@@ -691,7 +715,10 @@ fn parse_action(segments: &[&str], body: &[u8]) -> Result<PhoneAction, (u16, Str
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::services::team_share_service::{TeamCaller, TeamShareHub};
+    use crate::services::team_share_service::{
+        TeamAgentState, TeamCaller, TeamChat, TeamChatUpdate, TeamEntry, TeamEntryChange,
+        TeamPermissionRequest, TeamShareHub, TeamWorkspace,
+    };
     use std::io::{BufRead as _, Write as _};
     use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream};
     use std::sync::{Arc, Mutex};
@@ -710,6 +737,12 @@ mod tests {
 
     type Recorded = Arc<Mutex<Vec<PhoneAction>>>;
 
+    #[derive(Default)]
+    struct PushProbe {
+        devices: Mutex<Vec<PushDevice>>,
+        alerts: std::sync::atomic::AtomicUsize,
+    }
+
     fn start(
         login: &'static str,
         own_addresses: Vec<IpAddr>,
@@ -723,6 +756,16 @@ mod tests {
         own_addresses: Vec<IpAddr>,
         hub: TeamShareHub,
         tls: Option<TlsFiles>,
+    ) -> Result<(PhoneServer, Recorded), String> {
+        start_with_push(login, own_addresses, hub, tls, Arc::default())
+    }
+
+    fn start_with_push(
+        login: &'static str,
+        own_addresses: Vec<IpAddr>,
+        hub: TeamShareHub,
+        tls: Option<TlsFiles>,
+        probe: Arc<PushProbe>,
     ) -> Result<(PhoneServer, Recorded), String> {
         let recorded = Recorded::default();
         let handler: PhoneActionHandler = Arc::new({
@@ -763,6 +806,23 @@ mod tests {
                 pr_status: Arc::new(|_| Ok(PhonePrStatus::default())),
                 push_key: Arc::new(|| Ok("key".to_string())),
                 save_push_subscription: Arc::new(|_| Ok(())),
+                save_push_device: Arc::new({
+                    let probe = probe.clone();
+                    move |device| {
+                        probe
+                            .devices
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .push(device);
+                        Ok(())
+                    }
+                }),
+                send_test_alert: Arc::new(move || {
+                    probe
+                        .alerts
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Ok(())
+                }),
             },
             handler,
         )?;
@@ -938,6 +998,95 @@ mod tests {
         assert_eq!(subscribe("not a key", auth)?, 400);
         assert_eq!(subscribe(compressed, auth)?, 400);
         assert_eq!(subscribe(p256dh, "BTBZMqHH6r4Tts7J_aSI")?, 400);
+        Ok(())
+    }
+
+    const DEVICE_P256DH: &str = concat!(
+        "BCVxsr7N_eNgVRqvHtD0zTZsEc6-VV-JvLexhqUzORcx",
+        "aOzi6-AYWXvTBHm4bjyPjs7Vd8pZGH6SRpkNtoIAiw4"
+    );
+
+    fn post_app(address: SocketAddr, path: &str, body: &str) -> String {
+        format!(
+            "POST {path} HTTP/1.1\r\nHost: {address}\r\nOrigin: http://{address}\r\n\
+             Content-Type: application/json\r\n{PHONE_REQUEST_HEADER}: app\r\n\
+             Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    fn device_body(p256dh: &str) -> String {
+        format!(
+            r#"{{"install_id":"install-1","token":"fcm-token","p256dh":"{p256dh}","auth":"BTBZMqHH6r4Tts7J_aSIgg","name":"Pixel"}}"#
+        )
+    }
+
+    #[test]
+    fn push_device_route_saves_device() -> Result<(), String> {
+        let probe = Arc::new(PushProbe::default());
+        let (server, _recorded) = start_with_push(
+            "jay@example.com",
+            Vec::new(),
+            TeamShareHub::new(),
+            None,
+            probe.clone(),
+        )?;
+        let address = server.address();
+
+        let request = post_app(address, "/v1/push/devices", &device_body(DEVICE_P256DH));
+        assert_eq!(raw_status(address, &request)?, 200);
+        assert_eq!(
+            *probe.devices.lock().map_err(|err| err.to_string())?,
+            [PushDevice {
+                install_id: "install-1".to_string(),
+                token: "fcm-token".to_string(),
+                p256dh: DEVICE_P256DH.to_string(),
+                auth: "BTBZMqHH6r4Tts7J_aSIgg".to_string(),
+                name: "Pixel".to_string(),
+            }]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn push_device_route_refuses_bad_keys() -> Result<(), String> {
+        let probe = Arc::new(PushProbe::default());
+        let (server, _recorded) = start_with_push(
+            "jay@example.com",
+            Vec::new(),
+            TeamShareHub::new(),
+            None,
+            probe.clone(),
+        )?;
+        let address = server.address();
+
+        let request = post_app(address, "/v1/push/devices", &device_body("abc"));
+        assert_eq!(raw_status(address, &request)?, 400);
+        assert!(
+            probe
+                .devices
+                .lock()
+                .map_err(|err| err.to_string())?
+                .is_empty()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn app_post_with_matching_origin_is_accepted() -> Result<(), String> {
+        let probe = Arc::new(PushProbe::default());
+        let (server, _recorded) = start_with_push(
+            "jay@example.com",
+            Vec::new(),
+            TeamShareHub::new(),
+            None,
+            probe.clone(),
+        )?;
+        let address = server.address();
+
+        let request = post_app(address, "/v1/push/test", "{}");
+        assert_eq!(raw_status(address, &request)?, 200);
+        assert_eq!(probe.alerts.load(std::sync::atomic::Ordering::SeqCst), 1);
         Ok(())
     }
 
@@ -1174,5 +1323,196 @@ iBNGGY1f60D2l/vFaGYI8tsOOAetgeJ8rQ==
             }),
         );
         assert!(started.is_err());
+    }
+
+    fn wire_fixture_chat(id: &str, title: &str) -> TeamChat {
+        TeamChat {
+            id: id.to_string(),
+            title: title.to_string(),
+            agent: "claude".to_string(),
+            open: true,
+            live: true,
+            last_turn_ended_at: None,
+            last_turn_errored: false,
+            waiting: false,
+        }
+    }
+
+    fn wire_fixture_update() -> TeamChatUpdate {
+        use agent_client_protocol::schema as acp;
+        let tool_entry = |id: &str, title: &str, kind: acp::ToolKind, status| TeamEntry::Updates {
+            updates: vec![
+                acp::SessionUpdate::ToolCall(
+                    acp::ToolCall::new(acp::ToolCallId::new(id.to_string()), title.to_string())
+                        .kind(kind),
+                ),
+                acp::SessionUpdate::ToolCallUpdate(acp::ToolCallUpdate::new(
+                    acp::ToolCallId::new(id.to_string()),
+                    acp::ToolCallUpdateFields::new().status(status),
+                )),
+            ],
+        };
+        let message_entry = |update: acp::SessionUpdate| TeamEntry::Updates {
+            updates: vec![update],
+        };
+        let changes = vec![
+            message_entry(acp::SessionUpdate::UserMessageChunk(
+                acp::ContentChunk::new("Fix the login page".into()),
+            )),
+            message_entry(acp::SessionUpdate::AgentMessageChunk(
+                acp::ContentChunk::new("Looking at the form handler".into()),
+            )),
+            tool_entry(
+                "tool-1",
+                "Read login.rs",
+                acp::ToolKind::Read,
+                acp::ToolCallStatus::Completed,
+            ),
+            tool_entry(
+                "tool-2",
+                "Run cargo test",
+                acp::ToolKind::Execute,
+                acp::ToolCallStatus::Pending,
+            ),
+            tool_entry(
+                "tool-3",
+                "Edit login.rs",
+                acp::ToolKind::Edit,
+                acp::ToolCallStatus::InProgress,
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, entry)| TeamEntryChange { index, entry })
+        .collect::<Vec<_>>();
+        TeamChatUpdate {
+            cursor: "cursor-5".to_string(),
+            reset: true,
+            len: changes.len(),
+            changes,
+            plan: vec![
+                acp::PlanEntry::new(
+                    "Reproduce the bug",
+                    acp::PlanEntryPriority::High,
+                    acp::PlanEntryStatus::Completed,
+                ),
+                acp::PlanEntry::new(
+                    "Fix the handler",
+                    acp::PlanEntryPriority::Medium,
+                    acp::PlanEntryStatus::InProgress,
+                ),
+            ],
+            generating: true,
+            permissions: vec![TeamPermissionRequest {
+                tool_call_id: "tool-2".to_string(),
+                options: vec![
+                    acp::PermissionOption::new(
+                        "allow",
+                        "Allow",
+                        acp::PermissionOptionKind::AllowOnce,
+                    ),
+                    acp::PermissionOption::new(
+                        "reject",
+                        "Deny",
+                        acp::PermissionOptionKind::RejectOnce,
+                    ),
+                ],
+            }],
+        }
+    }
+
+    #[test]
+    fn android_wire_fixtures_match() -> Result<(), String> {
+        let mut waiting_chat = wire_fixture_chat("chat-1", "Fix the login page");
+        waiting_chat.waiting = true;
+        let mut finished_chat = wire_fixture_chat("chat-2", "Write the docs");
+        finished_chat.last_turn_ended_at = Some(1_700_000_100_000);
+        let workspaces = TeamWorkspaceList {
+            workspaces: vec![TeamWorkspace {
+                id: "ws-1".to_string(),
+                project: "alpha-repo".to_string(),
+                name: "login-fix".to_string(),
+                branch: "jay/login-fix".to_string(),
+                pr_number: Some(42),
+                pr_state: Some("ready".to_string()),
+                changed_files: 3,
+                additions: 20,
+                deletions: 4,
+                agent_state: TeamAgentState::WaitingForApproval,
+                idle_seconds: Some(12),
+                chats: vec![waiting_chat, finished_chat],
+                step_in: true,
+                share_files: false,
+                edit_files: false,
+                remote_url: None,
+                base_branch: Some("main".to_string()),
+                skip_patterns: Vec::new(),
+                agents: false,
+                root_path: None,
+            }],
+        };
+        let pr_status = PhonePrStatus {
+            found: true,
+            number: Some(42),
+            title: Some("Fix the login page".to_string()),
+            url: Some("https://github.com/example/alpha-repo/pull/42".to_string()),
+            state: Some("OPEN".to_string()),
+            is_draft: false,
+            merge_state_status: Some("CLEAN".to_string()),
+            head_ref_oid: Some("0123abcd".to_string()),
+            checks_summary: "3 of 3 checks passed".to_string(),
+            can_merge: true,
+            merge_method: "squash".to_string(),
+        };
+        let agents = PhoneAgentList {
+            agents: vec![PhoneAgent {
+                id: "claude".to_string(),
+                label: "Claude".to_string(),
+            }],
+        };
+        let repositories = PhoneRepositoryList {
+            repositories: vec![PhoneRepository {
+                id: "repo-1".to_string(),
+                name: "alpha-repo".to_string(),
+            }],
+        };
+        let outcome = PhoneActionOutcome {
+            chat_id: Some("chat-9".to_string()),
+            workspace_id: Some("ws-9".to_string()),
+            message: None,
+        };
+        let fixtures = [
+            ("workspaces.json", to_pretty(&workspaces)?),
+            ("chat_update.json", to_pretty(&wire_fixture_update())?),
+            ("pr_status.json", to_pretty(&pr_status)?),
+            ("agents.json", to_pretty(&agents)?),
+            ("repositories.json", to_pretty(&repositories)?),
+            ("outcome.json", to_pretty(&outcome)?),
+        ];
+        let directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../android/app/src/test/resources/wire");
+        let update = std::env::var("UPDATE_ANDROID_FIXTURES").is_ok_and(|value| value == "1");
+        if update {
+            std::fs::create_dir_all(&directory).map_err(|err| err.to_string())?;
+        }
+        for (name, json) in fixtures {
+            let path = directory.join(name);
+            if update {
+                std::fs::write(&path, format!("{json}\n")).map_err(|err| err.to_string())?;
+            } else {
+                let saved = std::fs::read_to_string(&path)
+                    .map_err(|err| format!("{}: {err}", path.display()))?;
+                if saved.trim_end() != json {
+                    return Err(format!(
+                        "{name} is out of date; rerun with UPDATE_ANDROID_FIXTURES=1"
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn to_pretty<T: serde::Serialize>(value: &T) -> Result<String, String> {
+        serde_json::to_string_pretty(value).map_err(|err| err.to_string())
     }
 }

@@ -17,7 +17,9 @@ use settings::{Settings as _, SettingsStore, TeamPeerContent, update_settings_fi
 use ui::{Checkbox, Headline, HeadlineSize, Switch, ToggleState, Tooltip, prelude::*};
 use util::ResultExt as _;
 
-use crate::phone::{phone_https_error, phone_page_url, phone_share, phone_start_error};
+use crate::phone::{
+    phone_app_alerts_error, phone_https_error, phone_page_url, phone_share, phone_start_error,
+};
 use crate::team::{
     SharingStatus, TeamPeer, TeamSettings, is_workspace_shared, set_workspace_shared, team_share,
 };
@@ -198,6 +200,13 @@ impl TeamSettingsView {
             .when_some(phone_https_error(cx), |card, err| {
                 card.child(
                     Label::new(format!("Phone alerts are off: {err}"))
+                        .size(LabelSize::Small)
+                        .color(Color::Warning),
+                )
+            })
+            .when_some(phone_app_alerts_error(cx), |card, err| {
+                card.child(
+                    Label::new(format!("App alerts are off: {err}"))
                         .size(LabelSize::Small)
                         .color(Color::Warning),
                 )

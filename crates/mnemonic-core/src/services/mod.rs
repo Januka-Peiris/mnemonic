@@ -10,6 +10,7 @@ pub mod checkpoint_service;
 pub mod command_safety_service;
 pub mod coordination_artifact_service;
 pub mod deep_link_service;
+pub mod fcm_service;
 pub mod environment_service;
 pub mod hook_service;
 pub mod review_service;

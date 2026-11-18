@@ -15,6 +15,8 @@ use p256::{PublicKey, SecretKey};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 
+use crate::services::team_share_service::is_plain_id;
+
 const SEND_TIMEOUT: Duration = Duration::from_secs(10);
 const RECORD_SIZE: u32 = 4096;
 const UNCOMPRESSED_POINT_LENGTH: u8 = 65;
@@ -24,6 +26,8 @@ const MAX_PLAINTEXT_LENGTH: usize = 3993;
 const TOKEN_LIFETIME_SECONDS: u64 = 12 * 60 * 60;
 const VAPID_SUBJECT: &str = "mailto:mnemonic@localhost";
 const VAPID_KEY_FILE: &str = "vapid.key";
+const MAX_DEVICE_TOKEN_BYTES: usize = 4096;
+const MAX_DEVICE_NAME_CHARS: usize = 100;
 
 /// Keys are base64url, as browsers send them.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -39,6 +43,50 @@ impl PushSubscription {
     /// failing every push later.
     pub fn check_keys(&self) -> Result<(), String> {
         decode_keys(self).map(|_| ())
+    }
+}
+
+/// An installed app: a push token to send to, and keys the Mac seals the
+/// alert with so the token's service never sees the contents.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PushDevice {
+    pub install_id: String,
+    pub token: String,
+    pub p256dh: String,
+    pub auth: String,
+    pub name: String,
+}
+
+impl std::fmt::Debug for PushDevice {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PushDevice")
+            .field("install_id", &self.install_id)
+            .field("name", &self.name)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PushDevice {
+    pub fn subscription(&self) -> PushSubscription {
+        PushSubscription {
+            endpoint: String::new(),
+            p256dh: self.p256dh.clone(),
+            auth: self.auth.clone(),
+        }
+    }
+
+    pub fn check(&self) -> Result<(), String> {
+        if !is_plain_id(&self.install_id) {
+            return Err("The install id may only use letters, digits, - and _".to_string());
+        }
+        if self.token.is_empty() || self.token.len() > MAX_DEVICE_TOKEN_BYTES {
+            return Err("The push token is missing or too long".to_string());
+        }
+        if self.name.chars().count() > MAX_DEVICE_NAME_CHARS {
+            return Err("The device name is too long".to_string());
+        }
+        self.subscription().check_keys()
     }
 }
 
@@ -338,6 +386,55 @@ mod tests {
             URL_SAFE_NO_PAD.encode(&body),
             URL_SAFE_NO_PAD.encode(&expected)
         );
+        Ok(())
+    }
+
+    #[test]
+    fn android_fixture_matches_mac_encryption() -> Result<(), String> {
+        let receiver_private = "q1dXpw3UpT5VOmu_cf_v6ih07Aems3njxI-JWgLcM94";
+        let receiver_public = concat!(
+            "BCVxsr7N_eNgVRqvHtD0zTZsEc6-VV-JvLexhqUzORcx",
+            "aOzi6-AYWXvTBHm4bjyPjs7Vd8pZGH6SRpkNtoIAiw4"
+        );
+        let auth = "BTBZMqHH6r4Tts7J_aSIgg";
+        let subscription = PushSubscription {
+            endpoint: "https://fcm.invalid/fixture".into(),
+            p256dh: receiver_public.into(),
+            auth: auth.into(),
+        };
+        let server_private: [u8; 32] = decode("yfWPiYE-n46HLnH0KqZOF1fJJU3MYrct3AELtAQ-oRw")?
+            .try_into()
+            .map_err(|_| "server private key is not 32 bytes".to_string())?;
+        let salt: [u8; 16] = decode("AAECAwQFBgcICQoLDA0ODw")?
+            .try_into()
+            .map_err(|_| "salt is not 16 bytes".to_string())?;
+        let plaintext =
+            r#"{"title":"mnemonic / fixture","body":"needs permission to run a command"}"#;
+
+        let body = encrypt_with(plaintext.as_bytes(), &subscription, &server_private, &salt)?;
+
+        let fixture = serde_json::json!({
+            "receiverPrivate": receiver_private,
+            "receiverPublic": receiver_public,
+            "auth": auth,
+            "body": URL_SAFE_NO_PAD.encode(&body),
+            "plaintext": URL_SAFE_NO_PAD.encode(plaintext),
+        });
+        let rendered = format!(
+            "{}\n",
+            serde_json::to_string_pretty(&fixture).map_err(|err| err.to_string())?
+        );
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../android/app/src/test/resources/mac_push_fixture.json");
+        if std::env::var("UPDATE_ANDROID_FIXTURES").as_deref() == Ok("1") {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).map_err(|err| err.to_string())?;
+            }
+            std::fs::write(&path, &rendered).map_err(|err| err.to_string())?;
+        }
+        let on_disk = std::fs::read_to_string(&path)
+            .map_err(|err| format!("couldn't read {}: {err}", path.display()))?;
+        assert_eq!(on_disk, rendered);
         Ok(())
     }
 

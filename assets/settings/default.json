@@ -1811,6 +1811,9 @@
     "ntfy_token": "",
     // Minutes without keyboard or mouse input on this Mac before alerts are sent.
     "notify_after_idle_minutes": 5,
+    // The Firebase service account key file (JSON) used to send alerts to the
+    // Android app. When empty, no app alerts are sent.
+    "fcm_service_account": "",
   },
   // Settings specific to journaling
   "journal": {
