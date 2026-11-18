@@ -12,6 +12,7 @@ import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.navigationBars
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.windowInsetsPadding
+import androidx.compose.foundation.gestures.scrollBy
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.rememberLazyListState
@@ -80,7 +81,6 @@ fun ChatScreen(
 ) {
     val state by viewModel.state.collectAsState()
     val lifecycle = LocalLifecycleOwner.current.lifecycle
-    val scope = androidx.compose.runtime.rememberCoroutineScope()
     LaunchedEffect(viewModel, lifecycle) {
         lifecycle.repeatOnLifecycle(Lifecycle.State.RESUMED) {
             launch { viewModel.follow() }
@@ -99,7 +99,10 @@ fun ChatScreen(
     val listState = rememberLazyListState()
     val pinned = remember(rows) { Snapshot.withoutReadObservation { nearBottom(listState) } }
     LaunchedEffect(rows) {
-        if (pinned && rows.isNotEmpty()) listState.scrollToItem(rows.size - 1)
+        if (pinned && rows.isNotEmpty()) {
+            listState.scrollToItem(rows.size - 1)
+            listState.scrollBy(100_000_000f)
+        }
     }
 
     Scaffold(
@@ -215,7 +218,7 @@ fun ChatScreen(
             confirmButton = {
                 TextButton(onClick = {
                     confirmingMerge = null
-                    viewModel.merge()
+                    viewModel.merge(merge)
                 }) { Text("Merge") }
             },
             dismissButton = { TextButton(onClick = { confirmingMerge = null }) { Text("Cancel") } },

@@ -35,7 +35,14 @@ sealed interface PrAction {
     data object None : PrAction
     data object CreatePr : PrAction
     data object Waiting : PrAction
-    data class Merge(val number: Long, val title: String, val method: String, val shortHead: String) : PrAction
+    data class Merge(
+        val number: Long,
+        val title: String,
+        val method: String,
+        val head: String,
+    ) : PrAction {
+        val shortHead: String get() = head.take(7)
+    }
 }
 
 fun prAction(pr: PhonePrStatus?, agentWorking: Boolean, requestHeld: Boolean): PrAction {
@@ -47,7 +54,7 @@ fun prAction(pr: PhonePrStatus?, agentWorking: Boolean, requestHeld: Boolean): P
         number = number,
         title = pr.title.orEmpty(),
         method = pr.mergeMethod.ifEmpty { "default" },
-        shortHead = pr.headRefOid.orEmpty().take(7),
+        head = pr.headRefOid.orEmpty(),
     )
 }
 
@@ -311,14 +318,12 @@ class ChatViewModel(
         }
     }
 
-    fun merge() {
-        val current = mutableState.value
-        val workspace = current.workspace ?: return
-        val status = current.pr ?: return
+    fun merge(confirmed: PrAction.Merge) {
+        val workspace = mutableState.value.workspace ?: return
         runPrCall {
-            val result = client.merge(workspace.id, status.headRefOid.orEmpty())
+            val result = client.merge(workspace.id, confirmed.head)
             if (result is MacResult.Ok) {
-                mutableState.update { it.copy(notice = result.value.message ?: "Merged PR #${status.number}") }
+                mutableState.update { it.copy(notice = result.value.message ?: "Merged PR #${confirmed.number}") }
             }
             result
         }

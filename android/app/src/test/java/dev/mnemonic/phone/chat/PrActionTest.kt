@@ -24,9 +24,19 @@ class PrActionTest {
     @Test
     fun mergeablePullRequestOffersMergeWithSevenCharacterHead() {
         assertEquals(
-            PrAction.Merge(212, "Make retry backoff exponential", "squash", "a1b2c3d"),
+            PrAction.Merge(212, "Make retry backoff exponential", "squash", "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678"),
             prAction(openPr(canMerge = true), agentWorking = false, requestHeld = false),
         )
+    }
+
+    @Test
+    fun confirmedMergeKeepsTheHeadTheDialogShowed() {
+        val shown = prAction(openPr(canMerge = true), agentWorking = false, requestHeld = false) as PrAction.Merge
+        val pushed = openPr(canMerge = true).copy(headRefOid = "ffffffffffffffffffffffffffffffffffffffff")
+        prAction(pushed, agentWorking = false, requestHeld = false)
+
+        assertEquals("a1b2c3d", shown.shortHead)
+        assertEquals("a1b2c3d4e5f60718293a4b5c6d7e8f9012345678", shown.head)
     }
 
     @Test
