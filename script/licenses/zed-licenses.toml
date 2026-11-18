@@ -1,4 +1,5 @@
 no-clearly-defined = true
+workarounds = ["ring"]
 private = { ignore = true }
 # Licenses allowed in Zed's dependencies. AGPL should not be added to this list.
 # When adding to this list, please check the following open source license policies:
