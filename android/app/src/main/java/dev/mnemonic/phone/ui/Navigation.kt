@@ -1,13 +1,8 @@
 package dev.mnemonic.phone.ui
 
-import androidx.compose.foundation.layout.Box
-import androidx.compose.foundation.layout.fillMaxSize
-import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
-import androidx.compose.ui.Alignment
-import androidx.compose.ui.Modifier
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.navigation.NavHostController
 import androidx.navigation.NavType
@@ -19,7 +14,11 @@ import androidx.navigation.navDeepLink
 import dev.mnemonic.phone.AppState
 import dev.mnemonic.phone.api.MacAddress
 import dev.mnemonic.phone.api.MacClient
+import dev.mnemonic.phone.chat.ChatScreen
+import dev.mnemonic.phone.chat.ChatViewModel
 import dev.mnemonic.phone.connect.ConnectScreen
+import dev.mnemonic.phone.diff.DiffScreen
+import dev.mnemonic.phone.task.NewTaskScreen
 import dev.mnemonic.phone.home.HomeScreen
 import dev.mnemonic.phone.home.HomeViewModel
 import dev.mnemonic.phone.settings.SettingsScreen
@@ -79,14 +78,42 @@ fun MnemonicNavigation(
             arguments = listOf(navArgument("chatId") { type = NavType.StringType }),
             deepLinks = listOf(navDeepLink { uriPattern = "mnemonic://chat/{chatId}" }),
         ) { entry ->
-            Placeholder("Chat " + entry.arguments?.getString("chatId").orEmpty())
+            val chatId = entry.arguments?.getString("chatId").orEmpty()
+            if (client != null) {
+                val viewModel: ChatViewModel = viewModel(key = "$savedAddress $chatId") {
+                    ChatViewModel(chatId, client, appState)
+                }
+                ChatScreen(
+                    viewModel = viewModel,
+                    onBack = { navigateBack(navController) },
+                    onOpenChat = { navController.navigate(Routes.chat(it)) },
+                    onDiff = { navController.navigate(Routes.diff(it)) },
+                )
+            }
         }
-        composable(Routes.NEW_TASK) { Placeholder("New task") }
+        composable(Routes.NEW_TASK) {
+            if (client != null) {
+                NewTaskScreen(
+                    client = client,
+                    onBack = { navController.popBackStack() },
+                    onStarted = { chatId ->
+                        navController.navigate(Routes.chat(chatId)) { popUpTo(Routes.NEW_TASK) { inclusive = true } }
+                    },
+                    onNoChat = { navController.popBackStack() },
+                )
+            }
+        }
         composable(
             Routes.DIFF,
             arguments = listOf(navArgument("workspaceId") { type = NavType.StringType }),
         ) { entry ->
-            Placeholder("Diff " + entry.arguments?.getString("workspaceId").orEmpty())
+            if (client != null) {
+                DiffScreen(
+                    workspaceId = entry.arguments?.getString("workspaceId").orEmpty(),
+                    client = client,
+                    onBack = { navController.popBackStack() },
+                )
+            }
         }
         composable(Routes.SETTINGS) {
             SettingsScreen(
@@ -102,7 +129,8 @@ fun MnemonicNavigation(
     }
 }
 
-@Composable
-private fun Placeholder(text: String) {
-    Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { Text(text) }
+private fun navigateBack(navController: NavHostController) {
+    if (!navController.popBackStack()) {
+        navController.navigate(Routes.HOME) { popUpTo(0) }
+    }
 }

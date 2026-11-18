@@ -21,7 +21,7 @@ sealed interface ChatItem {
         val kind: String = "other",
     ) : ChatItem
     data class FoldedTools(val tools: List<Tool>, val label: String) : ChatItem
-    data class Plan(val entries: List<PlanEntry>) : ChatItem
+    data class Plan(val entries: List<PlanEntry>, val done: Boolean) : ChatItem
     data class Compaction(val summary: String) : ChatItem
 }
 
@@ -89,7 +89,7 @@ class ChatState {
             built.addAll(entryItems)
         }
         flush()
-        if (plan.isNotEmpty()) built.add(ChatItem.Plan(plan))
+        if (plan.isNotEmpty()) built.add(ChatItem.Plan(plan, done = false))
         return built
     }
 
@@ -102,7 +102,7 @@ class ChatState {
 
     private fun itemsFor(entry: TeamEntry?): List<ChatItem> =
         when (entry) {
-            is TeamEntry.CompletedPlan -> listOf(ChatItem.Plan(entry.entries))
+            is TeamEntry.CompletedPlan -> listOf(ChatItem.Plan(entry.entries, done = true))
             is TeamEntry.Compaction -> listOf(ChatItem.Compaction(entry.summary.orEmpty()))
             is TeamEntry.Updates -> rebuildEntry(entry.updates)
             is TeamEntry.Unknown, null -> emptyList()

@@ -2,7 +2,10 @@ package dev.mnemonic.phone.chat
 
 import dev.mnemonic.phone.Fixtures
 import dev.mnemonic.phone.api.MacJson
+import dev.mnemonic.phone.api.PlanEntry
 import dev.mnemonic.phone.api.TeamChatUpdate
+import dev.mnemonic.phone.api.TeamEntry
+import dev.mnemonic.phone.api.TeamEntryChange
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -29,7 +32,9 @@ class ChatStateTest {
         val last = items[4] as ChatItem.FoldedTools
         assertEquals(listOf("tool-3"), last.tools.map { it.id })
         assertEquals("in_progress", last.tools.single().status)
-        assertEquals(2, (items[5] as ChatItem.Plan).entries.size)
+        val plan = items[5] as ChatItem.Plan
+        assertEquals(2, plan.entries.size)
+        assertFalse(plan.done)
         assertTrue(state.generating)
         assertEquals("cursor-5", state.cursor)
     }
@@ -61,5 +66,22 @@ class ChatStateTest {
         assertFalse(state.generating)
         assertTrue(state.permissions.isEmpty())
         assertEquals("c2", state.cursor)
+    }
+
+    @Test
+    fun completedPlanIsMarkedDoneAndLivePlanIsNot() {
+        val state = ChatState()
+        val update = fixtureUpdate().copy(
+            reset = true,
+            len = 1,
+            changes = listOf(
+                TeamEntryChange(0, TeamEntry.CompletedPlan(listOf(PlanEntry("Ship it", "medium", "completed")))),
+            ),
+            permissions = emptyList(),
+        )
+        state.apply(update)
+
+        val plans = state.items.filterIsInstance<ChatItem.Plan>()
+        assertEquals(listOf(true, false), plans.map { it.done })
     }
 }
