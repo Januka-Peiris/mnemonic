@@ -1,0 +1,8 @@
+{
+  "repositories": [
+    {
+      "id": "repo-1",
+      "name": "alpha-repo"
+    }
+  ]
+}
