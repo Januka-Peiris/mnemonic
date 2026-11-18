@@ -20,7 +20,7 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.contentOrNull
-import kotlinx.serialization.json.jsonPrimitive
+import kotlinx.serialization.json.JsonPrimitive
 
 private const val WORKSPACE_POLL_MS = 5000L
 private const val BACKOFF_START_MS = 2000L
@@ -46,18 +46,50 @@ private fun attentionRank(state: TeamAgentState): Int =
         TeamAgentState.Idle -> 3
     }
 
+data class PromptTool(val id: String, val title: String, val kind: String)
+
 data class PermissionPrompt(
     val request: TeamPermissionRequest?,
-    val toolTitle: String?,
-    val toolKind: String?,
+    val tool: PromptTool?,
     val fetchedAt: Long,
 )
+
+fun promptFrom(update: TeamChatUpdate, fetchedAt: Long): PermissionPrompt {
+    val request = update.permissions.firstOrNull()
+    var found: PromptTool? = null
+    if (request != null) {
+        for (change in update.changes) {
+            val updates = (change.entry as? TeamEntry.Updates)?.updates ?: continue
+            var current: PromptTool? = null
+            for (item in updates) {
+                when (item.text("sessionUpdate")) {
+                    "tool_call" -> current = PromptTool(
+                        id = item.text("toolCallId").orEmpty(),
+                        title = item.text("title").orEmpty(),
+                        kind = item.text("kind")?.takeIf { it.isNotEmpty() } ?: "other",
+                    )
+                    "tool_call_update" -> if (current != null && current.id == item.text("toolCallId")) {
+                        current = current.copy(
+                            title = item.text("title")?.takeIf { it.isNotEmpty() } ?: current.title,
+                            kind = item.text("kind")?.takeIf { it.isNotEmpty() } ?: current.kind,
+                        )
+                    }
+                }
+            }
+            if (current != null && current.id == request.toolCallId) found = current
+        }
+    }
+    return PermissionPrompt(request, found, fetchedAt)
+}
+
+private fun JsonObject.text(key: String): String? = (this[key] as? JsonPrimitive)?.contentOrNull
 
 data class HomeUiState(
     val workspaces: List<TeamWorkspace> = emptyList(),
     val loaded: Boolean = false,
     val refreshing: Boolean = false,
     val banner: String? = null,
+    val answerError: String? = null,
     val prompts: Map<String, PermissionPrompt> = emptyMap(),
     val answering: Set<String> = emptySet(),
     val answered: Set<String> = emptySet(),
@@ -86,7 +118,7 @@ class HomeViewModel(private val client: MacClient, private val appState: AppStat
 
     fun refresh() {
         viewModelScope.launch {
-            mutableState.update { it.copy(refreshing = true) }
+            mutableState.update { it.copy(refreshing = true, answerError = null) }
             load()
             mutableState.update { it.copy(refreshing = false) }
         }
@@ -98,7 +130,7 @@ class HomeViewModel(private val client: MacClient, private val appState: AppStat
 
     fun answer(chatId: String, toolCallId: String, optionId: String) {
         viewModelScope.launch {
-            mutableState.update { it.copy(answering = it.answering + chatId) }
+            mutableState.update { it.copy(answering = it.answering + chatId, answerError = null) }
             val result = client.answerPermission(chatId, toolCallId, optionId)
             val settled = result is MacResult.Ok || (result is MacResult.Refused && result.status == 409)
             mutableState.update {
@@ -106,8 +138,8 @@ class HomeViewModel(private val client: MacClient, private val appState: AppStat
                     answering = it.answering - chatId,
                     answered = if (settled) it.answered + "$chatId $toolCallId" else it.answered,
                     prompts = it.prompts - chatId,
-                    banner = when {
-                        settled -> it.banner
+                    answerError = when {
+                        settled -> null
                         result is MacResult.Refused -> result.reason
                         else -> CANT_REACH
                     },
@@ -150,8 +182,8 @@ class HomeViewModel(private val client: MacClient, private val appState: AppStat
         viewModelScope.launch {
             val update = client.chatUpdate(chatId, null, 0)
             loadingPrompts.remove(chatId)
-            val prompt = (update as? MacResult.Ok)?.value?.let { promptFrom(it) }
-                ?: PermissionPrompt(null, null, null, System.currentTimeMillis())
+            val prompt = (update as? MacResult.Ok)?.value?.let { promptFrom(it, System.currentTimeMillis()) }
+                ?: PermissionPrompt(null, null, System.currentTimeMillis())
             mutableState.update {
                 if (it.needsYou.any { item -> item is NeedsYouItem.Waiting && item.chat.id == chatId }) {
                     it.copy(prompts = it.prompts + (chatId to prompt))
@@ -161,29 +193,6 @@ class HomeViewModel(private val client: MacClient, private val appState: AppStat
             }
         }
     }
-
-    private fun promptFrom(update: TeamChatUpdate): PermissionPrompt {
-        val request = update.permissions.firstOrNull()
-        var title: String? = null
-        var kind: String? = null
-        if (request != null) {
-            for (change in update.changes) {
-                val updates = (change.entry as? TeamEntry.Updates)?.updates ?: continue
-                for (item in updates) {
-                    if (item.text("toolCallId") != request.toolCallId) continue
-                    when (item.text("sessionUpdate")) {
-                        "tool_call", "tool_call_update" -> {
-                            item.text("title")?.let { title = it }
-                            item.text("kind")?.let { kind = it }
-                        }
-                    }
-                }
-            }
-        }
-        return PermissionPrompt(request, title, kind, System.currentTimeMillis())
-    }
-
-    private fun JsonObject.text(key: String): String? = this[key]?.jsonPrimitive?.contentOrNull
 
     companion object {
         const val CANT_REACH = "Can't reach the Mac. Is Tailscale on?"

@@ -134,9 +134,9 @@ fun HomeScreen(
         ) {
             LazyColumn(
                 modifier = Modifier.fillMaxSize(),
-                contentPadding = PaddingValues(bottom = 88.dp),
+                contentPadding = PaddingValues(bottom = 112.dp),
             ) {
-                state.banner?.let { banner ->
+                listOfNotNull(state.banner, state.answerError).forEach { banner ->
                     item {
                         Text(
                             banner,
@@ -213,13 +213,13 @@ private fun WaitingCard(
     Column(modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 10.dp)) {
         CardLine("!", MaterialTheme.colorScheme.tertiary, workspaceTitle(item.workspace))
         Text(
-            if (answered) "answered" else permissionLine(prompt?.toolKind, prompt?.toolTitle != null),
+            if (answered) "answered" else permissionLine(prompt?.tool?.kind, prompt?.tool != null),
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
             maxLines = 1,
             overflow = TextOverflow.Ellipsis,
         )
-        prompt?.toolTitle?.let {
+        prompt?.tool?.title?.takeIf { it.isNotEmpty() }?.let {
             Text(
                 it,
                 style = MaterialTheme.typography.bodySmall,
