@@ -127,6 +127,8 @@ struct PendingPhoneAction {
 struct AppAlertStatus {
     has_devices: bool,
     key_error: Option<String>,
+    /// Why the last Google sign-in failed, until one succeeds.
+    sign_in_error: Option<String>,
 }
 
 /// State the server's request threads and the alert sender share, since
@@ -151,11 +153,12 @@ impl AppAlerts {
             None => false,
         };
         let key_path = lock(&self.key_path).clone();
-        let status = AppAlertStatus {
-            has_devices,
-            key_error: fcm_service::fcm_status(key_path.as_deref()).err(),
-        };
-        *lock(&self.status) = status;
+        let key_error = fcm_service::fcm_status(key_path.as_deref()).err();
+        {
+            let mut status = lock(&self.status);
+            status.has_devices = has_devices;
+            status.key_error = key_error;
+        }
         // The receiver only goes away when the app is quitting.
         self.changed.unbounded_send(()).ok();
     }
@@ -244,7 +247,10 @@ pub(crate) fn phone_https_error(cx: &App) -> Option<String> {
 /// Why app alerts can't be sent, when an app is registered to get them.
 pub(crate) fn phone_app_alerts_error(cx: &App) -> Option<String> {
     let status = lock(&phone_share(cx)?.read(cx).app_alerts.status).clone();
-    status.key_error.filter(|_| status.has_devices)
+    status
+        .key_error
+        .or(status.sign_in_error)
+        .filter(|_| status.has_devices)
 }
 
 impl PhoneShare {
@@ -399,6 +405,7 @@ impl PhoneShare {
         let key_path = settings.fcm_service_account.clone();
         if *lock(&self.app_alerts.key_path) != key_path {
             *lock(&self.app_alerts.key_path) = key_path;
+            lock(&self.app_alerts.status).sign_in_error = None;
             let app_alerts = self.app_alerts.clone();
             cx.background_spawn(async move { app_alerts.refresh_status() })
                 .detach();
@@ -916,7 +923,16 @@ fn send_to_devices(payload: &str, app_alerts: &AppAlerts) -> Result<(), String> 
     let key_path = lock(&app_alerts.key_path).clone();
     let key_path = key_path.ok_or_else(|| "No Firebase key file is set".to_string())?;
     let account = ServiceAccount::load(&key_path)?;
-    let access_token = AccessTokenCache::shared().token(&account)?;
+    let access_token = match AccessTokenCache::shared().token(&account) {
+        Ok(access_token) => {
+            lock(&app_alerts.status).sign_in_error = None;
+            access_token
+        }
+        Err(err) => {
+            lock(&app_alerts.status).sign_in_error = Some(err.clone());
+            return Err(err);
+        }
+    };
     let mut failures = Vec::new();
     for device in devices {
         match fcm_service::send(&account, &access_token, &device, payload.as_bytes()) {

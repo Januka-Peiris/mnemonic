@@ -155,7 +155,6 @@ pub enum FcmOutcome {
 pub fn outcome_for_status(status: u16, body: &str) -> Result<FcmOutcome, String> {
     match status {
         200..=299 => Ok(FcmOutcome::Delivered),
-        404 => Ok(FcmOutcome::Unregistered),
         _ if body.contains("UNREGISTERED") => Ok(FcmOutcome::Unregistered),
         _ => Err(format!("Firebase answered {status}: {body}")),
     }
@@ -243,13 +242,19 @@ mod tests {
 
     #[test]
     fn unregistered_answer_means_forget_device() {
-        assert_eq!(outcome_for_status(404, ""), Ok(FcmOutcome::Unregistered));
         assert_eq!(
             outcome_for_status(
-                400,
-                "{\"error\":{\"details\":[{\"errorCode\":\"UNREGISTERED\"}]}}"
+                404,
+                "{\"error\":{\"status\":\"NOT_FOUND\",\"details\":[{\"errorCode\":\"UNREGISTERED\"}]}}"
             ),
             Ok(FcmOutcome::Unregistered)
+        );
+        assert!(
+            outcome_for_status(
+                404,
+                "{\"error\":{\"status\":\"NOT_FOUND\",\"message\":\"Requested entity was not found.\"}}"
+            )
+            .is_err()
         );
         assert!(outcome_for_status(500, "x").is_err());
         assert_eq!(outcome_for_status(200, ""), Ok(FcmOutcome::Delivered));
