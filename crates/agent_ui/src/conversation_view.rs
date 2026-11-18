@@ -552,6 +552,12 @@ pub enum AcpServerViewEvent {
 
 impl EventEmitter<AcpServerViewEvent> for ConversationView {}
 
+#[derive(Clone)]
+struct ModelRefreshState {
+    draft: Vec<acp::ContentBlock>,
+    choices: Vec<(acp::SessionConfigId, acp::SessionConfigValueId)>,
+}
+
 pub struct ConversationView {
     agent: Rc<dyn AgentServer>,
     connection_store: Entity<AgentConnectionStore>,
@@ -586,6 +592,8 @@ pub struct ConversationView {
     /// causes mermaid diagrams to re-render).
     last_theme_id: Option<String>,
     draft_prompt_persist_task: Option<Task<()>>,
+    /// Retained across reconnect failures so retry can restore the unsent draft.
+    model_refresh: Option<ModelRefreshState>,
     /// Cache + worktree snapshot for resolving paths in markdown code spans.
     /// Shared with the child [`ThreadView`] when one is constructed.
     pub(crate) code_span_resolver: AgentCodeSpanResolver,
@@ -934,6 +942,7 @@ impl ConversationView {
             loading_status: None,
             last_theme_id: Some(cx.theme().id.clone()),
             draft_prompt_persist_task: None,
+            model_refresh: None,
             code_span_resolver,
             _subscriptions: subscriptions,
             focus_handle: cx.focus_handle(),
@@ -952,6 +961,112 @@ impl ConversationView {
             cx.emit(RootThreadUpdated);
         }
         cx.notify();
+    }
+
+    fn refresh_agent_models(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Result<()> {
+        anyhow::ensure!(
+            self.read_only.is_none(),
+            "Models cannot be refreshed in a read-only chat."
+        );
+        let connected = self
+            .as_connected()
+            .ok_or_else(|| anyhow!("Wait for the agent to connect."))?;
+        anyhow::ensure!(
+            connected.connection.supports_load_session(),
+            "This agent cannot reload chat history."
+        );
+        let root = self
+            .root_thread_view()
+            .ok_or_else(|| anyhow!("The chat is not connected."))?;
+        for view in connected.threads.values() {
+            let view = view.read(cx);
+            anyhow::ensure!(
+                view.thread.read(cx).status() == ThreadStatus::Idle
+                    && !view.is_loading_contents
+                    && !view.has_queued_messages(),
+                "Finish or stop the reply and clear queued messages before refreshing models."
+            );
+            anyhow::ensure!(
+                view.thread.read(cx).parent_session_id().is_none()
+                    || view.message_editor.read(cx).is_empty(cx),
+                "Save the subagent's draft before refreshing models."
+            );
+        }
+        let root = root.read(cx);
+        let draft = root
+            .message_editor
+            .read(cx)
+            .draft_content_blocks_snapshot(cx);
+        let thread = root.thread.read(cx);
+        let options = connected
+            .connection
+            .session_config_options(thread.session_id(), cx)
+            .map(|options| options.config_options())
+            .unwrap_or_default();
+        let mut choices: Vec<_> = options
+            .into_iter()
+            .filter_map(|option| {
+                let order = match option.category {
+                    Some(acp::SessionConfigOptionCategory::Model) => 0,
+                    Some(acp::SessionConfigOptionCategory::ThoughtLevel) => 1,
+                    _ => return None,
+                };
+                match option.kind {
+                    acp::SessionConfigKind::Select(select) => {
+                        Some((order, option.id, select.current_value))
+                    }
+                    _ => None,
+                }
+            })
+            .collect();
+        choices.sort_by_key(|(order, _, _)| *order);
+        self.model_refresh = Some(ModelRefreshState {
+            draft,
+            choices: choices
+                .into_iter()
+                .map(|(_, id, value)| (id, value))
+                .collect(),
+        });
+        // ACP supplies models on session load. A new connection also bypasses
+        // the cached session, rather than just rebuilding the same picker.
+        self.connection_store.update(cx, |store, cx| {
+            store.restart_connection(self.connection_key.clone(), self.agent.clone(), cx);
+        });
+        self.reset(window, cx);
+        Ok(())
+    }
+
+    async fn restore_model_choices(
+        thread: &Entity<AcpThread>,
+        choices: Vec<(acp::SessionConfigId, acp::SessionConfigValueId)>,
+        cx: &mut gpui::AsyncWindowContext,
+    ) -> Result<()> {
+        for (config_id, value) in choices {
+            let set = cx.update(|_, cx| -> Result<_> {
+                let thread = thread.read(cx);
+                let options = thread.connection().session_config_options(thread.session_id(), cx)
+                    .ok_or_else(|| anyhow!("The refreshed agent did not return model options."))?;
+                let option = options.config_options().into_iter().find(|option| option.id == config_id)
+                    .ok_or_else(|| anyhow!("The refreshed agent no longer offers {}.", config_id.0))?;
+                let supported = match option.kind {
+                    acp::SessionConfigKind::Select(select) => {
+                        if select.current_value == value { return Ok(None); }
+                        match select.options {
+                            acp::SessionConfigSelectOptions::Ungrouped(options) => options.iter().any(|option| option.value == value),
+                            acp::SessionConfigSelectOptions::Grouped(groups) => groups.iter().any(|group| group.options.iter().any(|option| option.value == value)),
+                            _ => false,
+                        }
+                    }
+                    _ => false,
+                };
+                anyhow::ensure!(supported, "The refreshed agent no longer offers the selected value {}. Your draft has been kept for retry.", value.0);
+                Ok(Some(options.set_config_option(config_id, value, cx)))
+            })??;
+            if let Some(set) = set {
+                set.await?;
+            }
+        }
+        Ok(())
     }
 
     fn reset(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1138,6 +1253,33 @@ impl ConversationView {
                 Ok(thread) => Ok(thread),
             };
 
+            let result = async {
+                let thread = result?;
+                let choices = this.read_with(cx, |this, _| {
+                    this.model_refresh
+                        .as_ref()
+                        .map(|refresh| refresh.choices.clone())
+                        .unwrap_or_default()
+                })?;
+                let restore = Self::restore_model_choices(&thread, choices, cx).await;
+                if let Err(error) = restore {
+                    let close = cx.update(|_, cx| {
+                        let thread = thread.read(cx);
+                        let connection = thread.connection().clone();
+                        let session_id = thread.session_id().clone();
+                        connection
+                            .supports_close_session()
+                            .then(|| connection.close_session(&session_id, cx))
+                    })?;
+                    if let Some(close) = close {
+                        close.await.log_err();
+                    }
+                    return Err(error);
+                }
+                anyhow::Ok(thread)
+            }
+            .await;
+
             this.update_in(cx, |this, window, cx| {
                 match result {
                     Ok(thread) => {
@@ -1149,6 +1291,14 @@ impl ConversationView {
                             conversation
                         });
 
+                        let initial_content = this
+                            .model_refresh
+                            .take()
+                            .map(|refresh| AgentInitialContent::ContentBlock {
+                                blocks: refresh.draft,
+                                auto_submit: false,
+                            })
+                            .or(initial_content);
                         let current = this.new_thread_view(
                             thread,
                             conversation.clone(),
@@ -1272,10 +1422,21 @@ impl ConversationView {
             // Use config options - don't create mode_selector or model_selector
             let agent_server = self.agent.clone();
             let fs = self.project.read(cx).fs().clone();
-            config_options_view =
-                Some(cx.new(|cx| {
-                    ConfigOptionsView::new(config_options, agent_server, fs, window, cx)
-                }));
+            let refresh_models: Option<super::config_options::RefreshModels> = (matches!(
+                agent_id.0.as_ref(),
+                agent_servers::CLAUDE_AGENT_ID | agent_servers::CODEX_ID
+            ) && connection
+                .supports_load_session()
+                && thread.read(cx).parent_session_id().is_none())
+            .then(|| {
+                let this = cx.weak_entity();
+                Rc::new(move |window: &mut Window, cx: &mut App| {
+                    this.update(cx, |this, cx| this.refresh_agent_models(window, cx))?
+                }) as super::config_options::RefreshModels
+            });
+            config_options_view = Some(cx.new(|cx| {
+                ConfigOptionsView::new(config_options, agent_server, fs, refresh_models, window, cx)
+            }));
             model_selector = None;
             mode_selector = None;
         } else {
@@ -3990,6 +4151,261 @@ pub(crate) mod tests {
         fn into_any(self: Rc<Self>) -> Rc<dyn Any> {
             self
         }
+    }
+
+    struct RefreshModelsServer {
+        connections: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl AgentServer for RefreshModelsServer {
+        fn logo(&self) -> IconName {
+            IconName::ZedAgent
+        }
+        fn agent_id(&self) -> AgentId {
+            AgentId::new("Test")
+        }
+        fn connect(
+            &self,
+            _delegate: AgentServerDelegate,
+            _project: Entity<Project>,
+            _cx: &mut App,
+        ) -> Task<Result<Rc<dyn AgentConnection>>> {
+            let generation = self
+                .connections
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let mut models = vec![
+                acp::SessionConfigSelectOption::new("original", "Original model"),
+                acp::SessionConfigSelectOption::new("chosen", "Chosen model"),
+            ];
+            if generation > 0 {
+                models.push(acp::SessionConfigSelectOption::new(
+                    "new-release",
+                    "New release",
+                ));
+            }
+            let options = acp::SessionConfigOption::select("model", "Model", "original", models)
+                .category(acp::SessionConfigOptionCategory::Model);
+            Task::ready(Ok(Rc::new(RefreshModelsConnection {
+                options: Rc::new(RefreshModelsOptions(std::cell::RefCell::new(vec![options]))),
+            })))
+        }
+        fn into_any(self: Rc<Self>) -> Rc<dyn Any> {
+            self
+        }
+    }
+
+    struct RefreshModelsOptions(std::cell::RefCell<Vec<acp::SessionConfigOption>>);
+
+    impl acp_thread::AgentSessionConfigOptions for RefreshModelsOptions {
+        fn config_options(&self) -> Vec<acp::SessionConfigOption> {
+            self.0.borrow().clone()
+        }
+        fn set_config_option(
+            &self,
+            id: acp::SessionConfigId,
+            value: acp::SessionConfigValueId,
+            _cx: &mut App,
+        ) -> Task<Result<Vec<acp::SessionConfigOption>>> {
+            for option in self.0.borrow_mut().iter_mut() {
+                if option.id == id
+                    && let acp::SessionConfigKind::Select(select) = &mut option.kind
+                {
+                    select.current_value = value.clone();
+                }
+            }
+            Task::ready(Ok(self.config_options()))
+        }
+    }
+
+    struct RefreshModelsConnection {
+        options: Rc<RefreshModelsOptions>,
+    }
+
+    impl AgentConnection for RefreshModelsConnection {
+        fn agent_id(&self) -> AgentId {
+            AgentId::new("Test")
+        }
+        fn telemetry_id(&self) -> SharedString {
+            "Test".into()
+        }
+        fn new_session(
+            self: Rc<Self>,
+            project: Entity<Project>,
+            _work_dirs: PathList,
+            cx: &mut App,
+        ) -> Task<Result<Entity<AcpThread>>> {
+            Task::ready(Ok(build_test_thread(
+                self,
+                project,
+                "Test",
+                acp::SessionId::new("same-chat"),
+                cx,
+            )))
+        }
+        fn supports_load_session(&self) -> bool {
+            true
+        }
+        fn load_session(
+            self: Rc<Self>,
+            id: acp::SessionId,
+            project: Entity<Project>,
+            _work_dirs: PathList,
+            _title: Option<SharedString>,
+            cx: &mut App,
+        ) -> Task<Result<Entity<AcpThread>>> {
+            let thread = build_test_thread(self, project, "Test", id, cx);
+            thread
+                .update(cx, |thread, cx| {
+                    thread.handle_session_update(
+                        acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new(
+                            "Existing reply".into(),
+                        )),
+                        cx,
+                    )
+                })
+                .expect("history replay");
+            Task::ready(Ok(thread))
+        }
+        fn session_config_options(
+            &self,
+            _id: &acp::SessionId,
+            _cx: &App,
+        ) -> Option<Rc<dyn acp_thread::AgentSessionConfigOptions>> {
+            Some(self.options.clone())
+        }
+        fn auth_methods(&self) -> &[acp::AuthMethod] {
+            &[]
+        }
+        fn authenticate(&self, _id: acp::AuthMethodId, _cx: &mut App) -> Task<Result<()>> {
+            Task::ready(Ok(()))
+        }
+        fn prompt(
+            &self,
+            _id: UserMessageId,
+            _params: acp::PromptRequest,
+            _cx: &mut App,
+        ) -> Task<Result<acp::PromptResponse>> {
+            Task::ready(Err(anyhow!("Refreshing models must not submit a prompt")))
+        }
+        fn cancel(&self, _id: &acp::SessionId, _cx: &mut App) {}
+        fn into_any(self: Rc<Self>) -> Rc<dyn Any> {
+            self
+        }
+    }
+
+    #[gpui::test]
+    async fn test_refresh_agent_models_does_not_interrupt_a_running_reply(cx: &mut TestAppContext) {
+        init_test(cx);
+        let connection = StubAgentConnection::new().with_supports_load_session(true);
+        let (view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection.clone()), cx).await;
+        let original_thread =
+            view.read_with(cx, |view, cx| view.root_thread(cx).expect("chat connected"));
+        let session_id = original_thread.read_with(cx, |thread, _| thread.session_id().clone());
+        message_editor(&view, cx).update_in(cx, |editor, window, cx| {
+            editor.set_text("Reply to this", window, cx)
+        });
+        active_thread(&view, cx).update_in(cx, |thread, window, cx| thread.send(window, cx));
+        let error = view
+            .update_in(cx, |view, window, cx| view.refresh_agent_models(window, cx))
+            .expect_err("refresh must not interrupt content preparation after Send");
+        assert!(error.to_string().contains("Finish or stop the reply"));
+        cx.run_until_parked();
+        let error = view
+            .update_in(cx, |view, window, cx| view.refresh_agent_models(window, cx))
+            .expect_err("refresh must refuse to interrupt a running reply");
+        assert!(error.to_string().contains("Finish or stop the reply"));
+        assert_eq!(
+            view.read_with(cx, |view, cx| view
+                .root_thread(cx)
+                .expect("chat still connected")
+                .entity_id()),
+            original_thread.entity_id()
+        );
+        connection.end_turn(session_id, acp::StopReason::EndTurn);
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    async fn test_refresh_agent_models_reloads_catalog_without_losing_chat_or_draft(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let connections = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (view, cx) = setup_conversation_view(
+            RefreshModelsServer {
+                connections: connections.clone(),
+            },
+            cx,
+        )
+        .await;
+        let original_thread =
+            view.read_with(cx, |view, cx| view.root_thread(cx).expect("chat connected"));
+        let session_id = original_thread.read_with(cx, |thread, _| thread.session_id().clone());
+        let options = original_thread.read_with(cx, |thread, cx| {
+            thread
+                .connection()
+                .session_config_options(thread.session_id(), cx)
+                .expect("model options")
+        });
+        cx.update(|_, cx| options.set_config_option("model".into(), "chosen".into(), cx))
+            .await
+            .expect("choose model");
+        message_editor(&view, cx).update_in(cx, |editor, window, cx| {
+            editor.set_text(" /not-a-command\n\n  ", window, cx)
+        });
+        view.update_in(cx, |view, window, cx| view.refresh_agent_models(window, cx))
+            .expect("refresh models");
+        cx.run_until_parked();
+        let refreshed_thread =
+            view.read_with(cx, |view, cx| view.root_thread(cx).expect("chat reloaded"));
+        refreshed_thread.read_with(cx, |thread, cx| {
+            assert_eq!(
+                thread.session_id(),
+                &session_id,
+                "refresh must reload the same conversation"
+            );
+            assert_eq!(
+                thread.entries().len(),
+                1,
+                "existing history should be replayed, without sending the draft"
+            );
+            let options = thread
+                .connection()
+                .session_config_options(thread.session_id(), cx)
+                .expect("refreshed options")
+                .config_options();
+            let model = options
+                .iter()
+                .find(|option| option.id.0.as_ref() == "model")
+                .expect("model option");
+            let acp::SessionConfigKind::Select(select) = &model.kind else {
+                panic!("select model")
+            };
+            assert_eq!(
+                select.current_value.0.as_ref(),
+                "chosen",
+                "refresh must keep the chosen model"
+            );
+            let acp::SessionConfigSelectOptions::Ungrouped(models) = &select.options else {
+                panic!("model list")
+            };
+            assert!(
+                models
+                    .iter()
+                    .any(|model| model.value.0.as_ref() == "new-release"),
+                "new release must appear in the actual chat options"
+            );
+        });
+        assert_eq!(
+            message_editor(&view, cx).read_with(cx, |editor, cx| editor.text(cx)),
+            " /not-a-command\n\n  "
+        );
+        assert_eq!(
+            connections.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "refresh must bypass the cached agent connection"
+        );
     }
 
     #[gpui::test]

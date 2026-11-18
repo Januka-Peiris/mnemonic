@@ -894,6 +894,7 @@ impl MessageEditor {
                     &crease_snapshot,
                     &buffer_snapshot,
                     supports_embedded_context,
+                    true,
                     |crease_id| {
                         contents
                             .remove(crease_id)
@@ -905,7 +906,8 @@ impl MessageEditor {
     }
 
     /// Snapshots the editor's current draft into a list of `ContentBlock`s
-    /// without awaiting any pending mention resolution.
+    /// without awaiting any pending mention resolution. Whitespace is kept,
+    /// including the leading space that escapes slash-command parsing.
     pub fn draft_content_blocks_snapshot(&self, cx: &App) -> Vec<acp::ContentBlock> {
         let editor = self.editor.read(cx);
         let crease_snapshot = editor.display_map.read(cx).crease_snapshot();
@@ -919,6 +921,7 @@ impl MessageEditor {
             &crease_snapshot,
             &buffer_snapshot,
             supports_embedded_context,
+            false,
             |crease_id| mention_set.resolved_mention_for_crease(crease_id),
         );
         chunks
@@ -2069,12 +2072,16 @@ fn build_chunks_from_creases(
     crease_snapshot: &CreaseSnapshot,
     buffer_snapshot: &MultiBufferSnapshot,
     supports_embedded_context: bool,
+    trim_whitespace: bool,
     mut resolve: impl FnMut(&CreaseId) -> Option<(MentionUri, Option<Mention>)>,
 ) -> (Vec<acp::ContentBlock>, Vec<Entity<Buffer>>) {
-    let mut ix = text
-        .char_indices()
-        .find(|(_, c)| !c.is_whitespace())
-        .map_or(text.len(), |(i, _)| i);
+    let mut ix = if trim_whitespace {
+        text.char_indices()
+            .find(|(_, character)| !character.is_whitespace())
+            .map_or(text.len(), |(index, _)| index)
+    } else {
+        0
+    };
     let mut chunks = Vec::new();
     let mut tracked_buffers = Vec::new();
 
@@ -2096,7 +2103,12 @@ fn build_chunks_from_creases(
     }
 
     if ix < text.len() {
-        let last_chunk = text[ix..].trim_end().to_owned();
+        let last_chunk = if trim_whitespace {
+            text[ix..].trim_end()
+        } else {
+            &text[ix..]
+        }
+        .to_owned();
         if !last_chunk.is_empty() {
             chunks.push(last_chunk.into());
         }
