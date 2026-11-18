@@ -67,6 +67,7 @@ fun MnemonicNavigation(
                 val viewModel: HomeViewModel = viewModel(key = savedAddress) { HomeViewModel(client, appState) }
                 HomeScreen(
                     viewModel = viewModel,
+                    http = http,
                     onOpenChat = { navController.navigate(Routes.chat(it)) },
                     onNewTask = { navController.navigate(Routes.NEW_TASK) },
                     onSettings = { navController.navigate(Routes.SETTINGS) },
@@ -118,6 +119,8 @@ fun MnemonicNavigation(
         composable(Routes.SETTINGS) {
             SettingsScreen(
                 address = savedAddress.orEmpty(),
+                client = client,
+                http = http,
                 onChangeAddress = {
                     navController.navigate(Routes.CONNECT) {
                         popUpTo(Routes.HOME) { inclusive = true }

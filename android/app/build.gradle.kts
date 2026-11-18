@@ -68,6 +68,8 @@ dependencies {
     implementation(platform(libs.compose.bom))
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.activity.compose)
+    implementation(platform(libs.firebase.bom))
+    implementation(libs.firebase.messaging)
     implementation(libs.compose.ui)
     implementation(libs.compose.material3)
     implementation(libs.androidx.navigation.compose)

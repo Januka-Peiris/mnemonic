@@ -35,6 +35,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
@@ -44,6 +45,10 @@ import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.repeatOnLifecycle
 import dev.mnemonic.phone.api.TeamAgentState
 import dev.mnemonic.phone.api.TeamWorkspace
+import dev.mnemonic.phone.push.AlertStatus
+import dev.mnemonic.phone.push.PushRegistration
+import dev.mnemonic.phone.push.rememberTurnOnAlerts
+import okhttp3.OkHttpClient
 
 fun formatIdle(seconds: Long?): String =
     when {
@@ -87,6 +92,7 @@ private fun stateColor(state: TeamAgentState): Color =
 @Composable
 fun HomeScreen(
     viewModel: HomeViewModel,
+    http: OkHttpClient,
     onOpenChat: (String) -> Unit,
     onNewTask: () -> Unit,
     onSettings: () -> Unit,
@@ -96,6 +102,9 @@ fun HomeScreen(
     LaunchedEffect(viewModel, lifecycle) {
         lifecycle.repeatOnLifecycle(Lifecycle.State.RESUMED) { viewModel.poll() }
     }
+    val context = LocalContext.current
+    val alertStatus by PushRegistration.status.collectAsState()
+    val turnOnAlerts = rememberTurnOnAlerts(context, http)
     var menuOpen by remember { mutableStateOf(false) }
     val expanded = rememberSaveable { mutableStateOf(setOf<String>()) }
 
@@ -147,6 +156,17 @@ fun HomeScreen(
                                 .background(MaterialTheme.colorScheme.errorContainer)
                                 .padding(12.dp),
                         )
+                    }
+                }
+                if (alertStatus == AlertStatus.NeedsPermission) {
+                    item {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp),
+                        ) {
+                            Text("Get alerts when an agent needs you", modifier = Modifier.weight(1f))
+                            Button(onClick = turnOnAlerts) { Text("Turn on alerts") }
+                        }
                     }
                 }
                 if (state.needsYou.isNotEmpty()) {
