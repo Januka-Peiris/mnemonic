@@ -2,6 +2,7 @@ pub mod activity_service;
 pub mod agent_context_service;
 pub mod agent_hub_service;
 pub mod agent_memory_service;
+pub mod agent_model_service;
 pub mod agent_profile_service;
 pub mod app_runtime_service;
 pub mod chat_transcript_service;

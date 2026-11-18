@@ -24,6 +24,9 @@ use mnemonic_core::repositories::{
     agent_started_chat_repository, chat_session_repository, workspace_repository,
 };
 use mnemonic_core::services::agent_hub_service::{ChatAgentChoice, ChatState};
+use mnemonic_core::services::agent_model_service::{
+    self, AgentModel, AgentModelProvider as AgentProvider,
+};
 use mnemonic_core::services::chat_transcript_service::{self, LinkedChat};
 use mnemonic_core::services::pr_draft_service::OpenReviewComment;
 use mnemonic_core::services::workspace_script_service::RunCommandPlan;
@@ -41,7 +44,7 @@ use util::ResultExt as _;
 use util::shell_builder::ShellBuilder;
 use ui::{
     Button, ButtonLike, ButtonStyle, ContextMenu, Icon, IconButton, IconName, Label, PopoverMenu,
-    Tooltip, h_flex, prelude::*, v_flex,
+    PopoverMenuHandle, Tooltip, h_flex, prelude::*, v_flex,
 };
 use workspace::item::{Item, ItemEvent, ItemHandle};
 use workspace::notifications::{DetachAndPromptErr as _, NotificationId};
@@ -100,22 +103,13 @@ const AUTO_FIX_MIN_GAP: Duration = Duration::from_secs(180);
 /// Auto-fix loop: give up after this many fix attempts.
 const AUTO_FIX_MAX_ATTEMPTS: u32 = 5;
 
-/// Claude model IDs and chip labels.
-const CLAUDE_MODELS: &[(&str, &str)] = &[
-    ("claude-fable-5-2", "Fable 5.2"),
-    ("claude-fable-5-1", "Fable 5.1"),
-    ("claude-opus-5-5", "Opus 5.5"),
-    ("claude-sonnet-5-5", "Sonnet 5.5"),
-    ("claude-haiku-5-5", "Haiku 5.5"),
-];
-
-/// Codex model IDs and chip labels.
-const CODEX_MODELS: &[(&str, &str)] = &[
-    ("gpt-6.1-sol", "GPT-6.1 Sol"),
-    ("gpt-6.1-terra", "GPT-6.1 Terra"),
-    ("gpt-6-astra", "GPT-6 Astra"),
-    ("gpt-6-luna", "GPT-6 Luna"),
-];
+#[derive(Default)]
+struct TerminalModelCatalog {
+    models: Vec<AgentModel>,
+    attempted: bool,
+    refreshing: bool,
+    error: Option<String>,
+}
 
 /// Effort levels for the effort dropdown.
 const AGENT_EFFORTS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
@@ -145,13 +139,6 @@ const INITIAL_CLAUDE_MODE_INDEX: usize = 3;
 /// are set separately via /permissions and aren't part of this cycle.
 const CODEX_AGENT_MODES: &[&str] = &["Default", "Plan"];
 const INITIAL_CODEX_MODE_INDEX: usize = 0;
-
-/// Which agent provider a terminal session is running.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum AgentProvider {
-    Claude,
-    Codex,
-}
 
 /// The ACP agents a workspace chat can run. Each id must be a registry
 /// agent listed under `agent_servers` in the default settings.
@@ -972,6 +959,8 @@ pub struct WorkspaceView {
     composer_height: Pixels,
     claude_model: String,
     codex_model: String,
+    model_catalogs: HashMap<AgentProvider, TerminalModelCatalog>,
+    model_menu: PopoverMenuHandle<ContextMenu>,
     agent_effort: String,
     claude_mode_index: usize,
     codex_mode_index: usize,
@@ -1151,6 +1140,7 @@ impl WorkspaceView {
         let cwd = self.worktree_path.clone();
         let linked_paths = self.linked_workspace_paths(cx);
         let project = self.project.clone();
+        let model = self.selected_terminal_model(provider).to_string();
         let session = session.to_string();
         let title = title.to_string();
 
@@ -1170,6 +1160,9 @@ impl WorkspaceView {
                         // Sessions always launch with full bypass; the Mode
                         // chip switches the running session live via shift+tab.
                         let mut agent_args = Vec::new();
+                        if !model.is_empty() {
+                            agent_args.extend(["--model".to_string(), model]);
+                        }
                         if agent_binary == "codex" {
                             agent_args
                                 .push("--dangerously-bypass-approvals-and-sandbox".to_string());
@@ -4390,13 +4383,22 @@ impl WorkspaceView {
             .unwrap_or(AgentProvider::Claude)
     }
 
+    fn selected_terminal_model(&self, provider: AgentProvider) -> &str {
+        match provider {
+            AgentProvider::Claude => &self.claude_model,
+            AgentProvider::Codex => &self.codex_model,
+        }
+    }
+
     /// Applies a model choice: live-switches the focused agent session via
     /// /model, and becomes the model for new sessions of that provider.
-    fn set_model(&mut self, model: &str, cx: &mut Context<Self>) {
-        if CLAUDE_MODELS.iter().any(|(id, _)| *id == model) {
-            self.claude_model = model.to_string();
-        } else if CODEX_MODELS.iter().any(|(id, _)| *id == model) {
-            self.codex_model = model.to_string();
+    fn set_model(&mut self, provider: AgentProvider, model: &str, cx: &mut Context<Self>) {
+        if self.active_provider() != provider {
+            return;
+        }
+        match provider {
+            AgentProvider::Claude => self.claude_model = model.to_string(),
+            AgentProvider::Codex => self.codex_model = model.to_string(),
         }
         self.dispatch_from(
             DispatchOrigin::Composer,
@@ -4408,16 +4410,111 @@ impl WorkspaceView {
     }
 
     fn model_label(&self) -> String {
-        let current_model = match self.active_provider() {
-            AgentProvider::Claude => &self.claude_model,
-            AgentProvider::Codex => &self.codex_model,
-        };
-        CLAUDE_MODELS
-            .iter()
-            .chain(CODEX_MODELS.iter())
-            .find(|(model, _)| *model == current_model.as_str())
-            .map(|(_, label)| label.to_string())
-            .unwrap_or_else(|| current_model.clone())
+        let provider = self.active_provider();
+        let current_model = self.selected_terminal_model(provider);
+        if current_model.is_empty() {
+            return "Agent default".to_string();
+        }
+        self.model_catalogs
+            .get(&provider)
+            .and_then(|catalog| {
+                catalog
+                    .models
+                    .iter()
+                    .find(|model| model.id == current_model)
+            })
+            .map(|model| model.name.clone())
+            .unwrap_or_else(|| current_model.to_string())
+    }
+
+    fn build_model_menu(
+        &self,
+        provider: AgentProvider,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Entity<ContextMenu> {
+        let this = cx.weak_entity();
+        let catalog = self.model_catalogs.get(&provider);
+        let models = catalog
+            .map(|catalog| catalog.models.clone())
+            .unwrap_or_default();
+        let refreshing = catalog.is_none_or(|catalog| catalog.refreshing);
+        let failed = catalog.is_some_and(|catalog| catalog.error.is_some());
+        ContextMenu::build(window, cx, move |mut menu, _, _| {
+            for model in models {
+                let this = this.clone();
+                menu = menu.entry(model.name, None, move |_, cx| {
+                    this.update(cx, |this, cx| this.set_model(provider, &model.id, cx))
+                        .log_err();
+                });
+            }
+            if refreshing {
+                menu = menu.label("Refreshing models...");
+            } else if failed {
+                menu = menu.label("Could not refresh models. Check the agent CLI and retry.");
+            }
+            menu.separator()
+                .entry("Refresh models", None, move |window, cx| {
+                    this.update(cx, |this, cx| {
+                        this.refresh_models(provider, true, window, cx)
+                    })
+                    .log_err();
+                })
+        })
+    }
+
+    fn refresh_models(
+        &mut self,
+        provider: AgentProvider,
+        force: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let catalog = self.model_catalogs.entry(provider).or_default();
+        if catalog.refreshing || (!force && catalog.attempted) {
+            return;
+        }
+        catalog.refreshing = true;
+        catalog.attempted = true;
+        let directory = self.worktree_path.clone();
+        cx.notify();
+        cx.spawn_in(window, async move |this, cx| {
+            let result = cx
+                .background_spawn(async move {
+                    agent_model_service::discover_models(provider, directory.as_deref())
+                })
+                .await;
+            let menu_handle = this.update(cx, |this, cx| {
+                let catalog = this.model_catalogs.entry(provider).or_default();
+                catalog.refreshing = false;
+                match result {
+                    Ok(models) => {
+                        catalog.models = models;
+                        catalog.error = None;
+                    }
+                    Err(error) => {
+                        log::error!("Failed to discover {provider:?} models: {error}");
+                        catalog.error = Some(error);
+                    }
+                }
+                cx.notify();
+                (this.active_provider() == provider).then(|| this.model_menu.clone())
+            })?;
+            if let Some(menu_handle) = menu_handle {
+                cx.update(|window, cx| {
+                    menu_handle.refresh_menu(
+                        window,
+                        cx,
+                        Rc::new(move |window, cx| {
+                            this.update(cx, |this, cx| this.build_model_menu(provider, window, cx))
+                                .log_err()
+                        }),
+                    );
+                })?;
+            }
+            anyhow::Ok(())
+        })
+        .detach_and_log_err(cx);
     }
 
     /// Applies an effort choice: live-switches the focused agent via
@@ -4586,13 +4683,18 @@ impl WorkspaceView {
 
         let model_menu = {
             let this = cx.weak_entity();
-            let models: &[(&str, &str)] = match self.active_provider() {
-                AgentProvider::Claude => CLAUDE_MODELS,
-                AgentProvider::Codex => CODEX_MODELS,
-            };
-            let models = models.to_vec();
+            let provider = self.active_provider();
+            let on_open = this.clone();
             PopoverMenu::new("composer-model-menu")
                 .anchor(Anchor::BottomLeft)
+                .with_handle(self.model_menu.clone())
+                .on_open(Rc::new(move |window, cx| {
+                    on_open
+                        .update(cx, |this, cx| {
+                            this.refresh_models(provider, false, window, cx);
+                        })
+                        .log_err();
+                }))
                 .trigger(
                     Button::new("composer-model", self.model_label())
                         .label_size(LabelSize::Small)
@@ -4600,25 +4702,12 @@ impl WorkspaceView {
                         .end_icon(chevron())
                         .tooltip(Tooltip::text(
                             "Model for the focused agent (switches it live) and for new \
-                             sessions",
+                             sessions. Models are discovered from the installed agent.",
                         )),
                 )
                 .menu(move |window, cx| {
-                    let this = this.clone();
-                    let models = models.clone();
-                    Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
-                        for (model, label) in &models {
-                            let this = this.clone();
-                            let model = *model;
-                            menu = menu.entry(*label, None, move |_, cx| {
-                                this.update(cx, |this, cx| {
-                                    this.set_model(model, cx);
-                                })
-                                .ok();
-                            });
-                        }
-                        menu
-                    }))
+                    this.update(cx, |this, cx| this.build_model_menu(provider, window, cx))
+                        .log_err()
                 })
         };
 
@@ -5636,8 +5725,10 @@ impl WorkspaceHost {
                     connection_store: None,
                     composer,
                     composer_height: px(110.),
-                    claude_model: "claude-opus-5-5".to_string(),
-                    codex_model: "gpt-6.1-sol".to_string(),
+                    claude_model: String::new(),
+                    codex_model: String::new(),
+                    model_catalogs: HashMap::new(),
+                    model_menu: PopoverMenuHandle::default(),
                     agent_effort: "high".to_string(),
                     claude_mode_index: INITIAL_CLAUDE_MODE_INDEX,
                     codex_mode_index: INITIAL_CODEX_MODE_INDEX,
