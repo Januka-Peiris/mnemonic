@@ -328,6 +328,7 @@ fn default_settings_for_agent() -> settings::CustomAgentServerSettings {
         default_config_options: Default::default(),
         favorite_config_option_values: Default::default(),
         allowed_config_option_values: Default::default(),
+        hidden_config_option_values: Default::default(),
     }
 }
 
@@ -423,6 +424,7 @@ mod tests {
                     default_config_options: HashMap::default(),
                     favorite_config_option_values: HashMap::default(),
                     allowed_config_option_values: HashMap::default(),
+                    hidden_config_option_values: HashMap::default(),
                 },
             )],
         );

@@ -1453,6 +1453,7 @@ async fn open_new_agent_servers_entry_in_settings_editor(
                                 default_config_options: Default::default(),
                                 favorite_config_option_values: Default::default(),
                                 allowed_config_option_values: Default::default(),
+                                hidden_config_option_values: Default::default(),
                             },
                         );
                     }
