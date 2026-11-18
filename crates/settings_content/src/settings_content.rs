@@ -1065,6 +1065,11 @@ pub struct PhoneSettingsContent {
     ///
     /// Default: 5
     pub notify_after_idle_minutes: Option<u32>,
+    /// The path of the Firebase service account key file (JSON) used to send
+    /// alerts to the Android app. When empty, no app alerts are sent.
+    ///
+    /// Default: ""
+    pub fcm_service_account: Option<String>,
 }
 
 #[with_fallible_options]
