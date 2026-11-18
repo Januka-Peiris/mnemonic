@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+export JAVA_HOME=/opt/homebrew/opt/openjdk@17
+export ANDROID_HOME="$HOME/Library/Android/sdk"
+
+root="$(cd "$(dirname "$0")/.." && pwd)"
+keystore="$HOME/.config/mnemonic/android-release.jks"
+keychain_service="mnemonic-android-release"
+
+ensure_release_signing() {
+    if [ ! -f "$keystore" ]; then
+        mkdir -p "$(dirname "$keystore")"
+        local password
+        password="$(openssl rand -hex 24)"
+        security add-generic-password -a "$USER" -s "$keychain_service" -w "$password"
+        "$JAVA_HOME/bin/keytool" -genkeypair -keystore "$keystore" \
+            -storepass "$password" -keypass "$password" \
+            -alias mnemonic -keyalg RSA -keysize 4096 -validity 10000 \
+            -dname "CN=Mnemonic"
+        chmod 600 "$keystore"
+    fi
+    MNEMONIC_KEYSTORE="$keystore"
+    MNEMONIC_KEYSTORE_PASSWORD="$(security find-generic-password -s "$keychain_service" -w)"
+    export MNEMONIC_KEYSTORE MNEMONIC_KEYSTORE_PASSWORD
+}
+
+build_release() {
+    ensure_release_signing
+    (cd "$root/android" && ./gradlew --console=plain assembleRelease)
+    echo "$root/android/app/build/outputs/apk/release/app-release.apk"
+}
+
+case "${1:-}" in
+    build)
+        build_release
+        ;;
+    install)
+        apk="$(build_release | tail -n 1)"
+        "$ANDROID_HOME/platform-tools/adb" install -r "$apk"
+        ;;
+    test)
+        (cd "$root/android" && ./gradlew --console=plain testDebugUnitTest)
+        ;;
+    *)
+        echo "usage: script/android build|install|test" >&2
+        exit 1
+        ;;
+esac
