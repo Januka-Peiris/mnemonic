@@ -1,6 +1,9 @@
 package dev.mnemonic.phone.api
 
 import java.io.IOException
+import java.net.UnknownServiceException
+import javax.net.ssl.SSLHandshakeException
+import javax.net.ssl.SSLPeerUnverifiedException
 import java.util.concurrent.TimeUnit
 import kotlin.coroutines.resume
 import kotlinx.coroutines.suspendCancellableCoroutine
@@ -21,10 +24,15 @@ import okhttp3.Response
 sealed interface MacResult<out T> {
     data class Ok<T>(val value: T) : MacResult<T>
     data class Refused(val status: Int, val reason: String) : MacResult<Nothing>
-    data class Unreachable(val cause: String) : MacResult<Nothing>
+    data class Unreachable(val cause: String, val addressUnusable: Boolean = false) : MacResult<Nothing>
 }
 
 class MacClient(private val address: MacAddress, private val http: OkHttpClient) {
+    // The Mac waits up to 60 s for a new task or merge before it answers.
+    private val postClient: OkHttpClient by lazy {
+        http.newBuilder().readTimeout(POST_READ_TIMEOUT_SECONDS, TimeUnit.SECONDS).build()
+    }
+
     suspend fun workspaces(): MacResult<TeamWorkspaceList> =
         get(url("v1", "workspaces"), serializer = TeamWorkspaceList.serializer())
 
@@ -120,7 +128,7 @@ class MacClient(private val address: MacAddress, private val http: OkHttpClient)
             .header("Origin", address.origin)
             .post(json.toString().toRequestBody("application/json".toMediaType()))
             .build()
-        return when (val outcome = execute(http, request)) {
+        return when (val outcome = execute(postClient, request)) {
             is Reply.Failed -> outcome.result
             is Reply.Body -> read(outcome.text)
         }
@@ -154,7 +162,11 @@ class MacClient(private val address: MacAddress, private val http: OkHttpClient)
             continuation.invokeOnCancellation { call.cancel() }
             call.enqueue(object : Callback {
                 override fun onFailure(call: Call, e: IOException) {
-                    continuation.resume(Reply.Failed(MacResult.Unreachable(e.message ?: e.javaClass.simpleName)))
+                    val unusable = e is UnknownServiceException || e is SSLHandshakeException ||
+                        e is SSLPeerUnverifiedException
+                    continuation.resume(
+                        Reply.Failed(MacResult.Unreachable(e.message ?: e.javaClass.simpleName, unusable)),
+                    )
                 }
 
                 override fun onResponse(call: Call, response: Response) {
@@ -170,4 +182,8 @@ class MacClient(private val address: MacAddress, private val http: OkHttpClient)
                 }
             })
         }
+
+    companion object {
+        const val POST_READ_TIMEOUT_SECONDS = 75L
+    }
 }

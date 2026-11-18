@@ -27,6 +27,10 @@ android {
         buildConfigField("boolean", "HAS_FIREBASE", hasFirebase.toString())
     }
 
+    testOptions {
+        unitTests.isReturnDefaultValues = true
+    }
+
     signingConfigs {
         create("release") {
             if (keystorePath != null && keystorePassword != null) {

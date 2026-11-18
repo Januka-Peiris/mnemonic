@@ -67,7 +67,12 @@ fun ConnectScreen(http: OkHttpClient, onConnected: (String) -> Unit) {
                     when (val result = MacClient(address, http).workspaces()) {
                         is MacResult.Ok -> onConnected(address.baseUrl)
                         is MacResult.Refused -> error = result.reason
-                        is MacResult.Unreachable -> error = "Can't reach the Mac. Is Tailscale on?"
+                        is MacResult.Unreachable -> error =
+                            if (result.addressUnusable) {
+                                "Use the full address shown in the Mac's Team window, like https://your-mac.tailnet.ts.net:47232"
+                            } else {
+                                "Can't reach the Mac. Is Tailscale on?"
+                            }
                     }
                     busy = false
                 }

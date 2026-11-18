@@ -3,6 +3,7 @@ package dev.mnemonic.phone.push
 import android.content.Context
 import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyProperties
+import android.util.Log
 import java.io.File
 import java.security.KeyStore
 import javax.crypto.Cipher
@@ -10,17 +11,30 @@ import javax.crypto.KeyGenerator
 import javax.crypto.SecretKey
 import javax.crypto.spec.GCMParameterSpec
 
-class PushKeyStore(context: Context) {
-    private val file = File(context.applicationContext.filesDir, "push_keys.bin")
+interface KeySealer {
+    fun seal(plain: ByteArray): ByteArray
+    fun open(sealed: ByteArray): ByteArray
+}
 
-    @Synchronized
-    fun keys(): PushKeys {
-        if (file.exists()) {
-            runCatching { return decode(open(file.readBytes())) }
+class PushKeyStore internal constructor(private val file: File, private val sealer: KeySealer) {
+    constructor(context: Context) : this(File(context.applicationContext.filesDir, "push_keys.bin"), KeystoreSealer)
+
+    /** Reads the saved keys only. Null, with a log line, when they are missing or unreadable. */
+    fun load(): PushKeys? = synchronized(LOCK) { read() }
+
+    /** Only registration may create keys, because it tells the Mac about them straight after. */
+    fun loadOrCreate(): PushKeys = synchronized(LOCK) {
+        read() ?: PushCrypto.generateKeys().also { file.writeBytes(sealer.seal(encode(it))) }
+    }
+
+    private fun read(): PushKeys? {
+        if (!file.exists()) return null
+        return try {
+            decode(sealer.open(file.readBytes()))
+        } catch (error: Exception) {
+            Log.w(TAG, "The saved push keys couldn't be read: ${error.message}")
+            null
         }
-        val fresh = PushCrypto.generateKeys()
-        file.writeBytes(seal(encode(fresh)))
-        return fresh
     }
 
     private fun encode(keys: PushKeys): ByteArray = keys.privateKey + keys.publicKey + keys.auth
@@ -34,13 +48,23 @@ class PushKeyStore(context: Context) {
         )
     }
 
-    private fun seal(plain: ByteArray): ByteArray {
+    internal companion object {
+        val LOCK = Any()
+        const val TAG = "MnemonicPush"
+        const val PRIVATE_LENGTH = 32
+        const val PUBLIC_LENGTH = 65
+        const val AUTH_LENGTH = 16
+    }
+}
+
+private object KeystoreSealer : KeySealer {
+    override fun seal(plain: ByteArray): ByteArray {
         val cipher = Cipher.getInstance(TRANSFORMATION)
         cipher.init(Cipher.ENCRYPT_MODE, secretKey())
         return cipher.iv + cipher.doFinal(plain)
     }
 
-    private fun open(sealed: ByteArray): ByteArray {
+    override fun open(sealed: ByteArray): ByteArray {
         val cipher = Cipher.getInstance(TRANSFORMATION)
         cipher.init(Cipher.DECRYPT_MODE, secretKey(), GCMParameterSpec(128, sealed, 0, IV_LENGTH))
         return cipher.doFinal(sealed, IV_LENGTH, sealed.size - IV_LENGTH)
@@ -60,13 +84,8 @@ class PushKeyStore(context: Context) {
         return generator.generateKey()
     }
 
-    private companion object {
-        const val ANDROID_KEYSTORE = "AndroidKeyStore"
-        const val ALIAS = "mnemonic_push"
-        const val TRANSFORMATION = "AES/GCM/NoPadding"
-        const val IV_LENGTH = 12
-        const val PRIVATE_LENGTH = 32
-        const val PUBLIC_LENGTH = 65
-        const val AUTH_LENGTH = 16
-    }
+    private const val ANDROID_KEYSTORE = "AndroidKeyStore"
+    private const val ALIAS = "mnemonic_push"
+    private const val TRANSFORMATION = "AES/GCM/NoPadding"
+    private const val IV_LENGTH = 12
 }

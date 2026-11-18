@@ -18,6 +18,8 @@ import dev.mnemonic.phone.api.MacResult
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.first
@@ -48,15 +50,15 @@ object PushRegistration {
     )
     val status: StateFlow<AlertStatus> = mutableStatus
 
-    suspend fun register(context: Context, http: OkHttpClient) {
+    suspend fun register(context: Context, http: OkHttpClient) = withContext(Dispatchers.IO) {
         val appContext = context.applicationContext
         if (!BuildConfig.HAS_FIREBASE) {
             mutableStatus.value = AlertStatus.NeedsFirebase
-            return
+            return@withContext
         }
         if (!Notifications.canPost(appContext)) {
             mutableStatus.value = AlertStatus.NeedsPermission
-            return
+            return@withContext
         }
         mutableStatus.value = AlertStatus.Working
         mutableStatus.value = try {
@@ -65,7 +67,7 @@ object PushRegistration {
             if (address == null) {
                 AlertStatus.Failed("Connect to your Mac first")
             } else {
-                val keys = PushKeyStore(appContext).keys()
+                val keys = PushKeyStore(appContext).loadOrCreate()
                 val result = MacClient(address, http).registerDevice(
                     installId = preferences.installId().orEmpty(),
                     token = fetchToken(),

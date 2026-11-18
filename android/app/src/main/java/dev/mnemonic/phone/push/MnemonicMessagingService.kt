@@ -22,7 +22,8 @@ class MnemonicMessagingService : FirebaseMessagingService() {
         val payload = try {
             val encoded = message.data["payload"] ?: error("The alert has no payload")
             val body = Base64.decode(encoded, Base64.URL_SAFE or Base64.NO_PADDING or Base64.NO_WRAP)
-            AlertPayload.parse(PushCrypto.decrypt(body, PushKeyStore(this).keys()))
+            val keys = PushKeyStore(this).load() ?: error("There are no readable push keys")
+            AlertPayload.parse(PushCrypto.decrypt(body, keys))
         } catch (error: Exception) {
             Log.w(TAG, "Dropped an alert that couldn't be read: ${error.message}")
             return

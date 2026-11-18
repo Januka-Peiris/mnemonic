@@ -129,6 +129,27 @@ struct AppAlertStatus {
     key_error: Option<String>,
     /// Why the last Google sign-in failed, until one succeeds.
     sign_in_error: Option<String>,
+    /// Why Firebase refused every send in the last attempt, until one is delivered.
+    send_error: Option<String>,
+}
+
+impl AppAlertStatus {
+    fn error(&self) -> Option<String> {
+        self.key_error
+            .clone()
+            .or_else(|| self.sign_in_error.clone())
+            .or_else(|| self.send_error.clone())
+            .filter(|_| self.has_devices)
+    }
+
+    /// A device Firebase dropped counts as neither delivered nor failed.
+    fn record_sends(&mut self, delivered: usize, errors: &[String]) {
+        if delivered > 0 {
+            self.send_error = None;
+        } else if let Some(first) = errors.first() {
+            self.send_error = Some(first.clone());
+        }
+    }
 }
 
 /// State the server's request threads and the alert sender share, since
@@ -246,11 +267,7 @@ pub(crate) fn phone_https_error(cx: &App) -> Option<String> {
 
 /// Why app alerts can't be sent, when an app is registered to get them.
 pub(crate) fn phone_app_alerts_error(cx: &App) -> Option<String> {
-    let status = lock(&phone_share(cx)?.read(cx).app_alerts.status).clone();
-    status
-        .key_error
-        .or(status.sign_in_error)
-        .filter(|_| status.has_devices)
+    lock(&phone_share(cx)?.read(cx).app_alerts.status).error()
 }
 
 impl PhoneShare {
@@ -934,9 +951,11 @@ fn send_to_devices(payload: &str, app_alerts: &AppAlerts) -> Result<(), String> 
         }
     };
     let mut failures = Vec::new();
+    let mut errors = Vec::new();
+    let mut delivered = 0;
     for device in devices {
         match fcm_service::send(&account, &access_token, &device, payload.as_bytes()) {
-            Ok(FcmOutcome::Delivered) => {}
+            Ok(FcmOutcome::Delivered) => delivered += 1,
             Ok(FcmOutcome::Unregistered) => {
                 if let Err(err) = push_device_repository::delete(&state.db, &device.install_id) {
                     log::warn!("Couldn't forget an app device Firebase dropped: {err}");
@@ -945,9 +964,11 @@ fn send_to_devices(payload: &str, app_alerts: &AppAlerts) -> Result<(), String> 
             Err(err) => {
                 log::warn!("Couldn't send an app alert to {}: {err}", device.name);
                 failures.push(format!("{}: {err}", device.name));
+                errors.push(err);
             }
         }
     }
+    lock(&app_alerts.status).record_sends(delivered, &errors);
     if failures.is_empty() {
         Ok(())
     } else {
@@ -1504,6 +1525,26 @@ mod tests {
     use gpui::TestAppContext;
     use mnemonic_core::models::WorkspacePrStatus;
     use mnemonic_core::services::team_share_service::TeamWorkspace;
+
+    #[test]
+    fn app_alert_error_reports_firebase_refusing_every_send_until_one_lands() {
+        let mut status = AppAlertStatus {
+            has_devices: true,
+            ..Default::default()
+        };
+        status.record_sends(0, &["404 project not found".to_string()]);
+        assert_eq!(status.error().as_deref(), Some("404 project not found"));
+
+        status.sign_in_error = Some("sign in failed".to_string());
+        assert_eq!(status.error().as_deref(), Some("sign in failed"));
+        status.key_error = Some("key missing".to_string());
+        assert_eq!(status.error().as_deref(), Some("key missing"));
+
+        status.record_sends(0, &[]);
+        assert_eq!(status.send_error.as_deref(), Some("404 project not found"));
+        status.record_sends(1, &["403 mismatch".to_string()]);
+        assert_eq!(status.send_error, None);
+    }
 
     #[gpui::test]
     async fn phone_can_answer_with_an_always_option(cx: &mut TestAppContext) {
