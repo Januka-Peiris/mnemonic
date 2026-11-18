@@ -17,7 +17,8 @@ use futures::future::{self, Either};
 use gpui::{AnyWindowHandle, App, AppContext as _, Context, Entity, Global, Subscription, Task};
 use mnemonic_core::models::{DiscoveredRepository, WorkspaceDetail, WorkspacePrStatus};
 use mnemonic_core::repositories::{
-    push_subscription_repository, repository_repository, workspace_repository,
+    push_device_repository, push_subscription_repository, repository_repository,
+    workspace_repository,
 };
 use mnemonic_core::services::ntfy_service::{
     self, Notice, NoticeKind, NtfyRequest, mac_idle_seconds, notice_body, ntfy_request,
@@ -33,7 +34,7 @@ use mnemonic_core::services::team_share_service::{
     tailscale_cert, tailscale_self,
 };
 use mnemonic_core::services::web_push_service::{
-    self, PushOutcome, PushSubscription, load_or_create_vapid_keys,
+    self, PushDevice, PushOutcome, PushSubscription, load_or_create_vapid_keys,
 };
 use settings::{RegisterSetting, Settings, SettingsStore};
 use workspace::Workspace;
@@ -649,6 +650,8 @@ fn start_server(
                 pr_status: Arc::new(phone_pr_status),
                 push_key: Arc::new(phone_push_key),
                 save_push_subscription: Arc::new(save_push_subscription),
+                save_push_device: Arc::new(save_push_device),
+                send_test_alert: Arc::new(send_test_alert),
             },
             action_handler.clone(),
         )
@@ -793,6 +796,17 @@ fn save_push_subscription(subscription: PushSubscription) -> Result<(), String> 
     let state = mnemonic_bridge::mnemonic_state_cloned()
         .ok_or_else(|| "Mnemonic isn't ready".to_string())?;
     push_subscription_repository::upsert(&state.db, &subscription)
+}
+
+fn save_push_device(device: PushDevice) -> Result<(), String> {
+    let state = mnemonic_bridge::mnemonic_state_cloned()
+        .ok_or_else(|| "Mnemonic isn't ready".to_string())?;
+    push_device_repository::upsert(&state.db, &device)
+}
+
+fn send_test_alert() -> Result<(), String> {
+    log::info!("Test alert requested; sending to app devices isn't wired yet");
+    Ok(())
 }
 
 /// The repositories, those with the newest workspace first. Workspaces carry

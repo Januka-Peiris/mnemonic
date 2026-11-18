@@ -17,7 +17,7 @@ use crate::services::team_share_server::{
 use crate::services::team_share_service::{
     CallerIdentity, TeamActionError, TeamShareHub, TeamWorkspaceList, TlsFiles, is_plain_id,
 };
-use crate::services::web_push_service::PushSubscription;
+use crate::services::web_push_service::{PushDevice, PushSubscription};
 
 /// Sent by the page on every POST. A page on another site can't add it
 /// without a CORS preflight, which this server never answers.
@@ -151,6 +151,8 @@ pub struct PhoneSources {
     /// The public VAPID key, base64url, that browsers subscribe with.
     pub push_key: Arc<dyn Fn() -> Result<String, String> + Send + Sync>,
     pub save_push_subscription: Arc<dyn Fn(PushSubscription) -> Result<(), String> + Send + Sync>,
+    pub save_push_device: Arc<dyn Fn(PushDevice) -> Result<(), String> + Send + Sync>,
+    pub send_test_alert: Arc<dyn Fn() -> Result<(), String> + Send + Sync>,
 }
 
 struct Shared {
@@ -539,6 +541,21 @@ fn handle_action(
             Err(reason) => text_response(400, &reason),
         };
     }
+    if let ["v1", "push", "devices"] = segments {
+        return match parse_push_device(&body) {
+            Ok(device) => match (shared.sources.save_push_device)(device) {
+                Ok(()) => json_response(200, "{}".to_string()),
+                Err(err) => text_response(500, &err),
+            },
+            Err(reason) => text_response(400, &reason),
+        };
+    }
+    if let ["v1", "push", "test"] = segments {
+        return match (shared.sources.send_test_alert)() {
+            Ok(()) => json_response(200, "{}".to_string()),
+            Err(err) => text_response(500, &err),
+        };
+    }
     let action = match parse_action(segments, &body) {
         Ok(action) => action,
         Err((status, reason)) => return text_response(status, &reason),
@@ -582,6 +599,13 @@ fn parse_push_subscription(body: &[u8]) -> Result<PushSubscription, String> {
     };
     subscription.check_keys()?;
     Ok(subscription)
+}
+
+fn parse_push_device(body: &[u8]) -> Result<PushDevice, String> {
+    let device: PushDevice =
+        serde_json::from_slice(body).map_err(|err| format!("Couldn't read the request: {err}"))?;
+    device.check()?;
+    Ok(device)
 }
 
 fn parse_action(segments: &[&str], body: &[u8]) -> Result<PhoneAction, (u16, String)> {
@@ -710,6 +734,12 @@ mod tests {
 
     type Recorded = Arc<Mutex<Vec<PhoneAction>>>;
 
+    #[derive(Default)]
+    struct PushProbe {
+        devices: Mutex<Vec<PushDevice>>,
+        alerts: std::sync::atomic::AtomicUsize,
+    }
+
     fn start(
         login: &'static str,
         own_addresses: Vec<IpAddr>,
@@ -723,6 +753,16 @@ mod tests {
         own_addresses: Vec<IpAddr>,
         hub: TeamShareHub,
         tls: Option<TlsFiles>,
+    ) -> Result<(PhoneServer, Recorded), String> {
+        start_with_push(login, own_addresses, hub, tls, Arc::default())
+    }
+
+    fn start_with_push(
+        login: &'static str,
+        own_addresses: Vec<IpAddr>,
+        hub: TeamShareHub,
+        tls: Option<TlsFiles>,
+        probe: Arc<PushProbe>,
     ) -> Result<(PhoneServer, Recorded), String> {
         let recorded = Recorded::default();
         let handler: PhoneActionHandler = Arc::new({
@@ -763,6 +803,23 @@ mod tests {
                 pr_status: Arc::new(|_| Ok(PhonePrStatus::default())),
                 push_key: Arc::new(|| Ok("key".to_string())),
                 save_push_subscription: Arc::new(|_| Ok(())),
+                save_push_device: Arc::new({
+                    let probe = probe.clone();
+                    move |device| {
+                        probe
+                            .devices
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .push(device);
+                        Ok(())
+                    }
+                }),
+                send_test_alert: Arc::new(move || {
+                    probe
+                        .alerts
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Ok(())
+                }),
             },
             handler,
         )?;
@@ -938,6 +995,95 @@ mod tests {
         assert_eq!(subscribe("not a key", auth)?, 400);
         assert_eq!(subscribe(compressed, auth)?, 400);
         assert_eq!(subscribe(p256dh, "BTBZMqHH6r4Tts7J_aSI")?, 400);
+        Ok(())
+    }
+
+    const DEVICE_P256DH: &str = concat!(
+        "BCVxsr7N_eNgVRqvHtD0zTZsEc6-VV-JvLexhqUzORcx",
+        "aOzi6-AYWXvTBHm4bjyPjs7Vd8pZGH6SRpkNtoIAiw4"
+    );
+
+    fn post_app(address: SocketAddr, path: &str, body: &str) -> String {
+        format!(
+            "POST {path} HTTP/1.1\r\nHost: {address}\r\nOrigin: http://{address}\r\n\
+             Content-Type: application/json\r\n{PHONE_REQUEST_HEADER}: app\r\n\
+             Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    fn device_body(p256dh: &str) -> String {
+        format!(
+            r#"{{"install_id":"install-1","token":"fcm-token","p256dh":"{p256dh}","auth":"BTBZMqHH6r4Tts7J_aSIgg","name":"Pixel"}}"#
+        )
+    }
+
+    #[test]
+    fn push_device_route_saves_device() -> Result<(), String> {
+        let probe = Arc::new(PushProbe::default());
+        let (server, _recorded) = start_with_push(
+            "jay@example.com",
+            Vec::new(),
+            TeamShareHub::new(),
+            None,
+            probe.clone(),
+        )?;
+        let address = server.address();
+
+        let request = post_app(address, "/v1/push/devices", &device_body(DEVICE_P256DH));
+        assert_eq!(raw_status(address, &request)?, 200);
+        assert_eq!(
+            *probe.devices.lock().map_err(|err| err.to_string())?,
+            [PushDevice {
+                install_id: "install-1".to_string(),
+                token: "fcm-token".to_string(),
+                p256dh: DEVICE_P256DH.to_string(),
+                auth: "BTBZMqHH6r4Tts7J_aSIgg".to_string(),
+                name: "Pixel".to_string(),
+            }]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn push_device_route_refuses_bad_keys() -> Result<(), String> {
+        let probe = Arc::new(PushProbe::default());
+        let (server, _recorded) = start_with_push(
+            "jay@example.com",
+            Vec::new(),
+            TeamShareHub::new(),
+            None,
+            probe.clone(),
+        )?;
+        let address = server.address();
+
+        let request = post_app(address, "/v1/push/devices", &device_body("abc"));
+        assert_eq!(raw_status(address, &request)?, 400);
+        assert!(
+            probe
+                .devices
+                .lock()
+                .map_err(|err| err.to_string())?
+                .is_empty()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn app_post_with_matching_origin_is_accepted() -> Result<(), String> {
+        let probe = Arc::new(PushProbe::default());
+        let (server, _recorded) = start_with_push(
+            "jay@example.com",
+            Vec::new(),
+            TeamShareHub::new(),
+            None,
+            probe.clone(),
+        )?;
+        let address = server.address();
+
+        let request = post_app(address, "/v1/push/test", "{}");
+        assert_eq!(raw_status(address, &request)?, 200);
+        assert_eq!(probe.alerts.load(std::sync::atomic::Ordering::SeqCst), 1);
         Ok(())
     }
 

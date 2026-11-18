@@ -798,6 +798,21 @@ pub fn run(connection: &Connection) -> Result<(), String> {
         )
         .map_err(|err| format!("Failed to create phone_push_subscriptions table: {err}"))?;
 
+    connection
+        .execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS phone_push_devices (
+                install_id TEXT PRIMARY KEY,
+                token TEXT NOT NULL,
+                p256dh TEXT NOT NULL,
+                auth TEXT NOT NULL,
+                name TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            "#,
+        )
+        .map_err(|err| format!("Failed to create phone_push_devices table: {err}"))?;
+
     Ok(())
 }
 

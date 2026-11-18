@@ -15,6 +15,8 @@ use p256::{PublicKey, SecretKey};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 
+use crate::services::team_share_service::is_plain_id;
+
 const SEND_TIMEOUT: Duration = Duration::from_secs(10);
 const RECORD_SIZE: u32 = 4096;
 const UNCOMPRESSED_POINT_LENGTH: u8 = 65;
@@ -24,6 +26,8 @@ const MAX_PLAINTEXT_LENGTH: usize = 3993;
 const TOKEN_LIFETIME_SECONDS: u64 = 12 * 60 * 60;
 const VAPID_SUBJECT: &str = "mailto:mnemonic@localhost";
 const VAPID_KEY_FILE: &str = "vapid.key";
+const MAX_DEVICE_TOKEN_BYTES: usize = 4096;
+const MAX_DEVICE_NAME_CHARS: usize = 100;
 
 /// Keys are base64url, as browsers send them.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -39,6 +43,50 @@ impl PushSubscription {
     /// failing every push later.
     pub fn check_keys(&self) -> Result<(), String> {
         decode_keys(self).map(|_| ())
+    }
+}
+
+/// An installed app: a push token to send to, and keys the Mac seals the
+/// alert with so the token's service never sees the contents.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PushDevice {
+    pub install_id: String,
+    pub token: String,
+    pub p256dh: String,
+    pub auth: String,
+    pub name: String,
+}
+
+impl std::fmt::Debug for PushDevice {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PushDevice")
+            .field("install_id", &self.install_id)
+            .field("name", &self.name)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PushDevice {
+    pub fn subscription(&self) -> PushSubscription {
+        PushSubscription {
+            endpoint: String::new(),
+            p256dh: self.p256dh.clone(),
+            auth: self.auth.clone(),
+        }
+    }
+
+    pub fn check(&self) -> Result<(), String> {
+        if !is_plain_id(&self.install_id) {
+            return Err("The install id may only use letters, digits, - and _".to_string());
+        }
+        if self.token.is_empty() || self.token.len() > MAX_DEVICE_TOKEN_BYTES {
+            return Err("The push token is missing or too long".to_string());
+        }
+        if self.name.chars().count() > MAX_DEVICE_NAME_CHARS {
+            return Err("The device name is too long".to_string());
+        }
+        self.subscription().check_keys()
     }
 }
 
