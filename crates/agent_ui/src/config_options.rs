@@ -29,12 +29,15 @@ use crate::{
 
 const PICKER_THRESHOLD: usize = 5;
 
+pub(crate) type RefreshModels = Rc<dyn Fn(&mut Window, &mut App) -> anyhow::Result<()>>;
+
 pub struct ConfigOptionsView {
     config_options: Rc<dyn AgentSessionConfigOptions>,
     selectors: Vec<Entity<ConfigOptionSelector>>,
     agent_server: Rc<dyn AgentServer>,
     fs: Arc<dyn Fs>,
     config_option_ids: Vec<acp::SessionConfigId>,
+    refresh_models: Option<RefreshModels>,
     _refresh_task: Task<()>,
 }
 
@@ -43,10 +46,18 @@ impl ConfigOptionsView {
         config_options: Rc<dyn AgentSessionConfigOptions>,
         agent_server: Rc<dyn AgentServer>,
         fs: Arc<dyn Fs>,
+        refresh_models: Option<RefreshModels>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let selectors = Self::build_selectors(&config_options, &agent_server, &fs, window, cx);
+        let selectors = Self::build_selectors(
+            &config_options,
+            &agent_server,
+            &fs,
+            &refresh_models,
+            window,
+            cx,
+        );
         let config_option_ids = Self::config_option_ids(&config_options);
 
         let rx = config_options.watch(cx);
@@ -68,6 +79,7 @@ impl ConfigOptionsView {
             agent_server,
             fs,
             config_option_ids,
+            refresh_models,
             _refresh_task: refresh_task,
         }
     }
@@ -204,6 +216,7 @@ impl ConfigOptionsView {
             &self.config_options,
             &self.agent_server,
             &self.fs,
+            &self.refresh_models,
             window,
             cx,
         );
@@ -214,6 +227,7 @@ impl ConfigOptionsView {
         config_options: &Rc<dyn AgentSessionConfigOptions>,
         agent_server: &Rc<dyn AgentServer>,
         fs: &Arc<dyn Fs>,
+        refresh_models: &Option<RefreshModels>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Vec<Entity<ConfigOptionSelector>> {
@@ -224,12 +238,19 @@ impl ConfigOptionsView {
                 let config_options = config_options.clone();
                 let agent_server = agent_server.clone();
                 let fs = fs.clone();
+                let refresh_models =
+                    if option.category == Some(acp::SessionConfigOptionCategory::Model) {
+                        refresh_models.clone()
+                    } else {
+                        None
+                    };
                 cx.new(|cx| {
                     ConfigOptionSelector::new(
                         config_options,
                         option.id.clone(),
                         agent_server,
                         fs,
+                        refresh_models,
                         window,
                         cx,
                     )
@@ -266,6 +287,7 @@ impl ConfigOptionSelector {
         config_id: acp::SessionConfigId,
         agent_server: Rc<dyn AgentServer>,
         fs: Arc<dyn Fs>,
+        refresh_models: Option<RefreshModels>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -289,6 +311,7 @@ impl ConfigOptionSelector {
                     config_id,
                     agent_server,
                     fs,
+                    refresh_models,
                     window,
                     picker_cx,
                 );
@@ -503,6 +526,8 @@ struct ConfigOptionPickerDelegate {
     selected_index: usize,
     selected_description: Option<(usize, SharedString)>,
     favorites: HashSet<acp::SessionConfigValueId>,
+    refresh_models: Option<RefreshModels>,
+    refresh_error: Option<String>,
     _settings_subscription: Subscription,
 }
 
@@ -512,6 +537,7 @@ impl ConfigOptionPickerDelegate {
         config_id: acp::SessionConfigId,
         agent_server: Rc<dyn AgentServer>,
         fs: Arc<dyn Fs>,
+        refresh_models: Option<RefreshModels>,
         window: &mut Window,
         cx: &mut Context<Picker<Self>>,
     ) -> Self {
@@ -553,6 +579,8 @@ impl ConfigOptionPickerDelegate {
             selected_index,
             selected_description: None,
             favorites,
+            refresh_models,
+            refresh_error: None,
             _settings_subscription: settings_subscription,
         }
     }
@@ -752,6 +780,30 @@ impl PickerDelegate for ConfigOptionPickerDelegate {
                 )
             }
         }
+    }
+
+    fn render_footer(
+        &self,
+        _window: &mut Window,
+        cx: &mut Context<Picker<Self>>,
+    ) -> Option<AnyElement> {
+        let refresh = self.refresh_models.clone()?;
+        Some(v_flex().p_1().gap_1()
+            .child(Button::new("refresh-chat-models", "Refresh models")
+                .label_size(LabelSize::Small)
+                .tooltip(Tooltip::text("Reload this chat's agent model list without starting a new conversation"))
+                .on_click(cx.listener(move |picker, _, window, cx| {
+                    match refresh(window, cx) {
+                        Ok(()) => cx.emit(DismissEvent),
+                        Err(error) => {
+                            picker.delegate.refresh_error = Some(error.to_string());
+                            cx.notify();
+                        }
+                    }
+                })))
+            .when_some(self.refresh_error.clone(), |this, error| {
+                this.child(Label::new(error).size(LabelSize::Small).color(Color::Error))
+            }).into_any_element())
     }
 
     fn documentation_aside(
@@ -976,6 +1028,7 @@ mod tests {
                 config_option_ids: ConfigOptionsView::config_option_ids(&config_options),
                 config_options,
                 selectors: Vec::new(),
+                refresh_models: None,
                 agent_server,
                 fs,
                 _refresh_task: Task::ready(()),
