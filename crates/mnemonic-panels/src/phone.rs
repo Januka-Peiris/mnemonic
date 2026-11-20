@@ -1295,9 +1295,16 @@ fn run_phone_action(
     }
 }
 
-fn archive_refusal(source: &str) -> Option<TeamActionError> {
-    (source == TEAM_COPY_SOURCE)
-        .then(|| TeamActionError::Invalid("Archive a teammate's copy on the Mac".to_string()))
+/// Why the phone may not archive a workspace with this source, if it may
+/// not. None for the source means the Mac has no such workspace.
+fn archive_refusal(source: Option<&str>) -> Option<TeamActionError> {
+    match source {
+        None => Some(TeamActionError::Invalid("No such workspace".to_string())),
+        Some(TEAM_COPY_SOURCE) => Some(TeamActionError::Invalid(
+            "Archive a teammate's copy on the Mac".to_string(),
+        )),
+        Some(_) => None,
+    }
 }
 
 /// Archives in the workspace's own window, else the frontmost one, as the
@@ -1315,14 +1322,15 @@ fn archive_workspace(
             .find(|workspace| workspace.id == workspace_id),
         Err(err) => return Task::ready(Err(TeamActionError::Failed(err))),
     };
-    let Some(workspace) = workspace else {
-        return Task::ready(Err(TeamActionError::Invalid(
-            "No such workspace".to_string(),
-        )));
-    };
-    if let Some(refusal) = archive_refusal(&workspace.workspace_source) {
+    let source = workspace
+        .as_ref()
+        .map(|workspace| workspace.workspace_source.as_str());
+    if let Some(refusal) = archive_refusal(source) {
         return Task::ready(Err(refusal));
     }
+    let workspace_name = workspace
+        .map(|workspace| workspace.name)
+        .unwrap_or_default();
     let Some(fallback_window) = front_window(cx) else {
         return Task::ready(Err(no_window()));
     };
@@ -1331,7 +1339,7 @@ fn archive_workspace(
             .await
             .map_err(TeamActionError::Invalid)?;
         cx.update(|cx| {
-            show_phone_notice(&fallback_window, format!("archived {}", workspace.name), cx);
+            show_phone_notice(&fallback_window, format!("archived {workspace_name}"), cx);
         });
         Ok(PhoneActionOutcome::default())
     })
@@ -1591,14 +1599,18 @@ mod tests {
     use mnemonic_core::services::team_share_service::TeamWorkspace;
 
     #[test]
-    fn archive_refuses_only_a_teammates_copy() {
+    fn archive_refuses_an_unknown_workspace_or_a_teammates_copy() {
         assert_eq!(
-            archive_refusal(TEAM_COPY_SOURCE),
+            archive_refusal(None),
+            Some(TeamActionError::Invalid("No such workspace".to_string()))
+        );
+        assert_eq!(
+            archive_refusal(Some(TEAM_COPY_SOURCE)),
             Some(TeamActionError::Invalid(
                 "Archive a teammate's copy on the Mac".to_string()
             ))
         );
-        assert_eq!(archive_refusal("local"), None);
+        assert_eq!(archive_refusal(Some("local")), None);
     }
 
     #[test]

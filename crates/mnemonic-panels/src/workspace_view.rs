@@ -240,6 +240,10 @@ pub(crate) struct ChatSession {
     /// A new review chat holds its prompt until it has been switched to the
     /// review model.
     awaiting_model: bool,
+    /// Phone messages waiting on a stop of the agent's turn. While any are,
+    /// nothing is sent, because a stopped turn reads as idle before the stop
+    /// finishes and a later message would otherwise overtake them.
+    phone_sends_waiting_on_cancel: usize,
     /// Watches the current root thread; replaced when the thread changes.
     thread_subscriptions: Vec<Subscription>,
     _subscriptions: Vec<Subscription>,
@@ -2872,6 +2876,7 @@ impl WorkspaceView {
             },
             app_messages,
             awaiting_model: record.is_review && record.acp_session_id.is_none(),
+            phone_sends_waiting_on_cancel: 0,
             thread_subscriptions: Vec::new(),
             _subscriptions: vec![observation, fork_requests],
         })
@@ -3611,7 +3616,7 @@ impl WorkspaceView {
         else {
             return;
         };
-        if chat.awaiting_model {
+        if chat.awaiting_model || chat.phone_sends_waiting_on_cancel > 0 {
             return;
         }
         let Some(text) = chat.pending_messages.take_next() else {
@@ -3650,7 +3655,8 @@ impl WorkspaceView {
 
     /// Sends the user's own message from the phone straight away: a running
     /// turn is stopped first, as by the chat's Stop button, since an agent
-    /// can't be handed a message mid-turn.
+    /// can't be handed a message mid-turn. Messages arriving while that stop
+    /// is under way queue behind it in arrival order.
     pub(crate) fn send_now_to_chat(
         &mut self,
         record_id: &str,
@@ -3661,6 +3667,7 @@ impl WorkspaceView {
         let Some(chat) = self.chat_by_record(record_id) else {
             return Task::ready(Err(not_open()));
         };
+        let cancel_under_way = chat.phone_sends_waiting_on_cancel > 0;
         let is_busy = chat
             .view
             .read(cx)
@@ -3668,7 +3675,7 @@ impl WorkspaceView {
             .is_some_and(|thread| thread.read(cx).status() != acp_thread::ThreadStatus::Idle);
         let root_thread_view = chat.view.read(cx).root_thread_view();
         let cancel = root_thread_view
-            .filter(|_| is_busy)
+            .filter(|_| is_busy && !cancel_under_way)
             .and_then(|thread_view| {
                 // Through the Stop button's path, so messages typed on the Mac
                 // stay queued rather than going out ahead of this one.
@@ -3681,15 +3688,31 @@ impl WorkspaceView {
             let sent = self.send_to_chat(record_id, text, cx);
             return Task::ready(if sent { Ok(()) } else { Err(not_open()) });
         };
-        let record_id = record_id.to_string();
+        let Some(chat) = self
+            .sessions
+            .iter_mut()
+            .filter_map(WorkspaceSession::chat_mut)
+            .find(|chat| chat.record_id == record_id)
+        else {
+            return Task::ready(Err(not_open()));
+        };
+        chat.phone_sends_waiting_on_cancel += 1;
+        chat.pending_messages.push(text);
+        let view_id = chat.view.entity_id();
         cx.spawn(async move |this, cx| {
             cancel.await;
-            // Queued only once the turn has stopped, so one flush sends it
-            // while the thread is idle.
-            let sent = this
-                .update(cx, |this, cx| this.send_to_chat(&record_id, text, cx))
-                .unwrap_or(false);
-            if sent { Ok(()) } else { Err(not_open()) }
+            this.update(cx, |this, cx| {
+                let chat = this
+                    .chat_index(view_id)
+                    .and_then(|index| this.sessions.get_mut(index))
+                    .and_then(WorkspaceSession::chat_mut)
+                    .ok_or_else(not_open)?;
+                chat.phone_sends_waiting_on_cancel =
+                    chat.phone_sends_waiting_on_cancel.saturating_sub(1);
+                this.flush_pending(view_id, cx);
+                Ok(())
+            })
+            .unwrap_or_else(|_| Err(not_open()))
         })
     }
 
@@ -7149,6 +7172,32 @@ pub(crate) mod tests {
                 .is_some_and(|chat| !chat.pending_messages.is_empty())
         });
         assert!(!still_pending);
+    }
+
+    #[gpui::test]
+    async fn phone_messages_sent_during_a_cancel_keep_their_order(cx: &mut gpui::TestAppContext) {
+        let (view_a, connection, thread, _data_dir, cx) = stub_chat_in_workspace_a(cx).await;
+        let (sending_a, sending_b) = view_a.update(cx, |view, cx| {
+            let sending_a = view.send_now_to_chat("stub-chat", "a".to_string(), cx);
+            let sending_b = view.send_now_to_chat("stub-chat", "b".to_string(), cx);
+            (sending_a, sending_b)
+        });
+        cx.run_until_parked();
+        assert_eq!(sending_a.await, Ok(()));
+        assert_eq!(sending_b.await, Ok(()));
+        assert_eq!(
+            cx.read(|cx| user_messages(&thread, cx)),
+            vec!["Start".to_string(), "a".to_string()],
+            "the first message goes out once the turn has stopped, the second waits behind it"
+        );
+
+        let session_id = thread.read_with(cx, |thread, _| thread.session_id().clone());
+        connection.end_turn(session_id, acp::StopReason::EndTurn);
+        cx.run_until_parked();
+        assert_eq!(
+            cx.read(|cx| user_messages(&thread, cx)),
+            vec!["Start".to_string(), "a".to_string(), "b".to_string()]
+        );
     }
 
     #[gpui::test]
