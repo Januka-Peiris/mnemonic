@@ -51,6 +51,25 @@ class MacClientTest {
     }
 
     @Test
+    fun archivePostsToArchiveRoute() = runBlocking {
+        server.enqueue(MockResponse().setBody("{}"))
+        server.enqueue(MockResponse().setResponseCode(400).setBody("The workspace has unpushed commits"))
+        val client = MacClient(address, OkHttpClient())
+
+        assertEquals(MacResult.Ok(Unit), client.archiveWorkspace("ws-1"))
+        val request = server.takeRequest()
+        assertEquals("POST", request.method)
+        assertEquals("/v1/workspaces/ws-1/archive", request.path)
+        assertEquals("app", request.getHeader("X-Mnemonic-Phone"))
+        assertEquals("{}", request.body.readUtf8())
+
+        assertEquals(
+            MacResult.Refused(400, "The workspace has unpushed commits"),
+            client.archiveWorkspace("ws-2"),
+        )
+    }
+
+    @Test
     fun aClosedPortIsUnreachable() = runBlocking {
         server.shutdown()
 

@@ -27,7 +27,7 @@ class PendingMessages {
         if (userMessages.size < seen) seen = userMessages.size
         val remaining = list.toMutableList()
         for (text in userMessages.drop(seen)) {
-            val index = remaining.indexOfFirst { it.text == text }
+            val index = remaining.indexOfFirst { it.text.trim() == text.trim() }
             if (index >= 0) remaining.removeAt(index)
         }
         seen = userMessages.size

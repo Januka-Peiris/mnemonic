@@ -356,6 +356,19 @@ class ChatViewModel(
         }
     }
 
+    fun archive(onArchived: () -> Unit) {
+        val workspace = mutableState.value.workspace
+        if (workspace == null) {
+            reportMissingWorkspace()
+            return
+        }
+        viewModelScope.launch {
+            mutableState.update { it.copy(error = null, notice = null) }
+            val result = client.archiveWorkspace(workspace.id)
+            if (result is MacResult.Ok) onArchived() else mutableState.update { it.copy(error = failure(result)) }
+        }
+    }
+
     fun retryPr() {
         val workspace = mutableState.value.workspace ?: return
         viewModelScope.launch { loadPr(workspace.id) }

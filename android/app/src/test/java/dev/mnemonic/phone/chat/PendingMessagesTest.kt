@@ -50,6 +50,15 @@ class PendingMessagesTest {
     }
 
     @Test
+    fun reconcileIgnoresSurroundingWhitespace() {
+        val pending = PendingMessages()
+        pending.add("hello\n")
+        assertEquals(emptyList<String>(), texts(pending.reconcile(listOf("hello"))))
+        pending.add("  bye")
+        assertEquals(emptyList<String>(), texts(pending.reconcile(listOf("hello", "bye\n"))))
+    }
+
+    @Test
     fun failKeepsWithError() {
         val pending = PendingMessages()
         val message = pending.add("hello")

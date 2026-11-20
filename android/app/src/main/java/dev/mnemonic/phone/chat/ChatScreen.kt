@@ -31,6 +31,7 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.Add
+import androidx.compose.material.icons.rounded.Archive
 import androidx.compose.material.icons.rounded.CallMerge
 import androidx.compose.material.icons.rounded.CheckCircle
 import androidx.compose.material.icons.rounded.Difference
@@ -81,6 +82,7 @@ import dev.mnemonic.phone.api.MacResult
 import dev.mnemonic.phone.api.TeamPermissionRequest
 import dev.mnemonic.phone.api.PhoneAgent
 import dev.mnemonic.phone.api.PlanEntry
+import dev.mnemonic.phone.ui.ArchiveDialog
 import dev.mnemonic.phone.ui.Composer
 import dev.mnemonic.phone.ui.MenuRow
 import dev.mnemonic.phone.ui.MnColors
@@ -126,16 +128,19 @@ fun ChatScreen(
 
     var draft by rememberSaveable { mutableStateOf("") }
     var confirmingMerge by remember { mutableStateOf<PrAction.Merge?>(null) }
+    var confirmingArchive by remember { mutableStateOf(false) }
+    var forceBottom by remember { mutableStateOf(false) }
     val dictate = rememberDictation { draft = appendSpoken(draft, it) }
 
     val rows = state.items
     val listState = rememberLazyListState()
     val rowCount = rows.size + state.pending.size
     val pinned = remember(rows, state.pending) { Snapshot.withoutReadObservation { nearBottom(listState) } }
-    LaunchedEffect(rows, state.pending) {
-        if (pinned && rowCount > 0) {
+    LaunchedEffect(rows, state.pending, forceBottom) {
+        if ((pinned || forceBottom) && rowCount > 0) {
             listState.scrollToItem(rowCount - 1)
             listState.scrollBy(100_000_000f)
+            forceBottom = false
         }
     }
 
@@ -163,7 +168,7 @@ fun ChatScreen(
                     ChatStatus.Error -> StatusLabel("error", StatusKind.Error)
                     ChatStatus.Idle -> StatusLabel("idle", StatusKind.Idle)
                 }
-                ChatMenu(state, viewModel, onDiff, onOpenChat, onMerge = { confirmingMerge = it })
+                ChatMenu(state, viewModel, onDiff, onOpenChat, onMerge = { confirmingMerge = it }, onArchive = { confirmingArchive = true })
             },
         )
         state.status?.let {
@@ -190,14 +195,19 @@ fun ChatScreen(
                 horizontalArrangement = Arrangement.spacedBy(6.dp),
             ) {
                 for (reply in QUICK_REPLIES) {
-                    ReplyChip(reply, enabled = true) { viewModel.send(reply) }
+                    ReplyChip(reply, enabled = true) { forceBottom = true
+                        viewModel.send(reply)
+                    }
                 }
             }
             Composer(
                 value = draft,
                 onValueChange = { draft = it },
                 placeholder = "Reply...",
-                onSend = { viewModel.send(draft) { draft = "" } },
+                onSend = {
+                    forceBottom = true
+                    viewModel.send(draft) { draft = "" }
+                },
                 onMic = dictate,
                 sendEnabled = draft.isNotBlank(),
             )
@@ -214,6 +224,17 @@ fun ChatScreen(
                 onDismiss = { viewModel.dismissPermission(request.toolCallId) },
             )
         }
+    }
+
+    if (confirmingArchive) {
+        ArchiveDialog(
+            name = workspace?.name ?: "this workspace",
+            onConfirm = {
+                confirmingArchive = false
+                viewModel.archive(onArchived = onBack)
+            },
+            onCancel = { confirmingArchive = false },
+        )
     }
 
     confirmingMerge?.let { merge ->
@@ -268,6 +289,7 @@ private fun ChatMenu(
     onDiff: (String) -> Unit,
     onOpenChat: (String) -> Unit,
     onMerge: (PrAction.Merge) -> Unit,
+    onArchive: () -> Unit,
 ) {
     val uriHandler = LocalUriHandler.current
     var open by remember { mutableStateOf(false) }
@@ -320,6 +342,10 @@ private fun ChatMenu(
                 uriHandler.openUri(it)
             })
             MenuRow("New chat", icon = Icons.Rounded.Add, onClick = { page = MenuPage.Agents })
+            MenuRow("Archive workspace", icon = Icons.Rounded.Archive, onClick = {
+                close()
+                onArchive()
+            })
         }
     }
     }

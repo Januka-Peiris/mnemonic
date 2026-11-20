@@ -138,6 +138,25 @@ class HomeViewModel(private val client: MacClient, private val appState: AppStat
         }
     }
 
+    fun archive(workspaceId: String) {
+        viewModelScope.launch {
+            mutableState.update { it.copy(answerError = null) }
+            when (val result = client.archiveWorkspace(workspaceId)) {
+                is MacResult.Ok -> {
+                    mutableState.update { state ->
+                        state.copy(
+                            workspaces = state.workspaces.filter { it.id != workspaceId },
+                            needsYou = state.needsYou.filter { it.workspace.id != workspaceId },
+                        )
+                    }
+                    load()
+                }
+                is MacResult.Refused -> mutableState.update { it.copy(answerError = result.reason) }
+                is MacResult.Unreachable -> mutableState.update { it.copy(answerError = CANT_REACH) }
+            }
+        }
+    }
+
     fun markOpened(chatId: String, endedAt: Long) {
         viewModelScope.launch { appState.markOpened(chatId, endedAt) }
     }
