@@ -48,7 +48,7 @@ use crate::chat_feed::{
 use crate::team::{answer_permission, show_step_in_notice, wait_for_reply, workspace_diff_source};
 use crate::workspace_detail_panel::request_pr;
 use crate::workspace_view::{
-    ChatAgent, WorkspaceHost, WorkspaceView, find_open_chat, find_workspace_window,
+    ChatAgent, OpenChat, WorkspaceHost, WorkspaceView, find_open_chat, find_workspace_window,
     open_window_handles,
 };
 
@@ -1270,7 +1270,7 @@ fn run_phone_action(
             tool_call_id,
             option_id,
         } => Task::ready(answer_chat_permission(chat_id, tool_call_id, option_id, cx)),
-        PhoneAction::Message { chat_id, text } => Task::ready(send_message(chat_id, text, cx)),
+        PhoneAction::Message { chat_id, text } => send_message(chat_id, text, cx),
         PhoneAction::NewChat {
             workspace_id,
             agent,
@@ -1334,29 +1334,41 @@ fn answer_chat_permission(
     Ok(PhoneActionOutcome::default())
 }
 
+/// Sends the message at once, stopping the agent's turn if it's working.
 fn send_message(
     chat_id: String,
     text: String,
     cx: &mut App,
-) -> Result<PhoneActionOutcome, TeamActionError> {
+) -> Task<Result<PhoneActionOutcome, TeamActionError>> {
     let closed = || TeamActionError::NothingToDo("This chat was closed on the Mac".to_string());
-    if find_open_chat(&chat_id, cx).is_none() {
-        let workspace_id = saved_chat_workspace(&chat_id, cx).ok_or_else(closed)?;
+    let chat = match open_chat_for_message(&chat_id, cx) {
+        Ok(chat) => chat,
+        Err(err) => return Task::ready(Err(err)),
+    };
+    let sending = chat
+        .view
+        .update(cx, |view, cx| view.send_now_to_chat(&chat_id, text, cx));
+    cx.spawn(async move |cx| {
+        sending.await.map_err(|_| closed())?;
+        cx.update(|cx| {
+            show_phone_notice(
+                &chat.window,
+                format!("sent a message to {}", chat.title),
+                cx,
+            )
+        });
+        Ok(PhoneActionOutcome::default())
+    })
+}
+
+/// The chat, its workspace opened first if it isn't loaded on the Mac.
+fn open_chat_for_message(chat_id: &str, cx: &mut App) -> Result<OpenChat, TeamActionError> {
+    let closed = || TeamActionError::NothingToDo("This chat was closed on the Mac".to_string());
+    if find_open_chat(chat_id, cx).is_none() {
+        let workspace_id = saved_chat_workspace(chat_id, cx).ok_or_else(closed)?;
         open_workspace_for_phone(&workspace_id, cx)?;
     }
-    let chat = find_open_chat(&chat_id, cx).ok_or_else(closed)?;
-    let sent = chat
-        .view
-        .update(cx, |view, cx| view.send_to_chat(&chat_id, text, cx));
-    if !sent {
-        return Err(closed());
-    }
-    show_phone_notice(
-        &chat.window,
-        format!("sent a message to {}", chat.title),
-        cx,
-    );
-    Ok(PhoneActionOutcome::default())
+    find_open_chat(chat_id, cx).ok_or_else(closed)
 }
 
 fn start_new_chat(
