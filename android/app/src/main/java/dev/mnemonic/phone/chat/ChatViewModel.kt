@@ -106,7 +106,6 @@ class PrRequestHold {
 data class ChatUiState(
     val items: List<ChatItem> = emptyList(),
     val permissions: Map<String, List<PermissionOption>> = emptyMap(),
-    val unplaced: Map<String, List<PermissionOption>> = emptyMap(),
     val generating: Boolean = false,
     val loaded: Boolean = false,
     val status: String? = null,
@@ -114,6 +113,7 @@ data class ChatUiState(
     val expandedFolds: Set<String> = emptySet(),
     val answering: Set<String> = emptySet(),
     val answered: Set<String> = emptySet(),
+    val dismissed: Set<String> = emptySet(),
     val pr: PhonePrStatus? = null,
     val prFailed: Boolean = false,
     val prLoading: Boolean = true,
@@ -125,7 +125,7 @@ data class ChatUiState(
 )
 
 class ChatViewModel(
-    private val chatId: String,
+    val chatId: String,
     private val client: MacClient,
     private val appState: AppState,
 ) : ViewModel() {
@@ -190,7 +190,6 @@ class ChatViewModel(
             it.copy(
                 items = chat.items,
                 permissions = chat.permissions,
-                unplaced = chat.unplacedPermissions,
                 generating = chat.generating,
                 status = status,
                 loaded = loaded,
@@ -249,8 +248,20 @@ class ChatViewModel(
         mutableState.update { it.copy(error = "This chat's workspace isn't in the list yet") }
     }
 
+    fun reportError(message: String) {
+        mutableState.update { it.copy(error = message) }
+    }
+
     fun dismissMessages() {
         mutableState.update { it.copy(error = null, notice = null) }
+    }
+
+    fun dismissPermission(toolCallId: String) {
+        mutableState.update { it.copy(dismissed = it.dismissed + toolCallId) }
+    }
+
+    fun reopenPermissions() {
+        mutableState.update { it.copy(dismissed = emptySet()) }
     }
 
     fun answer(toolCallId: String, optionId: String) {

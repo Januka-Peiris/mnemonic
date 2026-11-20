@@ -39,19 +39,6 @@ class ChatState {
     var items: List<ChatItem> = emptyList()
         private set
 
-    /** Permission requests whose tool call isn't in the transcript yet, which still need an answer. */
-    val unplacedPermissions: Map<String, List<PermissionOption>>
-        get() {
-            val placed = items.flatMap { item ->
-                when (item) {
-                    is ChatItem.Tool -> listOf(item.id)
-                    is ChatItem.FoldedTools -> item.tools.map { it.id }
-                    else -> emptyList()
-                }
-            }.toSet()
-            return permissions.filterKeys { it !in placed }
-        }
-
     fun apply(update: TeamChatUpdate) {
         if (update.reset) entries = mutableListOf()
         for (change in update.changes) {
@@ -73,13 +60,13 @@ class ChatState {
         var run = mutableListOf<ChatItem.Tool>()
         fun flush() {
             if (run.isEmpty()) return
-            built.add(ChatItem.FoldedTools(run.toList(), foldLabel(run)))
+            built.add(ChatItem.FoldedTools(run.toList(), toolRunSummary(run)))
             run = mutableListOf()
         }
         for (entry in entries) {
             val entryItems = itemsFor(entry)
             val tool = entryItems.singleOrNull() as? ChatItem.Tool
-            if (tool != null && !tool.waiting) {
+            if (tool != null && !tool.waiting && tool.status != "in_progress") {
                 run.add(tool)
                 continue
             }
@@ -91,13 +78,6 @@ class ChatState {
         flush()
         if (plan.isNotEmpty()) built.add(ChatItem.Plan(plan, done = false))
         return built
-    }
-
-    private fun foldLabel(run: List<ChatItem.Tool>): String {
-        val failed = run.count { it.status == "failed" }
-        var label = if (run.size == 1) run[0].title.ifEmpty { "1 tool call" } else "${run.size} tool calls"
-        if (failed > 0) label += ", $failed failed"
-        return label
     }
 
     private fun itemsFor(entry: TeamEntry?): List<ChatItem> =

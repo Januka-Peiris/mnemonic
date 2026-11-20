@@ -29,9 +29,9 @@ class ChatStateTest {
         val waiting = items[3] as ChatItem.Tool
         assertEquals("tool-2", waiting.id)
         assertTrue(waiting.waiting)
-        val last = items[4] as ChatItem.FoldedTools
-        assertEquals(listOf("tool-3"), last.tools.map { it.id })
-        assertEquals("in_progress", last.tools.single().status)
+        val last = items[4] as ChatItem.Tool
+        assertEquals("tool-3", last.id)
+        assertEquals("in_progress", last.status)
         val plan = items[5] as ChatItem.Plan
         assertEquals(2, plan.entries.size)
         assertFalse(plan.done)
@@ -46,9 +46,9 @@ class ChatStateTest {
         state.apply(update)
 
         val fold = state.items[2] as ChatItem.FoldedTools
-        assertEquals(listOf("tool-1", "tool-2", "tool-3"), fold.tools.map { it.id })
-        assertEquals("3 tool calls", fold.label)
-        assertFalse(state.items.any { it is ChatItem.Tool })
+        assertEquals(listOf("tool-1", "tool-2"), fold.tools.map { it.id })
+        assertEquals("read 1 file · ran 1 command", fold.label)
+        assertEquals("tool-3", (state.items[3] as ChatItem.Tool).id)
     }
 
     @Test
@@ -83,5 +83,30 @@ class ChatStateTest {
 
         val plans = state.items.filterIsInstance<ChatItem.Plan>()
         assertEquals(listOf(true, false), plans.map { it.done })
+    }
+
+    @Test
+    fun runningToolIsNeverFolded() {
+        val state = ChatState()
+        fun toolEntry(index: Int, status: String) =
+            TeamEntryChange(
+                index,
+                MacJson.decodeFromString<TeamEntry>(
+                    """{"kind":"updates","updates":[{"sessionUpdate":"tool_call","toolCallId":"t$index","title":"x","kind":"read","status":"$status"}]}""",
+                ),
+            )
+        state.apply(
+            TeamChatUpdate(
+                cursor = "c",
+                reset = true,
+                len = 3,
+                changes = listOf(toolEntry(0, "completed"), toolEntry(1, "in_progress"), toolEntry(2, "completed")),
+            ),
+        )
+
+        assertEquals(3, state.items.size)
+        assertEquals(1, (state.items[0] as ChatItem.FoldedTools).tools.size)
+        assertEquals("in_progress", (state.items[1] as ChatItem.Tool).status)
+        assertEquals(1, (state.items[2] as ChatItem.FoldedTools).tools.size)
     }
 }

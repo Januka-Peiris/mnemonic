@@ -1,0 +1,53 @@
+<style>
+.phones{display:flex;gap:22px;flex-wrap:wrap}
+.ph{width:300px;height:600px;border-radius:30px;overflow:hidden;position:relative;font-family:Inter,Roboto,system-ui,sans-serif;box-shadow:0 6px 24px rgba(0,0,0,.35);display:flex;flex-direction:column;font-size:12px;background:#0b0d10;color:#d7dae0}
+.sb{height:22px;font-size:11px;padding:4px 18px 0;display:flex;justify-content:space-between;color:#6b7280}
+.mono{font-family:"JetBrains Mono",Menlo,monospace}
+.bar{display:flex;align-items:center;gap:10px;padding:8px 14px;border-bottom:1px solid #161a20}
+.t1{font-weight:600}.t2{font-size:10.5px;color:#6b7280}
+.grp{font-size:9.5px;letter-spacing:.08em;color:#6b7280;padding:10px 14px 2px}
+.row{display:flex;align-items:center;gap:10px;padding:6px 14px;position:relative}
+.av{width:22px;height:22px;border-radius:6px;display:flex;align-items:center;justify-content:center;font-size:11px;flex:none}
+.st{font-size:9.5px;padding:1px 6px;border-radius:4px;white-space:nowrap}
+.k{background:#8b5cf6;color:#fff;border-radius:7px;padding:4px 10px;font-weight:600;font-size:11px;display:inline-block}
+.kg{background:#171a20;border:1px solid #262b33;border-radius:7px;padding:4px 10px;font-size:11px;display:inline-block;color:#c3c8d0}
+.grow{flex:1;overflow:hidden}
+.comp{margin:6px 10px 12px;background:#14171c;border:1px solid #262b33;border-radius:20px;padding:5px 5px 5px 14px;display:flex;align-items:center;gap:10px;color:#6b7280}
+.send{background:#8b5cf6;color:#fff;border-radius:50%;width:26px;height:26px;display:flex;align-items:center;justify-content:center;font-size:12px}
+.unread{background:#16122a}
+.unread::before{content:"";position:absolute;left:0;top:6px;bottom:6px;width:3px;border-radius:0 3px 3px 0;background:#8b5cf6}
+.dot{width:7px;height:7px;border-radius:50%;background:#a78bfa;flex:none}
+.ask{background:#15130c}
+.ask::before{content:"";position:absolute;left:0;top:6px;bottom:6px;width:3px;border-radius:0 3px 3px 0;background:#f5a524}
+.ok{background:#0e1a12}
+.ok::before{content:"";position:absolute;left:0;top:6px;bottom:6px;width:3px;border-radius:0 3px 3px 0;background:#22c55e}
+.lbl{font-size:12px;color:#888;margin:0 0 6px 4px;max-width:300px}
+.summary{margin:8px 10px 0;display:flex;gap:6px}
+</style>
+
+<h2>Your rule: amber = needs you, green = clear, purple = merged</h2>
+<p class="subtitle">Only "needs your OK" goes to the top. Unread runs stay under their repo, lit amber until you open them. Read and finished = green.</p>
+<div class="phones">
+<div>
+<div class="ph">
+  <div class="sb"><span>10:45</span><span>81%</span></div>
+  <div class="bar"><div class="t1" style="font-size:17px;flex:1">Mnemonic</div><span style="color:#8b93a1">⚙︎</span></div>
+  <div class="grow">
+   <div class="grp" style="color:#f5a524">NEEDS YOUR OK</div>
+   <div class="row ask" style="flex-wrap:wrap"><div class="av" style="background:#3a2a08;color:#f5a524">!</div><div style="flex:1;min-width:0"><div class="t1">fix-billing-retry</div><div class="t2">mnemonic · wants to run a command</div></div>
+     <div style="width:100%;padding-left:32px;margin-top:5px"><div class="mono t2" style="color:#8b93a1;margin-bottom:5px">$ cargo test -p billing</div><span class="k">Allow once</span> <span class="kg">Deny</span></div></div>
+   <div class="grp">MNEMONIC</div>
+   <div class="row"><div class="av" style="background:#3a2a08;color:#f5a524">!</div><div style="flex:1"><div>fix-billing-retry</div><div class="t2">Needs your OK</div></div><span class="st mono" style="background:#0f2a18;color:#22c55e">#212 ready</span></div>
+   <div class="row"><div class="av" style="background:#1e1638;color:#a78bfa">◐</div><div style="flex:1"><div>onboarding-copy</div><div class="t2">Working · 12s</div></div></div>
+   <div class="row"><div class="av" style="background:#0f2a18;color:#22c55e">✓</div><div style="flex:1"><div>phone-page-v2</div><div class="t2">Finished · 1d</div></div><span class="st mono" style="background:#1e1638;color:#a78bfa">#36 merged</span></div>
+   <div class="grp">SIDEKICK-DESKTOP-AGENT</div>
+   <div class="row ask"><div class="av" style="background:#3a2a08;color:#f5a524">✓</div><div style="flex:1"><div class="t1">gpu-scheduling</div><div class="t2" style="color:#f5a524">Finished · 4m · unread</div></div><div class="dot" style="background:#f5a524"></div></div>
+   <div class="row ask"><div class="av" style="background:#2a1212;color:#f87171">✕</div><div style="flex:1"><div class="t1">nightly-apply</div><div class="t2" style="color:#f5a524">Errored · 20m · unread</div></div><div class="dot" style="background:#f5a524"></div></div>
+   <div class="row"><div class="av" style="background:#0f2a18;color:#22c55e">✓</div><div style="flex:1"><div>onprem-lab</div><div class="t2">Finished · 2h</div></div></div>
+   <div class="grp">AXE-LOGISTICS</div>
+   <div class="row"><div class="av" style="background:#14171c;color:#3b4250">○</div><div style="flex:1"><div style="color:#8b93a1">route-planner</div><div class="t2">Idle 1d</div></div><span class="st mono" style="background:#1e1638;color:#a78bfa">#77 merged</span></div>
+  </div>
+  <div class="comp"><span style="flex:1">Start a new task…</span><span>🎙</span><span class="send">↑</span></div>
+</div>
+</div>
+</div>

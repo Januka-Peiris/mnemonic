@@ -10,9 +10,11 @@ import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
 import androidx.core.app.NotificationCompat
+import androidx.compose.ui.graphics.toArgb
 import androidx.core.content.ContextCompat
 import dev.mnemonic.phone.MainActivity
 import dev.mnemonic.phone.R
+import dev.mnemonic.phone.ui.MnColors
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
@@ -88,7 +90,8 @@ object Notifications {
         ensureChannels(context)
         val id = notificationId(chatId)
         val builder = NotificationCompat.Builder(context, channel)
-            .setSmallIcon(R.mipmap.ic_launcher)
+            .setSmallIcon(R.drawable.ic_notification)
+            .setColor(MnColors.accent.toArgb())
             .setContentTitle(title)
             .setContentText(text)
             .setAutoCancel(true)

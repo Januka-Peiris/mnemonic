@@ -7,12 +7,14 @@ import dev.mnemonic.phone.AppState.Companion.installedAt
 import dev.mnemonic.phone.AppState.Companion.openedAt
 import dev.mnemonic.phone.api.MacClient
 import dev.mnemonic.phone.api.MacResult
+import dev.mnemonic.phone.api.PhoneActionOutcome
 import dev.mnemonic.phone.api.TeamAgentState
 import dev.mnemonic.phone.api.TeamChatUpdate
 import dev.mnemonic.phone.api.TeamEntry
 import dev.mnemonic.phone.api.TeamPermissionRequest
 import dev.mnemonic.phone.api.TeamWorkspace
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.first
@@ -99,6 +101,18 @@ data class HomeUiState(
 class HomeViewModel(private val client: MacClient, private val appState: AppState) : ViewModel() {
     private val mutableState = MutableStateFlow(HomeUiState())
     val state: StateFlow<HomeUiState> = mutableState
+
+    val lastRepositoryId: Flow<String?> = appState.lastRepositoryId
+
+    suspend fun repositories() = client.repositories()
+
+    suspend fun agents() = client.agents()
+
+    suspend fun startTask(repositoryId: String, agentId: String, text: String): MacResult<PhoneActionOutcome> {
+        val result = client.startTask(repositoryId, agentId, text)
+        if (result is MacResult.Ok) appState.setLastRepositoryId(repositoryId)
+        return result
+    }
 
     private val loadingPrompts = mutableSetOf<String>()
 

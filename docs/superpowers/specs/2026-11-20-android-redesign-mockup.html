@@ -1,0 +1,116 @@
+<style>
+.phones{display:flex;gap:18px;flex-wrap:wrap}
+.ph{width:300px;height:620px;border-radius:30px;overflow:hidden;position:relative;font-family:Inter,Roboto,system-ui,sans-serif;box-shadow:0 6px 24px rgba(0,0,0,.35);display:flex;flex-direction:column;font-size:12px;background:#0b0d10;color:#d7dae0}
+.lbl{font-size:12px;color:#888;margin:0 0 6px 4px}
+.sb{height:22px;font-size:11px;padding:4px 18px 0;display:flex;justify-content:space-between;color:#6b7280}
+.mono{font-family:"JetBrains Mono",Menlo,monospace}
+.bar{display:flex;align-items:center;gap:10px;padding:8px 14px;border-bottom:1px solid #161a20}
+.t1{font-weight:600}.t2{font-size:10.5px;color:#6b7280}
+.ic{color:#8b93a1;font-size:16px}
+.grp{font-size:9.5px;letter-spacing:.08em;color:#6b7280;padding:10px 14px 2px}
+.row{display:flex;align-items:center;gap:10px;padding:6px 14px}
+.av{width:22px;height:22px;border-radius:6px;display:flex;align-items:center;justify-content:center;font-size:11px;flex:none}
+.st{font-size:9.5px;padding:1px 6px;border-radius:4px;white-space:nowrap}
+.need{margin:6px 10px;background:#15130c;border:1px solid #3a2a08;border-radius:10px;padding:8px 10px}
+.k{background:#8b5cf6;color:#fff;border-radius:7px;padding:4px 10px;font-weight:600;font-size:11px;display:inline-block}
+.kg{background:#171a20;border:1px solid #262b33;border-radius:7px;padding:4px 10px;font-size:11px;display:inline-block;color:#c3c8d0}
+.grow{flex:1;overflow:hidden;display:flex;flex-direction:column}
+.ub{align-self:flex-end;background:#2a2147;color:#ebe6ff;border-radius:16px 16px 4px 16px;padding:7px 11px;max-width:80%;margin:10px 12px 4px}
+.ag{padding:4px 14px;line-height:1.5;font-size:12px}
+.pill{display:inline-flex;gap:6px;align-items:center;background:#14171c;border:1px solid #1f242c;border-radius:999px;padding:3px 9px;font-size:10.5px;color:#8b93a1;margin:4px 14px;align-self:flex-start}
+.comp{margin:6px 10px 12px;background:#14171c;border:1px solid #262b33;border-radius:20px;padding:5px 5px 5px 14px;display:flex;align-items:center;gap:10px;color:#6b7280}
+.send{background:#8b5cf6;color:#fff;border-radius:50%;width:26px;height:26px;font-size:12px;display:flex;align-items:center;justify-content:center;font-weight:700}
+.chips{display:flex;gap:6px;padding:0 10px;overflow:hidden}
+.chip{background:#14171c;border:1px solid #262b33;border-radius:999px;padding:3px 9px;font-size:10.5px;white-space:nowrap;color:#c3c8d0}
+.sheet{position:absolute;left:0;right:0;bottom:0;background:#14171c;border-top:1px solid #262b33;border-radius:16px 16px 0 0;box-shadow:0 -10px 40px rgba(0,0,0,.6);padding:8px 14px 14px}
+.grab{width:30px;height:3px;background:#2f3540;border-radius:2px;margin:0 auto 8px}
+.bp{background:#8b5cf6;color:#fff;border-radius:12px;padding:11px;text-align:center;font-weight:600;margin-top:10px}
+.bs{background:#1d2128;border-radius:12px;padding:11px;text-align:center;font-weight:500;margin-top:8px;color:#c3c8d0}
+.dim{position:absolute;inset:0;background:rgba(0,0,0,.3)}
+.menu{position:absolute;right:10px;top:58px;background:#171a20;border:1px solid #262b33;border-radius:12px;padding:6px 0;width:170px;box-shadow:0 10px 30px rgba(0,0,0,.5)}
+.menu div{padding:7px 12px;font-size:11.5px}
+</style>
+
+<h2>B's colours, C's calm, smaller</h2>
+<p class="subtitle">Dark with one purple accent and B's coloured status labels; C's layout: no bottom tabs, settings behind the gear, chat bubbles, tool work as a small pill, permissions slide up from the bottom, a message box on Home to start a task.</p>
+
+<div class="phones">
+ <div>
+ <div class="lbl">Home</div>
+ <div class="ph">
+  <div class="sb"><span>10:45</span><span>81%</span></div>
+  <div class="bar"><div class="t1" style="font-size:17px;flex:1">Mnemonic</div><span class="ic">⚙︎</span></div>
+  <div class="grow">
+   <div class="need">
+    <div style="display:flex;gap:10px;align-items:center"><div class="av" style="background:#3a2a08;color:#f5a524">!</div><div style="flex:1;min-width:0"><div class="t1" style="font-size:12px">fix-billing-retry</div><div class="t2">mnemonic · wants to run a command</div></div></div>
+    <div class="mono" style="font-size:11px;color:#8b93a1;margin:5px 0 7px 32px">$ cargo test -p billing</div>
+    <div style="margin-left:32px"><span class="k">Allow once</span> <span class="kg">Deny</span></div>
+   </div>
+   <div class="grp">SIDEKICK-DESKTOP-AGENT</div>
+   <div class="row"><div class="av" style="background:#0f2a18;color:#22c55e">✓</div><div style="flex:1;min-width:0"><div>GPU scheduling</div><div class="t2">Finished · 4m</div></div><span class="st" style="background:#0f2a18;color:#22c55e">new</span></div>
+   <div class="row"><div class="av" style="background:#1e1638;color:#a78bfa">◐</div><div style="flex:1;min-width:0"><div>Pipeline steps</div><div class="t2">Working · 12s</div></div><span class="st mono" style="background:#171a20;color:#8b93a1">#812</span></div>
+   <div class="row"><div class="av" style="background:#14171c;color:#3b4250">○</div><div style="flex:1;min-width:0"><div style="color:#8b93a1">On-prem lab</div><div class="t2">2h ago</div></div></div>
+   <div class="grp">MNEMONIC</div>
+   <div class="row"><div class="av" style="background:#3a2a08;color:#f5a524">!</div><div style="flex:1;min-width:0"><div>fix-billing-retry</div><div class="t2">Needs you</div></div><span class="st mono" style="background:#0f2a18;color:#22c55e">#212 ready</span></div>
+  </div>
+  <div class="comp"><span style="flex:1">Start a new task…</span><span class="ic">🎙</span><span class="send">↑</span></div>
+ </div>
+ </div>
+
+ <div>
+ <div class="lbl">Chat</div>
+ <div class="ph">
+  <div class="sb"><span>10:45</span><span>81%</span></div>
+  <div class="bar"><span class="ic">←</span><div style="flex:1;min-width:0"><div class="t1" style="font-size:13px">GPU scheduling</div><div class="t2">sidekick-desktop-agent · Claude</div></div><span class="st" style="background:#1e1638;color:#a78bfa">working</span><span class="ic">⋯</span></div>
+  <div class="grow">
+   <div class="ub">Why did steps only get 73 minutes last night?</div>
+   <span class="pill">⚙︎ Read 4 files · ran 2 commands ›</span>
+   <div class="ag">143 minutes of GPU sat unused while steps got 73.</div>
+   <div class="ag"><b>Recommendation:</b> start steps as soon as the labeller has no more people to start. Last night that would have given steps about 4 hours.</div>
+   <span class="pill" style="color:#a78bfa;border-color:#2a2147">◌ Running <span class="mono" style="color:#c3c8d0">gh run list</span></span>
+  </div>
+  <div class="chips"><span class="chip">Yes, go ahead</span><span class="chip">Continue</span><span class="chip">Open a PR</span></div>
+  <div class="comp"><span style="flex:1">Reply…</span><span class="ic">🎙</span><span class="send">↑</span></div>
+ </div>
+ </div>
+
+ <div>
+ <div class="lbl">Permission</div>
+ <div class="ph">
+  <div class="sb"><span>10:45</span><span>81%</span></div>
+  <div class="bar"><span class="ic">←</span><div style="flex:1;min-width:0"><div class="t1" style="font-size:13px">GPU scheduling</div><div class="t2">sidekick-desktop-agent · Claude</div></div><span class="ic">⋯</span></div>
+  <div class="grow">
+   <div class="ub">Requeue BWG's apply and check it runs</div>
+   <div class="ag">I'll requeue it and watch the next run.</div>
+  </div>
+  <div class="dim"></div>
+  <div class="sheet">
+   <div class="grab"></div>
+   <div style="display:flex;align-items:center;gap:8px"><span class="st" style="background:#3a2a08;color:#f5a524">needs you</span><span class="t1" style="font-size:12px">Run this command?</span></div>
+   <div class="mono" style="background:#0b0d10;border:1px solid #1f242c;border-radius:7px;padding:7px 9px;margin-top:8px;font-size:10.5px">$ python scripts/requeue.py --org bwg</div>
+   <div style="display:flex;gap:6px;margin-top:10px"><span class="k" style="flex:1;text-align:center;padding:6px">Allow once</span><span class="kg" style="text-align:center;padding:6px 10px">Always</span><span class="kg" style="text-align:center;padding:6px 10px">Deny</span></div>
+  </div>
+ </div>
+ </div>
+
+ <div>
+ <div class="lbl">Chat menu (⋯)</div>
+ <div class="ph">
+  <div class="sb"><span>10:45</span><span>81%</span></div>
+  <div class="bar"><span class="ic">←</span><div style="flex:1;min-width:0"><div class="t1" style="font-size:13px">GPU scheduling</div><div class="t2">sidekick-desktop-agent · Claude</div></div><span class="ic" style="color:#d7dae0">⋯</span></div>
+  <div class="grow">
+   <div class="ub">Why did steps only get 73 minutes last night?</div>
+   <span class="pill">⚙︎ Read 4 files · ran 2 commands ›</span>
+   <div class="ag">143 minutes of GPU sat unused while steps got 73.</div>
+  </div>
+  <div class="menu">
+   <div>■&nbsp; Stop agent</div>
+   <div>±&nbsp; View diff</div>
+   <div style="color:#a78bfa">⇡&nbsp; Create PR</div>
+   <div>＋&nbsp; New chat</div>
+  </div>
+  <div class="chips"><span class="chip">Yes, go ahead</span><span class="chip">Continue</span><span class="chip">Open a PR</span></div>
+  <div class="comp"><span style="flex:1">Reply…</span><span class="ic">🎙</span><span class="send">↑</span></div>
+ </div>
+ </div>
+</div>
