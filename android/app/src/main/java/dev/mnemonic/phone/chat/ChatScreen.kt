@@ -55,6 +55,7 @@ import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
@@ -76,7 +77,7 @@ import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.repeatOnLifecycle
 import dev.mnemonic.phone.api.MacResult
-import dev.mnemonic.phone.api.PermissionOption
+import dev.mnemonic.phone.api.TeamPermissionRequest
 import dev.mnemonic.phone.api.PhoneAgent
 import dev.mnemonic.phone.api.PlanEntry
 import dev.mnemonic.phone.ui.Composer
@@ -94,11 +95,6 @@ import dev.mnemonic.phone.voice.rememberDictation
 import kotlinx.coroutines.launch
 
 private const val NEAR_BOTTOM_PX = 240
-
-private sealed interface Row {
-    data class Item(val item: ChatItem) : Row
-    data class Unplaced(val toolCallId: String, val options: List<PermissionOption>) : Row
-}
 
 private fun nearBottom(state: LazyListState): Boolean {
     val info = state.layoutInfo
@@ -129,9 +125,7 @@ fun ChatScreen(
     var confirmingMerge by remember { mutableStateOf<PrAction.Merge?>(null) }
     val dictate = rememberDictation { draft = appendSpoken(draft, it) }
 
-    val rows = remember(state.items, state.unplaced) {
-        state.items.map<ChatItem, Row> { Row.Item(it) } + state.unplaced.map { Row.Unplaced(it.key, it.value) }
-    }
+    val rows = state.items
     val listState = rememberLazyListState()
     val pinned = remember(rows) { Snapshot.withoutReadObservation { nearBottom(listState) } }
     LaunchedEffect(rows) {
@@ -146,7 +140,11 @@ fun ChatScreen(
     val title = chat?.title?.takeIf { it.isNotEmpty() } ?: workspace?.name ?: "Chat"
     val subtitle = workspace?.let { listOfNotNull(it.project.takeIf { project -> project.isNotEmpty() }, chat?.agent?.takeIf { agent -> agent.isNotEmpty() }).joinToString(" · ") }
         ?.takeIf { it.isNotEmpty() }
-    val pendingPermission = state.permissions.keys.any { it !in state.answered }
+    val pending = remember(state.permissions, state.answered) {
+        state.permissions.filterKeys { it !in state.answered }.map { TeamPermissionRequest(it.key, it.value) }
+    }
+    val pendingPermission = pending.isNotEmpty()
+    val sheet = sheetPermission(pending, state.dismissed)
     val status = chatStatus(state.generating, pendingPermission, workspace?.agentState)
 
     Column(Modifier.fillMaxSize().background(MnColors.background).statusBarsPadding()) {
@@ -176,20 +174,10 @@ fun ChatScreen(
             contentPadding = PaddingValues(horizontal = 14.dp, vertical = 10.dp),
             verticalArrangement = Arrangement.spacedBy(8.dp),
         ) {
-            items(rows.size) { index ->
-                when (val row = rows[index]) {
-                    is Row.Item -> ItemView(row.item, state, viewModel)
-                    is Row.Unplaced -> PromptCard(
-                        title = "Permission needed",
-                        options = row.options,
-                        enabled = row.toolCallId !in state.answering,
-                        onChoose = { viewModel.answer(row.toolCallId, it) },
-                        hidden = row.toolCallId in state.answered,
-                    )
-                }
-            }
+            items(rows.size) { index -> ItemView(rows[index], state, viewModel) }
         }
         Column(Modifier.windowInsetsPadding(WindowInsets.navigationBars).imePadding()) {
+            if (pendingPermission && sheet == null) NeedsOkBar(viewModel::reopenPermissions)
             Row(
                 Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(horizontal = 10.dp),
                 horizontalArrangement = Arrangement.spacedBy(6.dp),
@@ -205,6 +193,18 @@ fun ChatScreen(
                 onSend = { viewModel.send(draft) { draft = "" } },
                 onMic = dictate,
                 sendEnabled = draft.isNotBlank() && !state.sending,
+            )
+        }
+    }
+
+    sheet?.let { request ->
+        key(request.toolCallId) {
+            PermissionSheet(
+                request = request,
+                tool = findTool(state.items, request.toolCallId),
+                enabled = request.toolCallId !in state.answering,
+                onChoose = { viewModel.answer(request.toolCallId, it) },
+                onDismiss = { viewModel.dismissPermission(request.toolCallId) },
             )
         }
     }
@@ -433,15 +433,7 @@ private fun ItemView(item: ChatItem, state: ChatUiState, viewModel: ChatViewMode
         is ChatItem.Tool -> {
             val waiting = item.waiting && item.id !in state.answered
             when {
-                waiting -> Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                    ToolLine(item, waiting)
-                    PromptCard(
-                        title = item.title.ifEmpty { "The agent" },
-                        options = state.permissions[item.id].orEmpty(),
-                        enabled = item.id !in state.answering,
-                        onChoose = { viewModel.answer(item.id, it) },
-                    )
-                }
+                waiting -> ToolLine(item, waiting)
                 item.status == "in_progress" -> Pill(
                     text = buildAnnotatedString {
                         append("Running ")
@@ -483,35 +475,6 @@ private fun ItemView(item: ChatItem, state: ChatUiState, viewModel: ChatViewMode
             fontSize = 10.5.sp,
             color = MnColors.textMuted,
         )
-    }
-}
-
-@Composable
-private fun PromptCard(
-    title: String,
-    options: List<PermissionOption>,
-    enabled: Boolean,
-    onChoose: (String) -> Unit,
-    hidden: Boolean = false,
-) {
-    if (hidden) return
-    val shape = RoundedCornerShape(10.dp)
-    Column(
-        Modifier.fillMaxWidth().background(MnColors.warningCard, shape).border(1.dp, MnColors.warningSoft, shape).padding(10.dp),
-        verticalArrangement = Arrangement.spacedBy(8.dp),
-    ) {
-        Text("$title?", style = MaterialTheme.typography.titleSmall, color = MnColors.text)
-        if (options.isEmpty()) {
-            Text("Answer this on the Mac", style = MaterialTheme.typography.bodySmall, color = MnColors.textSecondary)
-        }
-        for (option in options) {
-            val allows = option.kind == "allow_once" || option.kind == "allow_always"
-            if (allows) {
-                PrimaryButton(option.name, onClick = { onChoose(option.optionId) }, enabled = enabled, modifier = Modifier.fillMaxWidth())
-            } else {
-                SecondaryButton(option.name, onClick = { onChoose(option.optionId) }, enabled = enabled, modifier = Modifier.fillMaxWidth())
-            }
-        }
     }
 }
 

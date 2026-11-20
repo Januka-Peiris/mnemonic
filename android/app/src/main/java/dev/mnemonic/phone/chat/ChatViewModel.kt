@@ -114,6 +114,7 @@ data class ChatUiState(
     val expandedFolds: Set<String> = emptySet(),
     val answering: Set<String> = emptySet(),
     val answered: Set<String> = emptySet(),
+    val dismissed: Set<String> = emptySet(),
     val pr: PhonePrStatus? = null,
     val prFailed: Boolean = false,
     val prLoading: Boolean = true,
@@ -255,6 +256,14 @@ class ChatViewModel(
 
     fun dismissMessages() {
         mutableState.update { it.copy(error = null, notice = null) }
+    }
+
+    fun dismissPermission(toolCallId: String) {
+        mutableState.update { it.copy(dismissed = it.dismissed + toolCallId) }
+    }
+
+    fun reopenPermissions() {
+        mutableState.update { it.copy(dismissed = emptySet()) }
     }
 
     fun answer(toolCallId: String, optionId: String) {
