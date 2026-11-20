@@ -2,6 +2,7 @@ package dev.mnemonic.phone.chat
 
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.horizontalScroll
@@ -36,12 +37,15 @@ sealed interface Inline {
 sealed interface Block {
     data class Paragraph(val inlines: List<Inline>) : Block
     data class CodeBlock(val text: String) : Block
+    data class ListBlock(val ordered: Boolean, val items: List<List<Inline>>) : Block
 }
 
 private val INLINE_PATTERN = Regex(
     "`([^`\\n]+)`|\\*\\*([^*\\n](?:[^\\n]*?[^*\\n])?)\\*\\*|\\[([^\\]\\n]+)\\]\\(([^)\\s]+)\\)|(https?://[^\\s<>()]+)",
 )
 private val TRAILING_PUNCTUATION = Regex("[.,;:!?'\"]+$")
+private val BULLET = Regex("^\\s{0,3}[-*+] +(.*)$")
+private val NUMBERED = Regex("^\\s{0,3}\\d+[.)] +(.*)$")
 private val FENCE = Regex("^ {0,3}(```+|~~~+)")
 
 private fun isWebUrl(text: String): Boolean =
@@ -106,6 +110,18 @@ fun parseBlocks(text: String): List<Block> {
             blocks.add(Block.CodeBlock(code.joinToString("\n")))
         } else if (line.isBlank()) {
             flushParagraph()
+        } else if (BULLET.matches(line) || NUMBERED.matches(line)) {
+            flushParagraph()
+            val ordered = NUMBERED.matches(line)
+            val marker = if (ordered) NUMBERED else BULLET
+            val items = mutableListOf<List<Inline>>()
+            while (index < lines.size) {
+                val item = marker.find(lines[index]) ?: break
+                items.add(parseInline(item.groupValues[1]))
+                index++
+            }
+            index--
+            blocks.add(Block.ListBlock(ordered, items))
         } else {
             paragraph.add(line)
         }
@@ -148,6 +164,17 @@ fun MarkdownText(text: String, modifier: Modifier = Modifier) {
         for (block in parseBlocks(text)) {
             when (block) {
                 is Block.Paragraph -> Text(inlineText(block.inlines), style = MaterialTheme.typography.bodyMedium)
+                is Block.ListBlock -> Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                    block.items.forEachIndexed { position, item ->
+                        Row {
+                            Text(
+                                if (block.ordered) "${position + 1}. " else "\u2022 ",
+                                style = MaterialTheme.typography.bodyMedium,
+                            )
+                            Text(inlineText(item), style = MaterialTheme.typography.bodyMedium)
+                        }
+                    }
+                }
                 is Block.CodeBlock -> Text(
                     block.text,
                     modifier = Modifier

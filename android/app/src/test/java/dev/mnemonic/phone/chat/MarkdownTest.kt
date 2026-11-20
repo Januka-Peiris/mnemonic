@@ -19,4 +19,24 @@ class MarkdownTest {
             parseInline("see https://x.dev/a."),
         )
     }
+
+    @Test
+    fun bulletListBecomesListBlock() {
+        val blocks = parseBlocks("- a\n- **b**")
+        val list = blocks.single() as Block.ListBlock
+        assertEquals(false, list.ordered)
+        assertEquals(2, list.items.size)
+        assertEquals(Inline.Bold(listOf(Inline.Text("b"))), list.items[1].single())
+    }
+
+    @Test
+    fun numberedList() {
+        val list = parseBlocks("1. x\n2. y").single() as Block.ListBlock
+        assertEquals(true, list.ordered)
+    }
+
+    @Test
+    fun dashWithoutSpaceIsParagraph() {
+        assertEquals(listOf<Block>(Block.Paragraph(listOf(Inline.Text("-not a list")))), parseBlocks("-not a list"))
+    }
 }
