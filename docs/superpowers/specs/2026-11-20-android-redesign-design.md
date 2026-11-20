@@ -95,16 +95,26 @@ Icons come from Material Symbols:
 ### Home
 
 - **Top bar:** "Mnemonic" on the left, gear on the right, which opens Settings.
-- **Needs you cards** (warning fill and border):
+- **Colour rule (Jay's, after trying the app):**
+  - amber means it needs Jay: a pending permission, or a run he hasn't read yet;
+  - green means clear: a finished run he has read;
+  - purple stays for merged PRs and the working icon.
+- **"Needs your OK" section** (amber section label), shown only while a permission is pending, and the only thing that moves to the top. Each card (warning fill and border) has:
   - A small square status icon, the workspace name, and "<repo> · wants to run a command" (the existing permission line) as the secondary line.
   - The command in code font.
   - **Allow once** (accent) and **Deny** (outlined), shown only when both once-only answers exist, as today.
   - Tapping the card opens the chat. The separate Open button goes.
-  - Finished and errored chats show as compact rows in this section, with a green "new" or red "error" label.
+- **Unread runs never move.** A chat whose turn finished or errored after Jay last opened it (today's `needsYou` Finished items) stays in its repo group. Its workspace row is lit amber until he opens the chat:
+  - a 3dp amber stripe on the left edge;
+  - the warning card tint as the row background;
+  - a small amber dot on the right;
+  - the secondary line in amber, reading "Finished · <time> · unread" or "Errored · <time> · unread".
+
+  The status square still shows ✓ or ✕.
 - **Repo headings** (section label style), then one row per workspace:
-  - a status square: amber "!" needs you, purple half-circle working, green check finished, grey circle idle, red cross error;
+  - a status square: amber "!" needs your OK, purple half-circle working, green check finished, grey circle idle, red cross error;
   - the name, and a secondary line with the state and time;
-  - a small code-font PR label (`#212 ready`, `#812`) on the right, coloured by PR state.
+  - a small code-font PR label (`#212 ready`, `#812`) on the right, coloured by PR state, with merged in purple.
 - **Tapping a row** opens its chat directly when it has one, and lists its chats inline when it has several (current behaviour). My call.
 - **Composer box at the bottom** reading "Start a new task...", with mic and send icons. Tapping it opens the New task sheet. Pull to refresh stays.
 - **The unreachable banner and answer errors** are compact error-coloured bars under the top bar.
