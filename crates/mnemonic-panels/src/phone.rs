@@ -1078,9 +1078,9 @@ fn action_timeout(action: &PhoneAction) -> Duration {
     }
 }
 
-/// What the phone hears when an action outlasts its timeout. A task or a
-/// merge is usually still going, so calling it a failure would invite the
-/// owner to start a second one.
+/// What the phone hears when an action outlasts its timeout. A task, a
+/// merge or a message waiting for the agent to stop is usually still going,
+/// so calling it a failure would invite the owner to do it a second time.
 fn timed_out(action: &PhoneAction) -> Result<PhoneActionOutcome, TeamActionError> {
     let still_running = |message: &str| {
         Ok(PhoneActionOutcome {
@@ -1094,6 +1094,9 @@ fn timed_out(action: &PhoneAction) -> Result<PhoneActionOutcome, TeamActionError
         }
         PhoneAction::Merge { .. } => {
             still_running("Still merging on the Mac; check the PR in a moment")
+        }
+        PhoneAction::Message { .. } => {
+            still_running("Stopping the agent on the Mac; your message goes out once it stops.")
         }
         _ => Err(TeamActionError::Failed("Timed out".to_string())),
     }
@@ -1868,6 +1871,24 @@ mod tests {
             )
         });
         assert_eq!(quick.await, Ok(PhoneActionOutcome::default()));
+    }
+
+    #[test]
+    fn a_message_still_stopping_the_agent_is_not_a_failure() {
+        let message = PhoneAction::Message {
+            chat_id: "chat".to_string(),
+            text: "carry on".to_string(),
+        };
+        assert_eq!(
+            timed_out(&message),
+            Ok(PhoneActionOutcome {
+                message: Some(
+                    "Stopping the agent on the Mac; your message goes out once it stops."
+                        .to_string()
+                ),
+                ..PhoneActionOutcome::default()
+            })
+        );
     }
 
     #[test]
