@@ -267,7 +267,7 @@ private fun WaitingCard(
             StatusSquare(StatusKind.NeedsYou)
             Column(Modifier.weight(1f)) {
                 Text(
-                    workspaceTitle(item.workspace),
+                    item.workspace.name,
                     fontSize = 12.sp,
                     color = MnColors.text,
                     maxLines = 1,
@@ -315,9 +315,11 @@ private fun FinishedRow(item: NeedsYouItem.Finished, onOpen: (String) -> Unit) {
     ) {
         StatusSquare(kind)
         Column(Modifier.weight(1f)) {
-            Text(workspaceTitle(item.workspace), fontSize = 12.sp, color = MnColors.text, maxLines = 1, overflow = TextOverflow.Ellipsis)
+            Text(item.workspace.name, fontSize = 12.sp, color = MnColors.text, maxLines = 1, overflow = TextOverflow.Ellipsis)
             Text(
-                (if (item.errored) "Errored: " else "Finished: ") + title,
+                listOf(item.workspace.project, (if (item.errored) "Errored: " else "Finished: ") + title)
+                    .filter { it.isNotEmpty() }
+                    .joinToString(" · "),
                 fontSize = 10.5.sp,
                 color = MnColors.textMuted,
                 maxLines = 1,
