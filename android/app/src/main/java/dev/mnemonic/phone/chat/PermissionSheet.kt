@@ -10,9 +10,12 @@ import androidx.compose.foundation.layout.ExperimentalLayoutApi
 import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.Text
@@ -83,7 +86,7 @@ fun PermissionSheet(
             if (command != null) {
                 Text(
                     if (tool.kind == "execute") "$ $command" else command,
-                    Modifier.padding(top = 8.dp).fillMaxWidth().background(MnColors.background, shape).border(1.dp, MnColors.pillBorder, shape).padding(horizontal = 9.dp, vertical = 7.dp),
+                    Modifier.padding(top = 8.dp).fillMaxWidth().heightIn(max = 160.dp).background(MnColors.background, shape).border(1.dp, MnColors.pillBorder, shape).verticalScroll(rememberScrollState()).padding(horizontal = 9.dp, vertical = 7.dp),
                     fontFamily = MonoFamily,
                     fontSize = 10.5.sp,
                     color = MnColors.textSoft,

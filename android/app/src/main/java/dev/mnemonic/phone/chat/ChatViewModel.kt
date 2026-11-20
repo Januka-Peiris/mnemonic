@@ -106,7 +106,6 @@ class PrRequestHold {
 data class ChatUiState(
     val items: List<ChatItem> = emptyList(),
     val permissions: Map<String, List<PermissionOption>> = emptyMap(),
-    val unplaced: Map<String, List<PermissionOption>> = emptyMap(),
     val generating: Boolean = false,
     val loaded: Boolean = false,
     val status: String? = null,
@@ -191,7 +190,6 @@ class ChatViewModel(
             it.copy(
                 items = chat.items,
                 permissions = chat.permissions,
-                unplaced = chat.unplacedPermissions,
                 generating = chat.generating,
                 status = status,
                 loaded = loaded,
