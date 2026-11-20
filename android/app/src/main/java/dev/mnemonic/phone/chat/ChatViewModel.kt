@@ -119,7 +119,7 @@ data class ChatUiState(
     val prLoading: Boolean = true,
     val prAction: PrAction = PrAction.None,
     val prBusy: Boolean = false,
-    val sending: Boolean = false,
+    val pending: List<PendingMessage> = emptyList(),
     val error: String? = null,
     val notice: String? = null,
 )
@@ -130,6 +130,7 @@ class ChatViewModel(
     private val appState: AppState,
 ) : ViewModel() {
     private val chat = ChatState()
+    private val pendingMessages = PendingMessages()
     private val mutableState = MutableStateFlow(ChatUiState())
     val state: StateFlow<ChatUiState> = mutableState
 
@@ -189,6 +190,7 @@ class ChatViewModel(
         mutableState.update {
             it.copy(
                 items = chat.items,
+                pending = pendingMessages.reconcile(userTexts()),
                 permissions = chat.permissions,
                 generating = chat.generating,
                 status = status,
@@ -279,13 +281,27 @@ class ChatViewModel(
         }
     }
 
+    private fun userTexts() = chat.items.filterIsInstance<ChatItem.UserMessage>().map { it.text }
+
     fun send(text: String, onSent: () -> Unit = {}) {
         if (text.isBlank()) return
+        val message = pendingMessages.add(text, userTexts().size)
+        mutableState.update { it.copy(pending = pendingMessages.items, error = null) }
+        onSent()
+        deliver(message)
+    }
+
+    fun retrySend(id: Long) {
+        val message = pendingMessages.items.firstOrNull { it.id == id } ?: return
+        mutableState.update { it.copy(pending = pendingMessages.retry(id)) }
+        deliver(message)
+    }
+
+    private fun deliver(message: PendingMessage) {
         viewModelScope.launch {
-            mutableState.update { it.copy(sending = true, error = null) }
-            val result = client.sendMessage(chatId, text)
-            mutableState.update { it.copy(sending = false, error = if (result is MacResult.Ok) null else failure(result)) }
-            if (result is MacResult.Ok) onSent()
+            val result = client.sendMessage(chatId, message.text)
+            val error = failure(result) ?: return@launch
+            mutableState.update { it.copy(pending = pendingMessages.fail(message.id, error)) }
         }
     }
 

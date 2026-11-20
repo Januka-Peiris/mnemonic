@@ -4,6 +4,7 @@ import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.ui.draw.alpha
 import androidx.compose.foundation.gestures.scrollBy
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
@@ -129,10 +130,11 @@ fun ChatScreen(
 
     val rows = state.items
     val listState = rememberLazyListState()
-    val pinned = remember(rows) { Snapshot.withoutReadObservation { nearBottom(listState) } }
-    LaunchedEffect(rows) {
-        if (pinned && rows.isNotEmpty()) {
-            listState.scrollToItem(rows.size - 1)
+    val rowCount = rows.size + state.pending.size
+    val pinned = remember(rows, state.pending) { Snapshot.withoutReadObservation { nearBottom(listState) } }
+    LaunchedEffect(rows, state.pending) {
+        if (pinned && rowCount > 0) {
+            listState.scrollToItem(rowCount - 1)
             listState.scrollBy(100_000_000f)
         }
     }
@@ -177,6 +179,9 @@ fun ChatScreen(
             verticalArrangement = Arrangement.spacedBy(8.dp),
         ) {
             items(rows.size) { index -> ItemView(rows[index], state, viewModel) }
+            items(state.pending.size, key = { state.pending[it].id }) { index ->
+                PendingBubble(state.pending[index], onRetry = { viewModel.retrySend(state.pending[index].id) })
+            }
         }
         Column(Modifier.windowInsetsPadding(WindowInsets.navigationBars).imePadding()) {
             if (pendingPermission && sheet == null) NeedsOkBar(viewModel::reopenPermissions)
@@ -185,7 +190,7 @@ fun ChatScreen(
                 horizontalArrangement = Arrangement.spacedBy(6.dp),
             ) {
                 for (reply in QUICK_REPLIES) {
-                    ReplyChip(reply, enabled = !state.sending) { viewModel.send(reply) }
+                    ReplyChip(reply, enabled = true) { viewModel.send(reply) }
                 }
             }
             Composer(
@@ -194,7 +199,7 @@ fun ChatScreen(
                 placeholder = "Reply...",
                 onSend = { viewModel.send(draft) { draft = "" } },
                 onMic = dictate,
-                sendEnabled = draft.isNotBlank() && !state.sending,
+                sendEnabled = draft.isNotBlank(),
             )
         }
     }
@@ -391,19 +396,40 @@ private fun ToolLine(tool: ChatItem.Tool, waiting: Boolean) {
 }
 
 @Composable
-private fun ItemView(item: ChatItem, state: ChatUiState, viewModel: ChatViewModel) {
-    when (item) {
-        is ChatItem.UserMessage -> BoxWithConstraints(Modifier.fillMaxWidth(), contentAlignment = Alignment.CenterEnd) {
+private fun PendingBubble(message: PendingMessage, onRetry: () -> Unit) {
+    Column(Modifier.fillMaxWidth(), horizontalAlignment = Alignment.End, verticalArrangement = Arrangement.spacedBy(2.dp)) {
+        UserBubble(message.text, Modifier.alpha(0.6f))
+        message.error?.let { error ->
+            Text(error, style = MaterialTheme.typography.bodySmall, color = MnColors.error)
             Text(
-                item.text,
-                Modifier
-                    .widthIn(max = maxWidth * 0.8f)
-                    .background(MnColors.userBubble, RoundedCornerShape(topStart = 16.dp, topEnd = 16.dp, bottomEnd = 4.dp, bottomStart = 16.dp))
-                    .padding(horizontal = 11.dp, vertical = 7.dp),
-                style = MaterialTheme.typography.bodyMedium,
-                color = MnColors.userBubbleText,
+                "Retry",
+                Modifier.clickable(onClick = onRetry).padding(vertical = 2.dp),
+                style = MaterialTheme.typography.labelMedium,
+                color = MnColors.accentText,
             )
         }
+    }
+}
+
+@Composable
+private fun UserBubble(text: String, modifier: Modifier = Modifier) {
+    BoxWithConstraints(modifier.fillMaxWidth(), contentAlignment = Alignment.CenterEnd) {
+        Text(
+            text,
+            Modifier
+                .widthIn(max = maxWidth * 0.8f)
+                .background(MnColors.userBubble, RoundedCornerShape(topStart = 16.dp, topEnd = 16.dp, bottomEnd = 4.dp, bottomStart = 16.dp))
+                .padding(horizontal = 11.dp, vertical = 7.dp),
+            style = MaterialTheme.typography.bodyMedium,
+            color = MnColors.userBubbleText,
+        )
+    }
+}
+
+@Composable
+private fun ItemView(item: ChatItem, state: ChatUiState, viewModel: ChatViewModel) {
+    when (item) {
+        is ChatItem.UserMessage -> UserBubble(item.text)
         is ChatItem.AgentMessage -> MarkdownText(item.text, Modifier.fillMaxWidth())
         is ChatItem.Thought -> {
             var open by rememberSaveable(item.text.hashCode()) { mutableStateOf(false) }
