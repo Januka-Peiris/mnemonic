@@ -7,6 +7,9 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ColumnScope
+import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.RowScope
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -24,6 +27,8 @@ import androidx.compose.material.icons.rounded.Close
 import androidx.compose.material.icons.rounded.Contrast
 import androidx.compose.material.icons.rounded.Mic
 import androidx.compose.material.icons.rounded.RadioButtonUnchecked
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
@@ -31,10 +36,12 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
@@ -99,7 +106,7 @@ fun TopBar(
 ) {
     Column {
         Row(
-            Modifier.fillMaxWidth().padding(horizontal = if (onBack == null) 14.dp else 4.dp, vertical = 6.dp),
+            Modifier.fillMaxWidth().padding(horizontal = if (onBack == null) 14.dp else 4.dp, vertical = if (onBack == null) 8.dp else 0.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
             if (onBack != null) {
@@ -161,7 +168,7 @@ fun Pill(
 }
 
 @Composable
-fun ReplyChip(text: String, onClick: () -> Unit) {
+fun ReplyChip(text: String, enabled: Boolean = true, onClick: () -> Unit) {
     val shape = RoundedCornerShape(999.dp)
     Text(
         text,
@@ -169,10 +176,11 @@ fun ReplyChip(text: String, onClick: () -> Unit) {
         color = MnColors.textSoft,
         maxLines = 1,
         modifier = Modifier
+            .alpha(if (enabled) 1f else 0.4f)
             .clip(shape)
             .background(MnColors.surface)
             .border(1.dp, MnColors.border, shape)
-            .clickable(onClick = onClick)
+            .clickable(enabled = enabled, onClick = onClick)
             .padding(horizontal = 9.dp, vertical = 3.dp),
     )
 }
@@ -291,5 +299,39 @@ fun SectionLabel(text: String) {
         maxLines = 1,
         overflow = TextOverflow.Ellipsis,
         modifier = Modifier.fillMaxWidth().padding(start = 14.dp, end = 14.dp, top = 10.dp, bottom = 2.dp),
+    )
+}
+
+@Composable
+fun SheetHandle() {
+    Box(
+        Modifier.padding(top = 8.dp, bottom = 8.dp).size(width = 30.dp, height = 3.dp)
+            .clip(RoundedCornerShape(2.dp)).background(MnColors.border),
+    )
+}
+
+@Composable
+fun MnMenu(expanded: Boolean, onDismissRequest: () -> Unit, content: @Composable ColumnScope.() -> Unit) {
+    DropdownMenu(
+        expanded = expanded,
+        onDismissRequest = onDismissRequest,
+        modifier = Modifier.widthIn(min = 170.dp),
+        containerColor = MnColors.surfaceRaised,
+        shape = RoundedCornerShape(12.dp),
+        border = BorderStroke(1.dp, MnColors.border),
+        content = content,
+    )
+}
+
+@Composable
+fun MenuRow(text: String, onClick: () -> Unit, icon: ImageVector? = null, enabled: Boolean = true, color: Color = MnColors.text) {
+    val tint = if (enabled) color else MnColors.textMuted
+    DropdownMenuItem(
+        text = { Text(text, fontSize = 11.5.sp, color = tint, maxLines = 1) },
+        leadingIcon = icon?.let { { Icon(it, contentDescription = null, tint = tint, modifier = Modifier.size(14.dp)) } },
+        onClick = onClick,
+        enabled = enabled,
+        contentPadding = PaddingValues(horizontal = 12.dp, vertical = 0.dp),
+        modifier = Modifier.height(32.dp),
     )
 }

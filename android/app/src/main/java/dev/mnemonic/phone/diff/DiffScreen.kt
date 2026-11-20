@@ -45,8 +45,8 @@ private sealed interface DiffState {
     data class Loaded(val text: String) : DiffState
 }
 
-private val AddedBackground = Color(0xFF22C55E).copy(alpha = 0.10f)
-private val RemovedBackground = Color(0xFFF87171).copy(alpha = 0.10f)
+private val AddedBackground = MnColors.success.copy(alpha = 0.10f)
+private val RemovedBackground = MnColors.error.copy(alpha = 0.10f)
 
 @Composable
 fun DiffScreen(workspaceId: String, client: MacClient, onBack: () -> Unit) {

@@ -29,6 +29,7 @@ import androidx.compose.ui.unit.sp
 import dev.mnemonic.phone.api.PermissionOption
 import dev.mnemonic.phone.api.TeamPermissionRequest
 import dev.mnemonic.phone.ui.MnColors
+import dev.mnemonic.phone.ui.SheetHandle
 import dev.mnemonic.phone.ui.MonoFamily
 import dev.mnemonic.phone.ui.PrimaryButton
 import dev.mnemonic.phone.ui.SecondaryButton
@@ -72,7 +73,8 @@ fun PermissionSheet(
     val (primary, others) = permissionButtons(request.options)
     ModalBottomSheet(
         onDismissRequest = onDismiss,
-        containerColor = MnColors.surfaceRaised,
+        containerColor = MnColors.surface,
+        dragHandle = { SheetHandle() },
         scrimColor = Color.Black.copy(alpha = 0.35f),
         shape = RoundedCornerShape(topStart = 14.dp, topEnd = 14.dp),
     ) {

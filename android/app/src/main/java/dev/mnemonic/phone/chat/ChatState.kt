@@ -39,19 +39,6 @@ class ChatState {
     var items: List<ChatItem> = emptyList()
         private set
 
-    /** Permission requests whose tool call isn't in the transcript yet, which still need an answer. */
-    val unplacedPermissions: Map<String, List<PermissionOption>>
-        get() {
-            val placed = items.flatMap { item ->
-                when (item) {
-                    is ChatItem.Tool -> listOf(item.id)
-                    is ChatItem.FoldedTools -> item.tools.map { it.id }
-                    else -> emptyList()
-                }
-            }.toSet()
-            return permissions.filterKeys { it !in placed }
-        }
-
     fun apply(update: TeamChatUpdate) {
         if (update.reset) entries = mutableListOf()
         for (change in update.changes) {

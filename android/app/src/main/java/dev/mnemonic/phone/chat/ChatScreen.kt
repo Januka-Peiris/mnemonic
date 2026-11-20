@@ -81,7 +81,9 @@ import dev.mnemonic.phone.api.TeamPermissionRequest
 import dev.mnemonic.phone.api.PhoneAgent
 import dev.mnemonic.phone.api.PlanEntry
 import dev.mnemonic.phone.ui.Composer
+import dev.mnemonic.phone.ui.MenuRow
 import dev.mnemonic.phone.ui.MnColors
+import dev.mnemonic.phone.ui.MnMenu
 import dev.mnemonic.phone.ui.MonoFamily
 import dev.mnemonic.phone.ui.Pill
 import dev.mnemonic.phone.ui.PrimaryButton
@@ -183,7 +185,7 @@ fun ChatScreen(
                 horizontalArrangement = Arrangement.spacedBy(6.dp),
             ) {
                 for (reply in QUICK_REPLIES) {
-                    ReplyChip(reply) { if (!state.sending) viewModel.send(reply) }
+                    ReplyChip(reply, enabled = !state.sending) { viewModel.send(reply) }
                 }
             }
             Composer(
@@ -255,19 +257,6 @@ private fun MessageBar(text: String, error: Boolean, onDismiss: () -> Unit) {
 }
 
 @Composable
-private fun MenuRow(text: String, onClick: () -> Unit, icon: ImageVector? = null, enabled: Boolean = true, color: Color = MnColors.text) {
-    val tint = if (enabled) color else MnColors.textMuted
-    DropdownMenuItem(
-        text = { Text(text, fontSize = 11.5.sp, color = tint, maxLines = 1) },
-        leadingIcon = icon?.let { { Icon(it, contentDescription = null, tint = tint, modifier = Modifier.size(14.dp)) } },
-        onClick = onClick,
-        enabled = enabled,
-        contentPadding = PaddingValues(horizontal = 12.dp, vertical = 0.dp),
-        modifier = Modifier.height(32.dp),
-    )
-}
-
-@Composable
 private fun ChatMenu(
     state: ChatUiState,
     viewModel: ChatViewModel,
@@ -286,14 +275,7 @@ private fun ChatMenu(
     IconButton(onClick = { open = true }) {
         Icon(Icons.Rounded.MoreHoriz, contentDescription = "More", tint = MnColors.textSecondary)
     }
-    DropdownMenu(
-        expanded = open,
-        onDismissRequest = ::close,
-        modifier = Modifier.widthIn(min = 170.dp),
-        containerColor = MnColors.surfaceRaised,
-        shape = RoundedCornerShape(12.dp),
-        border = BorderStroke(1.dp, MnColors.border),
-    ) {
+    MnMenu(expanded = open, onDismissRequest = ::close) {
         if (page == MenuPage.Agents) {
             val result by produceState<MacResult<List<PhoneAgent>>?>(null) { value = viewModel.agents() }
             when (val current = result) {

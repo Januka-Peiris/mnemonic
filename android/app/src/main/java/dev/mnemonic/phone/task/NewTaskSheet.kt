@@ -53,7 +53,10 @@ import dev.mnemonic.phone.api.PhoneAgent
 import dev.mnemonic.phone.api.PhoneRepository
 import dev.mnemonic.phone.home.HomeViewModel
 import dev.mnemonic.phone.ui.ErrorBar
+import dev.mnemonic.phone.ui.MenuRow
 import dev.mnemonic.phone.ui.MnColors
+import dev.mnemonic.phone.ui.MnMenu
+import dev.mnemonic.phone.ui.SheetHandle
 import dev.mnemonic.phone.voice.appendSpoken
 import dev.mnemonic.phone.voice.rememberDictation
 import kotlinx.coroutines.flow.first
@@ -139,12 +142,7 @@ fun NewTaskSheet(
         sheetState = sheetState,
         containerColor = MnColors.surface,
         shape = RoundedCornerShape(topStart = 16.dp, topEnd = 16.dp),
-        dragHandle = {
-            Box(
-                Modifier.padding(top = 8.dp, bottom = 8.dp).size(width = 30.dp, height = 3.dp)
-                    .clip(RoundedCornerShape(2.dp)).background(MnColors.border),
-            )
-        },
+        dragHandle = { SheetHandle() },
     ) {
         Column(
             Modifier.fillMaxWidth().imePadding().navigationBarsPadding().padding(start = 14.dp, end = 14.dp, bottom = 12.dp),
@@ -212,15 +210,12 @@ private fun DropdownChip(label: String, options: List<Pair<String, String>>, onS
             Text(label, fontSize = 11.sp, color = MnColors.textSoft, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.padding(end = 2.dp))
             Icon(Icons.Rounded.KeyboardArrowDown, contentDescription = null, tint = MnColors.textSecondary, modifier = Modifier.size(14.dp))
         }
-        DropdownMenu(expanded = open, onDismissRequest = { open = false }) {
+        MnMenu(expanded = open, onDismissRequest = { open = false }) {
             for ((id, name) in options) {
-                DropdownMenuItem(
-                    text = { Text(name, fontSize = 12.sp) },
-                    onClick = {
-                        onSelect(id)
-                        open = false
-                    },
-                )
+                MenuRow(name, onClick = {
+                    onSelect(id)
+                    open = false
+                })
             }
         }
     }
