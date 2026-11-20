@@ -4,6 +4,7 @@ import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.ui.draw.alpha
 import androidx.compose.foundation.gestures.scrollBy
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
@@ -30,6 +31,7 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.Add
+import androidx.compose.material.icons.rounded.Archive
 import androidx.compose.material.icons.rounded.CallMerge
 import androidx.compose.material.icons.rounded.CheckCircle
 import androidx.compose.material.icons.rounded.Difference
@@ -80,6 +82,7 @@ import dev.mnemonic.phone.api.MacResult
 import dev.mnemonic.phone.api.TeamPermissionRequest
 import dev.mnemonic.phone.api.PhoneAgent
 import dev.mnemonic.phone.api.PlanEntry
+import dev.mnemonic.phone.ui.ArchiveDialog
 import dev.mnemonic.phone.ui.Composer
 import dev.mnemonic.phone.ui.MenuRow
 import dev.mnemonic.phone.ui.MnColors
@@ -125,15 +128,19 @@ fun ChatScreen(
 
     var draft by rememberSaveable { mutableStateOf("") }
     var confirmingMerge by remember { mutableStateOf<PrAction.Merge?>(null) }
+    var confirmingArchive by remember { mutableStateOf(false) }
+    var forceBottom by remember { mutableStateOf(false) }
     val dictate = rememberDictation { draft = appendSpoken(draft, it) }
 
     val rows = state.items
     val listState = rememberLazyListState()
-    val pinned = remember(rows) { Snapshot.withoutReadObservation { nearBottom(listState) } }
-    LaunchedEffect(rows) {
-        if (pinned && rows.isNotEmpty()) {
-            listState.scrollToItem(rows.size - 1)
+    val rowCount = rows.size + state.pending.size
+    val pinned = remember(rows, state.pending) { Snapshot.withoutReadObservation { nearBottom(listState) } }
+    LaunchedEffect(rows, state.pending, forceBottom) {
+        if ((pinned || forceBottom) && rowCount > 0) {
+            listState.scrollToItem(rowCount - 1)
             listState.scrollBy(100_000_000f)
+            forceBottom = false
         }
     }
 
@@ -161,7 +168,7 @@ fun ChatScreen(
                     ChatStatus.Error -> StatusLabel("error", StatusKind.Error)
                     ChatStatus.Idle -> StatusLabel("idle", StatusKind.Idle)
                 }
-                ChatMenu(state, viewModel, onDiff, onOpenChat, onMerge = { confirmingMerge = it })
+                ChatMenu(state, viewModel, onDiff, onOpenChat, onMerge = { confirmingMerge = it }, onArchive = { confirmingArchive = true })
             },
         )
         state.status?.let {
@@ -177,6 +184,9 @@ fun ChatScreen(
             verticalArrangement = Arrangement.spacedBy(8.dp),
         ) {
             items(rows.size) { index -> ItemView(rows[index], state, viewModel) }
+            items(state.pending.size, key = { state.pending[it].id }) { index ->
+                PendingBubble(state.pending[index], onRetry = { viewModel.retrySend(state.pending[index].id) })
+            }
         }
         Column(Modifier.windowInsetsPadding(WindowInsets.navigationBars).imePadding()) {
             if (pendingPermission && sheet == null) NeedsOkBar(viewModel::reopenPermissions)
@@ -185,16 +195,21 @@ fun ChatScreen(
                 horizontalArrangement = Arrangement.spacedBy(6.dp),
             ) {
                 for (reply in QUICK_REPLIES) {
-                    ReplyChip(reply, enabled = !state.sending) { viewModel.send(reply) }
+                    ReplyChip(reply, enabled = true) { forceBottom = true
+                        viewModel.send(reply)
+                    }
                 }
             }
             Composer(
                 value = draft,
                 onValueChange = { draft = it },
                 placeholder = "Reply...",
-                onSend = { viewModel.send(draft) { draft = "" } },
+                onSend = {
+                    forceBottom = true
+                    viewModel.send(draft) { draft = "" }
+                },
                 onMic = dictate,
-                sendEnabled = draft.isNotBlank() && !state.sending,
+                sendEnabled = draft.isNotBlank(),
             )
         }
     }
@@ -209,6 +224,17 @@ fun ChatScreen(
                 onDismiss = { viewModel.dismissPermission(request.toolCallId) },
             )
         }
+    }
+
+    if (confirmingArchive) {
+        ArchiveDialog(
+            name = workspace?.name ?: "this workspace",
+            onConfirm = {
+                confirmingArchive = false
+                viewModel.archive(onArchived = onBack)
+            },
+            onCancel = { confirmingArchive = false },
+        )
     }
 
     confirmingMerge?.let { merge ->
@@ -236,7 +262,7 @@ fun ChatScreen(
 }
 
 @Composable
-private fun MessageBar(text: String, error: Boolean, onDismiss: () -> Unit) {
+fun MessageBar(text: String, error: Boolean, onDismiss: () -> Unit) {
     Row(
         Modifier.fillMaxWidth().background(if (error) MnColors.errorSoft else MnColors.surface).padding(start = 14.dp, end = 6.dp),
         verticalAlignment = Alignment.CenterVertically,
@@ -263,6 +289,7 @@ private fun ChatMenu(
     onDiff: (String) -> Unit,
     onOpenChat: (String) -> Unit,
     onMerge: (PrAction.Merge) -> Unit,
+    onArchive: () -> Unit,
 ) {
     val uriHandler = LocalUriHandler.current
     var open by remember { mutableStateOf(false) }
@@ -315,6 +342,10 @@ private fun ChatMenu(
                 uriHandler.openUri(it)
             })
             MenuRow("New chat", icon = Icons.Rounded.Add, onClick = { page = MenuPage.Agents })
+            MenuRow("Archive workspace", icon = Icons.Rounded.Archive, onClick = {
+                close()
+                onArchive()
+            })
         }
     }
     }
@@ -391,19 +422,40 @@ private fun ToolLine(tool: ChatItem.Tool, waiting: Boolean) {
 }
 
 @Composable
-private fun ItemView(item: ChatItem, state: ChatUiState, viewModel: ChatViewModel) {
-    when (item) {
-        is ChatItem.UserMessage -> BoxWithConstraints(Modifier.fillMaxWidth(), contentAlignment = Alignment.CenterEnd) {
+private fun PendingBubble(message: PendingMessage, onRetry: () -> Unit) {
+    Column(Modifier.fillMaxWidth(), horizontalAlignment = Alignment.End, verticalArrangement = Arrangement.spacedBy(2.dp)) {
+        UserBubble(message.text, Modifier.alpha(0.6f))
+        message.error?.let { error ->
+            Text(error, style = MaterialTheme.typography.bodySmall, color = MnColors.error)
             Text(
-                item.text,
-                Modifier
-                    .widthIn(max = maxWidth * 0.8f)
-                    .background(MnColors.userBubble, RoundedCornerShape(topStart = 16.dp, topEnd = 16.dp, bottomEnd = 4.dp, bottomStart = 16.dp))
-                    .padding(horizontal = 11.dp, vertical = 7.dp),
-                style = MaterialTheme.typography.bodyMedium,
-                color = MnColors.userBubbleText,
+                "Retry",
+                Modifier.clickable(onClick = onRetry).padding(vertical = 2.dp),
+                style = MaterialTheme.typography.labelMedium,
+                color = MnColors.accentText,
             )
         }
+    }
+}
+
+@Composable
+private fun UserBubble(text: String, modifier: Modifier = Modifier) {
+    BoxWithConstraints(modifier.fillMaxWidth(), contentAlignment = Alignment.CenterEnd) {
+        Text(
+            text,
+            Modifier
+                .widthIn(max = maxWidth * 0.8f)
+                .background(MnColors.userBubble, RoundedCornerShape(topStart = 16.dp, topEnd = 16.dp, bottomEnd = 4.dp, bottomStart = 16.dp))
+                .padding(horizontal = 11.dp, vertical = 7.dp),
+            style = MaterialTheme.typography.bodyMedium,
+            color = MnColors.userBubbleText,
+        )
+    }
+}
+
+@Composable
+private fun ItemView(item: ChatItem, state: ChatUiState, viewModel: ChatViewModel) {
+    when (item) {
+        is ChatItem.UserMessage -> UserBubble(item.text)
         is ChatItem.AgentMessage -> MarkdownText(item.text, Modifier.fillMaxWidth())
         is ChatItem.Thought -> {
             var open by rememberSaveable(item.text.hashCode()) { mutableStateOf(false) }

@@ -86,12 +86,57 @@ fun promptFrom(update: TeamChatUpdate, fetchedAt: Long): PermissionPrompt {
 
 private fun JsonObject.text(key: String): String? = (this[key] as? JsonPrimitive)?.contentOrNull
 
+/**
+ * Workspaces the phone asked the Mac to archive, hidden until the Mac's list no longer has them.
+ * Process-wide so an archive started from a chat still hides the row on Home.
+ */
+object ArchivingWorkspaces {
+    private val mutableIds = MutableStateFlow(emptySet<String>())
+    val ids: StateFlow<Set<String>> = mutableIds
+
+    private val mutableNotice = MutableStateFlow<String?>(null)
+    val notice: StateFlow<String?> = mutableNotice
+
+    /** False when this workspace is already being archived. */
+    fun start(workspaceId: String): Boolean {
+        while (true) {
+            val current = mutableIds.value
+            if (workspaceId in current) return false
+            if (mutableIds.compareAndSet(current, current + workspaceId)) return true
+        }
+    }
+
+    fun abandon(workspaceId: String) {
+        mutableIds.update { it - workspaceId }
+    }
+
+    /** Forgets the workspaces the Mac's list no longer has. */
+    fun confirm(listed: Set<String>) {
+        mutableIds.update { ids -> ids.filterTo(mutableSetOf()) { it in listed } }
+    }
+
+    fun showNotice(message: String?) {
+        if (message != null) mutableNotice.value = message
+    }
+
+    fun dismissNotice() {
+        mutableNotice.value = null
+    }
+}
+
+private fun HomeUiState.without(hidden: Set<String>): HomeUiState =
+    copy(
+        workspaces = workspaces.filter { it.id !in hidden },
+        needsYou = needsYou.filter { it.workspace.id !in hidden },
+    )
+
 data class HomeUiState(
     val workspaces: List<TeamWorkspace> = emptyList(),
     val loaded: Boolean = false,
     val refreshing: Boolean = false,
     val banner: String? = null,
     val answerError: String? = null,
+    val notice: String? = null,
     val prompts: Map<String, PermissionPrompt> = emptyMap(),
     val answering: Set<String> = emptySet(),
     val answered: Set<String> = emptySet(),
@@ -116,6 +161,15 @@ class HomeViewModel(private val client: MacClient, private val appState: AppStat
 
     private val loadingPrompts = mutableSetOf<String>()
 
+    init {
+        viewModelScope.launch {
+            ArchivingWorkspaces.notice.collect { notice -> mutableState.update { it.copy(notice = notice) } }
+        }
+        viewModelScope.launch {
+            ArchivingWorkspaces.ids.collect { hidden -> mutableState.update { it.without(hidden) } }
+        }
+    }
+
     suspend fun poll() {
         var backoff = BACKOFF_START_MS
         while (true) {
@@ -136,6 +190,31 @@ class HomeViewModel(private val client: MacClient, private val appState: AppStat
             load()
             mutableState.update { it.copy(refreshing = false) }
         }
+    }
+
+    fun archive(workspaceId: String) {
+        if (!ArchivingWorkspaces.start(workspaceId)) return
+        viewModelScope.launch {
+            mutableState.update { it.copy(answerError = null) }
+            var accepted = false
+            try {
+                when (val result = client.archiveWorkspace(workspaceId)) {
+                    is MacResult.Ok -> {
+                        accepted = true
+                        ArchivingWorkspaces.showNotice(result.value.message)
+                    }
+                    is MacResult.Refused -> mutableState.update { it.copy(answerError = result.reason) }
+                    is MacResult.Unreachable -> mutableState.update { it.copy(answerError = CANT_REACH) }
+                }
+            } finally {
+                if (!accepted) ArchivingWorkspaces.abandon(workspaceId)
+            }
+            load()
+        }
+    }
+
+    fun dismissNotice() {
+        ArchivingWorkspaces.dismissNotice()
     }
 
     fun markOpened(chatId: String, endedAt: Long) {
@@ -167,7 +246,10 @@ class HomeViewModel(private val client: MacClient, private val appState: AppStat
         when (val result = client.workspaces()) {
             is MacResult.Ok -> {
                 val preferences = appState.preferences.first()
-                val workspaces = result.value.workspaces
+                val listed = result.value.workspaces
+                ArchivingWorkspaces.confirm(listed.map { it.id }.toSet())
+                val hidden = ArchivingWorkspaces.ids.value
+                val workspaces = listed.filter { it.id !in hidden }
                 val items = needsYou(workspaces, { preferences.openedAt(it) }, preferences.installedAt())
                 val waiting = items.filterIsInstance<NeedsYouItem.Waiting>().map { it.chat.id }.toSet()
                 mutableState.update {

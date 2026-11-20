@@ -30,6 +30,7 @@ use mnemonic_core::services::phone_server::{
     PhoneRepository, PhoneServer, PhoneServerConfig, PhoneSources,
 };
 use mnemonic_core::services::pr_draft_service;
+use mnemonic_core::services::team_files_service::TEAM_COPY_SOURCE;
 use mnemonic_core::services::team_share_service::{
     DEFAULT_TEAM_PORT, TailscaleSelf, TailscaleWhois, TeamActionError, TeamShareHub, TlsFiles,
     tailscale_cert, tailscale_self,
@@ -48,7 +49,7 @@ use crate::chat_feed::{
 use crate::team::{answer_permission, show_step_in_notice, wait_for_reply, workspace_diff_source};
 use crate::workspace_detail_panel::request_pr;
 use crate::workspace_view::{
-    ChatAgent, WorkspaceHost, WorkspaceView, find_open_chat, find_workspace_window,
+    ChatAgent, OpenChat, WorkspaceHost, WorkspaceView, find_open_chat, find_workspace_window,
     open_window_handles,
 };
 
@@ -1073,14 +1074,16 @@ fn phone_pr_status(workspace_id: &str) -> Result<PhonePrStatus, String> {
 
 fn action_timeout(action: &PhoneAction) -> Duration {
     match action {
-        PhoneAction::StartTask { .. } | PhoneAction::Merge { .. } => LONG_ACTION_TIMEOUT,
+        PhoneAction::StartTask { .. } | PhoneAction::Merge { .. } | PhoneAction::Archive { .. } => {
+            LONG_ACTION_TIMEOUT
+        }
         _ => ACTION_TIMEOUT,
     }
 }
 
-/// What the phone hears when an action outlasts its timeout. A task or a
-/// merge is usually still going, so calling it a failure would invite the
-/// owner to start a second one.
+/// What the phone hears when an action outlasts its timeout. A task, a
+/// merge or a message waiting for the agent to stop is usually still going,
+/// so calling it a failure would invite the owner to do it a second time.
 fn timed_out(action: &PhoneAction) -> Result<PhoneActionOutcome, TeamActionError> {
     let still_running = |message: &str| {
         Ok(PhoneActionOutcome {
@@ -1094,6 +1097,12 @@ fn timed_out(action: &PhoneAction) -> Result<PhoneActionOutcome, TeamActionError
         }
         PhoneAction::Merge { .. } => {
             still_running("Still merging on the Mac; check the PR in a moment")
+        }
+        PhoneAction::Archive { .. } => {
+            still_running("Still archiving on the Mac; it will leave the list shortly")
+        }
+        PhoneAction::Message { .. } => {
+            still_running("Stopping the agent on the Mac; your message goes out once it stops.")
         }
         _ => Err(TeamActionError::Failed("Timed out".to_string())),
     }
@@ -1270,7 +1279,7 @@ fn run_phone_action(
             tool_call_id,
             option_id,
         } => Task::ready(answer_chat_permission(chat_id, tool_call_id, option_id, cx)),
-        PhoneAction::Message { chat_id, text } => Task::ready(send_message(chat_id, text, cx)),
+        PhoneAction::Message { chat_id, text } => send_message(chat_id, text, cx),
         PhoneAction::NewChat {
             workspace_id,
             agent,
@@ -1282,7 +1291,58 @@ fn run_phone_action(
             text,
         } => start_task(repository_id, agent, text, cx),
         PhoneAction::Merge { workspace_id, head } => merge_pr(workspace_id, head, cx),
+        PhoneAction::Archive { workspace_id } => archive_workspace(workspace_id, cx),
     }
+}
+
+/// Why the phone may not archive a workspace with this source, if it may
+/// not. None for the source means the Mac has no such workspace.
+fn archive_refusal(source: Option<&str>) -> Option<TeamActionError> {
+    match source {
+        None => Some(TeamActionError::Invalid("No such workspace".to_string())),
+        Some(TEAM_COPY_SOURCE) => Some(TeamActionError::Invalid(
+            "Archive a teammate's copy on the Mac".to_string(),
+        )),
+        Some(_) => None,
+    }
+}
+
+/// Archives in the workspace's own window, else the frontmost one, as the
+/// agent tool does. `check_can_archive`'s reason goes back as the refusal.
+fn archive_workspace(
+    workspace_id: String,
+    cx: &mut App,
+) -> Task<Result<PhoneActionOutcome, TeamActionError>> {
+    let Some(state) = mnemonic_bridge::mnemonic_state_cloned() else {
+        return Task::ready(Err(not_ready()));
+    };
+    let workspace = match workspace_repository::list(&state.db) {
+        Ok(workspaces) => workspaces
+            .into_iter()
+            .find(|workspace| workspace.id == workspace_id),
+        Err(err) => return Task::ready(Err(TeamActionError::Failed(err))),
+    };
+    let source = workspace
+        .as_ref()
+        .map(|workspace| workspace.workspace_source.as_str());
+    if let Some(refusal) = archive_refusal(source) {
+        return Task::ready(Err(refusal));
+    }
+    let workspace_name = workspace
+        .map(|workspace| workspace.name)
+        .unwrap_or_default();
+    let Some(fallback_window) = front_window(cx) else {
+        return Task::ready(Err(no_window()));
+    };
+    cx.spawn(async move |cx| {
+        crate::agent_hub::archive_workspace_by_id(workspace_id, Some(fallback_window.clone()), cx)
+            .await
+            .map_err(TeamActionError::Invalid)?;
+        cx.update(|cx| {
+            show_phone_notice(&fallback_window, format!("archived {workspace_name}"), cx);
+        });
+        Ok(PhoneActionOutcome::default())
+    })
 }
 
 fn stop_chat(chat_id: String, cx: &mut App) -> Result<PhoneActionOutcome, TeamActionError> {
@@ -1334,29 +1394,41 @@ fn answer_chat_permission(
     Ok(PhoneActionOutcome::default())
 }
 
+/// Sends the message at once, stopping the agent's turn if it's working.
 fn send_message(
     chat_id: String,
     text: String,
     cx: &mut App,
-) -> Result<PhoneActionOutcome, TeamActionError> {
+) -> Task<Result<PhoneActionOutcome, TeamActionError>> {
     let closed = || TeamActionError::NothingToDo("This chat was closed on the Mac".to_string());
-    if find_open_chat(&chat_id, cx).is_none() {
-        let workspace_id = saved_chat_workspace(&chat_id, cx).ok_or_else(closed)?;
+    let chat = match open_chat_for_message(&chat_id, cx) {
+        Ok(chat) => chat,
+        Err(err) => return Task::ready(Err(err)),
+    };
+    let sending = chat
+        .view
+        .update(cx, |view, cx| view.send_now_to_chat(&chat_id, text, cx));
+    cx.spawn(async move |cx| {
+        sending.await.map_err(|_| closed())?;
+        cx.update(|cx| {
+            show_phone_notice(
+                &chat.window,
+                format!("sent a message to {}", chat.title),
+                cx,
+            )
+        });
+        Ok(PhoneActionOutcome::default())
+    })
+}
+
+/// The chat, its workspace opened first if it isn't loaded on the Mac.
+fn open_chat_for_message(chat_id: &str, cx: &mut App) -> Result<OpenChat, TeamActionError> {
+    let closed = || TeamActionError::NothingToDo("This chat was closed on the Mac".to_string());
+    if find_open_chat(chat_id, cx).is_none() {
+        let workspace_id = saved_chat_workspace(chat_id, cx).ok_or_else(closed)?;
         open_workspace_for_phone(&workspace_id, cx)?;
     }
-    let chat = find_open_chat(&chat_id, cx).ok_or_else(closed)?;
-    let sent = chat
-        .view
-        .update(cx, |view, cx| view.send_to_chat(&chat_id, text, cx));
-    if !sent {
-        return Err(closed());
-    }
-    show_phone_notice(
-        &chat.window,
-        format!("sent a message to {}", chat.title),
-        cx,
-    );
-    Ok(PhoneActionOutcome::default())
+    find_open_chat(chat_id, cx).ok_or_else(closed)
 }
 
 fn start_new_chat(
@@ -1525,6 +1597,21 @@ mod tests {
     use gpui::TestAppContext;
     use mnemonic_core::models::WorkspacePrStatus;
     use mnemonic_core::services::team_share_service::TeamWorkspace;
+
+    #[test]
+    fn archive_refuses_an_unknown_workspace_or_a_teammates_copy() {
+        assert_eq!(
+            archive_refusal(None),
+            Some(TeamActionError::Invalid("No such workspace".to_string()))
+        );
+        assert_eq!(
+            archive_refusal(Some(TEAM_COPY_SOURCE)),
+            Some(TeamActionError::Invalid(
+                "Archive a teammate's copy on the Mac".to_string()
+            ))
+        );
+        assert_eq!(archive_refusal(Some("local")), None);
+    }
 
     #[test]
     fn app_alert_error_reports_firebase_refusing_every_send_until_one_lands() {
@@ -1856,6 +1943,24 @@ mod tests {
             )
         });
         assert_eq!(quick.await, Ok(PhoneActionOutcome::default()));
+    }
+
+    #[test]
+    fn a_message_still_stopping_the_agent_is_not_a_failure() {
+        let message = PhoneAction::Message {
+            chat_id: "chat".to_string(),
+            text: "carry on".to_string(),
+        };
+        assert_eq!(
+            timed_out(&message),
+            Ok(PhoneActionOutcome {
+                message: Some(
+                    "Stopping the agent on the Mac; your message goes out once it stops."
+                        .to_string()
+                ),
+                ..PhoneActionOutcome::default()
+            })
+        );
     }
 
     #[test]

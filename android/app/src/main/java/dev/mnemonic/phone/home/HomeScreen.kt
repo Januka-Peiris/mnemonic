@@ -17,6 +17,7 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.rounded.Archive
 import androidx.compose.material.icons.rounded.ArrowUpward
 import androidx.compose.material.icons.rounded.Mic
 import androidx.compose.material.icons.rounded.Settings
@@ -24,6 +25,9 @@ import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.SwipeToDismissBox
+import androidx.compose.material3.SwipeToDismissBoxValue
+import androidx.compose.material3.rememberSwipeToDismissBoxState
 import androidx.compose.material3.Text
 import androidx.compose.material3.pulltorefresh.PullToRefreshBox
 import androidx.compose.runtime.Composable
@@ -31,6 +35,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -49,11 +54,13 @@ import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.repeatOnLifecycle
 import dev.mnemonic.phone.api.TeamAgentState
+import dev.mnemonic.phone.chat.MessageBar
 import dev.mnemonic.phone.api.TeamWorkspace
 import dev.mnemonic.phone.push.AlertStatus
 import dev.mnemonic.phone.push.PushRegistration
 import dev.mnemonic.phone.push.rememberTurnOnAlerts
 import dev.mnemonic.phone.task.NewTaskSheet
+import dev.mnemonic.phone.ui.ArchiveDialog
 import dev.mnemonic.phone.ui.ErrorBar
 import dev.mnemonic.phone.ui.MnColors
 import dev.mnemonic.phone.ui.MonoFamily
@@ -136,6 +143,7 @@ fun HomeScreen(
     val turnOnAlerts = rememberTurnOnAlerts(context, http)
     val expanded = rememberSaveable { mutableStateOf(setOf<String>()) }
     var sheetOpen by rememberSaveable { mutableStateOf(false) }
+    var archivingId by remember { mutableStateOf<String?>(null) }
 
     fun open(chatId: String) {
         val ended = state.workspaces.flatMap { it.chats }.firstOrNull { it.id == chatId }?.lastTurnEndedAt ?: 0L
@@ -156,6 +164,7 @@ fun HomeScreen(
                 },
             )
             listOfNotNull(state.banner, state.answerError).forEach { ErrorBar(it) }
+            state.notice?.let { MessageBar(it, error = false, onDismiss = viewModel::dismissNotice) }
             PullToRefreshBox(
                 isRefreshing = state.refreshing,
                 onRefresh = viewModel::refresh,
@@ -194,6 +203,7 @@ fun HomeScreen(
                                 unread = unreadChat(workspace, state.needsYou),
                                 expanded = isExpanded,
                                 onOpen = ::open,
+                                onArchive = { archivingId = workspace.id },
                             ) {
                                 val only = workspace.chats.singleOrNull()
                                 if (only != null && only.open) {
@@ -208,6 +218,20 @@ fun HomeScreen(
             }
             NewTaskBar { sheetOpen = true }
         }
+    }
+
+    LaunchedEffect(state.workspaces, archivingId) {
+        if (archivingId != null && state.workspaces.none { it.id == archivingId }) archivingId = null
+    }
+    state.workspaces.firstOrNull { it.id == archivingId }?.let { workspace ->
+        ArchiveDialog(
+            name = workspace.name,
+            onConfirm = {
+                archivingId = null
+                viewModel.archive(workspace.id)
+            },
+            onCancel = { archivingId = null },
+        )
     }
 
     if (sheetOpen) {
@@ -337,11 +361,42 @@ private fun WorkspaceRow(
     unread: NeedsYouItem.Finished?,
     expanded: Boolean,
     onOpen: (String) -> Unit,
+    onArchive: () -> Unit,
+    onToggle: () -> Unit,
+) {
+    val swipe = rememberSwipeToDismissBoxState(confirmValueChange = { target ->
+        if (target == SwipeToDismissBoxValue.EndToStart) onArchive()
+        false
+    })
+    SwipeToDismissBox(
+        state = swipe,
+        enableDismissFromStartToEnd = false,
+        backgroundContent = {
+            Row(
+                Modifier.fillMaxSize().background(MnColors.surfaceRaised).padding(end = 18.dp),
+                horizontalArrangement = Arrangement.End,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Icon(Icons.Rounded.Archive, contentDescription = null, tint = MnColors.textSecondary, modifier = Modifier.size(16.dp))
+                Text("Archive", fontSize = 12.sp, color = MnColors.textSecondary, modifier = Modifier.padding(start = 6.dp))
+            }
+        },
+    ) {
+        WorkspaceRowContent(workspace, unread, expanded, onOpen, onToggle)
+    }
+}
+
+@Composable
+private fun WorkspaceRowContent(
+    workspace: TeamWorkspace,
+    unread: NeedsYouItem.Finished?,
+    expanded: Boolean,
+    onOpen: (String) -> Unit,
     onToggle: () -> Unit,
 ) {
     val status = rowStatus(workspace, unread)
     val stripe = MnColors.warning
-    Column(modifier = Modifier.fillMaxWidth()) {
+    Column(modifier = Modifier.fillMaxWidth().background(MnColors.background)) {
         Row(
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(10.dp),

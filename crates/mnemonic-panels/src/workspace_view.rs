@@ -16,7 +16,8 @@ use futures::future::Either;
 use gpui::{
     Action as _, Anchor, AnyWindowHandle, App, AppContext as _, Context, DragMoveEvent, Empty,
     Entity, EntityId, EventEmitter, ExternalPaths, FocusHandle, Focusable, IntoElement, Pixels,
-    Render, SharedString, Stateful, Subscription, WeakEntity, Window, WindowHandle, actions, px,
+    Render, SharedString, Stateful, Subscription, Task, WeakEntity, Window, WindowHandle, actions,
+    px,
 };
 use mnemonic_bridge::AgentAttention;
 use mnemonic_core::models::{ChatSessionRecord, WorkspaceSummary};
@@ -239,6 +240,10 @@ pub(crate) struct ChatSession {
     /// A new review chat holds its prompt until it has been switched to the
     /// review model.
     awaiting_model: bool,
+    /// Phone messages waiting on a stop of the agent's turn. While any are,
+    /// nothing is sent, because a stopped turn reads as idle before the stop
+    /// finishes and a later message would otherwise overtake them.
+    phone_sends_waiting_on_cancel: usize,
     /// Watches the current root thread; replaced when the thread changes.
     thread_subscriptions: Vec<Subscription>,
     _subscriptions: Vec<Subscription>,
@@ -2871,6 +2876,7 @@ impl WorkspaceView {
             },
             app_messages,
             awaiting_model: record.is_review && record.acp_session_id.is_none(),
+            phone_sends_waiting_on_cancel: 0,
             thread_subscriptions: Vec::new(),
             _subscriptions: vec![observation, fork_requests],
         })
@@ -3610,7 +3616,7 @@ impl WorkspaceView {
         else {
             return;
         };
-        if chat.awaiting_model {
+        if chat.awaiting_model || chat.phone_sends_waiting_on_cancel > 0 {
             return;
         }
         let Some(text) = chat.pending_messages.take_next() else {
@@ -3645,6 +3651,69 @@ impl WorkspaceView {
         let view_id = chat.view.entity_id();
         self.flush_pending(view_id, cx);
         true
+    }
+
+    /// Sends the user's own message from the phone straight away: a running
+    /// turn is stopped first, as by the chat's Stop button, since an agent
+    /// can't be handed a message mid-turn. Messages arriving while that stop
+    /// is under way queue behind it in arrival order.
+    pub(crate) fn send_now_to_chat(
+        &mut self,
+        record_id: &str,
+        text: String,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<(), String>> {
+        let not_open = || "That chat isn't open.".to_string();
+        let Some(chat) = self.chat_by_record(record_id) else {
+            return Task::ready(Err(not_open()));
+        };
+        let cancel_under_way = chat.phone_sends_waiting_on_cancel > 0;
+        let is_busy = chat
+            .view
+            .read(cx)
+            .root_thread(cx)
+            .is_some_and(|thread| thread.read(cx).status() != acp_thread::ThreadStatus::Idle);
+        let root_thread_view = chat.view.read(cx).root_thread_view();
+        let cancel = root_thread_view
+            .filter(|_| is_busy && !cancel_under_way)
+            .and_then(|thread_view| {
+                // Through the Stop button's path, so messages typed on the Mac
+                // stay queued rather than going out ahead of this one.
+                thread_view.update(cx, |thread_view, cx| {
+                    thread_view.cancel_generation(cx);
+                    thread_view._cancel_task.take()
+                })
+            });
+        let Some(cancel) = cancel else {
+            let sent = self.send_to_chat(record_id, text, cx);
+            return Task::ready(if sent { Ok(()) } else { Err(not_open()) });
+        };
+        let Some(chat) = self
+            .sessions
+            .iter_mut()
+            .filter_map(WorkspaceSession::chat_mut)
+            .find(|chat| chat.record_id == record_id)
+        else {
+            return Task::ready(Err(not_open()));
+        };
+        chat.phone_sends_waiting_on_cancel += 1;
+        chat.pending_messages.push(text);
+        let view_id = chat.view.entity_id();
+        cx.spawn(async move |this, cx| {
+            cancel.await;
+            this.update(cx, |this, cx| {
+                let chat = this
+                    .chat_index(view_id)
+                    .and_then(|index| this.sessions.get_mut(index))
+                    .and_then(WorkspaceSession::chat_mut)
+                    .ok_or_else(not_open)?;
+                chat.phone_sends_waiting_on_cancel =
+                    chat.phone_sends_waiting_on_cancel.saturating_sub(1);
+                this.flush_pending(view_id, cx);
+                Ok(())
+            })
+            .unwrap_or_else(|_| Err(not_open()))
+        })
     }
 
     pub(crate) fn window_handle(&self) -> AnyWindowHandle {
@@ -6979,6 +7048,189 @@ pub(crate) mod tests {
             cx.read(|cx| chat_state("stub-chat", cx)),
             ChatState::Replying,
             "a message still queued in Mnemonic means the reply shown is stale"
+        );
+    }
+
+    /// Workspace A with a chat on a stub agent, which holds the chat's
+    /// first turn, "Start", open until the test ends it.
+    async fn stub_chat_in_workspace_a(
+        cx: &mut gpui::TestAppContext,
+    ) -> (
+        Entity<WorkspaceView>,
+        acp_thread::StubAgentConnection,
+        Entity<acp_thread::AcpThread>,
+        tempfile::TempDir,
+        &mut gpui::VisualTestContext,
+    ) {
+        let (workspace, _state, data_dir, cx) = window_showing_workspace_a(cx).await;
+        let view_a = workspace
+            .read_with(cx, host_of)
+            .and_then(|host| host.read_with(cx, |host, _| host.views.get("ws-a").cloned()))
+            .expect("workspace A is open");
+        let connection = acp_thread::StubAgentConnection::new();
+        let record = ChatSessionRecord {
+            id: "stub-chat".to_string(),
+            workspace_id: "ws-a".to_string(),
+            agent: "stub-agent".to_string(),
+            title: "Stub".to_string(),
+            acp_session_id: None,
+            is_review: false,
+            is_primary: false,
+            position: 1,
+        };
+        let server = Rc::new(StubServer(connection.clone()));
+        view_a.update_in(cx, |view, window, cx| {
+            view.open_chat_with_server(record, server, Some("Start".to_string()), false, window, cx)
+        });
+        cx.run_until_parked();
+        let thread = view_a
+            .read_with(cx, |view, cx| {
+                view.chat_by_record("stub-chat")?
+                    .view
+                    .read(cx)
+                    .root_thread(cx)
+            })
+            .expect("the stub chat is connected");
+        (view_a, connection, thread, data_dir, cx)
+    }
+
+    fn user_messages(thread: &Entity<acp_thread::AcpThread>, cx: &App) -> Vec<String> {
+        thread
+            .read(cx)
+            .entries()
+            .iter()
+            .filter_map(|entry| match entry {
+                acp_thread::AgentThreadEntry::UserMessage(message) => {
+                    Some(user_message_text(message))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn record_stops(
+        thread: &Entity<acp_thread::AcpThread>,
+        cx: &mut gpui::VisualTestContext,
+    ) -> (Rc<std::cell::RefCell<Vec<acp::StopReason>>>, Subscription) {
+        let stops = Rc::new(std::cell::RefCell::new(Vec::new()));
+        let subscription = cx.update(|_, cx| {
+            cx.subscribe(thread, {
+                let stops = stops.clone();
+                move |_, event, _| {
+                    if let acp_thread::AcpThreadEvent::Stopped(reason) = event {
+                        stops.borrow_mut().push(reason.clone());
+                    }
+                }
+            })
+        });
+        (stops, subscription)
+    }
+
+    #[gpui::test]
+    async fn phone_message_interrupts_busy_chat(cx: &mut gpui::TestAppContext) {
+        let (view_a, connection, thread, _data_dir, cx) = stub_chat_in_workspace_a(cx).await;
+        let (stops, _subscription) = record_stops(&thread, cx);
+        cx.update(|_, cx| queue_typed_message("stub-chat", vec!["Typed on the Mac".into()], cx));
+        assert_eq!(
+            thread.read_with(cx, |thread, _| thread.status()),
+            acp_thread::ThreadStatus::Generating
+        );
+
+        let sending = view_a.update(cx, |view, cx| {
+            view.send_now_to_chat("stub-chat", "carry on".to_string(), cx)
+        });
+        cx.run_until_parked();
+        assert_eq!(sending.await, Ok(()));
+
+        assert_eq!(
+            *stops.borrow(),
+            vec![acp::StopReason::Cancelled],
+            "the turn that was running is cancelled"
+        );
+        assert_eq!(
+            cx.read(|cx| user_messages(&thread, cx)),
+            vec!["Start".to_string(), "carry on".to_string()],
+            "the phone's message goes out at once, ahead of the Mac's queue"
+        );
+        assert_eq!(
+            cx.read(|cx| queued_message_count("stub-chat", cx)),
+            1,
+            "the message typed on the Mac stays queued"
+        );
+
+        let session_id = thread.read_with(cx, |thread, _| thread.session_id().clone());
+        connection.end_turn(session_id, acp::StopReason::EndTurn);
+        cx.run_until_parked();
+        let sent = cx.read(|cx| user_messages(&thread, cx));
+        assert_eq!(
+            sent.iter().filter(|text| *text == "carry on").count(),
+            1,
+            "the phone's message is sent exactly once, got {sent:?}"
+        );
+        let still_pending = view_a.read_with(cx, |view, _| {
+            view.chat_by_record("stub-chat")
+                .is_some_and(|chat| !chat.pending_messages.is_empty())
+        });
+        assert!(!still_pending);
+    }
+
+    #[gpui::test]
+    async fn phone_messages_sent_during_a_cancel_keep_their_order(cx: &mut gpui::TestAppContext) {
+        let (view_a, connection, thread, _data_dir, cx) = stub_chat_in_workspace_a(cx).await;
+        let (sending_a, sending_b) = view_a.update(cx, |view, cx| {
+            let sending_a = view.send_now_to_chat("stub-chat", "a".to_string(), cx);
+            let sending_b = view.send_now_to_chat("stub-chat", "b".to_string(), cx);
+            (sending_a, sending_b)
+        });
+        cx.run_until_parked();
+        assert_eq!(sending_a.await, Ok(()));
+        assert_eq!(sending_b.await, Ok(()));
+        assert_eq!(
+            cx.read(|cx| user_messages(&thread, cx)),
+            vec!["Start".to_string(), "a".to_string()],
+            "the first message goes out once the turn has stopped, the second waits behind it"
+        );
+
+        let session_id = thread.read_with(cx, |thread, _| thread.session_id().clone());
+        connection.end_turn(session_id, acp::StopReason::EndTurn);
+        cx.run_until_parked();
+        assert_eq!(
+            cx.read(|cx| user_messages(&thread, cx)),
+            vec!["Start".to_string(), "a".to_string(), "b".to_string()]
+        );
+    }
+
+    #[gpui::test]
+    async fn phone_message_to_idle_chat_sends_without_cancel(cx: &mut gpui::TestAppContext) {
+        let (view_a, connection, thread, _data_dir, cx) = stub_chat_in_workspace_a(cx).await;
+        let session_id = thread.read_with(cx, |thread, _| thread.session_id().clone());
+        connection.end_turn(session_id, acp::StopReason::EndTurn);
+        cx.run_until_parked();
+        let (stops, _subscription) = record_stops(&thread, cx);
+
+        let sending = view_a.update(cx, |view, cx| {
+            view.send_now_to_chat("stub-chat", "carry on".to_string(), cx)
+        });
+        cx.run_until_parked();
+        assert_eq!(sending.await, Ok(()));
+
+        assert!(stops.borrow().is_empty(), "nothing was cancelled");
+        assert_eq!(
+            cx.read(|cx| user_messages(&thread, cx)),
+            vec!["Start".to_string(), "carry on".to_string()]
+        );
+        assert_eq!(
+            thread.read_with(cx, |thread, _| thread.status()),
+            acp_thread::ThreadStatus::Generating,
+            "the stub is answering the phone's message"
+        );
+        assert_eq!(
+            view_a
+                .update(cx, |view, cx| {
+                    view.send_now_to_chat("missing", "carry on".to_string(), cx)
+                })
+                .await,
+            Err("That chat isn't open.".to_string())
         );
     }
 }

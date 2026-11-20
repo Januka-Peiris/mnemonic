@@ -28,6 +28,7 @@ import androidx.compose.material.icons.rounded.Close
 import androidx.compose.material.icons.rounded.Contrast
 import androidx.compose.material.icons.rounded.Mic
 import androidx.compose.material.icons.rounded.RadioButtonUnchecked
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.Icon
@@ -337,5 +338,18 @@ fun MenuRow(text: String, onClick: () -> Unit, icon: ImageVector? = null, enable
         enabled = enabled,
         contentPadding = PaddingValues(horizontal = 12.dp, vertical = 0.dp),
         modifier = Modifier.height(32.dp),
+    )
+}
+
+@Composable
+fun ArchiveDialog(name: String, onConfirm: () -> Unit, onCancel: () -> Unit) {
+    AlertDialog(
+        onDismissRequest = onCancel,
+        containerColor = MnColors.surfaceRaised,
+        shape = RoundedCornerShape(12.dp),
+        title = { Text("Archive $name?", style = MaterialTheme.typography.titleMedium, color = MnColors.text) },
+        text = { Text("You can restore it on the Mac.", style = MaterialTheme.typography.bodySmall, color = MnColors.textSecondary) },
+        confirmButton = { PrimaryButton("Archive", onClick = onConfirm) },
+        dismissButton = { SecondaryButton("Cancel", onClick = onCancel) },
     )
 }

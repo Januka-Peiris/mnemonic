@@ -79,6 +79,9 @@ class MacClient(private val address: MacAddress, private val http: OkHttpClient)
     suspend fun merge(workspaceId: String, head: String): MacResult<PhoneActionOutcome> =
         action(url("v1", "workspaces", workspaceId, "merge"), "head" to head)
 
+    suspend fun archiveWorkspace(workspaceId: String): MacResult<PhoneActionOutcome> =
+        action(url("v1", "workspaces", workspaceId, "archive"))
+
     suspend fun registerDevice(
         installId: String,
         token: String,
