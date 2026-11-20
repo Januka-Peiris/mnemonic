@@ -54,6 +54,7 @@ import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.repeatOnLifecycle
 import dev.mnemonic.phone.api.TeamAgentState
+import dev.mnemonic.phone.chat.MessageBar
 import dev.mnemonic.phone.api.TeamWorkspace
 import dev.mnemonic.phone.push.AlertStatus
 import dev.mnemonic.phone.push.PushRegistration
@@ -163,6 +164,7 @@ fun HomeScreen(
                 },
             )
             listOfNotNull(state.banner, state.answerError).forEach { ErrorBar(it) }
+            state.notice?.let { MessageBar(it, error = false, onDismiss = viewModel::dismissNotice) }
             PullToRefreshBox(
                 isRefreshing = state.refreshing,
                 onRefresh = viewModel::refresh,
@@ -218,6 +220,9 @@ fun HomeScreen(
         }
     }
 
+    LaunchedEffect(state.workspaces, archivingId) {
+        if (archivingId != null && state.workspaces.none { it.id == archivingId }) archivingId = null
+    }
     state.workspaces.firstOrNull { it.id == archivingId }?.let { workspace ->
         ArchiveDialog(
             name = workspace.name,

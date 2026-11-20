@@ -262,7 +262,7 @@ fun ChatScreen(
 }
 
 @Composable
-private fun MessageBar(text: String, error: Boolean, onDismiss: () -> Unit) {
+fun MessageBar(text: String, error: Boolean, onDismiss: () -> Unit) {
     Row(
         Modifier.fillMaxWidth().background(if (error) MnColors.errorSoft else MnColors.surface).padding(start = 14.dp, end = 6.dp),
         verticalAlignment = Alignment.CenterVertically,

@@ -11,6 +11,7 @@ import dev.mnemonic.phone.api.PhoneActionOutcome
 import dev.mnemonic.phone.api.PhonePrStatus
 import dev.mnemonic.phone.api.TeamAgentState
 import dev.mnemonic.phone.api.TeamWorkspace
+import dev.mnemonic.phone.home.ArchivingWorkspaces
 import dev.mnemonic.phone.home.HomeViewModel
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.delay
@@ -18,6 +19,8 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 
 private const val CHAT_WAIT_SECONDS = 25
@@ -131,6 +134,7 @@ class ChatViewModel(
 ) : ViewModel() {
     private val chat = ChatState()
     private val pendingMessages = PendingMessages()
+    private val sending = Mutex()
     private val mutableState = MutableStateFlow(ChatUiState())
     val state: StateFlow<ChatUiState> = mutableState
 
@@ -297,9 +301,11 @@ class ChatViewModel(
         deliver(message)
     }
 
+    // One send at a time, so messages reach the Mac in the order they were sent. The mutex is
+    // fair, and `launch` on the main dispatcher asks for it before returning.
     private fun deliver(message: PendingMessage) {
         viewModelScope.launch {
-            val result = client.sendMessage(chatId, message.text)
+            val result = sending.withLock { client.sendMessage(chatId, message.text) }
             val error = failure(result) ?: return@launch
             mutableState.update { it.copy(pending = pendingMessages.fail(message.id, error)) }
         }
@@ -362,10 +368,22 @@ class ChatViewModel(
             reportMissingWorkspace()
             return
         }
+        if (!ArchivingWorkspaces.start(workspace.id)) return
         viewModelScope.launch {
             mutableState.update { it.copy(error = null, notice = null) }
-            val result = client.archiveWorkspace(workspace.id)
-            if (result is MacResult.Ok) onArchived() else mutableState.update { it.copy(error = failure(result)) }
+            var accepted = false
+            try {
+                val result = client.archiveWorkspace(workspace.id)
+                if (result is MacResult.Ok) {
+                    accepted = true
+                    ArchivingWorkspaces.showNotice(result.value.message)
+                    onArchived()
+                } else {
+                    mutableState.update { it.copy(error = failure(result)) }
+                }
+            } finally {
+                if (!accepted) ArchivingWorkspaces.abandon(workspace.id)
+            }
         }
     }
 
