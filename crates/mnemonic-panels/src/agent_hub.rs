@@ -14,7 +14,7 @@ use agent_client_protocol::schema as acp;
 use agent_servers::SessionToolProvider;
 use futures::StreamExt;
 use futures::channel::{mpsc, oneshot};
-use gpui::{App, AppContext as _, AsyncApp, Global, Task};
+use gpui::{App, AppContext as _, AsyncApp, Entity, Global, Task};
 use mnemonic_core::models::{AgentStartedChat, WorkspaceSummary};
 use mnemonic_core::repositories::{
     agent_started_chat_repository, chat_session_repository, repository_repository,
@@ -32,6 +32,7 @@ use mnemonic_core::services::agent_hub_service::{
 use mnemonic_core::services::mcp_http::required_str;
 use mnemonic_core::services::workspace_service;
 use mnemonic_core::state::AppState;
+use workspace::Workspace;
 
 use crate::team::workspace_root;
 use crate::workspace_panel::{
@@ -793,19 +794,37 @@ async fn archive_workspace(
     let state = cx.update(|cx| mnemonic_bridge::mnemonic_state(cx));
     let workspaces = workspace_repository::list(&state.db)?;
     let workspace = resolve_workspace(&workspaces, text)?.clone();
+    let fallback_window = cx.update(|cx| find_open_chat(caller_chat, cx).map(|chat| chat.window));
+    archive_workspace_by_id(workspace.id.clone(), fallback_window, cx).await?;
+    Ok(format!(
+        "Archived workspace {} \"{}\".",
+        workspace.id, workspace.name
+    ))
+}
+
+/// Archives the workspace in its own window, else `fallback_window`, where
+/// its view is built without being shown.
+pub(crate) async fn archive_workspace_by_id(
+    workspace_id: String,
+    fallback_window: Option<Entity<Workspace>>,
+    cx: &mut AsyncApp,
+) -> Result<(), String> {
+    let state = cx.update(|cx| mnemonic_bridge::mnemonic_state(cx));
+    let workspace = workspace_repository::list(&state.db)?
+        .into_iter()
+        .find(|workspace| workspace.id == workspace_id)
+        .ok_or_else(|| "No such workspace.".to_string())?;
     let root = workspace_root(&workspace)
         .ok_or_else(|| "The workspace has no folder to archive.".to_string())?;
     cx.background_spawn({
         let state = state.clone();
-        let workspace_id = workspace.id.clone();
+        let workspace_id = workspace_id.clone();
         async move { check_can_archive(&state.db, &workspace_id, &root) }
     })
     .await?;
-    // The teardown runs in the workspace's view: the window showing it, else
-    // the caller's, where it is built without being shown.
     let (window, window_handle) = cx.update(|cx| {
-        let window = find_workspace_window(&workspace.id, cx)
-            .or_else(|| find_open_chat(caller_chat, cx).map(|chat| chat.window))
+        let window = find_workspace_window(&workspace_id, cx)
+            .or(fallback_window)
             .ok_or_else(|| "This chat isn't open in Mnemonic.".to_string())?;
         let handle = window_handle_of(&window, cx)
             .ok_or_else(|| "This chat's window is closed.".to_string())?;
@@ -814,11 +833,11 @@ async fn archive_workspace(
     archive_own_workspace(
         window.downgrade(),
         window_handle,
-        workspace.id.clone(),
+        workspace_id.clone(),
         state,
         {
             let window = window.clone();
-            let workspace_id = workspace.id.clone();
+            let workspace_id = workspace_id.clone();
             move |window_context, cx| {
                 let built = window.update(cx, |window, cx| {
                     WorkspaceHost::ensure_background_view(window, &workspace_id, window_context, cx)
@@ -829,7 +848,7 @@ async fn archive_workspace(
             }
         },
         {
-            let workspace_id = workspace.id.clone();
+            let workspace_id = workspace_id.clone();
             move |err, _| {
                 log::warn!("Archive {workspace_id}: teardown not run: {err}; archiving anyway");
             }
@@ -840,14 +859,11 @@ async fn archive_workspace(
     cx.update(|cx| {
         for window in open_windows(cx) {
             if let Some(panel) = window.read(cx).panel::<WorkspacePanel>(cx) {
-                panel.update(cx, |panel, cx| panel.forget_workspace(&workspace.id, cx));
+                panel.update(cx, |panel, cx| panel.forget_workspace(&workspace_id, cx));
             }
         }
     });
-    Ok(format!(
-        "Archived workspace {} \"{}\".",
-        workspace.id, workspace.name
-    ))
+    Ok(())
 }
 
 #[cfg(test)]
@@ -858,7 +874,7 @@ mod tests {
         window_showing_workspace_a,
     };
     use acp_thread::{PermissionOptions, StubAgentConnection};
-    use gpui::{Entity, VisualTestContext};
+    use gpui::VisualTestContext;
     use mnemonic_core::models::DiscoveredRepository;
     use mnemonic_core::repositories::settings_repository;
     use mnemonic_core::services::agent_hub_service::MAX_BUSY_CHILDREN;

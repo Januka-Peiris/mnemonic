@@ -77,6 +77,9 @@ pub enum PhoneAction {
         workspace_id: String,
         head: String,
     },
+    Archive {
+        workspace_id: String,
+    },
 }
 
 #[derive(Clone, Debug, Default, PartialEq, serde::Serialize)]
@@ -708,6 +711,11 @@ fn parse_action(segments: &[&str], body: &[u8]) -> Result<PhoneAction, (u16, Str
                 head: head.to_string(),
             })
         }
+        ["v1", "workspaces", workspace_id, "archive"] if is_plain_id(workspace_id) => {
+            Ok(PhoneAction::Archive {
+                workspace_id: workspace_id.to_string(),
+            })
+        }
         _ => Err((404, "Not found".to_string())),
     }
 }
@@ -1235,6 +1243,24 @@ mod tests {
         assert_eq!(
             status(&["v1", "workspaces", "ws-1", "merge"], br#"{"head":""}"#),
             Err(400)
+        );
+    }
+
+    #[test]
+    fn archive_route_parses() {
+        assert_eq!(
+            parse_action(&["v1", "workspaces", "ws-1", "archive"], b"{}"),
+            Ok(PhoneAction::Archive {
+                workspace_id: "ws-1".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn archive_route_refuses_bad_id() {
+        assert_eq!(
+            parse_action(&["v1", "workspaces", "a b", "archive"], b"{}"),
+            Err((404, "Not found".to_string()))
         );
     }
 

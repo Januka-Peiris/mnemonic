@@ -30,6 +30,7 @@ use mnemonic_core::services::phone_server::{
     PhoneRepository, PhoneServer, PhoneServerConfig, PhoneSources,
 };
 use mnemonic_core::services::pr_draft_service;
+use mnemonic_core::services::team_files_service::TEAM_COPY_SOURCE;
 use mnemonic_core::services::team_share_service::{
     DEFAULT_TEAM_PORT, TailscaleSelf, TailscaleWhois, TeamActionError, TeamShareHub, TlsFiles,
     tailscale_cert, tailscale_self,
@@ -1073,7 +1074,9 @@ fn phone_pr_status(workspace_id: &str) -> Result<PhonePrStatus, String> {
 
 fn action_timeout(action: &PhoneAction) -> Duration {
     match action {
-        PhoneAction::StartTask { .. } | PhoneAction::Merge { .. } => LONG_ACTION_TIMEOUT,
+        PhoneAction::StartTask { .. } | PhoneAction::Merge { .. } | PhoneAction::Archive { .. } => {
+            LONG_ACTION_TIMEOUT
+        }
         _ => ACTION_TIMEOUT,
     }
 }
@@ -1094,6 +1097,9 @@ fn timed_out(action: &PhoneAction) -> Result<PhoneActionOutcome, TeamActionError
         }
         PhoneAction::Merge { .. } => {
             still_running("Still merging on the Mac; check the PR in a moment")
+        }
+        PhoneAction::Archive { .. } => {
+            still_running("Still archiving on the Mac; it will leave the list shortly")
         }
         PhoneAction::Message { .. } => {
             still_running("Stopping the agent on the Mac; your message goes out once it stops.")
@@ -1285,7 +1291,50 @@ fn run_phone_action(
             text,
         } => start_task(repository_id, agent, text, cx),
         PhoneAction::Merge { workspace_id, head } => merge_pr(workspace_id, head, cx),
+        PhoneAction::Archive { workspace_id } => archive_workspace(workspace_id, cx),
     }
+}
+
+fn archive_refusal(source: &str) -> Option<TeamActionError> {
+    (source == TEAM_COPY_SOURCE)
+        .then(|| TeamActionError::Invalid("Archive a teammate's copy on the Mac".to_string()))
+}
+
+/// Archives in the workspace's own window, else the frontmost one, as the
+/// agent tool does. `check_can_archive`'s reason goes back as the refusal.
+fn archive_workspace(
+    workspace_id: String,
+    cx: &mut App,
+) -> Task<Result<PhoneActionOutcome, TeamActionError>> {
+    let Some(state) = mnemonic_bridge::mnemonic_state_cloned() else {
+        return Task::ready(Err(not_ready()));
+    };
+    let workspace = match workspace_repository::list(&state.db) {
+        Ok(workspaces) => workspaces
+            .into_iter()
+            .find(|workspace| workspace.id == workspace_id),
+        Err(err) => return Task::ready(Err(TeamActionError::Failed(err))),
+    };
+    let Some(workspace) = workspace else {
+        return Task::ready(Err(TeamActionError::Invalid(
+            "No such workspace".to_string(),
+        )));
+    };
+    if let Some(refusal) = archive_refusal(&workspace.workspace_source) {
+        return Task::ready(Err(refusal));
+    }
+    let Some(fallback_window) = front_window(cx) else {
+        return Task::ready(Err(no_window()));
+    };
+    cx.spawn(async move |cx| {
+        crate::agent_hub::archive_workspace_by_id(workspace_id, Some(fallback_window.clone()), cx)
+            .await
+            .map_err(TeamActionError::Invalid)?;
+        cx.update(|cx| {
+            show_phone_notice(&fallback_window, format!("archived {}", workspace.name), cx);
+        });
+        Ok(PhoneActionOutcome::default())
+    })
 }
 
 fn stop_chat(chat_id: String, cx: &mut App) -> Result<PhoneActionOutcome, TeamActionError> {
@@ -1540,6 +1589,17 @@ mod tests {
     use gpui::TestAppContext;
     use mnemonic_core::models::WorkspacePrStatus;
     use mnemonic_core::services::team_share_service::TeamWorkspace;
+
+    #[test]
+    fn archive_refuses_only_a_teammates_copy() {
+        assert_eq!(
+            archive_refusal(TEAM_COPY_SOURCE),
+            Some(TeamActionError::Invalid(
+                "Archive a teammate's copy on the Mac".to_string()
+            ))
+        );
+        assert_eq!(archive_refusal("local"), None);
+    }
 
     #[test]
     fn app_alert_error_reports_firebase_refusing_every_send_until_one_lands() {
