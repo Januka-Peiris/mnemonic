@@ -37,3 +37,6 @@ fun needsYou(
     finished.sortByDescending { it.chat.lastTurnEndedAt ?: 0L }
     return waiting + finished
 }
+
+fun unreadChat(workspace: TeamWorkspace, items: List<NeedsYouItem>): NeedsYouItem.Finished? =
+    items.filterIsInstance<NeedsYouItem.Finished>().firstOrNull { it.workspace.id == workspace.id }

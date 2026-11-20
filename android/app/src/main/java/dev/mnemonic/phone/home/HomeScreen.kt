@@ -36,6 +36,10 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.drawBehind
+import androidx.compose.ui.geometry.CornerRadius
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.style.TextOverflow
@@ -88,17 +92,18 @@ fun permissionLine(toolKind: String?, hasTool: Boolean): String =
         else -> if (hasTool) "needs permission to use a tool" else "needs permission"
     }
 
-private fun statusKind(workspace: TeamWorkspace, finished: Boolean): StatusKind =
+private fun statusKind(workspace: TeamWorkspace, finished: Boolean, errored: Boolean): StatusKind =
     when (workspace.agentState) {
         TeamAgentState.WaitingForApproval -> StatusKind.NeedsYou
         TeamAgentState.Error -> StatusKind.Error
+        TeamAgentState.Idle -> if (errored) StatusKind.Error else if (finished) StatusKind.Finished else StatusKind.Idle
         TeamAgentState.Working -> StatusKind.Working
-        TeamAgentState.Idle -> if (finished) StatusKind.Finished else StatusKind.Idle
     }
 
-private fun rowDetail(workspace: TeamWorkspace, finished: Boolean): String =
+private fun rowDetail(workspace: TeamWorkspace, unread: NeedsYouItem.Finished?): String =
     when {
-        finished && workspace.agentState == TeamAgentState.Idle -> "Finished · " + formatIdle(workspace.idleSeconds)
+        unread != null && workspace.agentState == TeamAgentState.Idle ->
+            (if (unread.errored) "Errored" else "Finished") + " · " + formatIdle(workspace.idleSeconds) + " · unread"
         else -> stateLabel(workspace).replaceFirstChar { it.uppercase() }
     }
 
@@ -126,8 +131,6 @@ fun HomeScreen(
         viewModel.markOpened(chatId, ended)
         onOpenChat(chatId)
     }
-
-    val finishedWorkspaces = state.needsYou.filterIsInstance<NeedsYouItem.Finished>().map { it.workspace.id }.toSet()
 
     Scaffold(containerColor = MnColors.background) { padding ->
         Column(Modifier.fillMaxSize().padding(padding)) {
@@ -159,13 +162,11 @@ fun HomeScreen(
                             }
                         }
                     }
-                    if (state.needsYou.isNotEmpty()) {
-                        item { SectionLabel("Needs you") }
-                        items(state.needsYou, key = { "need-" + it.chat.id }) { item ->
-                            when (item) {
-                                is NeedsYouItem.Waiting -> WaitingCard(item, state, viewModel, ::open)
-                                is NeedsYouItem.Finished -> FinishedRow(item, ::open)
-                            }
+                    val waiting = state.needsYou.filterIsInstance<NeedsYouItem.Waiting>()
+                    if (waiting.isNotEmpty()) {
+                        item { SectionLabel("Needs your OK", color = MnColors.warning) }
+                        items(waiting, key = { "need-" + it.chat.id }) { item ->
+                            WaitingCard(item, state, viewModel, ::open)
                         }
                     }
                     if (!state.loaded) {
@@ -179,7 +180,7 @@ fun HomeScreen(
                             val isExpanded = workspace.id in expanded.value
                             WorkspaceRow(
                                 workspace = workspace,
-                                finished = workspace.id in finishedWorkspaces,
+                                unread = unreadChat(workspace, state.needsYou),
                                 expanded = isExpanded,
                                 onOpen = ::open,
                             ) {
@@ -301,32 +302,6 @@ private fun WaitingCard(
 }
 
 @Composable
-private fun FinishedRow(item: NeedsYouItem.Finished, onOpen: (String) -> Unit) {
-    val title = item.chat.title.ifEmpty { "Untitled chat" }
-    val kind = if (item.errored) StatusKind.Error else StatusKind.Finished
-    Row(
-        Modifier.fillMaxWidth().clickable { onOpen(item.chat.id) }.padding(horizontal = 14.dp, vertical = 6.dp),
-        verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(10.dp),
-    ) {
-        StatusSquare(kind)
-        Column(Modifier.weight(1f)) {
-            Text(item.workspace.name, fontSize = 12.sp, color = MnColors.text, maxLines = 1, overflow = TextOverflow.Ellipsis)
-            Text(
-                listOf(item.workspace.project, (if (item.errored) "Errored: " else "Finished: ") + title)
-                    .filter { it.isNotEmpty() }
-                    .joinToString(" · "),
-                fontSize = 10.5.sp,
-                color = MnColors.textMuted,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-            )
-        }
-        StatusLabel(if (item.errored) "error" else "new", kind)
-    }
-}
-
-@Composable
 private fun PrLabel(number: Long, state: String?) {
     val (foreground, background) = when (state) {
         "ready", "open" -> MnColors.success to MnColors.successSoft
@@ -348,18 +323,31 @@ private fun PrLabel(number: Long, state: String?) {
 @Composable
 private fun WorkspaceRow(
     workspace: TeamWorkspace,
-    finished: Boolean,
+    unread: NeedsYouItem.Finished?,
     expanded: Boolean,
     onOpen: (String) -> Unit,
     onToggle: () -> Unit,
 ) {
+    val finished = unread != null
+    val stripe = MnColors.warning
     Column(modifier = Modifier.fillMaxWidth()) {
         Row(
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(10.dp),
-            modifier = Modifier.fillMaxWidth().clickable(onClick = onToggle).padding(horizontal = 14.dp, vertical = 6.dp),
+            modifier = Modifier
+                .fillMaxWidth()
+                .then(if (unread != null) Modifier.background(MnColors.warningCard).drawBehind {
+                    drawRoundRect(
+                        stripe,
+                        topLeft = Offset(0f, 6.dp.toPx()),
+                        size = Size(3.dp.toPx(), size.height - 12.dp.toPx()),
+                        cornerRadius = CornerRadius(3.dp.toPx()),
+                    )
+                } else Modifier)
+                .clickable(onClick = onToggle)
+                .padding(horizontal = 14.dp, vertical = 6.dp),
         ) {
-            StatusSquare(statusKind(workspace, finished))
+            StatusSquare(statusKind(workspace, finished, unread?.errored == true))
             Column(Modifier.weight(1f)) {
                 Text(
                     workspace.name,
@@ -368,9 +356,16 @@ private fun WorkspaceRow(
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
                 )
-                Text(rowDetail(workspace, finished), fontSize = 10.5.sp, color = MnColors.textMuted, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                Text(
+                    rowDetail(workspace, unread),
+                    fontSize = 10.5.sp,
+                    color = if (unread != null) MnColors.warning else MnColors.textMuted,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
             }
             workspace.prNumber?.let { PrLabel(it, workspace.prState) }
+            if (unread != null) Box(Modifier.size(7.dp).clip(CircleShape).background(MnColors.warning))
         }
         if (expanded) {
             for (chat in workspace.chats) {

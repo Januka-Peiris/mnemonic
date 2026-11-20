@@ -294,10 +294,10 @@ fun ErrorBar(text: String) {
 }
 
 @Composable
-fun SectionLabel(text: String) {
+fun SectionLabel(text: String, color: Color = MnColors.textMuted) {
     Text(
         text.uppercase(),
-        color = MnColors.textMuted,
+        color = color,
         fontSize = 10.sp,
         letterSpacing = 0.8.sp,
         maxLines = 1,
