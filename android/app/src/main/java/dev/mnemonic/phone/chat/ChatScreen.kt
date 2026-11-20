@@ -29,7 +29,13 @@ import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.rounded.Add
+import androidx.compose.material.icons.rounded.CallMerge
 import androidx.compose.material.icons.rounded.CheckCircle
+import androidx.compose.material.icons.rounded.Difference
+import androidx.compose.material.icons.rounded.OpenInNew
+import androidx.compose.material.icons.rounded.Stop
+import androidx.compose.material.icons.rounded.Upload
 import androidx.compose.material.icons.rounded.Close
 import androidx.compose.material.icons.rounded.Contrast
 import androidx.compose.material.icons.rounded.MoreHoriz
@@ -58,6 +64,7 @@ import androidx.compose.runtime.snapshots.Snapshot
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalUriHandler
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.SpanStyle
@@ -72,7 +79,6 @@ import dev.mnemonic.phone.api.MacResult
 import dev.mnemonic.phone.api.PermissionOption
 import dev.mnemonic.phone.api.PhoneAgent
 import dev.mnemonic.phone.api.PlanEntry
-import dev.mnemonic.phone.home.workspaceTitle
 import dev.mnemonic.phone.ui.Composer
 import dev.mnemonic.phone.ui.MnColors
 import dev.mnemonic.phone.ui.MonoFamily
@@ -249,9 +255,11 @@ private fun MessageBar(text: String, error: Boolean, onDismiss: () -> Unit) {
 }
 
 @Composable
-private fun MenuRow(text: String, onClick: () -> Unit, enabled: Boolean = true, color: Color = MnColors.text) {
+private fun MenuRow(text: String, onClick: () -> Unit, icon: ImageVector? = null, enabled: Boolean = true, color: Color = MnColors.text) {
+    val tint = if (enabled) color else MnColors.textMuted
     DropdownMenuItem(
-        text = { Text(text, fontSize = 11.5.sp, color = if (enabled) color else MnColors.textMuted, maxLines = 1) },
+        text = { Text(text, fontSize = 11.5.sp, color = tint, maxLines = 1) },
+        leadingIcon = icon?.let { { Icon(it, contentDescription = null, tint = tint, modifier = Modifier.size(14.dp)) } },
         onClick = onClick,
         enabled = enabled,
         contentPadding = PaddingValues(horizontal = 12.dp, vertical = 0.dp),
@@ -290,12 +298,18 @@ private fun ChatMenu(
             val result by produceState<MacResult<List<PhoneAgent>>?>(null) { value = viewModel.agents() }
             when (val current = result) {
                 null -> MenuRow("Loading...", onClick = {}, enabled = false)
-                is MacResult.Refused -> MenuRow(current.reason, onClick = {}, enabled = false, color = MnColors.error)
-                is MacResult.Unreachable -> MenuRow(dev.mnemonic.phone.home.HomeViewModel.CANT_REACH, onClick = {}, enabled = false, color = MnColors.error)
+                is MacResult.Refused -> LaunchedEffect(current) {
+                    close()
+                    viewModel.reportError(current.reason)
+                }
+                is MacResult.Unreachable -> LaunchedEffect(current) {
+                    close()
+                    viewModel.reportError(dev.mnemonic.phone.home.HomeViewModel.CANT_REACH)
+                }
                 is MacResult.Ok -> {
                     if (current.value.isEmpty()) MenuRow("No agents are enabled on the Mac", onClick = {}, enabled = false)
                     for (agent in current.value) {
-                        MenuRow("New chat with ${agent.label}", onClick = {
+                        MenuRow("New chat with ${agent.label}", icon = Icons.Rounded.Add, onClick = {
                             close()
                             viewModel.newChat(agent.id, onOpenChat)
                         })
@@ -304,43 +318,56 @@ private fun ChatMenu(
             }
         } else {
             if (state.generating) {
-                MenuRow("Stop agent", onClick = {
+                MenuRow("Stop agent", icon = Icons.Rounded.Stop, onClick = {
                     close()
                     viewModel.stop()
                 })
             }
-            MenuRow("View diff", onClick = {
+            MenuRow("View diff", icon = Icons.Rounded.Difference, onClick = {
                 close()
                 val workspace = state.workspace
                 if (workspace != null) onDiff(workspace.id) else viewModel.reportMissingWorkspace()
             })
-            PrMenuRow(state, viewModel, onMerge = {
-                close()
-                onMerge(it)
-            }, onOpenUrl = {
+            PrMenuRow(state, viewModel, onClose = ::close, onMerge = onMerge, onOpenUrl = {
                 close()
                 uriHandler.openUri(it)
             })
-            MenuRow("New chat", onClick = { page = MenuPage.Agents })
+            MenuRow("New chat", icon = Icons.Rounded.Add, onClick = { page = MenuPage.Agents })
         }
     }
     }
 }
 
 @Composable
-private fun PrMenuRow(state: ChatUiState, viewModel: ChatViewModel, onMerge: (PrAction.Merge) -> Unit, onOpenUrl: (String) -> Unit) {
+private fun PrMenuRow(
+    state: ChatUiState,
+    viewModel: ChatViewModel,
+    onClose: () -> Unit,
+    onMerge: (PrAction.Merge) -> Unit,
+    onOpenUrl: (String) -> Unit,
+) {
     val pr = state.pr
     val busy = state.prBusy
     when {
-        pr == null && state.prLoading -> MenuRow("PR...", onClick = {}, enabled = false)
-        pr == null && state.prFailed -> MenuRow("Retry PR status", onClick = viewModel::retryPr)
-        state.workspace == null -> MenuRow("PR", onClick = {}, enabled = false)
+        pr == null && state.prLoading -> MenuRow("PR...", icon = Icons.Rounded.Upload, onClick = {}, enabled = false)
+        pr == null && state.prFailed -> MenuRow("Retry PR status", icon = Icons.Rounded.Upload, onClick = {
+            onClose()
+            viewModel.retryPr()
+        })
+        state.workspace == null -> MenuRow("PR", icon = Icons.Rounded.Upload, onClick = {}, enabled = false)
         else -> when (val action = state.prAction) {
-            PrAction.CreatePr -> MenuRow("Create PR", onClick = viewModel::createPr, enabled = !busy, color = MnColors.accentText)
-            PrAction.Waiting -> MenuRow("Waiting for PR...", onClick = {}, enabled = false)
-            is PrAction.Merge -> MenuRow("Merge #${action.number}", onClick = { onMerge(action) }, enabled = !busy, color = MnColors.accentText)
+            PrAction.CreatePr -> MenuRow("Create PR", icon = Icons.Rounded.Upload, onClick = {
+                onClose()
+                viewModel.createPr()
+            }, enabled = !busy, color = MnColors.accentText)
+            PrAction.Waiting -> MenuRow("Waiting for PR...", icon = Icons.Rounded.Upload, onClick = {}, enabled = false)
+            is PrAction.Merge -> MenuRow("Merge #${action.number}", icon = Icons.Rounded.CallMerge, onClick = {
+                onClose()
+                onMerge(action)
+            }, enabled = !busy, color = MnColors.accentText)
             PrAction.None -> MenuRow(
                 openPrLabel(pr, state.workspace.prState),
+                icon = Icons.Rounded.OpenInNew,
                 onClick = { pr?.url?.takeIf { it.startsWith("https://") || it.startsWith("http://") }?.let(onOpenUrl) },
             )
         }

@@ -249,6 +249,10 @@ class ChatViewModel(
         mutableState.update { it.copy(error = "This chat's workspace isn't in the list yet") }
     }
 
+    fun reportError(message: String) {
+        mutableState.update { it.copy(error = message) }
+    }
+
     fun dismissMessages() {
         mutableState.update { it.copy(error = null, notice = null) }
     }

@@ -89,9 +89,6 @@ fun permissionLine(toolKind: String?, hasTool: Boolean): String =
         else -> if (hasTool) "needs permission to use a tool" else "needs permission"
     }
 
-fun workspaceTitle(workspace: TeamWorkspace): String =
-    if (workspace.project.isNotEmpty()) "${workspace.project} / ${workspace.name}" else workspace.name
-
 private fun statusKind(workspace: TeamWorkspace, finished: Boolean): StatusKind =
     when (workspace.agentState) {
         TeamAgentState.WaitingForApproval -> StatusKind.NeedsYou
