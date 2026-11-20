@@ -125,7 +125,7 @@ data class ChatUiState(
 )
 
 class ChatViewModel(
-    private val chatId: String,
+    val chatId: String,
     private val client: MacClient,
     private val appState: AppState,
 ) : ViewModel() {

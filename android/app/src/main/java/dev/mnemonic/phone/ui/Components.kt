@@ -10,6 +10,7 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.RowScope
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.CircleShape
@@ -126,7 +127,7 @@ fun TopBar(
             }
             actions()
         }
-        Box(Modifier.fillMaxWidth().size(width = 0.dp, height = 1.dp).background(MnColors.divider))
+        Box(Modifier.fillMaxWidth().height(1.dp).background(MnColors.divider))
     }
 }
 

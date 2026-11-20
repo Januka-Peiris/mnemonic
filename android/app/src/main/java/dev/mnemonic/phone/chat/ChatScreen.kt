@@ -1,34 +1,49 @@
 package dev.mnemonic.phone.chat
 
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.scrollBy
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.navigationBars
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.statusBarsPadding
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.layout.windowInsetsPadding
-import androidx.compose.foundation.gestures.scrollBy
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.rounded.CheckCircle
+import androidx.compose.material.icons.rounded.Close
+import androidx.compose.material.icons.rounded.Contrast
+import androidx.compose.material.icons.rounded.MoreHoriz
+import androidx.compose.material.icons.rounded.RadioButtonUnchecked
+import androidx.compose.material.icons.rounded.Settings
+import androidx.compose.material.icons.rounded.Check
 import androidx.compose.material3.AlertDialog
-import androidx.compose.material3.Button
-import androidx.compose.material3.ExperimentalMaterial3Api
-import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.OutlinedButton
-import androidx.compose.material3.OutlinedTextField
-import androidx.compose.material3.RadioButton
-import androidx.compose.material3.Scaffold
-import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
-import androidx.compose.material3.TextButton
-import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
@@ -42,10 +57,14 @@ import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshots.Snapshot
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalUriHandler
-import androidx.compose.ui.text.font.FontFamily
-import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.text.SpanStyle
+import androidx.compose.ui.text.buildAnnotatedString
+import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.repeatOnLifecycle
@@ -54,8 +73,18 @@ import dev.mnemonic.phone.api.PermissionOption
 import dev.mnemonic.phone.api.PhoneAgent
 import dev.mnemonic.phone.api.PlanEntry
 import dev.mnemonic.phone.home.workspaceTitle
-import dev.mnemonic.phone.voice.MicButton
+import dev.mnemonic.phone.ui.Composer
+import dev.mnemonic.phone.ui.MnColors
+import dev.mnemonic.phone.ui.MonoFamily
+import dev.mnemonic.phone.ui.Pill
+import dev.mnemonic.phone.ui.PrimaryButton
+import dev.mnemonic.phone.ui.ReplyChip
+import dev.mnemonic.phone.ui.SecondaryButton
+import dev.mnemonic.phone.ui.StatusKind
+import dev.mnemonic.phone.ui.StatusLabel
+import dev.mnemonic.phone.ui.TopBar
 import dev.mnemonic.phone.voice.appendSpoken
+import dev.mnemonic.phone.voice.rememberDictation
 import kotlinx.coroutines.launch
 
 private const val NEAR_BOTTOM_PX = 240
@@ -71,7 +100,8 @@ private fun nearBottom(state: LazyListState): Boolean {
     return last.index >= info.totalItemsCount - 1 && last.offset + last.size - info.viewportEndOffset < NEAR_BOTTOM_PX
 }
 
-@OptIn(ExperimentalMaterial3Api::class)
+private enum class MenuPage { Main, Agents }
+
 @Composable
 fun ChatScreen(
     viewModel: ChatViewModel,
@@ -90,8 +120,8 @@ fun ChatScreen(
     DisposableEffect(viewModel) { onDispose { viewModel.markOpened() } }
 
     var draft by rememberSaveable { mutableStateOf("") }
-    var pickingAgent by remember { mutableStateOf(false) }
     var confirmingMerge by remember { mutableStateOf<PrAction.Merge?>(null) }
+    val dictate = rememberDictation { draft = appendSpoken(draft, it) }
 
     val rows = remember(state.items, state.unplaced) {
         state.items.map<ChatItem, Row> { Row.Item(it) } + state.unplaced.map { Row.Unplaced(it.key, it.value) }
@@ -105,145 +135,214 @@ fun ChatScreen(
         }
     }
 
-    Scaffold(
-        topBar = {
-            TopAppBar(
-                title = {
-                    Text(
-                        state.workspace?.let { workspaceTitle(it) } ?: "Chat",
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis,
-                    )
-                },
-                navigationIcon = { TextButton(onClick = onBack) { Text("Back") } },
-                actions = {
-                    if (state.generating) TextButton(onClick = viewModel::stop) { Text("Stop") }
-                },
-            )
-        },
-        bottomBar = {
-            Surface(
-                tonalElevation = 3.dp,
-                modifier = Modifier.windowInsetsPadding(WindowInsets.navigationBars).imePadding(),
-            ) {
-                Column(Modifier.padding(horizontal = 12.dp, vertical = 8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        for (reply in QUICK_REPLIES) {
-                            OutlinedButton(onClick = { viewModel.send(reply) }, enabled = !state.sending) { Text(reply) }
-                        }
-                    }
-                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-                        OutlinedTextField(
-                            value = draft,
-                            onValueChange = { draft = it },
-                            modifier = Modifier.weight(1f),
-                            placeholder = { Text("Message") },
-                            maxLines = 5,
-                        )
-                        MicButton(onSpoken = { draft = appendSpoken(draft, it) })
-                        Button(
-                            onClick = { viewModel.send(draft) { draft = "" } },
-                            enabled = draft.isNotBlank() && !state.sending,
-                        ) { Text("Send") }
-                    }
-                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
-                        OutlinedButton(onClick = { pickingAgent = true }) { Text("New chat") }
-                        OutlinedButton(
-                            onClick = {
-                                val workspace = state.workspace
-                                if (workspace != null) onDiff(workspace.id) else viewModel.reportMissingWorkspace()
-                            },
-                        ) { Text("Diff") }
-                        PrButton(state, viewModel, onMerge = { confirmingMerge = it })
-                    }
+    val workspace = state.workspace
+    val chat = workspace?.chats?.firstOrNull { it.id == viewModel.chatId }
+    val title = chat?.title?.takeIf { it.isNotEmpty() } ?: workspace?.name ?: "Chat"
+    val subtitle = workspace?.let { listOfNotNull(it.project.takeIf { project -> project.isNotEmpty() }, chat?.agent?.takeIf { agent -> agent.isNotEmpty() }).joinToString(" · ") }
+        ?.takeIf { it.isNotEmpty() }
+    val pendingPermission = state.permissions.keys.any { it !in state.answered }
+    val status = chatStatus(state.generating, pendingPermission, workspace?.agentState)
+
+    Column(Modifier.fillMaxSize().background(MnColors.background).statusBarsPadding()) {
+        TopBar(
+            title = title,
+            subtitle = subtitle,
+            onBack = onBack,
+            actions = {
+                when (status) {
+                    ChatStatus.Working -> StatusLabel("working", StatusKind.Working)
+                    ChatStatus.NeedsYou -> StatusLabel("needs you", StatusKind.NeedsYou)
+                    ChatStatus.Error -> StatusLabel("error", StatusKind.Error)
+                    ChatStatus.Idle -> StatusLabel("idle", StatusKind.Idle)
                 }
-            }
-        },
-    ) { padding ->
-        Column(Modifier.padding(padding)) {
-            state.status?.let {
-                Text(it, Modifier.padding(horizontal = 16.dp, vertical = 4.dp), color = MaterialTheme.colorScheme.onSurfaceVariant)
-            }
-            (state.error ?: state.notice)?.let { message ->
-                Row(
-                    Modifier.fillMaxWidth().background(MaterialTheme.colorScheme.secondaryContainer).padding(start = 16.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    Text(
-                        message,
-                        Modifier.weight(1f),
-                        color = if (state.error != null) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSecondaryContainer,
+                ChatMenu(state, viewModel, onDiff, onOpenChat, onMerge = { confirmingMerge = it })
+            },
+        )
+        state.status?.let {
+            Text(it, Modifier.padding(horizontal = 14.dp, vertical = 4.dp), style = MaterialTheme.typography.bodySmall, color = MnColors.textMuted)
+        }
+        (state.error ?: state.notice)?.let { message ->
+            MessageBar(message, error = state.error != null, onDismiss = viewModel::dismissMessages)
+        }
+        LazyColumn(
+            state = listState,
+            modifier = Modifier.weight(1f).fillMaxWidth(),
+            contentPadding = PaddingValues(horizontal = 14.dp, vertical = 10.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            items(rows.size) { index ->
+                when (val row = rows[index]) {
+                    is Row.Item -> ItemView(row.item, state, viewModel)
+                    is Row.Unplaced -> PromptCard(
+                        title = "Permission needed",
+                        options = row.options,
+                        enabled = row.toolCallId !in state.answering,
+                        onChoose = { viewModel.answer(row.toolCallId, it) },
+                        hidden = row.toolCallId in state.answered,
                     )
-                    TextButton(onClick = viewModel::dismissMessages) { Text("OK") }
-                }
-            }
-            LazyColumn(
-                state = listState,
-                modifier = Modifier.weight(1f).fillMaxWidth(),
-                contentPadding = androidx.compose.foundation.layout.PaddingValues(12.dp),
-                verticalArrangement = Arrangement.spacedBy(10.dp),
-            ) {
-                items(rows.size) { index ->
-                    when (val row = rows[index]) {
-                        is Row.Item -> ItemView(row.item, state, viewModel)
-                        is Row.Unplaced -> PromptCard(
-                            title = "Permission needed",
-                            options = row.options,
-                            enabled = row.toolCallId !in state.answering,
-                            onChoose = { viewModel.answer(row.toolCallId, it) },
-                            hidden = row.toolCallId in state.answered,
-                        )
-                    }
                 }
             }
         }
-    }
-
-    if (pickingAgent) {
-        AgentPicker(
-            load = viewModel::agents,
-            onDismiss = { pickingAgent = false },
-            onStart = { agent ->
-                pickingAgent = false
-                viewModel.newChat(agent, onOpenChat)
-            },
-        )
+        Column(Modifier.windowInsetsPadding(WindowInsets.navigationBars).imePadding()) {
+            Row(
+                Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(horizontal = 10.dp),
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+            ) {
+                for (reply in QUICK_REPLIES) {
+                    ReplyChip(reply) { if (!state.sending) viewModel.send(reply) }
+                }
+            }
+            Composer(
+                value = draft,
+                onValueChange = { draft = it },
+                placeholder = "Reply...",
+                onSend = { viewModel.send(draft) { draft = "" } },
+                onMic = dictate,
+                sendEnabled = draft.isNotBlank() && !state.sending,
+            )
+        }
     }
 
     confirmingMerge?.let { merge ->
         AlertDialog(
             onDismissRequest = { confirmingMerge = null },
-            title = { Text("Merge #${merge.number}: ${merge.title}") },
-            text = { Text("Merge method: ${merge.method}\nHead commit: ${merge.shortHead}") },
+            containerColor = MnColors.surfaceRaised,
+            shape = RoundedCornerShape(12.dp),
+            title = { Text("Merge #${merge.number}: ${merge.title}", style = MaterialTheme.typography.titleMedium, color = MnColors.text) },
+            text = {
+                Text(
+                    "Merge method: ${merge.method}\nHead commit: ${merge.shortHead}",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MnColors.textSecondary,
+                )
+            },
             confirmButton = {
-                TextButton(onClick = {
+                PrimaryButton("Merge", onClick = {
                     confirmingMerge = null
                     viewModel.merge(merge)
-                }) { Text("Merge") }
+                })
             },
-            dismissButton = { TextButton(onClick = { confirmingMerge = null }) { Text("Cancel") } },
+            dismissButton = { SecondaryButton("Cancel", onClick = { confirmingMerge = null }) },
         )
     }
 }
 
 @Composable
-private fun PrButton(state: ChatUiState, viewModel: ChatViewModel, onMerge: (PrAction.Merge) -> Unit) {
+private fun MessageBar(text: String, error: Boolean, onDismiss: () -> Unit) {
+    Row(
+        Modifier.fillMaxWidth().background(if (error) MnColors.errorSoft else MnColors.surface).padding(start = 14.dp, end = 6.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text(
+            text,
+            Modifier.weight(1f).padding(vertical = 6.dp),
+            color = if (error) MnColors.error else MnColors.textSoft,
+            fontSize = 11.sp,
+        )
+        Text(
+            "OK",
+            Modifier.clickable(onClick = onDismiss).padding(horizontal = 10.dp, vertical = 8.dp),
+            color = MnColors.textSecondary,
+            fontSize = 11.sp,
+        )
+    }
+}
+
+@Composable
+private fun MenuRow(text: String, onClick: () -> Unit, enabled: Boolean = true, color: Color = MnColors.text) {
+    DropdownMenuItem(
+        text = { Text(text, fontSize = 11.5.sp, color = if (enabled) color else MnColors.textMuted, maxLines = 1) },
+        onClick = onClick,
+        enabled = enabled,
+        contentPadding = PaddingValues(horizontal = 12.dp, vertical = 0.dp),
+        modifier = Modifier.height(32.dp),
+    )
+}
+
+@Composable
+private fun ChatMenu(
+    state: ChatUiState,
+    viewModel: ChatViewModel,
+    onDiff: (String) -> Unit,
+    onOpenChat: (String) -> Unit,
+    onMerge: (PrAction.Merge) -> Unit,
+) {
     val uriHandler = LocalUriHandler.current
+    var open by remember { mutableStateOf(false) }
+    var page by remember { mutableStateOf(MenuPage.Main) }
+    fun close() {
+        open = false
+        page = MenuPage.Main
+    }
+    Box {
+    IconButton(onClick = { open = true }) {
+        Icon(Icons.Rounded.MoreHoriz, contentDescription = "More", tint = MnColors.textSecondary)
+    }
+    DropdownMenu(
+        expanded = open,
+        onDismissRequest = ::close,
+        modifier = Modifier.widthIn(min = 170.dp),
+        containerColor = MnColors.surfaceRaised,
+        shape = RoundedCornerShape(12.dp),
+        border = BorderStroke(1.dp, MnColors.border),
+    ) {
+        if (page == MenuPage.Agents) {
+            val result by produceState<MacResult<List<PhoneAgent>>?>(null) { value = viewModel.agents() }
+            when (val current = result) {
+                null -> MenuRow("Loading...", onClick = {}, enabled = false)
+                is MacResult.Refused -> MenuRow(current.reason, onClick = {}, enabled = false, color = MnColors.error)
+                is MacResult.Unreachable -> MenuRow(dev.mnemonic.phone.home.HomeViewModel.CANT_REACH, onClick = {}, enabled = false, color = MnColors.error)
+                is MacResult.Ok -> {
+                    if (current.value.isEmpty()) MenuRow("No agents are enabled on the Mac", onClick = {}, enabled = false)
+                    for (agent in current.value) {
+                        MenuRow("New chat with ${agent.label}", onClick = {
+                            close()
+                            viewModel.newChat(agent.id, onOpenChat)
+                        })
+                    }
+                }
+            }
+        } else {
+            if (state.generating) {
+                MenuRow("Stop agent", onClick = {
+                    close()
+                    viewModel.stop()
+                })
+            }
+            MenuRow("View diff", onClick = {
+                close()
+                val workspace = state.workspace
+                if (workspace != null) onDiff(workspace.id) else viewModel.reportMissingWorkspace()
+            })
+            PrMenuRow(state, viewModel, onMerge = {
+                close()
+                onMerge(it)
+            }, onOpenUrl = {
+                close()
+                uriHandler.openUri(it)
+            })
+            MenuRow("New chat", onClick = { page = MenuPage.Agents })
+        }
+    }
+    }
+}
+
+@Composable
+private fun PrMenuRow(state: ChatUiState, viewModel: ChatViewModel, onMerge: (PrAction.Merge) -> Unit, onOpenUrl: (String) -> Unit) {
     val pr = state.pr
     val busy = state.prBusy
     when {
-        pr == null && state.prLoading -> OutlinedButton(onClick = {}, enabled = false) { Text("PR") }
-        pr == null && state.prFailed -> OutlinedButton(onClick = viewModel::retryPr) { Text("PR") }
-        state.workspace == null -> OutlinedButton(onClick = {}, enabled = false) { Text("PR") }
+        pr == null && state.prLoading -> MenuRow("PR...", onClick = {}, enabled = false)
+        pr == null && state.prFailed -> MenuRow("Retry PR status", onClick = viewModel::retryPr)
+        state.workspace == null -> MenuRow("PR", onClick = {}, enabled = false)
         else -> when (val action = state.prAction) {
-            PrAction.CreatePr -> OutlinedButton(onClick = viewModel::createPr, enabled = !busy) { Text("Create PR") }
-            PrAction.Waiting -> OutlinedButton(onClick = {}, enabled = false) { Text("PR requested") }
-            is PrAction.Merge -> Button(onClick = { onMerge(action) }, enabled = !busy) {
-                Text("PR #${action.number}: Merge")
-            }
-            PrAction.None -> OutlinedButton(
-                onClick = { pr?.url?.takeIf { it.startsWith("https://") || it.startsWith("http://") }?.let(uriHandler::openUri) },
-            ) { Text(openPrLabel(pr, state.workspace.prState)) }
+            PrAction.CreatePr -> MenuRow("Create PR", onClick = viewModel::createPr, enabled = !busy, color = MnColors.accentText)
+            PrAction.Waiting -> MenuRow("Waiting for PR...", onClick = {}, enabled = false)
+            is PrAction.Merge -> MenuRow("Merge #${action.number}", onClick = { onMerge(action) }, enabled = !busy, color = MnColors.accentText)
+            PrAction.None -> MenuRow(
+                openPrLabel(pr, state.workspace.prState),
+                onClick = { pr?.url?.takeIf { it.startsWith("https://") || it.startsWith("http://") }?.let(onOpenUrl) },
+            )
         }
     }
 }
@@ -255,98 +354,60 @@ private fun openPrLabel(pr: dev.mnemonic.phone.api.PhonePrStatus?, workspaceStat
 }
 
 @Composable
-private fun AgentPicker(
-    load: suspend () -> MacResult<List<PhoneAgent>>,
-    onDismiss: () -> Unit,
-    onStart: (String) -> Unit,
-) {
-    val result by produceState<MacResult<List<PhoneAgent>>?>(null) { value = load() }
-    var chosen by remember { mutableStateOf<String?>(null) }
-    val agents = (result as? MacResult.Ok)?.value.orEmpty()
-    val selected = chosen ?: agents.firstOrNull()?.id
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        title = { Text("New chat") },
-        text = {
-            Column {
-                when (val current = result) {
-                    null -> Text("Loading...")
-                    is MacResult.Refused -> Text(current.reason, color = MaterialTheme.colorScheme.error)
-                    is MacResult.Unreachable -> Text(dev.mnemonic.phone.home.HomeViewModel.CANT_REACH, color = MaterialTheme.colorScheme.error)
-                    is MacResult.Ok -> if (agents.isEmpty()) Text("No agents are enabled on the Mac")
-                }
-                for (agent in agents) {
-                    Row(Modifier.fillMaxWidth().clickable { chosen = agent.id }, verticalAlignment = Alignment.CenterVertically) {
-                        RadioButton(selected = selected == agent.id, onClick = { chosen = agent.id })
-                        Text(agent.label)
-                    }
-                }
-            }
-        },
-        confirmButton = {
-            TextButton(onClick = { selected?.let(onStart) }, enabled = selected != null) { Text("Start") }
-        },
-        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
-    )
-}
-
-private fun statusLabel(status: String): String =
-    when (status) {
-        "pending" -> "pending"
-        "in_progress" -> "running"
-        "completed" -> "done"
-        else -> status
+private fun ToolStatusIcon(status: String, waiting: Boolean) {
+    val (icon, tint) = when {
+        waiting -> Icons.Rounded.RadioButtonUnchecked to MnColors.warning
+        status == "completed" -> Icons.Rounded.Check to MnColors.success
+        status == "failed" -> Icons.Rounded.Close to MnColors.error
+        status == "in_progress" -> Icons.Rounded.Contrast to MnColors.accentText
+        else -> Icons.Rounded.RadioButtonUnchecked to MnColors.textMuted
     }
+    Icon(icon, contentDescription = status, tint = tint, modifier = Modifier.size(12.dp))
+}
 
 @Composable
 private fun ToolLine(tool: ChatItem.Tool, waiting: Boolean) {
-    Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.Top) {
-        Text("[${tool.kind.replace('_', ' ')}]", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-        Text(tool.title, Modifier.weight(1f), style = MaterialTheme.typography.bodySmall, fontFamily = FontFamily.Monospace)
+    Row(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalAlignment = Alignment.CenterVertically) {
+        ToolStatusIcon(tool.status, waiting)
         Text(
-            if (waiting) "waiting" else statusLabel(tool.status),
-            style = MaterialTheme.typography.labelSmall,
-            color = when {
-                waiting -> MaterialTheme.colorScheme.tertiary
-                tool.status == "failed" -> MaterialTheme.colorScheme.error
-                tool.status == "in_progress" -> MaterialTheme.colorScheme.primary
-                else -> MaterialTheme.colorScheme.onSurfaceVariant
-            },
+            tool.title.ifEmpty { tool.kind },
+            Modifier.weight(1f),
+            fontFamily = MonoFamily,
+            fontSize = 10.5.sp,
+            color = MnColors.textSecondary,
+            maxLines = 2,
         )
+        if (waiting) Text("waiting", fontSize = 10.sp, color = MnColors.warning)
     }
 }
 
 @Composable
 private fun ItemView(item: ChatItem, state: ChatUiState, viewModel: ChatViewModel) {
     when (item) {
-        is ChatItem.UserMessage -> Column(
-            Modifier.fillMaxWidth().background(MaterialTheme.colorScheme.secondaryContainer).padding(10.dp),
-        ) {
-            val color = MaterialTheme.colorScheme.onSecondaryContainer
-            Text("you", style = MaterialTheme.typography.labelSmall, color = color)
-            Text(item.text, style = MaterialTheme.typography.bodyMedium, color = color)
+        is ChatItem.UserMessage -> BoxWithConstraints(Modifier.fillMaxWidth(), contentAlignment = Alignment.CenterEnd) {
+            Text(
+                item.text,
+                Modifier
+                    .widthIn(max = maxWidth * 0.8f)
+                    .background(MnColors.userBubble, RoundedCornerShape(topStart = 16.dp, topEnd = 16.dp, bottomEnd = 4.dp, bottomStart = 16.dp))
+                    .padding(horizontal = 11.dp, vertical = 7.dp),
+                style = MaterialTheme.typography.bodyMedium,
+                color = MnColors.userBubbleText,
+            )
         }
-        is ChatItem.AgentMessage -> Column(Modifier.fillMaxWidth()) {
-            Text("agent", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-            MarkdownText(item.text)
-        }
+        is ChatItem.AgentMessage -> MarkdownText(item.text, Modifier.fillMaxWidth())
         is ChatItem.Thought -> {
             var open by rememberSaveable(item.text.hashCode()) { mutableStateOf(false) }
-            Column {
-                Text(
-                    (if (open) "▾ " else "▸ ") + "Thinking",
-                    Modifier.clickable { open = !open },
-                    style = MaterialTheme.typography.labelMedium,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-                if (open) MarkdownText(item.text)
+            Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                Pill(AnnotatedString(if (open) "Thinking \u25BE" else "Thinking \u203A"), onClick = { open = !open })
+                if (open) MarkdownText(item.text, Modifier.padding(start = 4.dp))
             }
         }
         is ChatItem.Tool -> {
             val waiting = item.waiting && item.id !in state.answered
-            Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                ToolLine(item, waiting)
-                if (waiting) {
+            when {
+                waiting -> Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    ToolLine(item, waiting)
                     PromptCard(
                         title = item.title.ifEmpty { "The agent" },
                         options = state.permissions[item.id].orEmpty(),
@@ -354,26 +415,46 @@ private fun ItemView(item: ChatItem, state: ChatUiState, viewModel: ChatViewMode
                         onChoose = { viewModel.answer(item.id, it) },
                     )
                 }
+                item.status == "in_progress" -> Pill(
+                    text = buildAnnotatedString {
+                        append("Running ")
+                        withStyle(SpanStyle(fontFamily = MonoFamily, color = MnColors.textSoft)) { append(item.title.ifEmpty { item.kind }) }
+                    },
+                    accent = true,
+                    leading = { CircularProgressIndicator(Modifier.size(10.dp), color = MnColors.accentText, strokeWidth = 1.5.dp) },
+                )
+                else -> ToolLine(item, waiting = false)
             }
         }
         is ChatItem.FoldedTools -> {
             val key = item.tools.first().id
             val expanded = key in state.expandedFolds
+            val failed = toolRunFailed(item.tools)
             Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                Text(
-                    (if (expanded) "▾ " else "▸ ") + item.label,
-                    Modifier.fillMaxWidth().clickable { viewModel.toggleFold(key) }.padding(vertical = 4.dp),
-                    style = MaterialTheme.typography.labelLarge,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                Pill(
+                    text = buildAnnotatedString {
+                        append(item.label)
+                        if (failed > 0) {
+                            append(" \u00B7 ")
+                            withStyle(SpanStyle(color = MnColors.error)) { append("$failed failed") }
+                        }
+                        append(if (expanded) " \u25BE" else " \u203A")
+                    },
+                    leading = { Icon(Icons.Rounded.Settings, contentDescription = null, tint = MnColors.textSecondary, modifier = Modifier.size(11.dp)) },
+                    onClick = { viewModel.toggleFold(key) },
                 )
-                if (expanded) item.tools.forEach { ToolLine(it, waiting = false) }
+                if (expanded) {
+                    Column(Modifier.padding(start = 6.dp), verticalArrangement = Arrangement.spacedBy(3.dp)) {
+                        item.tools.forEach { ToolLine(it, waiting = false) }
+                    }
+                }
             }
         }
         is ChatItem.Plan -> PlanBox(if (item.done) "Plan done" else "Plan", item.entries)
         is ChatItem.Compaction -> Text(
             "Earlier messages were summarised",
-            style = MaterialTheme.typography.labelMedium,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            fontSize = 10.5.sp,
+            color = MnColors.textMuted,
         )
     }
 }
@@ -387,20 +468,21 @@ private fun PromptCard(
     hidden: Boolean = false,
 ) {
     if (hidden) return
+    val shape = RoundedCornerShape(10.dp)
     Column(
-        Modifier.fillMaxWidth().border(1.dp, MaterialTheme.colorScheme.tertiary).padding(10.dp),
+        Modifier.fillMaxWidth().background(MnColors.warningCard, shape).border(1.dp, MnColors.warningSoft, shape).padding(10.dp),
         verticalArrangement = Arrangement.spacedBy(8.dp),
     ) {
-        Text("$title?", style = MaterialTheme.typography.titleSmall)
+        Text("$title?", style = MaterialTheme.typography.titleSmall, color = MnColors.text)
         if (options.isEmpty()) {
-            Text("Answer this on the Mac", color = MaterialTheme.colorScheme.onSurfaceVariant)
+            Text("Answer this on the Mac", style = MaterialTheme.typography.bodySmall, color = MnColors.textSecondary)
         }
         for (option in options) {
             val allows = option.kind == "allow_once" || option.kind == "allow_always"
             if (allows) {
-                Button(onClick = { onChoose(option.optionId) }, enabled = enabled, modifier = Modifier.fillMaxWidth()) { Text(option.name) }
+                PrimaryButton(option.name, onClick = { onChoose(option.optionId) }, enabled = enabled, modifier = Modifier.fillMaxWidth())
             } else {
-                OutlinedButton(onClick = { onChoose(option.optionId) }, enabled = enabled, modifier = Modifier.fillMaxWidth()) { Text(option.name) }
+                SecondaryButton(option.name, onClick = { onChoose(option.optionId) }, enabled = enabled, modifier = Modifier.fillMaxWidth())
             }
         }
     }
@@ -408,18 +490,21 @@ private fun PromptCard(
 
 @Composable
 private fun PlanBox(title: String, entries: List<PlanEntry>) {
-    Column(Modifier.fillMaxWidth().background(MaterialTheme.colorScheme.surfaceVariant).padding(10.dp)) {
-        Text(title, style = MaterialTheme.typography.titleSmall)
-        HorizontalDivider(Modifier.padding(vertical = 4.dp))
+    val shape = RoundedCornerShape(10.dp)
+    Column(
+        Modifier.fillMaxWidth().background(MnColors.surface, shape).border(1.dp, MnColors.pillBorder, shape).padding(horizontal = 10.dp, vertical = 8.dp),
+        verticalArrangement = Arrangement.spacedBy(5.dp),
+    ) {
+        Text(title, style = MaterialTheme.typography.titleSmall, color = MnColors.text)
         for (entry in entries) {
-            val marker = when (entry.status) {
-                "completed" -> "[x]"
-                "in_progress" -> "[~]"
-                else -> "[ ]"
-            }
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                Text(marker, fontFamily = FontFamily.Monospace)
-                Text(entry.content, Modifier.weight(1f))
+            Row(horizontalArrangement = Arrangement.spacedBy(7.dp), verticalAlignment = Alignment.Top) {
+                val (icon, tint) = when (entry.status) {
+                    "completed" -> Icons.Rounded.CheckCircle to MnColors.success
+                    "in_progress" -> Icons.Rounded.Contrast to MnColors.accentText
+                    else -> Icons.Rounded.RadioButtonUnchecked to MnColors.textMuted
+                }
+                Icon(icon, contentDescription = entry.status, tint = tint, modifier = Modifier.padding(top = 2.dp).size(13.dp))
+                Text(entry.content, Modifier.weight(1f), style = MaterialTheme.typography.bodySmall, color = MnColors.textSoft)
             }
         }
     }

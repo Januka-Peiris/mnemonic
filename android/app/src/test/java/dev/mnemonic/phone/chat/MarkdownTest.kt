@@ -31,8 +31,10 @@ class MarkdownTest {
 
     @Test
     fun numberedList() {
-        val list = parseBlocks("1. x\n2. y").single() as Block.ListBlock
+        val list = parseBlocks("3. x\n4. y").single() as Block.ListBlock
         assertEquals(true, list.ordered)
+        assertEquals(3, list.start)
+        assertEquals(listOf(Inline.Text("x")), list.items[0])
     }
 
     @Test

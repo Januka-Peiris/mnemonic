@@ -37,7 +37,7 @@ sealed interface Inline {
 sealed interface Block {
     data class Paragraph(val inlines: List<Inline>) : Block
     data class CodeBlock(val text: String) : Block
-    data class ListBlock(val ordered: Boolean, val items: List<List<Inline>>) : Block
+    data class ListBlock(val ordered: Boolean, val items: List<List<Inline>>, val start: Int = 1) : Block
 }
 
 private val INLINE_PATTERN = Regex(
@@ -45,7 +45,7 @@ private val INLINE_PATTERN = Regex(
 )
 private val TRAILING_PUNCTUATION = Regex("[.,;:!?'\"]+$")
 private val BULLET = Regex("^\\s{0,3}[-*+] +(.*)$")
-private val NUMBERED = Regex("^\\s{0,3}\\d+[.)] +(.*)$")
+private val NUMBERED = Regex("^\\s{0,3}(\\d+)[.)] +(.*)$")
 private val FENCE = Regex("^ {0,3}(```+|~~~+)")
 
 private fun isWebUrl(text: String): Boolean =
@@ -114,14 +114,15 @@ fun parseBlocks(text: String): List<Block> {
             flushParagraph()
             val ordered = NUMBERED.matches(line)
             val marker = if (ordered) NUMBERED else BULLET
+            val start = if (ordered) NUMBERED.find(line)?.groupValues?.get(1)?.toIntOrNull() ?: 1 else 1
             val items = mutableListOf<List<Inline>>()
             while (index < lines.size) {
                 val item = marker.find(lines[index]) ?: break
-                items.add(parseInline(item.groupValues[1]))
+                items.add(parseInline(item.groupValues.last()))
                 index++
             }
             index--
-            blocks.add(Block.ListBlock(ordered, items))
+            blocks.add(Block.ListBlock(ordered, items, start))
         } else {
             paragraph.add(line)
         }
@@ -168,7 +169,7 @@ fun MarkdownText(text: String, modifier: Modifier = Modifier) {
                     block.items.forEachIndexed { position, item ->
                         Row {
                             Text(
-                                if (block.ordered) "${position + 1}. " else "\u2022 ",
+                                if (block.ordered) "${block.start + position}. " else "\u2022 ",
                                 style = MaterialTheme.typography.bodyMedium,
                             )
                             Text(inlineText(item), style = MaterialTheme.typography.bodyMedium)
@@ -183,7 +184,7 @@ fun MarkdownText(text: String, modifier: Modifier = Modifier) {
                         .horizontalScroll(rememberScrollState())
                         .padding(8.dp),
                     fontFamily = FontFamily.Monospace,
-                    fontSize = 13.sp,
+                    fontSize = 11.5.sp,
                     softWrap = false,
                 )
             }
