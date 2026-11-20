@@ -9,6 +9,7 @@ import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
 import java.util.UUID
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.map
 
 private val Context.dataStore: DataStore<Preferences> by preferencesDataStore(name = "mnemonic_app_state")
 
@@ -25,6 +26,12 @@ class AppState(context: Context) {
         store.edit { it[openedKey(chatId)] = maxOf(System.currentTimeMillis(), endedAt) }
     }
 
+    val lastRepositoryId: Flow<String?> = store.data.map { it[LAST_REPOSITORY] }
+
+    suspend fun setLastRepositoryId(id: String) {
+        store.edit { it[LAST_REPOSITORY] = id }
+    }
+
     suspend fun ensureInstalled() {
         store.edit {
             if (it[INSTALLED_AT] == null) it[INSTALLED_AT] = System.currentTimeMillis()
@@ -35,6 +42,7 @@ class AppState(context: Context) {
     companion object {
         private val ADDRESS = stringPreferencesKey("address")
         private val INSTALLED_AT = longPreferencesKey("installed_at")
+        private val LAST_REPOSITORY = stringPreferencesKey("last_repository")
         private val INSTALL_ID = stringPreferencesKey("install_id")
 
         private fun openedKey(chatId: String) = longPreferencesKey("opened_$chatId")

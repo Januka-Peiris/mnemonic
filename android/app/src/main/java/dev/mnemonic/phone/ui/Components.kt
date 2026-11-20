@@ -18,7 +18,11 @@ import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.ArrowBack
 import androidx.compose.material.icons.rounded.ArrowUpward
+import androidx.compose.material.icons.rounded.Check
+import androidx.compose.material.icons.rounded.Close
+import androidx.compose.material.icons.rounded.Contrast
 import androidx.compose.material.icons.rounded.Mic
+import androidx.compose.material.icons.rounded.RadioButtonUnchecked
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
@@ -47,7 +51,7 @@ private fun styleOf(kind: StatusKind): KindStyle =
         StatusKind.NeedsYou -> KindStyle("!", MnColors.warning, MnColors.warningSoft, "needs you")
         StatusKind.Working -> KindStyle("◐", MnColors.accentText, MnColors.accentSoft, "working")
         StatusKind.Finished -> KindStyle("✓", MnColors.success, MnColors.successSoft, "new")
-        StatusKind.Idle -> KindStyle("○", Color(0xFF3B4250), MnColors.surface, "idle")
+        StatusKind.Idle -> KindStyle("○", MnColors.idleSquare, MnColors.surface, "idle")
         StatusKind.Error -> KindStyle("✕", MnColors.error, MnColors.errorSoft, "error")
     }
 
@@ -58,7 +62,18 @@ fun StatusSquare(kind: StatusKind) {
         Modifier.size(22.dp).clip(RoundedCornerShape(6.dp)).background(style.background),
         contentAlignment = Alignment.Center,
     ) {
-        Text(style.glyph, color = style.foreground, fontSize = 11.sp)
+        val icon = when (kind) {
+            StatusKind.NeedsYou -> null
+            StatusKind.Working -> Icons.Rounded.Contrast
+            StatusKind.Finished -> Icons.Rounded.Check
+            StatusKind.Idle -> Icons.Rounded.RadioButtonUnchecked
+            StatusKind.Error -> Icons.Rounded.Close
+        }
+        if (icon == null) {
+            Text(style.glyph, color = style.foreground, fontSize = 11.sp, fontWeight = FontWeight.Bold)
+        } else {
+            Icon(icon, contentDescription = style.label, tint = style.foreground, modifier = Modifier.size(14.dp))
+        }
     }
 }
 
@@ -127,7 +142,7 @@ fun Pill(
         Modifier
             .clip(shape)
             .background(if (accent) MnColors.accentSoft else MnColors.surface)
-            .border(1.dp, if (accent) MnColors.accent else Color(0xFF1F242C), shape)
+            .border(1.dp, if (accent) MnColors.accent else MnColors.pillBorder, shape)
             .then(if (onClick != null) Modifier.clickable(onClick = onClick) else Modifier)
             .padding(horizontal = 9.dp, vertical = 3.dp),
         horizontalArrangement = Arrangement.spacedBy(6.dp),
@@ -150,7 +165,7 @@ fun ReplyChip(text: String, onClick: () -> Unit) {
     Text(
         text,
         fontSize = 10.5.sp,
-        color = Color(0xFFC3C8D0),
+        color = MnColors.textSoft,
         maxLines = 1,
         modifier = Modifier
             .clip(shape)
@@ -241,7 +256,7 @@ fun SecondaryButton(text: String, onClick: () -> Unit, enabled: Boolean = true, 
     val shape = RoundedCornerShape(7.dp)
     Text(
         text,
-        color = if (enabled) Color(0xFFC3C8D0) else MnColors.textMuted,
+        color = if (enabled) MnColors.textSoft else MnColors.textMuted,
         fontSize = 11.sp,
         textAlign = TextAlign.Center,
         maxLines = 1,

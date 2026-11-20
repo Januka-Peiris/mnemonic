@@ -31,3 +31,20 @@ fun MicButton(onSpoken: (String) -> Unit, enabled: Boolean = true) {
     if (!available) return
     TextButton(onClick = { launcher.launch(intent) }, enabled = enabled) { Text("Mic") }
 }
+
+@Composable
+fun rememberDictation(onSpoken: (String) -> Unit): (() -> Unit)? {
+    val context = LocalContext.current
+    val intent = remember {
+        Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH)
+            .putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+    }
+    val available = remember { context.packageManager.queryIntentActivities(intent, 0).isNotEmpty() }
+    val launcher = rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
+        if (result.resultCode == Activity.RESULT_OK) {
+            val best = result.data?.getStringArrayListExtra(RecognizerIntent.EXTRA_RESULTS)?.firstOrNull()
+            if (!best.isNullOrBlank()) onSpoken(best)
+        }
+    }
+    return if (available) ({ launcher.launch(intent) }) else null
+}

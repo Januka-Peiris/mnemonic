@@ -18,7 +18,6 @@ import dev.mnemonic.phone.chat.ChatScreen
 import dev.mnemonic.phone.chat.ChatViewModel
 import dev.mnemonic.phone.connect.ConnectScreen
 import dev.mnemonic.phone.diff.DiffScreen
-import dev.mnemonic.phone.task.NewTaskScreen
 import dev.mnemonic.phone.home.HomeScreen
 import dev.mnemonic.phone.home.HomeViewModel
 import dev.mnemonic.phone.settings.SettingsScreen
@@ -29,7 +28,6 @@ object Routes {
     const val CONNECT = "connect"
     const val HOME = "home"
     const val CHAT = "chat/{chatId}"
-    const val NEW_TASK = "newTask"
     const val DIFF = "diff/{workspaceId}"
     const val SETTINGS = "settings"
 
@@ -69,7 +67,6 @@ fun MnemonicNavigation(
                     viewModel = viewModel,
                     http = http,
                     onOpenChat = { navController.navigate(Routes.chat(it)) },
-                    onNewTask = { navController.navigate(Routes.NEW_TASK) },
                     onSettings = { navController.navigate(Routes.SETTINGS) },
                 )
             }
@@ -89,18 +86,6 @@ fun MnemonicNavigation(
                     onBack = { navigateBack(navController) },
                     onOpenChat = { navController.navigate(Routes.chat(it)) },
                     onDiff = { navController.navigate(Routes.diff(it)) },
-                )
-            }
-        }
-        composable(Routes.NEW_TASK) {
-            if (client != null) {
-                NewTaskScreen(
-                    client = client,
-                    onBack = { navController.popBackStack() },
-                    onStarted = { chatId ->
-                        navController.navigate(Routes.chat(chatId)) { popUpTo(Routes.NEW_TASK) { inclusive = true } }
-                    },
-                    onNoChat = { navController.popBackStack() },
                 )
             }
         }
