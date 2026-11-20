@@ -92,20 +92,31 @@ fun permissionLine(toolKind: String?, hasTool: Boolean): String =
         else -> if (hasTool) "needs permission to use a tool" else "needs permission"
     }
 
-private fun statusKind(workspace: TeamWorkspace, finished: Boolean, errored: Boolean): StatusKind =
-    when (workspace.agentState) {
-        TeamAgentState.WaitingForApproval -> StatusKind.NeedsYou
-        TeamAgentState.Error -> StatusKind.Error
-        TeamAgentState.Idle -> if (errored) StatusKind.Error else if (finished) StatusKind.Finished else StatusKind.Idle
-        TeamAgentState.Working -> StatusKind.Working
+data class RowStatus(val kind: StatusKind, val detail: String)
+
+fun formatDuration(seconds: Long?): String? =
+    when {
+        seconds == null -> null
+        seconds < 60 -> "now"
+        seconds < 3600 -> "${seconds / 60}m"
+        seconds < 86400 -> "${seconds / 3600}h"
+        else -> "${seconds / 86400}d"
     }
 
-private fun rowDetail(workspace: TeamWorkspace, unread: NeedsYouItem.Finished?): String =
-    when {
-        unread != null && workspace.agentState == TeamAgentState.Idle ->
-            (if (unread.errored) "Errored" else "Finished") + " · " + formatIdle(workspace.idleSeconds) + " · unread"
-        else -> stateLabel(workspace).replaceFirstChar { it.uppercase() }
+fun rowStatus(workspace: TeamWorkspace, unread: NeedsYouItem.Finished?): RowStatus {
+    when (workspace.agentState) {
+        TeamAgentState.WaitingForApproval -> return RowStatus(StatusKind.NeedsYou, "Needs you")
+        TeamAgentState.Error -> return RowStatus(StatusKind.Error, "Error")
+        TeamAgentState.Working -> return RowStatus(StatusKind.Working, "Working")
+        TeamAgentState.Idle -> {}
     }
+    val lastEnded = workspace.chats.filter { it.lastTurnEndedAt != null }.maxByOrNull { it.lastTurnEndedAt ?: 0L }
+    val errored = unread?.errored ?: lastEnded?.lastTurnErrored
+    if (errored == null) return RowStatus(StatusKind.Idle, formatIdle(workspace.idleSeconds).replaceFirstChar { it.uppercase() })
+    val label = if (errored) "Errored" else "Finished"
+    val line = listOfNotNull(label, formatDuration(workspace.idleSeconds), if (unread != null) "unread" else null)
+    return RowStatus(if (errored) StatusKind.Error else StatusKind.Finished, line.joinToString(" · "))
+}
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -328,7 +339,7 @@ private fun WorkspaceRow(
     onOpen: (String) -> Unit,
     onToggle: () -> Unit,
 ) {
-    val finished = unread != null
+    val status = rowStatus(workspace, unread)
     val stripe = MnColors.warning
     Column(modifier = Modifier.fillMaxWidth()) {
         Row(
@@ -347,17 +358,17 @@ private fun WorkspaceRow(
                 .clickable(onClick = onToggle)
                 .padding(horizontal = 14.dp, vertical = 6.dp),
         ) {
-            StatusSquare(statusKind(workspace, finished, unread?.errored == true))
+            StatusSquare(status.kind)
             Column(Modifier.weight(1f)) {
                 Text(
                     workspace.name,
                     fontSize = 13.sp,
-                    color = if (workspace.agentState == TeamAgentState.Idle && !finished) MnColors.textSecondary else MnColors.text,
+                    color = if (status.kind == StatusKind.Idle) MnColors.textSecondary else MnColors.text,
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
                 )
                 Text(
-                    rowDetail(workspace, unread),
+                    status.detail,
                     fontSize = 10.5.sp,
                     color = if (unread != null) MnColors.warning else MnColors.textMuted,
                     maxLines = 1,
