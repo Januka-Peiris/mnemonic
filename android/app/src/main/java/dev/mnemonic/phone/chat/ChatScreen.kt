@@ -200,6 +200,14 @@ fun ChatScreen(
                     }
                 }
             }
+            if (state.options.isNotEmpty()) {
+                Row(
+                    Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(start = 10.dp, end = 10.dp, top = 6.dp),
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                ) {
+                    OptionChips(state.options, state.chosenOptions, enabled = !state.optionsBusy, onSelect = viewModel::setOption)
+                }
+            }
             Composer(
                 value = draft,
                 onValueChange = { draft = it },

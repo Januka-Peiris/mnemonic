@@ -8,6 +8,7 @@ import dev.mnemonic.phone.AppState.Companion.openedAt
 import dev.mnemonic.phone.api.MacClient
 import dev.mnemonic.phone.api.MacResult
 import dev.mnemonic.phone.api.PhoneActionOutcome
+import dev.mnemonic.phone.api.PhoneOptionChoice
 import dev.mnemonic.phone.api.TeamAgentState
 import dev.mnemonic.phone.api.TeamChatUpdate
 import dev.mnemonic.phone.api.TeamEntry
@@ -153,8 +154,13 @@ class HomeViewModel(private val client: MacClient, private val appState: AppStat
 
     suspend fun agents() = client.agents()
 
-    suspend fun startTask(repositoryId: String, agentId: String, text: String): MacResult<PhoneActionOutcome> {
-        val result = client.startTask(repositoryId, agentId, text)
+    suspend fun startTask(
+        repositoryId: String,
+        agentId: String,
+        text: String,
+        choices: List<PhoneOptionChoice>,
+    ): MacResult<PhoneActionOutcome> {
+        val result = client.startTask(repositoryId, agentId, text, choices)
         if (result is MacResult.Ok) appState.setLastRepositoryId(repositoryId)
         return result
     }

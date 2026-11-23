@@ -31,6 +31,8 @@ const ICON: &[u8] = include_bytes!("../../../zed/resources/app-icon@2x.png");
 const MAX_MESSAGE_BYTES: usize = 16 * 1024;
 /// Room for a message of `MAX_MESSAGE_BYTES` whose characters JSON escapes.
 const MAX_ACTION_BODY_BYTES: usize = MAX_MESSAGE_BYTES * 4;
+const MAX_OPTION_CHOICES: usize = 8;
+const MAX_OPTION_ID_BYTES: usize = 256;
 
 pub struct PhoneServerConfig {
     pub bind: IpAddr,
@@ -58,16 +60,23 @@ pub enum PhoneAction {
         chat_id: String,
         text: String,
     },
+    /// Sets the chat's model or effort, in order, since the efforts an
+    /// agent offers can depend on the model.
+    SetChatOptions {
+        chat_id: String,
+        choices: Vec<PhoneOptionChoice>,
+    },
     NewChat {
         workspace_id: String,
         agent: String,
     },
     /// Creates a workspace in the repository and sends `text` to its chat
-    /// as the user's first message.
+    /// as the user's first message, once `choices` are set.
     StartTask {
         repository_id: String,
         agent: String,
         text: String,
+        choices: Vec<PhoneOptionChoice>,
     },
     CreatePr {
         workspace_id: String,
@@ -92,6 +101,49 @@ pub struct PhoneActionOutcome {
     /// What GitHub said, for `PhoneAction::Merge`, or, for a task or merge
     /// that outlasted its timeout, that it is still going on the Mac.
     pub message: Option<String>,
+    /// The chat's options once set, for `PhoneAction::SetChatOptions`. None
+    /// when the chat's agent hasn't connected yet and they are set once it
+    /// has.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub options: Option<Vec<PhoneChatOption>>,
+}
+
+/// A value for one of a chat's options, as the phone picked it.
+#[derive(Clone, Debug, PartialEq, serde::Deserialize)]
+pub struct PhoneOptionChoice {
+    pub config_id: String,
+    pub value: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PhoneChatOptionKind {
+    Model,
+    Effort,
+}
+
+/// One of a chat's settings the phone can change.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct PhoneChatOption {
+    /// What a choice names it by.
+    pub id: String,
+    pub name: String,
+    pub kind: PhoneChatOptionKind,
+    /// None in an agent's list, which no chat is using.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current: Option<String>,
+    pub values: Vec<PhoneChatOptionValue>,
+}
+
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct PhoneChatOptionValue {
+    pub id: String,
+    pub name: String,
+}
+
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+pub struct PhoneChatOptionList {
+    pub options: Vec<PhoneChatOption>,
 }
 
 pub type PhoneActionHandler =
@@ -103,6 +155,9 @@ pub struct PhoneAgent {
     /// What a new chat request names it by.
     pub id: String,
     pub label: String,
+    /// The model and effort a new chat can start with, as last offered by
+    /// one of this agent's chats. Empty until one has connected.
+    pub options: Vec<PhoneChatOption>,
 }
 
 #[derive(Clone, Debug, PartialEq, serde::Serialize)]
@@ -140,6 +195,9 @@ pub struct PhonePrStatus {
     pub merge_method: String,
 }
 
+/// A chat's options while its agent is connected, else None.
+pub type PhoneChatOptionSource = Arc<dyn Fn(&str) -> Option<Vec<PhoneChatOption>> + Send + Sync>;
+
 pub type PhoneRepositorySource =
     Arc<dyn Fn() -> Result<Vec<PhoneRepository>, String> + Send + Sync>;
 pub type PhonePrStatusSource = Arc<dyn Fn(&str) -> Result<PhonePrStatus, String> + Send + Sync>;
@@ -148,6 +206,7 @@ pub type PhonePrStatusSource = Arc<dyn Fn(&str) -> Result<PhonePrStatus, String>
 pub struct PhoneSources {
     pub diff: DiffSource,
     pub agents: PhoneAgentSource,
+    pub chat_options: PhoneChatOptionSource,
     /// Most recently used first.
     pub repositories: PhoneRepositorySource,
     pub pr_status: PhonePrStatusSource,
@@ -377,6 +436,15 @@ fn handle(mut request: Request, shared: &Shared) {
         }
         ["v1", "chats", chat_id] if is_plain_id(chat_id) => {
             chat_update_response(&shared.hub, chat_id, query)
+        }
+        ["v1", "chats", chat_id, "options"] if is_plain_id(chat_id) => {
+            let list = PhoneChatOptionList {
+                options: (shared.sources.chat_options)(chat_id).unwrap_or_default(),
+            };
+            match serde_json::to_string(&list) {
+                Ok(body) => json_response(200, body),
+                Err(err) => text_response(500, &err.to_string()),
+            }
         }
         _ => text_response(404, "Not found"),
     };
@@ -630,6 +698,12 @@ fn parse_action(segments: &[&str], body: &[u8]) -> Result<PhoneAction, (u16, Str
         repository_id: String,
         agent: String,
         text: String,
+        #[serde(default)]
+        options: Vec<PhoneOptionChoice>,
+    }
+    #[derive(serde::Deserialize)]
+    struct OptionsBody {
+        options: Vec<PhoneOptionChoice>,
     }
     #[derive(serde::Deserialize)]
     struct MergeBody {
@@ -643,6 +717,20 @@ fn parse_action(segments: &[&str], body: &[u8]) -> Result<PhoneAction, (u16, Str
             return Err((413, "The message is too long".to_string()));
         }
         Ok(())
+    }
+    fn check_choices(choices: &[PhoneOptionChoice]) -> Result<(), (u16, String)> {
+        if choices.len() > MAX_OPTION_CHOICES {
+            return Err((400, "Too many options".to_string()));
+        }
+        let well_formed = |text: &str| !text.trim().is_empty() && text.len() <= MAX_OPTION_ID_BYTES;
+        if choices
+            .iter()
+            .all(|choice| well_formed(&choice.config_id) && well_formed(&choice.value))
+        {
+            Ok(())
+        } else {
+            Err((400, "An option or its value is missing".to_string()))
+        }
     }
     fn read<T: serde::de::DeserializeOwned>(body: &[u8]) -> Result<T, (u16, String)> {
         serde_json::from_slice(body)
@@ -668,6 +756,17 @@ fn parse_action(segments: &[&str], body: &[u8]) -> Result<PhoneAction, (u16, Str
                 text: message.text,
             })
         }
+        ["v1", "chats", chat_id, "options"] if is_plain_id(chat_id) => {
+            let options: OptionsBody = read(body)?;
+            if options.options.is_empty() {
+                return Err((400, "No options given".to_string()));
+            }
+            check_choices(&options.options)?;
+            Ok(PhoneAction::SetChatOptions {
+                chat_id: chat_id.to_string(),
+                choices: options.options,
+            })
+        }
         ["v1", "workspaces", workspace_id, "chats"] if is_plain_id(workspace_id) => {
             let new_chat: NewChatBody = read(body)?;
             let agent = new_chat.agent.trim();
@@ -689,10 +788,12 @@ fn parse_action(segments: &[&str], body: &[u8]) -> Result<PhoneAction, (u16, Str
                 return Err((400, "No agent given".to_string()));
             }
             check_message(&task.text)?;
+            check_choices(&task.options)?;
             Ok(PhoneAction::StartTask {
                 repository_id: task.repository_id,
                 agent: agent.to_string(),
                 text: task.text,
+                choices: task.options,
             })
         }
         ["v1", "workspaces", workspace_id, "pr"] if is_plain_id(workspace_id) => {
@@ -799,6 +900,7 @@ mod tests {
             PhoneSources {
                 diff: Arc::new(|workspace_id: &str| Ok(format!("diff of {workspace_id}"))),
                 agents: Arc::new(Vec::new),
+                chat_options: Arc::new(|_| None),
                 repositories: Arc::new(|| {
                     Ok(vec![
                         PhoneRepository {
@@ -1206,12 +1308,35 @@ mod tests {
         assert_eq!(
             parse_action(
                 &["v1", "tasks"],
-                br#"{"repository_id":"repo-1","agent":"codex","text":"Fix the login page"}"#
+                br#"{"repository_id":"repo-1","agent":"codex","text":"Fix the login page","options":[{"config_id":"model","value":"gpt-6.1-sol"}]}"#
             ),
             Ok(PhoneAction::StartTask {
                 repository_id: "repo-1".to_string(),
                 agent: "codex".to_string(),
                 text: "Fix the login page".to_string(),
+                choices: vec![PhoneOptionChoice {
+                    config_id: "model".to_string(),
+                    value: "gpt-6.1-sol".to_string(),
+                }],
+            })
+        );
+        assert_eq!(
+            parse_action(
+                &["v1", "chats", "chat-1", "options"],
+                br#"{"options":[{"config_id":"model","value":"opus"},{"config_id":"effort","value":"max"}]}"#
+            ),
+            Ok(PhoneAction::SetChatOptions {
+                chat_id: "chat-1".to_string(),
+                choices: vec![
+                    PhoneOptionChoice {
+                        config_id: "model".to_string(),
+                        value: "opus".to_string(),
+                    },
+                    PhoneOptionChoice {
+                        config_id: "effort".to_string(),
+                        value: "max".to_string(),
+                    },
+                ],
             })
         );
         assert_eq!(
@@ -1242,6 +1367,17 @@ mod tests {
         );
         assert_eq!(
             status(&["v1", "workspaces", "ws-1", "merge"], br#"{"head":""}"#),
+            Err(400)
+        );
+        assert_eq!(
+            status(&["v1", "chats", "chat-1", "options"], br#"{"options":[]}"#),
+            Err(400)
+        );
+        assert_eq!(
+            status(
+                &["v1", "chats", "chat-1", "options"],
+                br#"{"options":[{"config_id":"model","value":" "}]}"#
+            ),
             Err(400)
         );
     }
@@ -1490,11 +1626,53 @@ iBNGGY1f60D2l/vFaGYI8tsOOAetgeJ8rQ==
             can_merge: true,
             merge_method: "squash".to_string(),
         };
+        let model_option = PhoneChatOption {
+            id: "model".to_string(),
+            name: "Model".to_string(),
+            kind: PhoneChatOptionKind::Model,
+            current: None,
+            values: vec![
+                PhoneChatOptionValue {
+                    id: "opus".to_string(),
+                    name: "Opus 5.5".to_string(),
+                },
+                PhoneChatOptionValue {
+                    id: "sonnet".to_string(),
+                    name: "Sonnet 5.5".to_string(),
+                },
+            ],
+        };
+        let effort_option = PhoneChatOption {
+            id: "effort".to_string(),
+            name: "Effort".to_string(),
+            kind: PhoneChatOptionKind::Effort,
+            current: Some("high".to_string()),
+            values: vec![
+                PhoneChatOptionValue {
+                    id: "high".to_string(),
+                    name: "High".to_string(),
+                },
+                PhoneChatOptionValue {
+                    id: "max".to_string(),
+                    name: "Max".to_string(),
+                },
+            ],
+        };
         let agents = PhoneAgentList {
             agents: vec![PhoneAgent {
                 id: "claude".to_string(),
                 label: "Claude".to_string(),
+                options: vec![model_option.clone()],
             }],
+        };
+        let chat_options = PhoneChatOptionList {
+            options: vec![
+                PhoneChatOption {
+                    current: Some("opus".to_string()),
+                    ..model_option
+                },
+                effort_option,
+            ],
         };
         let repositories = PhoneRepositoryList {
             repositories: vec![PhoneRepository {
@@ -1506,12 +1684,14 @@ iBNGGY1f60D2l/vFaGYI8tsOOAetgeJ8rQ==
             chat_id: Some("chat-9".to_string()),
             workspace_id: Some("ws-9".to_string()),
             message: None,
+            options: None,
         };
         let fixtures = [
             ("workspaces.json", to_pretty(&workspaces)?),
             ("chat_update.json", to_pretty(&wire_fixture_update())?),
             ("pr_status.json", to_pretty(&pr_status)?),
             ("agents.json", to_pretty(&agents)?),
+            ("chat_options.json", to_pretty(&chat_options)?),
             ("repositories.json", to_pretty(&repositories)?),
             ("outcome.json", to_pretty(&outcome)?),
         ];

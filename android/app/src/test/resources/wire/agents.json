@@ -2,7 +2,24 @@
   "agents": [
     {
       "id": "claude",
-      "label": "Claude"
+      "label": "Claude",
+      "options": [
+        {
+          "id": "model",
+          "name": "Model",
+          "kind": "model",
+          "values": [
+            {
+              "id": "opus",
+              "name": "Opus 5.5"
+            },
+            {
+              "id": "sonnet",
+              "name": "Sonnet 5.5"
+            }
+          ]
+        }
+      ]
     }
   ]
 }

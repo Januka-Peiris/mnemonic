@@ -761,6 +761,8 @@ mod test_support {
         supports_session_additional_directories: bool,
         agent_id: AgentId,
         telemetry_id: SharedString,
+        session_config_options:
+            Option<Arc<dyn Fn() -> Rc<dyn AgentSessionConfigOptions> + Send + Sync>>,
     }
 
     struct Session {
@@ -784,6 +786,7 @@ mod test_support {
                 supports_session_additional_directories: false,
                 agent_id: AgentId::new("stub"),
                 telemetry_id: "stub".into(),
+                session_config_options: None,
             }
         }
 
@@ -819,6 +822,15 @@ mod test_support {
 
         pub fn with_telemetry_id(mut self, telemetry_id: SharedString) -> Self {
             self.telemetry_id = telemetry_id;
+            self
+        }
+
+        /// Every session offers the config options `make` returns.
+        pub fn with_session_config_options(
+            mut self,
+            make: impl Fn() -> Rc<dyn AgentSessionConfigOptions> + Send + Sync + 'static,
+        ) -> Self {
+            self.session_config_options = Some(Arc::new(make));
             self
         }
 
@@ -912,6 +924,14 @@ mod test_support {
             _session_id: &acp::SessionId,
         ) -> Option<Rc<dyn AgentModelSelector>> {
             Some(self.model_selector_impl())
+        }
+
+        fn session_config_options(
+            &self,
+            _session_id: &acp::SessionId,
+            _cx: &App,
+        ) -> Option<Rc<dyn AgentSessionConfigOptions>> {
+            self.session_config_options.as_ref().map(|make| make())
         }
 
         fn new_session(
