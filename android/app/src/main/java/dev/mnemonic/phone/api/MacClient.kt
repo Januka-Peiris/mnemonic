@@ -8,6 +8,8 @@ import java.util.concurrent.TimeUnit
 import kotlin.coroutines.resume
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.serialization.DeserializationStrategy
+import kotlinx.serialization.builtins.ListSerializer
+import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonObject
@@ -55,6 +57,12 @@ class MacClient(private val address: MacAddress, private val http: OkHttpClient)
     suspend fun agents(): MacResult<PhoneAgentList> =
         get(url("v1", "agents"), serializer = PhoneAgentList.serializer())
 
+    suspend fun chatOptions(chatId: String): MacResult<PhoneChatOptionList> =
+        get(url("v1", "chats", chatId, "options"), PhoneChatOptionList.serializer())
+
+    suspend fun setChatOptions(chatId: String, choices: List<PhoneOptionChoice>): MacResult<PhoneActionOutcome> =
+        action(url("v1", "chats", chatId, "options"), buildJsonObject { put("options", encode(choices)) })
+
     suspend fun repositories(): MacResult<PhoneRepositoryList> =
         get(url("v1", "repositories"), serializer = PhoneRepositoryList.serializer())
 
@@ -70,8 +78,21 @@ class MacClient(private val address: MacAddress, private val http: OkHttpClient)
     suspend fun newChat(workspaceId: String, agent: String): MacResult<PhoneActionOutcome> =
         action(url("v1", "workspaces", workspaceId, "chats"), "agent" to agent)
 
-    suspend fun startTask(repositoryId: String, agent: String, text: String): MacResult<PhoneActionOutcome> =
-        action(url("v1", "tasks"), "repository_id" to repositoryId, "agent" to agent, "text" to text)
+    suspend fun startTask(
+        repositoryId: String,
+        agent: String,
+        text: String,
+        choices: List<PhoneOptionChoice>,
+    ): MacResult<PhoneActionOutcome> =
+        action(
+            url("v1", "tasks"),
+            buildJsonObject {
+                put("repository_id", JsonPrimitive(repositoryId))
+                put("agent", JsonPrimitive(agent))
+                put("text", JsonPrimitive(text))
+                put("options", encode(choices))
+            },
+        )
 
     suspend fun createPr(workspaceId: String): MacResult<PhoneActionOutcome> =
         action(url("v1", "workspaces", workspaceId, "pr"))
@@ -114,17 +135,31 @@ class MacClient(private val address: MacAddress, private val http: OkHttpClient)
             is Reply.Body -> MacResult.Ok(outcome.text)
         }
 
+    private fun encode(choices: List<PhoneOptionChoice>): JsonElement =
+        MacJson.encodeToJsonElement(ListSerializer(PhoneOptionChoice.serializer()), choices)
+
     private suspend fun action(target: HttpUrl, vararg fields: Pair<String, String>): MacResult<PhoneActionOutcome> =
-        post(target, *fields) { body ->
+        action(target, fields(*fields))
+
+    private suspend fun action(target: HttpUrl, json: JsonObject): MacResult<PhoneActionOutcome> =
+        post(target, json) { body ->
             decode(body, PhoneActionOutcome.serializer())
         }
+
+    private fun fields(vararg fields: Pair<String, String>): JsonObject =
+        buildJsonObject { fields.forEach { (key, value) -> put(key, JsonPrimitive(value)) } }
 
     private suspend fun <T> post(
         target: HttpUrl,
         vararg fields: Pair<String, String>,
         read: (String) -> MacResult<T>,
+    ): MacResult<T> = post(target, fields(*fields), read)
+
+    private suspend fun <T> post(
+        target: HttpUrl,
+        json: JsonObject,
+        read: (String) -> MacResult<T>,
     ): MacResult<T> {
-        val json: JsonObject = buildJsonObject { fields.forEach { (key, value) -> put(key, JsonPrimitive(value)) } }
         val request = Request.Builder()
             .url(target)
             .header("X-Mnemonic-Phone", "app")

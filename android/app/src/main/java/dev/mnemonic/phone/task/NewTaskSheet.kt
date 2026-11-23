@@ -4,6 +4,8 @@ import android.widget.Toast
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -51,7 +53,10 @@ import androidx.compose.ui.unit.sp
 import dev.mnemonic.phone.api.MacResult
 import dev.mnemonic.phone.api.PhoneAgent
 import dev.mnemonic.phone.api.PhoneRepository
+import dev.mnemonic.phone.chat.OptionChips
+import dev.mnemonic.phone.chat.orderedChoices
 import dev.mnemonic.phone.home.HomeViewModel
+import dev.mnemonic.phone.ui.DropdownChip
 import dev.mnemonic.phone.ui.ErrorBar
 import dev.mnemonic.phone.ui.MenuRow
 import dev.mnemonic.phone.ui.MnColors
@@ -79,6 +84,7 @@ fun NewTaskSheet(
     var agents by remember { mutableStateOf<List<PhoneAgent>>(emptyList()) }
     var repositoryId by rememberSaveable { mutableStateOf<String?>(null) }
     var agentId by rememberSaveable { mutableStateOf<String?>(null) }
+    var chosenOptions by remember(agentId) { mutableStateOf(emptyMap<String, String>()) }
     var text by rememberSaveable { mutableStateOf("") }
     var error by remember { mutableStateOf<String?>(null) }
     var starting by remember { mutableStateOf(false) }
@@ -119,7 +125,8 @@ fun NewTaskSheet(
         starting = true
         error = null
         scope.launch {
-            val result = viewModel.startTask(chosenRepository.id, chosenAgent.id, text)
+            val choices = orderedChoices(chosenAgent.options, chosenOptions)
+            val result = viewModel.startTask(chosenRepository.id, chosenAgent.id, text, choices)
             starting = false
             when (result) {
                 is MacResult.Ok -> {
@@ -148,9 +155,12 @@ fun NewTaskSheet(
             Modifier.fillMaxWidth().imePadding().navigationBarsPadding().padding(start = 14.dp, end = 14.dp, bottom = 12.dp),
             verticalArrangement = Arrangement.spacedBy(8.dp),
         ) {
-            Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                DropdownChip(repository?.name ?: "Repository", repositories.map { it.id to it.name }) { repositoryId = it }
-                DropdownChip(agent?.label ?: "Agent", agents.map { it.id to it.label }) { agentId = it }
+            Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                DropdownChip(repository?.name ?: "Repository", repositories.map { it.id to it.name }, selectedId = repositoryId) { repositoryId = it }
+                DropdownChip(agent?.label ?: "Agent", agents.map { it.id to it.label }, selectedId = agentId) { agentId = it }
+                OptionChips(agent?.options.orEmpty(), chosenOptions) { option, value ->
+                    chosenOptions = chosenOptions + (option.id to value)
+                }
             }
             error?.let { message ->
                 Box(Modifier.clip(RoundedCornerShape(6.dp))) { ErrorBar(message) }
@@ -192,30 +202,6 @@ fun NewTaskSheet(
                         modifier = Modifier.size(16.dp),
                     )
                 }
-            }
-        }
-    }
-}
-
-@Composable
-private fun DropdownChip(label: String, options: List<Pair<String, String>>, onSelect: (String) -> Unit) {
-    var open by remember { mutableStateOf(false) }
-    val shape = RoundedCornerShape(999.dp)
-    Box {
-        Row(
-            Modifier.clip(shape).background(MnColors.surfaceRaised).border(1.dp, MnColors.border, shape)
-                .clickable { open = true }.padding(start = 10.dp, end = 6.dp, top = 4.dp, bottom = 4.dp),
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            Text(label, fontSize = 11.sp, color = MnColors.textSoft, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.padding(end = 2.dp))
-            Icon(Icons.Rounded.KeyboardArrowDown, contentDescription = null, tint = MnColors.textSecondary, modifier = Modifier.size(14.dp))
-        }
-        MnMenu(expanded = open, onDismissRequest = { open = false }) {
-            for ((id, name) in options) {
-                MenuRow(name, onClick = {
-                    onSelect(id)
-                    open = false
-                })
             }
         }
     }

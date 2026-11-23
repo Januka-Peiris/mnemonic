@@ -29,6 +29,7 @@ use mnemonic_core::services::agent_model_service::{
     self, AgentModel, AgentModelProvider as AgentProvider,
 };
 use mnemonic_core::services::chat_transcript_service::{self, LinkedChat};
+use mnemonic_core::services::phone_server::PhoneOptionChoice;
 use mnemonic_core::services::pr_draft_service::OpenReviewComment;
 use mnemonic_core::services::workspace_script_service::RunCommandPlan;
 use mnemonic_core::services::{
@@ -240,6 +241,12 @@ pub(crate) struct ChatSession {
     /// A new review chat holds its prompt until it has been switched to the
     /// review model.
     awaiting_model: bool,
+    /// Model and effort the phone picked before the agent connected, set
+    /// once it has. Nothing is sent until then, so the first message goes
+    /// to the model picked.
+    pending_choices: Vec<PhoneOptionChoice>,
+    /// Phone choices being set. Nothing is sent meanwhile.
+    choices_in_flight: usize,
     /// Phone messages waiting on a stop of the agent's turn. While any are,
     /// nothing is sent, because a stopped turn reads as idle before the stop
     /// finishes and a later message would otherwise overtake them.
@@ -2876,6 +2883,8 @@ impl WorkspaceView {
             },
             app_messages,
             awaiting_model: record.is_review && record.acp_session_id.is_none(),
+            pending_choices: Vec::new(),
+            choices_in_flight: 0,
             phone_sends_waiting_on_cancel: 0,
             thread_subscriptions: Vec::new(),
             _subscriptions: vec![observation, fork_requests],
@@ -3058,6 +3067,11 @@ impl WorkspaceView {
             if chat.awaiting_model {
                 self.select_review_model(view_id, thread, cx);
             } else {
+                let choices = std::mem::take(&mut chat.pending_choices);
+                if !choices.is_empty() {
+                    self.apply_choices(view_id, thread, choices, cx)
+                        .detach_and_log_err(cx);
+                }
                 self.flush_pending(view_id, cx);
             }
         }
@@ -3616,7 +3630,11 @@ impl WorkspaceView {
         else {
             return;
         };
-        if chat.awaiting_model || chat.phone_sends_waiting_on_cancel > 0 {
+        if chat.awaiting_model
+            || chat.phone_sends_waiting_on_cancel > 0
+            || !chat.pending_choices.is_empty()
+            || chat.choices_in_flight > 0
+        {
             return;
         }
         let Some(text) = chat.pending_messages.take_next() else {
@@ -3718,6 +3736,101 @@ impl WorkspaceView {
 
     pub(crate) fn window_handle(&self) -> AnyWindowHandle {
         self.window_handle
+    }
+
+    /// Sets a chat's model or effort from the phone. A chat whose agent
+    /// hasn't connected gets them once it has, and resolves to None.
+    pub(crate) fn set_chat_options(
+        &mut self,
+        record_id: &str,
+        choices: Vec<PhoneOptionChoice>,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<Option<Vec<acp::SessionConfigOption>>, String>> {
+        let Some(chat) = self.chat_by_record(record_id) else {
+            return Task::ready(Err("That chat isn't open.".to_string()));
+        };
+        let view_id = chat.view.entity_id();
+        let observed_thread = chat
+            .view
+            .read(cx)
+            .root_thread(cx)
+            .filter(|thread| chat.observed_thread == Some(thread.entity_id()));
+        if let Some(thread) = observed_thread {
+            let applying = self.apply_choices(view_id, thread, choices, cx);
+            return cx.background_spawn(async move { applying.await.map(Some) });
+        }
+        let Some(chat) = self
+            .chat_index(view_id)
+            .and_then(|index| self.sessions.get_mut(index))
+            .and_then(WorkspaceSession::chat_mut)
+        else {
+            return Task::ready(Err("That chat isn't open.".to_string()));
+        };
+        for choice in choices {
+            chat.pending_choices
+                .retain(|pending| pending.config_id != choice.config_id);
+            chat.pending_choices.push(choice);
+        }
+        Task::ready(Ok(None))
+    }
+
+    /// Sets the choices in order, holding the chat's messages until done.
+    fn apply_choices(
+        &mut self,
+        view_id: EntityId,
+        thread: Entity<acp_thread::AcpThread>,
+        choices: Vec<PhoneOptionChoice>,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<Vec<acp::SessionConfigOption>, String>> {
+        let Some(config_options) = session_config_options(&thread, cx) else {
+            return Task::ready(Err(
+                "This agent has no model or effort to choose".to_string()
+            ));
+        };
+        let Some(chat) = self
+            .chat_index(view_id)
+            .and_then(|index| self.sessions.get_mut(index))
+            .and_then(WorkspaceSession::chat_mut)
+        else {
+            return Task::ready(Err("That chat isn't open.".to_string()));
+        };
+        chat.choices_in_flight += 1;
+        cx.spawn(async move |this, cx| {
+            let mut current = config_options.config_options();
+            let mut result = Ok(());
+            for choice in choices {
+                if let Err(err) = check_config_choice(&current, &choice) {
+                    result = Err(err);
+                    break;
+                }
+                let setting = cx.update(|cx| {
+                    config_options.set_config_option(
+                        acp::SessionConfigId::new(choice.config_id.clone()),
+                        acp::SessionConfigValueId::new(choice.value.clone()),
+                        cx,
+                    )
+                });
+                match setting.await {
+                    Ok(options) => current = options,
+                    Err(err) => {
+                        result = Err(format!("The agent refused the change: {err}"));
+                        break;
+                    }
+                }
+            }
+            this.update(cx, |this, cx| {
+                if let Some(chat) = this
+                    .chat_index(view_id)
+                    .and_then(|index| this.sessions.get_mut(index))
+                    .and_then(WorkspaceSession::chat_mut)
+                {
+                    chat.choices_in_flight = chat.choices_in_flight.saturating_sub(1);
+                }
+                this.flush_pending(view_id, cx);
+            })
+            .log_err();
+            result.map(|()| current)
+        })
     }
 
     /// Stops a chat's agent the way its own Stop button does. Always on the
@@ -5133,6 +5246,93 @@ pub(crate) fn find_workspace_window(workspace_id: &str, cx: &App) -> Option<Enti
                 .any(|host| host.read(cx).views.contains_key(workspace_id))
         })
     })
+}
+
+fn session_config_options(
+    thread: &Entity<acp_thread::AcpThread>,
+    cx: &App,
+) -> Option<Rc<dyn acp_thread::AgentSessionConfigOptions>> {
+    let thread = thread.read(cx);
+    thread
+        .connection()
+        .session_config_options(thread.session_id(), cx)
+}
+
+/// A select option's values, groups flattened.
+pub(crate) fn config_option_values(
+    option: &acp::SessionConfigOption,
+) -> Vec<&acp::SessionConfigSelectOption> {
+    match &option.kind {
+        acp::SessionConfigKind::Select(select) => match &select.options {
+            acp::SessionConfigSelectOptions::Ungrouped(options) => options.iter().collect(),
+            acp::SessionConfigSelectOptions::Grouped(groups) => groups
+                .iter()
+                .flat_map(|group| group.options.iter())
+                .collect(),
+            _ => Vec::new(),
+        },
+        _ => Vec::new(),
+    }
+}
+
+fn check_config_choice(
+    options: &[acp::SessionConfigOption],
+    choice: &PhoneOptionChoice,
+) -> Result<(), String> {
+    let option = options
+        .iter()
+        .find(|option| option.id.0.as_ref() == choice.config_id)
+        .ok_or_else(|| format!("This agent has no {} setting", choice.config_id))?;
+    if config_option_values(option)
+        .iter()
+        .any(|value| value.value.0.as_ref() == choice.value)
+    {
+        Ok(())
+    } else {
+        Err(format!(
+            "{} {} isn't offered here",
+            option.name, choice.value
+        ))
+    }
+}
+
+/// Every connected chat's record id, agent and options, for the phone.
+pub(crate) fn open_chat_options(
+    cx: &App,
+) -> Vec<(String, ChatAgent, Vec<acp::SessionConfigOption>)> {
+    let mut found = Vec::new();
+    for window in open_windows(cx) {
+        for pane in window.read(cx).panes() {
+            for host in pane
+                .read(cx)
+                .items()
+                .filter_map(|item| item.downcast::<WorkspaceHost>())
+            {
+                for view in host.read(cx).views.values() {
+                    for chat in view
+                        .read(cx)
+                        .sessions
+                        .iter()
+                        .filter_map(WorkspaceSession::chat)
+                    {
+                        let options = chat
+                            .view
+                            .read(cx)
+                            .root_thread(cx)
+                            .and_then(|thread| session_config_options(&thread, cx));
+                        if let Some(options) = options {
+                            found.push((
+                                chat.record_id.clone(),
+                                chat.agent,
+                                options.config_options(),
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    found
 }
 
 /// Finds a loaded chat by its record id, in whichever window holds it.
@@ -7124,6 +7324,141 @@ pub(crate) mod tests {
             })
         });
         (stops, subscription)
+    }
+
+    /// A model option whose changes hang until the test lets them through.
+    #[derive(Clone)]
+    struct GatedConfigOptions(Arc<std::sync::Mutex<GatedState>>);
+
+    struct GatedState {
+        options: Vec<acp::SessionConfigOption>,
+        gates: Vec<futures::channel::oneshot::Sender<()>>,
+    }
+
+    impl GatedConfigOptions {
+        fn new() -> Self {
+            let model = acp::SessionConfigOption::select(
+                "model",
+                "Model",
+                "opus",
+                vec![
+                    acp::SessionConfigSelectOption::new("opus", "Opus"),
+                    acp::SessionConfigSelectOption::new("sonnet", "Sonnet"),
+                ],
+            )
+            .category(acp::SessionConfigOptionCategory::Model);
+            Self(Arc::new(std::sync::Mutex::new(GatedState {
+                options: vec![model],
+                gates: Vec::new(),
+            })))
+        }
+
+        fn state(&self) -> std::sync::MutexGuard<'_, GatedState> {
+            self.0
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+        }
+
+        fn open_gates(&self) {
+            for gate in self.state().gates.drain(..) {
+                gate.send(()).ok();
+            }
+        }
+
+        fn current_model(&self) -> Option<String> {
+            match &self.state().options.first()?.kind {
+                acp::SessionConfigKind::Select(select) => Some(select.current_value.0.to_string()),
+                _ => None,
+            }
+        }
+    }
+
+    impl acp_thread::AgentSessionConfigOptions for GatedConfigOptions {
+        fn config_options(&self) -> Vec<acp::SessionConfigOption> {
+            self.state().options.clone()
+        }
+
+        fn set_config_option(
+            &self,
+            _config_id: acp::SessionConfigId,
+            value: acp::SessionConfigValueId,
+            cx: &mut App,
+        ) -> Task<anyhow::Result<Vec<acp::SessionConfigOption>>> {
+            let (gate, opened) = futures::channel::oneshot::channel();
+            self.state().gates.push(gate);
+            let this = self.clone();
+            cx.foreground_executor().spawn(async move {
+                opened.await?;
+                let mut state = this.state();
+                for option in state.options.iter_mut() {
+                    if let acp::SessionConfigKind::Select(select) = &mut option.kind {
+                        select.current_value = value.clone();
+                    }
+                }
+                Ok(state.options.clone())
+            })
+        }
+    }
+
+    #[gpui::test]
+    async fn phone_model_is_set_before_the_first_message(cx: &mut gpui::TestAppContext) {
+        let (workspace, _state, _data_dir, cx) = window_showing_workspace_a(cx).await;
+        let view_a = workspace
+            .read_with(cx, host_of)
+            .and_then(|host| host.read_with(cx, |host, _| host.views.get("ws-a").cloned()))
+            .expect("workspace A is open");
+        let config_options = GatedConfigOptions::new();
+        let connection = acp_thread::StubAgentConnection::new().with_session_config_options({
+            let config_options = config_options.clone();
+            move || Rc::new(config_options.clone())
+        });
+        let record = ChatSessionRecord {
+            id: "stub-chat".to_string(),
+            workspace_id: "ws-a".to_string(),
+            agent: "stub-agent".to_string(),
+            title: "Stub".to_string(),
+            acp_session_id: None,
+            is_review: false,
+            is_primary: false,
+            position: 1,
+        };
+        let server = Rc::new(StubServer(connection));
+        let setting = view_a.update_in(cx, |view, window, cx| {
+            view.open_chat_with_server(record, server, None, false, window, cx);
+            let setting = view.set_chat_options(
+                "stub-chat",
+                vec![PhoneOptionChoice {
+                    config_id: "model".to_string(),
+                    value: "sonnet".to_string(),
+                }],
+                cx,
+            );
+            view.send_to_chat("stub-chat", "Start".to_string(), cx);
+            setting
+        });
+        cx.run_until_parked();
+        assert_eq!(setting.await, Ok(None), "set once the agent connects");
+        let thread = view_a
+            .read_with(cx, |view, cx| {
+                view.chat_by_record("stub-chat")?
+                    .view
+                    .read(cx)
+                    .root_thread(cx)
+            })
+            .expect("the stub chat is connected");
+        assert_eq!(
+            cx.read(|cx| user_messages(&thread, cx)),
+            Vec::<String>::new(),
+            "the first message waits while the model is being set"
+        );
+
+        config_options.open_gates();
+        cx.run_until_parked();
+        assert_eq!(config_options.current_model().as_deref(), Some("sonnet"));
+        assert_eq!(
+            cx.read(|cx| user_messages(&thread, cx)),
+            vec!["Start".to_string()]
+        );
     }
 
     #[gpui::test]

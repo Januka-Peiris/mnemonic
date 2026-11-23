@@ -156,6 +156,9 @@ select, textarea {
 }
 #task-text { min-height: 180px; resize: vertical; }
 .form-row { display: flex; gap: 8px; justify-content: flex-end; }
+.option-row { display: flex; gap: 8px; overflow-x: auto; }
+.option-row select { flex: 0 0 auto; width: auto; padding: 6px 8px; font-size: 14px; }
+#chat-options { margin-bottom: 8px; }
 #transcript { padding: 8px 12px; }
 .message { margin: 10px 0; word-break: break-word; }
 .message .who { font-size: 12px; font-weight: 600; color: var(--muted); }
@@ -276,6 +279,7 @@ button.listening { border-color: var(--attention); color: var(--attention); }
     <label class="field">Agent
       <select id="task-agent"></select>
     </label>
+    <div class="option-row" id="task-options"></div>
     <button id="task-start" class="primary">Start</button>
   </div>
 </main>
@@ -286,6 +290,7 @@ button.listening { border-color: var(--attention); color: var(--attention); }
   <div id="chat-status"></div>
 </main>
 <footer id="chat-footer" class="hidden">
+  <div class="option-row hidden" id="chat-options"></div>
   <div class="quick-replies" id="quick-replies"></div>
   <div class="composer">
     <textarea id="message" rows="1" placeholder="Message..."></textarea>
@@ -574,6 +579,9 @@ const app = {
   prBusy: false,
   // Workspace id to { at, sawWorking, stoppedAt } for a sent Create PR.
   prRequested: new Map(),
+  taskAgents: [],
+  // Agent id to a Map of config id to the value chosen for a new task.
+  taskChoices: new Map(),
 };
 
 function findChat(chatId) {
@@ -601,6 +609,7 @@ async function loadWorkspaces() {
     renderHome();
     renderChatHeader();
     renderPrButton();
+    if (app.chat) loadChatOptions(app.chat);
   } catch (error) {
     showError(error);
   }
@@ -913,12 +922,21 @@ function startChat(chatId) {
     generating: false,
     plan: [],
     loaded: false,
+    options: [],
+    optionsKey: "",
+    // Config id to a value sent before the chat's agent connected on the Mac.
+    chosen: new Map(),
+    optionsBusy: false,
+    optionsLoading: false,
+    agentOptions: null,
   };
   app.pr = null;
   element("transcript").replaceChildren();
   element("prompts").replaceChildren();
   element("plan").replaceChildren();
   element("chat-status").textContent = "Loading...";
+  renderChatOptions();
+  loadChatOptions(app.chat);
   element("message").value = "";
   resizeComposer();
   element("stop").disabled = true;
@@ -1395,6 +1413,121 @@ function fillSelect(select, items, label) {
   if (items.some((item) => item.id === previous)) select.value = previous;
 }
 
+function optionSelect(option, selected, onChange) {
+  const select = make("select");
+  select.setAttribute("aria-label", option.name);
+  if (!option.values.some((value) => value.id === selected)) {
+    const fallback = make("option", "", option.name + ": default");
+    fallback.value = "";
+    select.appendChild(fallback);
+  }
+  for (const value of option.values) {
+    const item = make("option", "", value.name);
+    item.value = value.id;
+    select.appendChild(item);
+  }
+  select.value = option.values.some((value) => value.id === selected) ? selected : "";
+  select.addEventListener("change", () => {
+    if (select.value) onChange(select.value);
+  });
+  return select;
+}
+
+// Model first: the efforts an agent offers can depend on the model.
+function orderedChoices(options, chosen) {
+  return [...options]
+    .sort((left, right) => (left.kind === "model" ? 0 : 1) - (right.kind === "model" ? 0 : 1))
+    .filter((option) => chosen.has(option.id))
+    .map((option) => ({ config_id: option.id, value: chosen.get(option.id) }));
+}
+
+function taskChoices(agentId) {
+  if (!app.taskChoices.has(agentId)) app.taskChoices.set(agentId, new Map());
+  return app.taskChoices.get(agentId);
+}
+
+function renderTaskOptions() {
+  const agentId = element("task-agent").value;
+  const agent = app.taskAgents.find((candidate) => candidate.id === agentId);
+  const chosen = taskChoices(agentId);
+  element("task-options").replaceChildren(
+    ...((agent && agent.options) || []).map((option) =>
+      optionSelect(option, chosen.get(option.id), (value) => chosen.set(option.id, value)),
+    ),
+  );
+}
+
+async function loadChatOptions(chat) {
+  if (chat.optionsBusy || chat.optionsLoading) return;
+  chat.optionsLoading = true;
+  let options;
+  let live;
+  try {
+    options = (await getJson("/v1/chats/" + encodeURIComponent(chat.id) + "/options", chat.abort.signal)).options || [];
+    live = options.length > 0;
+    if (!live) {
+      // The chat's agent hasn't connected on the Mac yet, so offer what the agent offered before.
+      const found = findChat(chat.id);
+      if (!found) return;
+      if (!chat.agentOptions) {
+        chat.agentOptions = new Map((await loadAgents()).map((agent) => [agent.label, agent.options || []]));
+      }
+      options = chat.agentOptions.get(found.chat.agent) || [];
+    }
+  } catch (error) {
+    // The workspace poll already reports a Mac that can't be reached.
+    return;
+  } finally {
+    chat.optionsLoading = false;
+  }
+  if (chat.optionsBusy || app.chat !== chat) return;
+  const key = JSON.stringify(options);
+  if (key === chat.optionsKey) return;
+  chat.optionsKey = key;
+  chat.options = options;
+  if (live) chat.chosen.clear();
+  renderChatOptions();
+}
+
+function renderChatOptions() {
+  const chat = app.chat;
+  const row = element("chat-options");
+  const options = chat ? chat.options : [];
+  row.classList.toggle("hidden", !options.length);
+  row.replaceChildren(
+    ...options.map((option) => {
+      const selected = chat.chosen.has(option.id) ? chat.chosen.get(option.id) : option.current;
+      const select = optionSelect(option, selected, (value) => setChatOption(chat, option, value));
+      select.disabled = chat.optionsBusy;
+      return select;
+    }),
+  );
+}
+
+async function setChatOption(chat, option, value) {
+  if (chat.optionsBusy) return;
+  chat.optionsBusy = true;
+  renderChatOptions();
+  try {
+    const outcome = await post("/v1/chats/" + encodeURIComponent(chat.id) + "/options", {
+      options: [{ config_id: option.id, value }],
+    });
+    if (outcome.options) {
+      chat.options = outcome.options;
+      chat.optionsKey = JSON.stringify(outcome.options);
+      chat.chosen.clear();
+    } else {
+      // Set on the Mac once the chat's agent connects.
+      chat.chosen.set(option.id, value);
+    }
+  } catch (error) {
+    showError(error);
+  } finally {
+    chat.optionsBusy = false;
+    if (app.chat === chat) renderChatOptions();
+  }
+}
+
 async function showNewTask() {
   const start = element("task-start");
   start.disabled = true;
@@ -1405,6 +1538,8 @@ async function showNewTask() {
     ]);
     fillSelect(element("task-repository"), repositories, (repository) => repository.name);
     fillSelect(element("task-agent"), agents, (agent) => agent.label);
+    app.taskAgents = agents;
+    renderTaskOptions();
     if (!repositories.length) {
       showError(new RequestError("No repositories are added in Mnemonic on the Mac"));
     } else if (!agents.length) {
@@ -1429,7 +1564,9 @@ async function startTask() {
   start.disabled = true;
   start.textContent = "Starting...";
   try {
-    const outcome = await post("/v1/tasks", { repository_id: repositoryId, agent, text });
+    const offered = app.taskAgents.find((candidate) => candidate.id === agent);
+    const options = orderedChoices((offered && offered.options) || [], taskChoices(agent));
+    const outcome = await post("/v1/tasks", { repository_id: repositoryId, agent, text, options });
     element("task-text").value = "";
     hideError();
     if (outcome.chat_id) {
@@ -1652,6 +1789,7 @@ element("new-task").addEventListener("click", () => {
   location.hash = "new";
 });
 element("task-start").addEventListener("click", startTask);
+element("task-agent").addEventListener("change", renderTaskOptions);
 element("send").addEventListener("click", sendMessage);
 element("stop").addEventListener("click", stopChat);
 element("diff").addEventListener("click", showDiff);

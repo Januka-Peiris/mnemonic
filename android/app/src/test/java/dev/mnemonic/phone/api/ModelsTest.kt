@@ -54,4 +54,15 @@ class ModelsTest {
         assertEquals("chat-9", outcome.chatId)
         assertEquals("ws-9", outcome.workspaceId)
     }
+
+    @Test
+    fun chatOptionsDecode() {
+        val options = MacJson.decodeFromString<PhoneChatOptionList>(Fixtures.wire("chat_options.json")).options
+        assertEquals(listOf("model", "effort"), options.map { it.kind })
+        assertEquals("opus", options[0].current)
+        assertEquals(listOf("opus", "sonnet"), options[0].values.map { it.id })
+        val offered = MacJson.decodeFromString<PhoneAgentList>(Fixtures.wire("agents.json")).agents.single().options.single()
+        assertEquals("model", offered.id)
+        assertEquals(null, offered.current)
+    }
 }

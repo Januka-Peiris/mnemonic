@@ -144,7 +144,26 @@ data class PhonePrStatus(
 )
 
 @Serializable
-data class PhoneAgent(val id: String, val label: String)
+data class PhoneChatOptionValue(val id: String, val name: String)
+
+/** A chat's model or effort. [current] is null in an agent's list, which no chat is using. */
+@Serializable
+data class PhoneChatOption(
+    val id: String,
+    val name: String,
+    val kind: String = "",
+    val current: String? = null,
+    val values: List<PhoneChatOptionValue> = emptyList(),
+)
+
+@Serializable
+data class PhoneChatOptionList(val options: List<PhoneChatOption> = emptyList())
+
+@Serializable
+data class PhoneOptionChoice(@SerialName("config_id") val configId: String, val value: String)
+
+@Serializable
+data class PhoneAgent(val id: String, val label: String, val options: List<PhoneChatOption> = emptyList())
 
 @Serializable
 data class PhoneAgentList(val agents: List<PhoneAgent> = emptyList())
@@ -160,4 +179,5 @@ data class PhoneActionOutcome(
     @SerialName("chat_id") val chatId: String? = null,
     @SerialName("workspace_id") val workspaceId: String? = null,
     val message: String? = null,
+    val options: List<PhoneChatOption>? = null,
 )

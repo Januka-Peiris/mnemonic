@@ -18,7 +18,7 @@ use gpui::{AnyWindowHandle, App, AppContext as _, Context, Entity, Global, Subsc
 use mnemonic_core::models::{DiscoveredRepository, WorkspaceDetail, WorkspacePrStatus};
 use mnemonic_core::repositories::{
     push_device_repository, push_subscription_repository, repository_repository,
-    workspace_repository,
+    settings_repository, workspace_repository,
 };
 use mnemonic_core::services::fcm_service::{self, AccessTokenCache, FcmOutcome, ServiceAccount};
 use mnemonic_core::services::ntfy_service::{
@@ -26,8 +26,9 @@ use mnemonic_core::services::ntfy_service::{
     should_notify,
 };
 use mnemonic_core::services::phone_server::{
-    PhoneAction, PhoneActionHandler, PhoneActionOutcome, PhoneAgent, PhonePrStatus,
-    PhoneRepository, PhoneServer, PhoneServerConfig, PhoneSources,
+    PhoneAction, PhoneActionHandler, PhoneActionOutcome, PhoneAgent, PhoneChatOption,
+    PhoneChatOptionKind, PhoneChatOptionValue, PhoneOptionChoice, PhonePrStatus, PhoneRepository,
+    PhoneServer, PhoneServerConfig, PhoneSources,
 };
 use mnemonic_core::services::pr_draft_service;
 use mnemonic_core::services::team_files_service::TEAM_COPY_SOURCE;
@@ -49,8 +50,8 @@ use crate::chat_feed::{
 use crate::team::{answer_permission, show_step_in_notice, wait_for_reply, workspace_diff_source};
 use crate::workspace_detail_panel::request_pr;
 use crate::workspace_view::{
-    ChatAgent, OpenChat, WorkspaceHost, WorkspaceView, find_open_chat, find_workspace_window,
-    open_window_handles,
+    ChatAgent, OpenChat, WorkspaceHost, WorkspaceView, config_option_values, find_open_chat,
+    find_workspace_window, open_chat_options, open_window_handles,
 };
 
 const DEFAULT_NOTIFY_AFTER_IDLE_MINUTES: u32 = 5;
@@ -216,9 +217,13 @@ pub(crate) struct PhoneShare {
     action_task: Option<Task<()>>,
     /// When each alert last went out.
     last_notified: HashMap<AlertKey, Instant>,
-    /// The agents new chats may use, kept here for the server's request
-    /// threads, which can't read the settings.
-    enabled_agents: Arc<Mutex<Vec<PhoneAgent>>>,
+    /// What the phone may choose, kept here for the server's request
+    /// threads, which can't read the settings or the chats.
+    choices: Arc<Mutex<PhoneChoices>>,
+    /// Each agent's model and effort, as its chats last offered them, so a
+    /// new chat can be started with them before any is connected. Loaded
+    /// from the database on first use.
+    agent_options: Option<HashMap<String, Vec<PhoneChatOption>>>,
     app_alerts: Arc<AppAlerts>,
     _app_alerts_task: Task<()>,
     _feed_subscription: Subscription,
@@ -297,7 +302,8 @@ impl PhoneShare {
             tailscale_watch: None,
             action_task: None,
             last_notified: HashMap::new(),
-            enabled_agents: Arc::default(),
+            choices: Arc::default(),
+            agent_options: None,
             app_alerts: Arc::new(AppAlerts {
                 key_path: Mutex::new(None),
                 page_url: Mutex::new(None),
@@ -451,7 +457,7 @@ impl PhoneShare {
         self.stop();
         self.port = Some(port);
         let hub = self.feed.read(cx).hub().clone();
-        let enabled_agents = self.enabled_agents.clone();
+        let choices = self.choices.clone();
         let app_alerts = self.app_alerts.clone();
         let (action_sender, mut action_receiver) = mpsc::unbounded::<PendingPhoneAction>();
         self.action_task = Some(cx.spawn(async move |_, cx| {
@@ -481,12 +487,10 @@ impl PhoneShare {
                 let attempt = cx
                     .background_spawn({
                         let hub = hub.clone();
-                        let enabled_agents = enabled_agents.clone();
+                        let choices = choices.clone();
                         let action_sender = action_sender.clone();
                         let app_alerts = app_alerts.clone();
-                        async move {
-                            start_server(port, hub, enabled_agents, app_alerts, action_sender)
-                        }
+                        async move { start_server(port, hub, choices, app_alerts, action_sender) }
                     })
                     .await;
                 let started = this.update(cx, |this, cx| {
@@ -651,20 +655,128 @@ impl PhoneShare {
         if self.server.is_none() {
             return Vec::new();
         }
-        *self
-            .enabled_agents
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = ChatAgent::enabled(cx)
-            .into_iter()
-            .map(|agent| PhoneAgent {
-                id: agent.agent_id().to_string(),
-                label: agent.label().to_string(),
-            })
-            .collect();
+        self.publish_choices(cx);
         self.feed.update(cx, |feed, cx| {
             feed.publish(records, &|_| WorkspaceFlags::default(), cx)
         })
     }
+}
+
+impl PhoneShare {
+    fn publish_choices(&mut self, cx: &App) {
+        let agent_options = self.agent_options.get_or_insert_with(load_agent_options);
+        let mut chat_options = HashMap::new();
+        let mut agent_options_changed = false;
+        for (record_id, agent, options) in open_chat_options(cx) {
+            let options = phone_chat_options(&options);
+            if options.is_empty() {
+                continue;
+            }
+            let offered: Vec<PhoneChatOption> = options
+                .iter()
+                .map(|option| PhoneChatOption {
+                    current: None,
+                    ..option.clone()
+                })
+                .collect();
+            let known = agent_options.get(agent.agent_id());
+            if known != Some(&offered) {
+                agent_options.insert(agent.agent_id().to_string(), offered);
+                agent_options_changed = true;
+            }
+            chat_options.insert(record_id, options);
+        }
+        if agent_options_changed {
+            save_agent_options(agent_options.clone(), cx);
+        }
+        let agents = ChatAgent::enabled(cx)
+            .into_iter()
+            .map(|agent| PhoneAgent {
+                id: agent.agent_id().to_string(),
+                label: agent.label().to_string(),
+                options: agent_options
+                    .get(agent.agent_id())
+                    .cloned()
+                    .unwrap_or_default(),
+            })
+            .collect();
+        *lock(&self.choices) = PhoneChoices {
+            agents,
+            chat_options,
+        };
+    }
+}
+
+/// What the phone may choose: the agents for new chats, and each connected
+/// chat's model and effort.
+#[derive(Default)]
+struct PhoneChoices {
+    agents: Vec<PhoneAgent>,
+    chat_options: HashMap<String, Vec<PhoneChatOption>>,
+}
+
+const AGENT_OPTIONS_KEY: &str = "phone_agent_options";
+
+fn load_agent_options() -> HashMap<String, Vec<PhoneChatOption>> {
+    let Some(state) = mnemonic_bridge::mnemonic_state_cloned() else {
+        return HashMap::new();
+    };
+    match settings_repository::get_value(&state.db, AGENT_OPTIONS_KEY) {
+        Ok(Some(json)) => serde_json::from_str(&json).unwrap_or_else(|err| {
+            log::error!("Couldn't read {AGENT_OPTIONS_KEY}: {err}");
+            HashMap::new()
+        }),
+        Ok(None) => HashMap::new(),
+        Err(err) => {
+            log::error!("Couldn't read {AGENT_OPTIONS_KEY}: {err}");
+            HashMap::new()
+        }
+    }
+}
+
+fn save_agent_options(options: HashMap<String, Vec<PhoneChatOption>>, cx: &App) {
+    let Some(state) = mnemonic_bridge::mnemonic_state_cloned() else {
+        return;
+    };
+    cx.background_spawn(async move {
+        let saved = serde_json::to_string(&options)
+            .map_err(|err| err.to_string())
+            .and_then(|json| settings_repository::set_value(&state.db, AGENT_OPTIONS_KEY, &json));
+        if let Err(err) = saved {
+            log::error!("Couldn't save {AGENT_OPTIONS_KEY}: {err}");
+        }
+    })
+    .detach();
+}
+
+/// The chat's model and effort, the only options the phone changes.
+fn phone_chat_options(options: &[acp::SessionConfigOption]) -> Vec<PhoneChatOption> {
+    options
+        .iter()
+        .filter_map(|option| {
+            let kind = match option.category.as_ref()? {
+                acp::SessionConfigOptionCategory::Model => PhoneChatOptionKind::Model,
+                acp::SessionConfigOptionCategory::ThoughtLevel => PhoneChatOptionKind::Effort,
+                _ => return None,
+            };
+            let acp::SessionConfigKind::Select(select) = &option.kind else {
+                return None;
+            };
+            Some(PhoneChatOption {
+                id: option.id.0.to_string(),
+                name: option.name.clone(),
+                kind,
+                current: Some(select.current_value.0.to_string()),
+                values: config_option_values(option)
+                    .into_iter()
+                    .map(|value| PhoneChatOptionValue {
+                        id: value.value.0.to_string(),
+                        name: value.name.clone(),
+                    })
+                    .collect(),
+            })
+        })
+        .collect()
 }
 
 fn page_url(me: &TailscaleSelf, port: u16, https: bool) -> String {
@@ -718,7 +830,7 @@ struct StartedServer {
 fn start_server(
     port: u16,
     hub: TeamShareHub,
-    enabled_agents: Arc<Mutex<Vec<PhoneAgent>>>,
+    choices: Arc<Mutex<PhoneChoices>>,
     app_alerts: Arc<AppAlerts>,
     action_sender: mpsc::UnboundedSender<PendingPhoneAction>,
 ) -> Result<StartedServer, String> {
@@ -747,7 +859,8 @@ fn start_server(
         wait_for_reply(&reply_receiver, &claimed, timeout)
     });
     let start = |tls: Option<TlsFiles>| {
-        let enabled_agents = enabled_agents.clone();
+        let agent_choices = choices.clone();
+        let chat_choices = choices.clone();
         let app_alerts = app_alerts.clone();
         PhoneServer::start(
             PhoneServerConfig {
@@ -765,11 +878,9 @@ fn start_server(
             Arc::new(TailscaleWhois::default()),
             PhoneSources {
                 diff: workspace_diff_source(),
-                agents: Arc::new(move || {
-                    enabled_agents
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .clone()
+                agents: Arc::new(move || lock(&agent_choices).agents.clone()),
+                chat_options: Arc::new(move |chat_id| {
+                    lock(&chat_choices).chat_options.get(chat_id).cloned()
                 }),
                 repositories: Arc::new(phone_repositories),
                 pr_status: Arc::new(phone_pr_status),
@@ -1280,6 +1391,7 @@ fn run_phone_action(
             option_id,
         } => Task::ready(answer_chat_permission(chat_id, tool_call_id, option_id, cx)),
         PhoneAction::Message { chat_id, text } => send_message(chat_id, text, cx),
+        PhoneAction::SetChatOptions { chat_id, choices } => set_chat_options(chat_id, choices, cx),
         PhoneAction::NewChat {
             workspace_id,
             agent,
@@ -1289,7 +1401,8 @@ fn run_phone_action(
             repository_id,
             agent,
             text,
-        } => start_task(repository_id, agent, text, cx),
+            choices,
+        } => start_task(repository_id, agent, text, choices, cx),
         PhoneAction::Merge { workspace_id, head } => merge_pr(workspace_id, head, cx),
         PhoneAction::Archive { workspace_id } => archive_workspace(workspace_id, cx),
     }
@@ -1431,6 +1544,36 @@ fn open_chat_for_message(chat_id: &str, cx: &mut App) -> Result<OpenChat, TeamAc
     find_open_chat(chat_id, cx).ok_or_else(closed)
 }
 
+/// Sets the chat's model or effort, opening its workspace first if it
+/// isn't loaded on the Mac.
+fn set_chat_options(
+    chat_id: String,
+    choices: Vec<PhoneOptionChoice>,
+    cx: &mut App,
+) -> Task<Result<PhoneActionOutcome, TeamActionError>> {
+    let chat = match open_chat_for_message(&chat_id, cx) {
+        Ok(chat) => chat,
+        Err(err) => return Task::ready(Err(err)),
+    };
+    let setting = chat
+        .view
+        .update(cx, |view, cx| view.set_chat_options(&chat_id, choices, cx));
+    cx.spawn(async move |cx| {
+        let options = setting.await.map_err(TeamActionError::Invalid)?;
+        cx.update(|cx| {
+            show_phone_notice(
+                &chat.window,
+                format!("changed the model or effort in {}", chat.title),
+                cx,
+            )
+        });
+        Ok(PhoneActionOutcome {
+            options: options.map(|options| phone_chat_options(&options)),
+            ..PhoneActionOutcome::default()
+        })
+    })
+}
+
 fn start_new_chat(
     workspace_id: String,
     agent: String,
@@ -1507,6 +1650,7 @@ fn start_task(
     repository_id: String,
     agent: String,
     text: String,
+    choices: Vec<PhoneOptionChoice>,
     cx: &mut App,
 ) -> Task<Result<PhoneActionOutcome, TeamActionError>> {
     let (created, repository_name) = match create_task_workspace(&repository_id, &agent, cx) {
@@ -1516,8 +1660,11 @@ fn start_task(
     cx.spawn(async move |cx| {
         let (detail, chat_id) = created.await.map_err(TeamActionError::Failed)?;
         let workspace_id = detail.summary.id;
-        cx.update(|cx| {
+        let (setting, outcome) = cx.update(|cx| {
             let (window, view) = open_workspace_for_phone(&workspace_id, cx)?;
+            // Set first, so the message waits for the model and effort.
+            let setting = (!choices.is_empty())
+                .then(|| view.update(cx, |view, cx| view.set_chat_options(&chat_id, choices, cx)));
             let sent = view.update(cx, |view, cx| view.send_to_chat(&chat_id, text, cx));
             if !sent {
                 return Err(TeamActionError::Failed(
@@ -1525,12 +1672,27 @@ fn start_task(
                 ));
             }
             show_phone_notice(&window, format!("started a task in {repository_name}"), cx);
-            Ok(PhoneActionOutcome {
-                chat_id: Some(chat_id),
-                workspace_id: Some(workspace_id),
-                message: None,
-            })
-        })
+            Ok((
+                setting,
+                PhoneActionOutcome {
+                    chat_id: Some(chat_id),
+                    workspace_id: Some(workspace_id),
+                    ..PhoneActionOutcome::default()
+                },
+            ))
+        })?;
+        match setting {
+            Some(setting) => match setting.await {
+                Ok(_) => Ok(outcome),
+                Err(err) => Ok(PhoneActionOutcome {
+                    message: Some(format!(
+                        "Started, but the model or effort wasn't set: {err}"
+                    )),
+                    ..outcome
+                }),
+            },
+            None => Ok(outcome),
+        }
     })
 }
 
@@ -1801,6 +1963,7 @@ mod tests {
                 repository_id: "repo-1".to_string(),
                 agent: "claude".to_string(),
                 text: "Fix the login page".to_string(),
+                choices: Vec::new(),
             },
         ];
         for action in needs_a_window {

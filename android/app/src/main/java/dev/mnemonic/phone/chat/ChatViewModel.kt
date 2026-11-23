@@ -7,6 +7,8 @@ import dev.mnemonic.phone.api.MacClient
 import dev.mnemonic.phone.api.MacResult
 import dev.mnemonic.phone.api.PermissionOption
 import dev.mnemonic.phone.api.PhoneAgent
+import dev.mnemonic.phone.api.PhoneChatOption
+import dev.mnemonic.phone.api.PhoneOptionChoice
 import dev.mnemonic.phone.api.PhoneActionOutcome
 import dev.mnemonic.phone.api.PhonePrStatus
 import dev.mnemonic.phone.api.TeamAgentState
@@ -123,6 +125,11 @@ data class ChatUiState(
     val prAction: PrAction = PrAction.None,
     val prBusy: Boolean = false,
     val pending: List<PendingMessage> = emptyList(),
+    /** The chat's model and effort; its agent's list while the chat isn't connected on the Mac. */
+    val options: List<PhoneChatOption> = emptyList(),
+    /** Picked here and not yet shown in [options], by option id. */
+    val chosenOptions: Map<String, String> = emptyMap(),
+    val optionsBusy: Boolean = false,
     val error: String? = null,
     val notice: String? = null,
 )
@@ -142,6 +149,7 @@ class ChatViewModel(
     private val hold = PrRequestHold()
     private var prFetchedAt = 0L
     private var prKey: String? = null
+    private var agentOptions: Map<String, List<PhoneChatOption>>? = null
 
     init {
         markOpened()
@@ -183,6 +191,7 @@ class ChatViewModel(
     suspend fun watch() {
         while (true) {
             loadWorkspace()
+            loadOptions()
             recomputePr()
             delay(if (mutableState.value.workspace == null) NEW_CHAT_RETRY_MS * 2 else WORKSPACE_POLL_MS)
         }
@@ -216,6 +225,40 @@ class ChatViewModel(
         if (prKey != key || stale || hold.needsRefresh(prFetchedAt)) {
             prKey = key
             loadPr(workspace.id)
+        }
+    }
+
+    private suspend fun loadOptions() {
+        if (mutableState.value.optionsBusy) return
+        val live = (client.chatOptions(chatId) as? MacResult.Ok)?.value?.options ?: return
+        if (live.isNotEmpty()) {
+            mutableState.update { if (it.optionsBusy) it else it.copy(options = live, chosenOptions = emptyMap()) }
+            return
+        }
+        val label = mutableState.value.workspace?.chats?.firstOrNull { it.id == chatId }?.agent ?: return
+        val offered = agentOptions ?: (client.agents() as? MacResult.Ok)?.value?.agents
+            ?.associate { it.label to it.options }
+            ?.also { agentOptions = it }
+            ?: return
+        mutableState.update { if (it.optionsBusy) it else it.copy(options = offered[label].orEmpty()) }
+    }
+
+    fun setOption(option: PhoneChatOption, value: String) {
+        val current = mutableState.value
+        if ((current.chosenOptions[option.id] ?: option.current) == value || current.optionsBusy) return
+        mutableState.update { it.copy(optionsBusy = true, chosenOptions = it.chosenOptions + (option.id to value), error = null) }
+        viewModelScope.launch {
+            val result = client.setChatOptions(chatId, listOf(PhoneOptionChoice(option.id, value)))
+            val error = failure(result)
+            val updated = (result as? MacResult.Ok)?.value?.options
+            mutableState.update {
+                when {
+                    error != null -> it.copy(optionsBusy = false, chosenOptions = it.chosenOptions - option.id, error = error)
+                    updated != null -> it.copy(optionsBusy = false, options = updated, chosenOptions = it.chosenOptions - option.id)
+                    // Set on the Mac once the chat's agent connects.
+                    else -> it.copy(optionsBusy = false)
+                }
+            }
         }
     }
 

@@ -36,6 +36,11 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.setValue
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.getValue
+import androidx.compose.material.icons.rounded.KeyboardArrowDown
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
@@ -352,4 +357,34 @@ fun ArchiveDialog(name: String, onConfirm: () -> Unit, onCancel: () -> Unit) {
         confirmButton = { PrimaryButton("Archive", onClick = onConfirm) },
         dismissButton = { SecondaryButton("Cancel", onClick = onCancel) },
     )
+}
+
+@Composable
+fun DropdownChip(
+    label: String,
+    options: List<Pair<String, String>>,
+    selectedId: String? = null,
+    enabled: Boolean = true,
+    onSelect: (String) -> Unit,
+) {
+    var open by remember { mutableStateOf(false) }
+    val shape = RoundedCornerShape(999.dp)
+    Box {
+        Row(
+            Modifier.alpha(if (enabled) 1f else 0.4f).clip(shape).background(MnColors.surfaceRaised).border(1.dp, MnColors.border, shape)
+                .clickable(enabled = enabled) { open = true }.padding(start = 10.dp, end = 6.dp, top = 4.dp, bottom = 4.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text(label, fontSize = 11.sp, color = MnColors.textSoft, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.padding(end = 2.dp))
+            Icon(Icons.Rounded.KeyboardArrowDown, contentDescription = null, tint = MnColors.textSecondary, modifier = Modifier.size(14.dp))
+        }
+        MnMenu(expanded = open, onDismissRequest = { open = false }) {
+            for ((id, name) in options) {
+                MenuRow(name, icon = if (id == selectedId) Icons.Rounded.Check else null, onClick = {
+                    onSelect(id)
+                    open = false
+                })
+            }
+        }
+    }
 }

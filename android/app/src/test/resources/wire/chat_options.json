@@ -1,0 +1,36 @@
+{
+  "options": [
+    {
+      "id": "model",
+      "name": "Model",
+      "kind": "model",
+      "current": "opus",
+      "values": [
+        {
+          "id": "opus",
+          "name": "Opus 5.5"
+        },
+        {
+          "id": "sonnet",
+          "name": "Sonnet 5.5"
+        }
+      ]
+    },
+    {
+      "id": "effort",
+      "name": "Effort",
+      "kind": "effort",
+      "current": "high",
+      "values": [
+        {
+          "id": "high",
+          "name": "High"
+        },
+        {
+          "id": "max",
+          "name": "Max"
+        }
+      ]
+    }
+  ]
+}
