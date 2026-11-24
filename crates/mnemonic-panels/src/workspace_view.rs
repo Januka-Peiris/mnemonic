@@ -62,7 +62,7 @@ use crate::team_workspace_view::{TeammateChatItem, TeammateWorkspaceView, teamma
 use crate::workspace_detail_panel::WorkspaceDetailPanel;
 use crate::workspaces_settings::WorkspacesSettings;
 use crate::workspace_panel::{
-    WorkspacePanel, branch_slug_from_message, is_generated_workspace_name,
+    WorkspacePanel, branch_slug_from_message, is_generated_workspace_name, primary_chat_record,
 };
 
 /// Marker for auto-fix loop toasts.
@@ -842,10 +842,10 @@ fn queued_message_text(blocks: &[acp::ContentBlock]) -> Option<String> {
     Some(text)
 }
 
-/// Workspaces created chat-first have a primary chat; every other workspace
-/// keeps starting its main claude CLI, even after chats are added to it.
-pub(crate) fn should_start_main_cli(records: &[ChatSessionRecord]) -> bool {
-    !records.iter().any(|record| record.is_primary)
+/// A workspace always opens on a chat: one with no saved chats, such as
+/// one whose chats were all closed, gets a new one.
+pub(crate) fn needs_first_chat(records: &[ChatSessionRecord]) -> bool {
+    records.is_empty()
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -1026,6 +1026,20 @@ impl WorkspaceView {
     /// persistent tmux session.
     fn spawn_primary_agent(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.spawn_agent_terminal("main", "agent", AgentProvider::Claude, None, window, cx);
+    }
+
+    /// Opens a chat with the default agent as the workspace's primary chat,
+    /// or its claude CLI when that agent can't start a chat.
+    fn open_first_chat(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let record = primary_chat_record(&self.workspace_id, ChatAgent::default_agent(cx));
+        if !self.open_chat(record.clone(), None, true, window, cx) {
+            self.spawn_primary_agent(window, cx);
+            return;
+        }
+        let state = mnemonic_bridge::mnemonic_state(cx);
+        if let Err(err) = chat_session_repository::insert(&state.db, &record) {
+            log::error!("Failed to save the workspace's first chat: {err}");
+        }
     }
 
     fn add_session(&mut self, kind: NewSession, window: &mut Window, cx: &mut Context<Self>) {
@@ -6030,12 +6044,12 @@ impl WorkspaceHost {
                 };
             view.update(cx, |view, cx| {
                 view.refresh_diagnostic_summary(&project, cx);
-                let start_main_cli = should_start_main_cli(&chat_records);
+                let needs_chat = needs_first_chat(&chat_records);
                 for record in chat_records {
                     view.open_chat(record, None, true, window, cx);
                 }
-                if start_main_cli {
-                    view.spawn_primary_agent(window, cx);
+                if needs_chat {
+                    view.open_first_chat(window, cx);
                 } else {
                     view.activate_session(0, window, cx);
                 }
@@ -6786,20 +6800,19 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn workspaces_not_created_chat_first_keep_their_main_cli() {
-        let record = |is_primary: bool| ChatSessionRecord {
+    fn workspace_whose_chats_were_closed_gets_a_new_chat() {
+        let chat = ChatSessionRecord {
             id: "chat".to_string(),
             workspace_id: "ws".to_string(),
             agent: "codex-acp".to_string(),
             title: "Codex".to_string(),
             acp_session_id: None,
             is_review: false,
-            is_primary,
+            is_primary: false,
             position: 0,
         };
-        assert!(should_start_main_cli(&[]));
-        assert!(should_start_main_cli(&[record(false)]));
-        assert!(!should_start_main_cli(&[record(true)]));
+        assert!(needs_first_chat(&[]));
+        assert!(!needs_first_chat(&[chat]));
     }
 
     #[test]

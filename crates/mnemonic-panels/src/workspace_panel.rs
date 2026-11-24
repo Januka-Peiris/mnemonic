@@ -61,8 +61,8 @@ use mnemonic_core::services::{
 };
 use settings::Settings as _;
 use ui::{
-    Button, ButtonStyle, CommonAnimationExt as _, ContextMenu, ContextMenuEntry, Icon, IconButton,
-    IconName, Label, PopoverMenu, Tooltip, h_flex, prelude::*, right_click_menu, v_flex,
+    Button, ButtonStyle, ContextMenu, ContextMenuEntry, Icon, IconButton, IconName, Label,
+    PopoverMenu, Tooltip, h_flex, prelude::*, right_click_menu, v_flex,
 };
 use util::ResultExt as _;
 use workspace::dock::{DockPosition, PanelEvent};
@@ -2106,13 +2106,11 @@ impl WorkspacePanel {
                 "Agent finished or needs your input",
             ),
             None if running => (
+                // Not animated: an animation re-renders the whole panel on
+                // every frame for as long as any agent runs.
                 Icon::new(IconName::ArrowCircle)
                     .size(IconSize::XSmall)
                     .color(Color::Muted)
-                    .with_keyed_rotate_animation(
-                        SharedString::from(format!("agent-running-{workspace_id}")),
-                        2,
-                    )
                     .into_any_element(),
                 "Agent running",
             ),
@@ -2173,7 +2171,7 @@ const NAME_ANIMALS: &[&str] = &[
 ];
 
 /// The chat a new workspace opens with, in place of the claude CLI.
-fn primary_chat_record(workspace_id: &str, agent: ChatAgent) -> ChatSessionRecord {
+pub(crate) fn primary_chat_record(workspace_id: &str, agent: ChatAgent) -> ChatSessionRecord {
     ChatSessionRecord {
         id: uuid::Uuid::new_v4().to_string(),
         workspace_id: workspace_id.to_string(),
@@ -3365,7 +3363,7 @@ mod tests {
 
         assert_eq!(record.workspace_id, "ws-1");
         assert_eq!(record.agent, ChatAgent::Codex.agent_id());
-        assert!(!crate::workspace_view::should_start_main_cli(&[record]));
+        assert!(!crate::workspace_view::needs_first_chat(&[record]));
     }
 
     #[test]

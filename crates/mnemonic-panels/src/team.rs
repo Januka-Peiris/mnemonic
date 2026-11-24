@@ -42,7 +42,7 @@ use mnemonic_core::services::team_share_service::{
     TeamWorkspace, tailscale_self,
 };
 use settings::{RegisterSetting, Settings, SettingsStore};
-use ui::{CommonAnimationExt as _, Tooltip, prelude::*};
+use ui::{Tooltip, prelude::*};
 use util::ResultExt as _;
 use util::markdown::MarkdownCodeBlock;
 use workspace::notifications::NotificationId;
@@ -2177,10 +2177,11 @@ pub(crate) fn render_agent_state(id: &str, state: TeamAgentState, cx: &App) -> A
     };
     let (indicator, tooltip) = match state {
         TeamAgentState::Working => (
+            // Not animated: an animation re-renders the whole panel on every
+            // frame for as long as any agent runs.
             Icon::new(IconName::ArrowCircle)
                 .size(IconSize::XSmall)
                 .color(Color::Muted)
-                .with_keyed_rotate_animation(SharedString::from(format!("team-running-{id}")), 2)
                 .into_any_element(),
             "Agent running",
         ),

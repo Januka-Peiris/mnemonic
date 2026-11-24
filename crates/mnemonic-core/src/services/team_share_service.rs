@@ -689,6 +689,10 @@ fn run_tailscale(args: &[&str]) -> Result<Vec<u8>, String> {
 fn tailscale_command(args: &[&str]) -> Result<std::process::Command, String> {
     let binary = tailscale_binary().ok_or_else(|| "Tailscale isn't installed".to_string())?;
     let mut command = std::process::Command::new(&binary);
+    // Tailscale.app's binary starts the GUI instead of acting as the CLI
+    // when it has no TERM, as in an app opened from the Finder before the
+    // login shell's environment is loaded. It then prints no JSON.
+    command.env("TAILSCALE_BE_CLI", "1");
     command.args(args);
     Ok(command)
 }
