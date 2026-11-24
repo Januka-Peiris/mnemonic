@@ -33,6 +33,9 @@ const MAX_MESSAGE_BYTES: usize = 16 * 1024;
 const MAX_ACTION_BODY_BYTES: usize = MAX_MESSAGE_BYTES * 4;
 const MAX_OPTION_CHOICES: usize = 8;
 const MAX_OPTION_ID_BYTES: usize = 256;
+/// A recording sent to be transcribed, base64 in JSON. Compressed speech is
+/// a few KB a second, so this is well over ten minutes.
+const MAX_RECORDING_BODY_BYTES: usize = 16 * 1024 * 1024;
 
 pub struct PhoneServerConfig {
     pub bind: IpAddr,
@@ -215,6 +218,8 @@ pub struct PhoneSources {
     pub save_push_subscription: Arc<dyn Fn(PushSubscription) -> Result<(), String> + Send + Sync>,
     pub save_push_device: Arc<dyn Fn(PushDevice) -> Result<(), String> + Send + Sync>,
     pub send_test_alert: Arc<dyn Fn() -> Result<(), String> + Send + Sync>,
+    /// Turns a recording into text.
+    pub transcribe: Arc<dyn Fn(Vec<u8>) -> Result<String, String> + Send + Sync>,
 }
 
 struct Shared {
@@ -592,16 +597,30 @@ fn handle_action(
     shared: &Shared,
     segments: &[&str],
 ) -> Response<std::io::Cursor<Vec<u8>>> {
+    let limit = if segments == ["v1", "transcribe"] {
+        MAX_RECORDING_BODY_BYTES
+    } else {
+        MAX_ACTION_BODY_BYTES
+    };
     let mut body = Vec::new();
     let read = request
         .as_reader()
-        .take(MAX_ACTION_BODY_BYTES as u64 + 1)
+        .take(limit as u64 + 1)
         .read_to_end(&mut body);
     if let Err(err) = read {
         return text_response(400, &format!("Couldn't read the request: {err}"));
     }
-    if body.len() > MAX_ACTION_BODY_BYTES {
+    if body.len() > limit {
         return text_response(413, "The request is too long");
+    }
+    if let ["v1", "transcribe"] = segments {
+        return match parse_recording(&body) {
+            Ok(audio) => match (shared.sources.transcribe)(audio) {
+                Ok(text) => json_response(200, serde_json::json!({ "text": text }).to_string()),
+                Err(err) => text_response(500, &err),
+            },
+            Err(reason) => text_response(400, &reason),
+        };
     }
     if let ["v1", "push", "subscriptions"] = segments {
         return match parse_push_subscription(&body) {
@@ -670,6 +689,23 @@ fn parse_push_subscription(body: &[u8]) -> Result<PushSubscription, String> {
     };
     subscription.check_keys()?;
     Ok(subscription)
+}
+
+fn parse_recording(body: &[u8]) -> Result<Vec<u8>, String> {
+    use base64::Engine as _;
+    #[derive(serde::Deserialize)]
+    struct Recording {
+        audio: String,
+    }
+    let recording: Recording =
+        serde_json::from_slice(body).map_err(|err| format!("Couldn't read the request: {err}"))?;
+    let audio = base64::engine::general_purpose::STANDARD
+        .decode(recording.audio)
+        .map_err(|_| "The recording isn't base64".to_string())?;
+    if audio.is_empty() {
+        return Err("The recording is empty".to_string());
+    }
+    Ok(audio)
 }
 
 fn parse_push_device(body: &[u8]) -> Result<PushDevice, String> {
@@ -850,6 +886,7 @@ mod tests {
     struct PushProbe {
         devices: Mutex<Vec<PushDevice>>,
         alerts: std::sync::atomic::AtomicUsize,
+        recordings: Mutex<Vec<Vec<u8>>>,
     }
 
     fn start(
@@ -927,11 +964,22 @@ mod tests {
                         Ok(())
                     }
                 }),
-                send_test_alert: Arc::new(move || {
+                send_test_alert: Arc::new({
+                    let probe = probe.clone();
+                    move || {
+                        probe
+                            .alerts
+                            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        Ok(())
+                    }
+                }),
+                transcribe: Arc::new(move |audio| {
                     probe
-                        .alerts
-                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                    Ok(())
+                        .recordings
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .push(audio);
+                    Ok("Open a PR".to_string())
                 }),
             },
             handler,
@@ -1178,6 +1226,33 @@ mod tests {
                 .lock()
                 .map_err(|err| err.to_string())?
                 .is_empty()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn recording_longer_than_an_action_is_transcribed() -> Result<(), String> {
+        use base64::Engine as _;
+        let probe = Arc::new(PushProbe::default());
+        let (server, _recorded) = start_with_push(
+            "jay@example.com",
+            Vec::new(),
+            TeamShareHub::new(),
+            None,
+            probe.clone(),
+        )?;
+        let address = server.address();
+        let audio = vec![7u8; MAX_ACTION_BODY_BYTES * 2];
+        let body = serde_json::json!({
+            "audio": base64::engine::general_purpose::STANDARD.encode(&audio)
+        })
+        .to_string();
+
+        let request = post_app(address, "/v1/transcribe", &body);
+        assert_eq!(raw_status(address, &request)?, 200);
+        assert_eq!(
+            *probe.recordings.lock().map_err(|err| err.to_string())?,
+            [audio]
         );
         Ok(())
     }

@@ -1,0 +1,62 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+export JAVA_HOME=/opt/homebrew/opt/openjdk@17
+export PATH="$JAVA_HOME/bin:$PATH"
+
+root="$(cd "$(dirname "$0")/.." && pwd)"
+device="${GARMIN_DEVICE:-fr955}"
+key="$HOME/.config/mnemonic/garmin-developer-key"
+sdk_root="$HOME/Library/Application Support/Garmin/ConnectIQ/Sdks"
+output="$root/garmin/bin/Mnemonic.prg"
+
+find_sdk() {
+    local bin
+    bin="$(ls -d "$sdk_root"/*/bin 2>/dev/null | sort | tail -n 1 || true)"
+    if [ -z "$bin" ] || [ ! -x "$bin/monkeyc" ]; then
+        echo "The Connect IQ SDK isn't installed. Open SdkManager and install the latest SDK." >&2
+        exit 1
+    fi
+    if [ ! -d "$HOME/Library/Application Support/Garmin/ConnectIQ/Devices/$device" ]; then
+        echo "The $device device files aren't installed. Sign in to SdkManager and add the $device." >&2
+        exit 1
+    fi
+    sdk_bin="$bin"
+}
+
+ensure_key() {
+    if [ ! -f "$key" ]; then
+        mkdir -p "$(dirname "$key")"
+        local pem
+        pem="$(mktemp)"
+        openssl genrsa -out "$pem" 4096 2>/dev/null
+        openssl pkcs8 -topk8 -inform PEM -outform DER -in "$pem" -out "$key" -nocrypt
+        rm -f "$pem"
+        chmod 600 "$key"
+    fi
+}
+
+build() {
+    find_sdk
+    ensure_key
+    mkdir -p "$(dirname "$output")"
+    "$sdk_bin/monkeyc" --jungles "$root/garmin/monkey.jungle" --device "$device" \
+        --output "$output" --private-key "$key" --warn
+    echo "$output"
+}
+
+case "${1:-}" in
+    build)
+        build
+        ;;
+    simulate)
+        build
+        open "$sdk_bin/ConnectIQ.app"
+        sleep 3
+        "$sdk_bin/monkeydo" "$output" "$device"
+        ;;
+    *)
+        echo "usage: script/garmin build|simulate" >&2
+        exit 1
+        ;;
+esac

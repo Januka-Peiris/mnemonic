@@ -3,6 +3,12 @@
 
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
+    <!-- A connected-device foreground service must hold one of a few permissions; this one is granted at install. -->
+    <uses-permission android:name="android.permission.CHANGE_NETWORK_STATE" />
 
     <queries>
         <intent>
@@ -40,6 +46,11 @@
                 <action android:name="com.google.firebase.MESSAGING_EVENT" />
             </intent-filter>
         </service>
+
+        <service
+            android:name=".watch.WatchService"
+            android:exported="false"
+            android:foregroundServiceType="connectedDevice|microphone" />
 
         <receiver
             android:name=".push.PermissionReplyReceiver"

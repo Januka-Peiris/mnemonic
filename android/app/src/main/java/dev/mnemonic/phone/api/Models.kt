@@ -175,6 +175,9 @@ data class PhoneRepository(val id: String, val name: String)
 data class PhoneRepositoryList(val repositories: List<PhoneRepository> = emptyList())
 
 @Serializable
+data class PhoneTranscript(val text: String)
+
+@Serializable
 data class PhoneActionOutcome(
     @SerialName("chat_id") val chatId: String? = null,
     @SerialName("workspace_id") val workspaceId: String? = null,
