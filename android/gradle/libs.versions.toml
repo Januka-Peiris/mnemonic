@@ -13,6 +13,7 @@ navigationCompose = "2.8.9"
 datastore = "1.1.4"
 lifecycle = "2.8.7"
 firebaseBom = "33.16.0"
+connectIq = "2.4.0"
 
 [libraries]
 androidx-core-ktx = { module = "androidx.core:core-ktx", version.ref = "coreKtx" }
@@ -31,6 +32,7 @@ kotlinx-coroutines-core = { module = "org.jetbrains.kotlinx:kotlinx-coroutines-c
 kotlinx-serialization-json = { module = "org.jetbrains.kotlinx:kotlinx-serialization-json", version.ref = "serialization" }
 firebase-bom = { module = "com.google.firebase:firebase-bom", version.ref = "firebaseBom" }
 firebase-messaging = { module = "com.google.firebase:firebase-messaging" }
+garmin-connectiq = { module = "com.garmin.connectiq:ciq-companion-app-sdk", version.ref = "connectIq" }
 junit = { module = "junit:junit", version.ref = "junit" }
 
 [plugins]

@@ -1,0 +1,16 @@
+<?xml version="1.0"?>
+<iq:manifest xmlns:iq="http://www.garmin.com/xml/connectiq" version="3">
+    <!-- The id must match WATCH_APP_ID in the Android app's WatchFeed.kt. -->
+    <iq:application id="163dee77350747308e7952aee33d65ec" type="watch-app" name="@Strings.AppName" entry="MnemonicApp" launcherIcon="@Drawables.LauncherIcon" minApiLevel="3.1.0">
+        <iq:products>
+            <iq:product id="fr955"/>
+        </iq:products>
+        <iq:permissions>
+            <iq:uses-permission id="Communications"/>
+        </iq:permissions>
+        <iq:languages>
+            <iq:language>eng</iq:language>
+        </iq:languages>
+        <iq:barrels/>
+    </iq:application>
+</iq:manifest>

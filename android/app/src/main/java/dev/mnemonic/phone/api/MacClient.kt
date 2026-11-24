@@ -1,6 +1,7 @@
 package dev.mnemonic.phone.api
 
 import java.io.IOException
+import java.util.Base64
 import java.net.UnknownServiceException
 import javax.net.ssl.SSLHandshakeException
 import javax.net.ssl.SSLPeerUnverifiedException
@@ -33,6 +34,14 @@ class MacClient(private val address: MacAddress, private val http: OkHttpClient)
     // The Mac waits up to 60 s for a new task or merge before it answers.
     private val postClient: OkHttpClient by lazy {
         http.newBuilder().readTimeout(POST_READ_TIMEOUT_SECONDS, TimeUnit.SECONDS).build()
+    }
+
+    // A long recording can take a while to upload and transcribe.
+    private val transcribeClient: OkHttpClient by lazy {
+        http.newBuilder()
+            .writeTimeout(TRANSCRIBE_TIMEOUT_SECONDS, TimeUnit.SECONDS)
+            .readTimeout(TRANSCRIBE_TIMEOUT_SECONDS, TimeUnit.SECONDS)
+            .build()
     }
 
     suspend fun workspaces(): MacResult<TeamWorkspaceList> =
@@ -119,6 +128,16 @@ class MacClient(private val address: MacAddress, private val http: OkHttpClient)
             "name" to name,
         ) { MacResult.Ok(Unit) }
 
+    /** Whisper on the Mac turns the recording into text. */
+    suspend fun transcribe(audio: ByteArray): MacResult<String> =
+        post(url("v1", "transcribe"), fields("audio" to Base64.getEncoder().encodeToString(audio)), transcribeClient) { body ->
+            when (val transcript = decode(body, PhoneTranscript.serializer())) {
+                is MacResult.Ok -> MacResult.Ok(transcript.value.text)
+                is MacResult.Refused -> transcript
+                is MacResult.Unreachable -> transcript
+            }
+        }
+
     suspend fun sendTestAlert(): MacResult<Unit> = post(url("v1", "push", "test")) { MacResult.Ok(Unit) }
 
     private fun url(vararg segments: String): HttpUrl =
@@ -153,11 +172,12 @@ class MacClient(private val address: MacAddress, private val http: OkHttpClient)
         target: HttpUrl,
         vararg fields: Pair<String, String>,
         read: (String) -> MacResult<T>,
-    ): MacResult<T> = post(target, fields(*fields), read)
+    ): MacResult<T> = post(target, fields(*fields), read = read)
 
     private suspend fun <T> post(
         target: HttpUrl,
         json: JsonObject,
+        client: OkHttpClient = postClient,
         read: (String) -> MacResult<T>,
     ): MacResult<T> {
         val request = Request.Builder()
@@ -166,7 +186,7 @@ class MacClient(private val address: MacAddress, private val http: OkHttpClient)
             .header("Origin", address.origin)
             .post(json.toString().toRequestBody("application/json".toMediaType()))
             .build()
-        return when (val outcome = execute(postClient, request)) {
+        return when (val outcome = execute(client, request)) {
             is Reply.Failed -> outcome.result
             is Reply.Body -> read(outcome.text)
         }
@@ -223,5 +243,6 @@ class MacClient(private val address: MacAddress, private val http: OkHttpClient)
 
     companion object {
         const val POST_READ_TIMEOUT_SECONDS = 75L
+        private const val TRANSCRIBE_TIMEOUT_SECONDS = 180L
     }
 }

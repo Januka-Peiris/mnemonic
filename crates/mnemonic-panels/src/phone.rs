@@ -32,6 +32,7 @@ use mnemonic_core::services::phone_server::{
 };
 use mnemonic_core::services::pr_draft_service;
 use mnemonic_core::services::team_files_service::TEAM_COPY_SOURCE;
+use mnemonic_core::services::transcription_service::{self, WHISPER_MODEL_FILE};
 use mnemonic_core::services::team_share_service::{
     DEFAULT_TEAM_PORT, TailscaleSelf, TailscaleWhois, TeamActionError, TeamShareHub, TlsFiles,
     tailscale_cert, tailscale_self,
@@ -789,6 +790,13 @@ fn page_url(me: &TailscaleSelf, port: u16, https: bool) -> String {
     format!("{scheme}://{host}:{port}/")
 }
 
+fn transcribe_recording(audio: Vec<u8>) -> Result<String, String> {
+    let model = mnemonic_bridge::mnemonic_state_cloned()
+        .map(|state| state.data_dir.join("whisper").join(WHISPER_MODEL_FILE))
+        .ok_or_else(|| "Mnemonic is still starting".to_string())?;
+    transcription_service::transcribe(&audio, &model)
+}
+
 fn certificate_directory() -> Option<PathBuf> {
     mnemonic_bridge::mnemonic_state_cloned().map(|state| state.data_dir.join("phone"))
 }
@@ -895,6 +903,7 @@ fn start_server(
                     }
                 }),
                 send_test_alert: Arc::new(move || send_test_alert(&app_alerts)),
+                transcribe: Arc::new(transcribe_recording),
             },
             action_handler.clone(),
         )

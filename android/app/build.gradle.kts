@@ -84,6 +84,7 @@ dependencies {
     implementation(libs.okhttp)
     implementation(libs.kotlinx.serialization.json)
     implementation(libs.kotlinx.coroutines.core)
+    implementation(libs.garmin.connectiq) { artifact { type = "aar" } }
 
     testImplementation(libs.junit)
     testImplementation(libs.okhttp.mockwebserver)

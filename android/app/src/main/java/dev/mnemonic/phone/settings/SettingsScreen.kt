@@ -1,5 +1,8 @@
 package dev.mnemonic.phone.settings
 
+import android.Manifest
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -36,6 +39,7 @@ import dev.mnemonic.phone.ui.PrimaryButton
 import dev.mnemonic.phone.ui.SecondaryButton
 import dev.mnemonic.phone.ui.SectionLabel
 import dev.mnemonic.phone.ui.TopBar
+import dev.mnemonic.phone.watch.WatchService
 import kotlinx.coroutines.launch
 import okhttp3.OkHttpClient
 
@@ -103,6 +107,8 @@ fun SettingsScreen(
             }
         }
         Divider()
+        WatchSection()
+        Divider()
         SectionLabel("Version")
         Text(
             BuildConfig.VERSION_NAME,
@@ -110,6 +116,45 @@ fun SettingsScreen(
             fontSize = 13.sp,
             modifier = Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 4.dp),
         )
+    }
+}
+
+@Composable
+private fun WatchSection() {
+    val context = LocalContext.current
+    val running by WatchService.running.collectAsState()
+    val status by WatchService.status.collectAsState()
+    // Watch mode still works without the microphone; only Speak needs it.
+    val askForMicrophone = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) {
+        WatchService.start(context)
+    }
+    SectionLabel("Watch")
+    Text(
+        when {
+            !running -> "Read and answer chats from the Mnemonic app on your Garmin. Speak listens through the phone's microphone."
+            status.isNotEmpty() -> status
+            else -> "Watch mode is on"
+        },
+        color = MnColors.textSoft,
+        fontSize = 13.sp,
+        lineHeight = 19.sp,
+        modifier = Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 4.dp),
+    )
+    Row(Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 6.dp)) {
+        if (running) {
+            SecondaryButton("Turn off watch mode", onClick = { WatchService.stop(context) })
+        } else {
+            PrimaryButton(
+                "Turn on watch mode",
+                onClick = {
+                    if (WatchService.canRecord(context)) {
+                        WatchService.start(context)
+                    } else {
+                        askForMicrophone.launch(Manifest.permission.RECORD_AUDIO)
+                    }
+                },
+            )
+        }
     }
 }
 

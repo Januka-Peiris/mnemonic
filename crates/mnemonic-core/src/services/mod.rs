@@ -45,6 +45,7 @@ pub mod phone_server;
 // pub mod rebase_service;
 pub mod terminal_service;
 pub mod terminal_ws_server;
+pub mod transcription_service;
 pub mod workspace_attention_service;
 pub mod workspace_cleanup_service;
 pub mod workspace_file_tree_service;
