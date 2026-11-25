@@ -43,19 +43,33 @@ pub fn transcribe(audio: &[u8], model: &Path) -> Result<String, String> {
     let directory =
         tempfile::tempdir().map_err(|err| format!("Couldn't save the recording: {err}"))?;
     let recording = directory.path().join("recording");
-    std::fs::write(&recording, audio).map_err(|err| format!("Couldn't save the recording: {err}"))?;
+    std::fs::write(&recording, audio)
+        .map_err(|err| format!("Couldn't save the recording: {err}"))?;
     // whisper.cpp reads only 16 kHz mono WAV reliably.
     let wav = directory.path().join("recording.wav");
-    run(Command::new(ffmpeg)
+    run(Command::new(&ffmpeg)
         .args(["-nostdin", "-loglevel", "error", "-i"])
         .arg(&recording)
         .args(["-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le"])
         .arg(&wav))
     .map_err(|err| format!("Couldn't read the recording: {err}"))?;
+    // Whisper writes "you" for a silent recording, as when another app,
+    // such as the camera, has the microphone.
+    let (_, levels) = run(Command::new(&ffmpeg)
+        .args(["-nostdin", "-hide_banner", "-i"])
+        .arg(&wav)
+        .args(["-af", "volumedetect", "-f", "null", "-"]))
+    .map_err(|err| format!("Couldn't read the recording: {err}"))?;
+    if peak_volume(&levels).is_some_and(|peak| peak < SILENT_PEAK_DB) {
+        return Err(
+            "Didn't hear anything. Is another app, like the camera, using the microphone?"
+                .to_string(),
+        );
+    }
     let threads = std::thread::available_parallelism()
         .map(|count| count.get().min(8))
         .unwrap_or(4);
-    let output = run(Command::new(whisper)
+    let (output, _) = run(Command::new(whisper)
         .arg("--model")
         .arg(model)
         .arg("--file")
@@ -73,10 +87,14 @@ pub fn transcribe(audio: &[u8], model: &Path) -> Result<String, String> {
 
 // Only called from the phone server's request threads, never the UI thread.
 #[allow(clippy::disallowed_methods)]
-fn run(command: &mut Command) -> Result<String, String> {
+/// The command's stdout and stderr when it succeeds.
+fn run(command: &mut Command) -> Result<(String, String), String> {
     let output = command.output().map_err(|err| err.to_string())?;
     if output.status.success() {
-        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+        Ok((
+            String::from_utf8_lossy(&output.stdout).into_owned(),
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+        ))
     } else {
         let stderr = String::from_utf8_lossy(&output.stderr);
         Err(stderr
@@ -87,6 +105,18 @@ fn run(command: &mut Command) -> Result<String, String> {
             .trim()
             .to_string())
     }
+}
+
+/// Below this, the loudest moment of a recording is silence rather than
+/// someone speaking, even quietly into a distant microphone.
+const SILENT_PEAK_DB: f64 = -50.0;
+
+/// The `max_volume` that ffmpeg's volumedetect filter reports, in dB.
+fn peak_volume(levels: &str) -> Option<f64> {
+    levels.lines().find_map(|line| {
+        let (_, value) = line.split_once("max_volume:")?;
+        value.trim().trim_end_matches("dB").trim().parse().ok()
+    })
 }
 
 /// Whisper writes a segment per line, and marks silence and noise with
@@ -107,6 +137,14 @@ fn spoken_text(output: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reads_the_peak_volume() {
+        let levels = "[Parsed_volumedetect_0 @ 0x6000] mean_volume: -91.0 dB\n\
+                      [Parsed_volumedetect_0 @ 0x6000] max_volume: -91.0 dB\n";
+        assert_eq!(peak_volume(levels), Some(-91.0));
+        assert_eq!(peak_volume("no levels"), None);
+    }
 
     #[test]
     fn silence_is_not_text() {
