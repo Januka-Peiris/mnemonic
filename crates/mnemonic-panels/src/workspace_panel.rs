@@ -54,6 +54,8 @@ const PROJECT_SETUP_SCRIPT_KEY: &str = "setup_script";
 const PROJECT_RUN_SCRIPT_KEY: &str = workspace_script_service::PROJECT_RUN_SCRIPT_KEY;
 const PROJECT_INIT_FILES_KEY: &str = "workspace_init_files";
 const WORKSPACE_ORDER_KEY: &str = "panel_workspace_order";
+const PINNED_WORKSPACES_KEY: &str = "panel_pinned_workspaces";
+const WORKSPACE_LABELS_KEY: &str = "panel_workspace_labels";
 use mnemonic_core::services::team_files_service::TEAM_COPY_SOURCE;
 use mnemonic_core::services::{
     environment_service, pr_draft_service, repo_scanner_service, workspace_port_service, workspace_script_service,
@@ -112,6 +114,9 @@ pub struct WorkspacePanel {
     activities: Vec<ActivityItem>,
     workspace_order: HashMap<String, Vec<String>>,
     project_order: Vec<String>,
+    /// Pinned workspace ids, in the order the Pinned section lists them.
+    pinned_workspaces: Option<Vec<String>>,
+    workspace_labels: Option<HashMap<String, String>>,
 }
 
 impl WorkspacePanel {
@@ -138,6 +143,8 @@ impl WorkspacePanel {
                 activities: Vec::new(),
                 workspace_order: HashMap::new(),
                 project_order: Vec::new(),
+                pinned_workspaces: None,
+                workspace_labels: None,
             };
             panel.refresh(cx);
             panel
@@ -298,6 +305,142 @@ impl WorkspacePanel {
                 }
             }
         }
+        if self.pinned_workspaces.is_none() {
+            let pinned = settings_repository::get_value(&state.db, PINNED_WORKSPACES_KEY)
+                .log_err()
+                .flatten()
+                .and_then(|json| serde_json::from_str::<Vec<String>>(&json).log_err());
+            self.pinned_workspaces = Some(pinned.unwrap_or_default());
+        }
+        if self.workspace_labels.is_none() {
+            let labels = settings_repository::get_value(&state.db, WORKSPACE_LABELS_KEY)
+                .log_err()
+                .flatten()
+                .and_then(|json| serde_json::from_str::<HashMap<String, String>>(&json).log_err());
+            self.workspace_labels = Some(labels.unwrap_or_default());
+        }
+    }
+
+    fn is_pinned(&self, workspace_id: &str) -> bool {
+        self.pinned_workspaces
+            .as_ref()
+            .is_some_and(|pinned| pinned.iter().any(|id| id == workspace_id))
+    }
+
+    /// The open workspaces that are pinned, in pinned order.
+    fn pinned_workspace_summaries(&self) -> Vec<&WorkspaceSummary> {
+        self.pinned_workspaces
+            .iter()
+            .flatten()
+            .filter_map(|id| self.workspaces.iter().find(|ws| &ws.id == id))
+            .collect()
+    }
+
+    fn workspace_label(&self, workspace_id: &str) -> Option<&str> {
+        self.workspace_labels
+            .as_ref()
+            .and_then(|labels| labels.get(workspace_id))
+            .map(String::as_str)
+    }
+
+    fn save_pinned_workspaces(&self, cx: &App) {
+        let state = mnemonic_bridge::mnemonic_state(cx);
+        match serde_json::to_string(self.pinned_workspaces.as_ref().unwrap_or(&Vec::new())) {
+            Ok(json) => {
+                settings_repository::set_value(&state.db, PINNED_WORKSPACES_KEY, &json).log_err();
+            }
+            Err(err) => log::error!("Failed to save pinned workspaces: {err}"),
+        }
+    }
+
+    fn set_workspace_pinned(&mut self, workspace_id: &str, pinned: bool, cx: &mut Context<Self>) {
+        let existing_ids: Vec<&str> = self.workspaces.iter().map(|ws| ws.id.as_str()).collect();
+        let list = self.pinned_workspaces.get_or_insert_with(Vec::new);
+        // Archived and deleted workspaces drop out of the pin list here.
+        list.retain(|id| id != workspace_id && existing_ids.contains(&id.as_str()));
+        if pinned {
+            list.push(workspace_id.to_string());
+        }
+        self.save_pinned_workspaces(cx);
+        cx.notify();
+    }
+
+    fn reorder_pinned(&mut self, dragged_id: &str, target_id: &str, cx: &App) {
+        let mut order: Vec<String> = self
+            .pinned_workspace_summaries()
+            .iter()
+            .map(|ws| ws.id.clone())
+            .collect();
+        if !move_onto(&mut order, dragged_id, target_id) {
+            return;
+        }
+        self.pinned_workspaces = Some(order);
+        self.save_pinned_workspaces(cx);
+    }
+
+    fn set_workspace_label(&mut self, workspace_id: &str, label: &str, cx: &mut Context<Self>) {
+        let labels = self.workspace_labels.get_or_insert_with(HashMap::new);
+        let label = label.trim();
+        if label.is_empty() {
+            labels.remove(workspace_id);
+        } else {
+            labels.insert(workspace_id.to_string(), label.to_string());
+        }
+        let state = mnemonic_bridge::mnemonic_state(cx);
+        match serde_json::to_string(labels) {
+            Ok(json) => {
+                settings_repository::set_value(&state.db, WORKSPACE_LABELS_KEY, &json).log_err();
+            }
+            Err(err) => log::error!("Failed to save workspace labels: {err}"),
+        }
+        cx.notify();
+    }
+
+    /// Moves a workspace one place up or down within the section it is
+    /// listed in: the Pinned section, or its project.
+    fn move_workspace(&mut self, workspace_id: &str, up: bool, cx: &mut Context<Self>) {
+        let order: Vec<String> = if self.is_pinned(workspace_id) {
+            self.pinned_workspace_summaries()
+                .iter()
+                .map(|ws| ws.id.clone())
+                .collect()
+        } else {
+            let Some(project) = self
+                .workspaces
+                .iter()
+                .find(|ws| ws.id == workspace_id)
+                .map(workspace_project)
+            else {
+                return;
+            };
+            self.grouped_workspaces()
+                .into_iter()
+                .find(|(name, _)| *name == project)
+                .map(|(_, workspaces)| workspaces.iter().map(|ws| ws.id.clone()).collect())
+                .unwrap_or_default()
+        };
+        let Some(index) = order.iter().position(|id| id == workspace_id) else {
+            return;
+        };
+        let neighbor = if up {
+            index.checked_sub(1)
+        } else {
+            Some(index + 1).filter(|next| *next < order.len())
+        };
+        let Some(neighbor_id) = neighbor.and_then(|neighbor| order.get(neighbor)).cloned() else {
+            return;
+        };
+        if self.is_pinned(workspace_id) {
+            self.reorder_pinned(workspace_id, &neighbor_id, cx);
+        } else if let Some(project) = self
+            .workspaces
+            .iter()
+            .find(|ws| ws.id == workspace_id)
+            .map(workspace_project)
+        {
+            self.reorder_workspace(workspace_id, &project, &neighbor_id, cx);
+        }
+        cx.notify();
     }
 
     fn save_ordering(&self, cx: &App) {
@@ -316,19 +459,14 @@ impl WorkspacePanel {
             groups.entry(repo.name.clone()).or_default();
         }
         for ws in &self.workspaces {
-            let project = if ws.repo.is_empty() {
-                "ungrouped".to_string()
-            } else {
-                ws.repo.clone()
-            };
-            groups.entry(project).or_default().push(ws);
+            if self.is_pinned(&ws.id) {
+                continue;
+            }
+            groups.entry(workspace_project(ws)).or_default().push(ws);
         }
-        // Apply custom workspace ordering within each group.
         for (project, workspaces) in &mut groups {
             if let Some(order) = self.workspace_order.get(project) {
-                workspaces.sort_by_key(|ws| {
-                    order.iter().position(|id| id == &ws.id).unwrap_or(usize::MAX)
-                });
+                workspaces.sort_by_key(|ws| saved_order_rank(order, &ws.id));
             }
         }
         // Apply custom project ordering.
@@ -391,37 +529,23 @@ impl WorkspacePanel {
     }
 
     fn reorder_workspace(&mut self, dragged_id: &str, project: &str, target_id: &str, cx: &App) {
-        if dragged_id == target_id {
-            return;
-        }
-        // Build current workspace IDs for this project group.
-        let current_ids: Vec<String> = self
-            .workspaces
-            .iter()
-            .filter(|ws| {
-                let p = if ws.repo.is_empty() { "ungrouped" } else { &ws.repo };
-                p == project
+        let Some(mut order) = self
+            .grouped_workspaces()
+            .into_iter()
+            .find(|(name, _)| name == project)
+            .map(|(_, workspaces)| {
+                workspaces
+                    .iter()
+                    .map(|ws| ws.id.clone())
+                    .collect::<Vec<_>>()
             })
-            .map(|ws| ws.id.clone())
-            .collect();
-        let order = self
-            .workspace_order
-            .entry(project.to_string())
-            .or_insert_with(|| current_ids.clone());
-        // Append any new workspace IDs not yet in the order list.
-        for id in &current_ids {
-            if !order.contains(id) {
-                order.push(id.clone());
-            }
+        else {
+            return;
+        };
+        if !move_onto(&mut order, dragged_id, target_id) {
+            return;
         }
-        let Some(from) = order.iter().position(|id| id == dragged_id) else {
-            return;
-        };
-        let Some(to) = order.iter().position(|id| id == target_id) else {
-            return;
-        };
-        let id = order.remove(from);
-        order.insert(to, id);
+        self.workspace_order.insert(project.to_string(), order);
         self.save_ordering(cx);
     }
 
@@ -577,12 +701,17 @@ impl WorkspacePanel {
         cx: &mut Context<Self>,
     ) {
         let visible_ids: Vec<String> = self
-            .grouped_workspaces()
+            .pinned_workspace_summaries()
             .into_iter()
-            .filter(|(project, _)| {
-                !self.collapsed_projects.contains(project) && !self.is_project_hidden(project)
-            })
-            .flat_map(|(_, workspaces)| workspaces)
+            .chain(
+                self.grouped_workspaces()
+                    .into_iter()
+                    .filter(|(project, _)| {
+                        !self.collapsed_projects.contains(project)
+                            && !self.is_project_hidden(project)
+                    })
+                    .flat_map(|(_, workspaces)| workspaces),
+            )
             .map(|workspace| workspace.id.clone())
             .collect();
         if visible_ids.is_empty() {
@@ -635,10 +764,11 @@ impl WorkspacePanel {
         .detach();
     }
 
-    fn open_rename_prompt(
+    fn open_text_prompt(
         &mut self,
+        purpose: WorkspaceTextPrompt,
         workspace_id: String,
-        current_name: String,
+        current_text: String,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -648,7 +778,7 @@ impl WorkspacePanel {
         let panel = cx.weak_entity();
         workspace.update(cx, |workspace, cx| {
             workspace.toggle_modal(window, cx, |window, cx| {
-                RenameWorkspaceModal::new(panel, workspace_id, current_name, window, cx)
+                WorkspaceTextModal::new(panel, purpose, workspace_id, current_text, window, cx)
             });
         });
     }
@@ -1441,6 +1571,11 @@ impl WorkspacePanel {
             .repositories
             .iter()
             .any(|repository| repository.name == project);
+        let open_workspace_count = self
+            .workspaces
+            .iter()
+            .filter(|ws| workspace_project(ws) == project)
+            .count();
         let drag_data = DraggedProject {
             name: project.to_string(),
         };
@@ -1553,14 +1688,15 @@ impl WorkspacePanel {
                                 .when(has_repository, |menu| {
                                     // Its workspaces would be left without the
                                     // project they are created and refreshed from.
-                                    let label = if count == 0 {
+                                    let label = if open_workspace_count == 0 {
                                         "Remove Project"
                                     } else {
                                         "Remove Project (archive its workspaces first)"
                                     };
                                     menu.item(
-                                        ContextMenuEntry::new(label).disabled(count > 0).handler(
-                                            move |_, cx| {
+                                        ContextMenuEntry::new(label)
+                                            .disabled(open_workspace_count > 0)
+                                            .handler(move |_, cx| {
                                                 this.update(cx, |this, cx| {
                                                     this.remove_project(
                                                         project_for_remove.clone(),
@@ -1568,8 +1704,7 @@ impl WorkspacePanel {
                                                     );
                                                 })
                                                 .log_err();
-                                            },
-                                        ),
+                                            }),
                                     )
                                 })
                             }))
@@ -1590,7 +1725,7 @@ impl WorkspacePanel {
 
         if !collapsed {
             for ws in workspaces {
-                group = group.child(self.render_workspace_row(ws, project, cx));
+                group = group.child(self.render_workspace_row(ws, project, false, cx));
             }
             let archived: Vec<&ArchivedWorkspace> = self
                 .archived
@@ -1606,6 +1741,37 @@ impl WorkspacePanel {
         }
 
         group
+    }
+
+    fn render_pinned_section(
+        &self,
+        pinned: &[&WorkspaceSummary],
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let mut section = v_flex().w_full().child(
+            h_flex()
+                .px_2()
+                .h(px(28.))
+                .gap_1()
+                .items_center()
+                .w_full()
+                .child(
+                    Icon::new(IconName::Pin)
+                        .size(IconSize::XSmall)
+                        .color(Color::Muted),
+                )
+                .child(Label::new("Pinned").size(LabelSize::Default))
+                .child(
+                    Label::new(pinned.len().to_string())
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted),
+                ),
+        );
+        for ws in pinned {
+            let project = workspace_project(ws);
+            section = section.child(self.render_workspace_row(ws, &project, true, cx));
+        }
+        section
     }
 
     /// A collapsed "Hidden (n)" row below the projects that expands to the
@@ -1788,8 +1954,11 @@ impl WorkspacePanel {
         &self,
         ws: &WorkspaceSummary,
         project: &str,
+        in_pinned_section: bool,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
+        let workspace_label = self.workspace_label(&ws.id).map(str::to_string);
+        let menu_label = workspace_label.clone();
         let is_selected = self
             .selected_workspace_id
             .as_ref()
@@ -1876,12 +2045,16 @@ impl WorkspacePanel {
             })
             .on_drop(cx.listener(
                 move |this, dragged: &DraggedWorkspace, _window, cx| {
-                    this.reorder_workspace(
-                        &dragged.id,
-                        &drop_target_project,
-                        &drop_target_id,
-                        cx,
-                    );
+                    if in_pinned_section {
+                        this.reorder_pinned(&dragged.id, &drop_target_id, cx);
+                    } else {
+                        this.reorder_workspace(
+                            &dragged.id,
+                            &drop_target_project,
+                            &drop_target_id,
+                            cx,
+                        );
+                    }
                     cx.notify();
                 },
             ))
@@ -1915,13 +2088,41 @@ impl WorkspacePanel {
                 }
             })
             .child(
-                div().flex_grow(1.0).overflow_hidden().child(
-                    Label::new(ws.name.clone())
-                        .size(LabelSize::Default)
-                        .color(Color::Default)
-                        .single_line(),
-                ),
+                h_flex()
+                    .flex_grow(1.0)
+                    .min_w_0()
+                    .gap_1()
+                    .overflow_hidden()
+                    .child(
+                        Label::new(ws.name.clone())
+                            .size(LabelSize::Default)
+                            .color(Color::Default)
+                            .single_line(),
+                    )
+                    .when(in_pinned_section, |el| {
+                        el.child(
+                            Label::new(project.to_string())
+                                .size(LabelSize::XSmall)
+                                .color(Color::Muted)
+                                .single_line(),
+                        )
+                    }),
             )
+            .when_some(workspace_label, |el, label| {
+                el.child(
+                    div()
+                        .flex_none()
+                        .px_1()
+                        .rounded_sm()
+                        .bg(cx.theme().colors().element_background)
+                        .child(
+                            Label::new(label)
+                                .size(LabelSize::XSmall)
+                                .color(Color::Muted)
+                                .single_line(),
+                        ),
+                )
+            })
             .when_some(shared_indicator, |el, indicator| el.child(indicator))
             .when_some(linked_tooltip, |el, tooltip| {
                 el.child(
@@ -1980,6 +2181,7 @@ impl WorkspacePanel {
                 let branch = menu_branch.clone();
                 let path = menu_path.clone();
                 let link_candidates = link_candidates.clone();
+                let menu_label = menu_label.clone();
                 ContextMenu::build(window, cx, move |mut menu, _, _| {
                     if let Some(path) = path {
                         menu = menu
@@ -2054,7 +2256,8 @@ impl WorkspacePanel {
                             // back, so the prompt keeps it.
                             window.defer(cx, move |window, cx| {
                                 this.update(cx, |this, cx| {
-                                    this.open_rename_prompt(
+                                    this.open_text_prompt(
+                                        WorkspaceTextPrompt::Rename,
                                         workspace_id,
                                         workspace_name,
                                         window,
@@ -2063,6 +2266,89 @@ impl WorkspacePanel {
                                 })
                                 .log_err();
                             });
+                        }
+                    })
+                    .separator()
+                    .entry(
+                        if in_pinned_section {
+                            "Unpin"
+                        } else {
+                            "Pin to Top"
+                        },
+                        None,
+                        {
+                            let this = this.clone();
+                            let workspace_id = workspace_id.clone();
+                            move |_, cx| {
+                                this.update(cx, |this, cx| {
+                                    this.set_workspace_pinned(
+                                        &workspace_id,
+                                        !in_pinned_section,
+                                        cx,
+                                    );
+                                })
+                                .log_err();
+                            }
+                        },
+                    )
+                    .entry(
+                        if menu_label.is_some() {
+                            "Edit Label…"
+                        } else {
+                            "Add Label…"
+                        },
+                        None,
+                        {
+                            let this = this.clone();
+                            let workspace_id = workspace_id.clone();
+                            let current_label = menu_label.clone().unwrap_or_default();
+                            move |window, cx| {
+                                let this = this.clone();
+                                let workspace_id = workspace_id.clone();
+                                let current_label = current_label.clone();
+                                window.defer(cx, move |window, cx| {
+                                    this.update(cx, |this, cx| {
+                                        this.open_text_prompt(
+                                            WorkspaceTextPrompt::Label,
+                                            workspace_id,
+                                            current_label,
+                                            window,
+                                            cx,
+                                        );
+                                    })
+                                    .log_err();
+                                });
+                            }
+                        },
+                    )
+                    .when(menu_label.is_some(), |menu| {
+                        let this = this.clone();
+                        let workspace_id = workspace_id.clone();
+                        menu.entry("Remove Label", None, move |_, cx| {
+                            this.update(cx, |this, cx| {
+                                this.set_workspace_label(&workspace_id, "", cx);
+                            })
+                            .log_err();
+                        })
+                    })
+                    .entry("Move Up", None, {
+                        let this = this.clone();
+                        let workspace_id = workspace_id.clone();
+                        move |_, cx| {
+                            this.update(cx, |this, cx| {
+                                this.move_workspace(&workspace_id, true, cx);
+                            })
+                            .log_err();
+                        }
+                    })
+                    .entry("Move Down", None, {
+                        let this = this.clone();
+                        let workspace_id = workspace_id.clone();
+                        move |_, cx| {
+                            this.update(cx, |this, cx| {
+                                this.move_workspace(&workspace_id, false, cx);
+                            })
+                            .log_err();
                         }
                     })
                     .separator()
@@ -2171,6 +2457,40 @@ const NAME_ANIMALS: &[&str] = &[
 ];
 
 /// The chat a new workspace opens with, in place of the claude CLI.
+fn workspace_project(workspace: &WorkspaceSummary) -> String {
+    if workspace.repo.is_empty() {
+        "ungrouped".to_string()
+    } else {
+        workspace.repo.clone()
+    }
+}
+
+/// Workspaces missing from the saved order are newer than it, so they rank
+/// first, keeping the newest-first order the database lists them in.
+fn saved_order_rank(order: &[String], workspace_id: &str) -> usize {
+    order
+        .iter()
+        .position(|id| id == workspace_id)
+        .map_or(0, |position| position + 1)
+}
+
+/// Moves `dragged_id` to where `target_id` is, shifting the ones between.
+/// Returns false when there is nothing to move.
+fn move_onto(order: &mut Vec<String>, dragged_id: &str, target_id: &str) -> bool {
+    if dragged_id == target_id {
+        return false;
+    }
+    let (Some(from), Some(to)) = (
+        order.iter().position(|id| id == dragged_id),
+        order.iter().position(|id| id == target_id),
+    ) else {
+        return false;
+    };
+    let id = order.remove(from);
+    order.insert(to, id);
+    true
+}
+
 pub(crate) fn primary_chat_record(workspace_id: &str, agent: ChatAgent) -> ChatSessionRecord {
     ChatSessionRecord {
         id: uuid::Uuid::new_v4().to_string(),
@@ -3059,29 +3379,41 @@ impl Render for ProjectSettingsModal {
     }
 }
 
-struct RenameWorkspaceModal {
+#[derive(Clone, Copy)]
+enum WorkspaceTextPrompt {
+    Rename,
+    Label,
+}
+
+struct WorkspaceTextModal {
     editor: Entity<Editor>,
     panel: WeakEntity<WorkspacePanel>,
+    purpose: WorkspaceTextPrompt,
     workspace_id: String,
 }
 
-impl RenameWorkspaceModal {
+impl WorkspaceTextModal {
     fn new(
         panel: WeakEntity<WorkspacePanel>,
+        purpose: WorkspaceTextPrompt,
         workspace_id: String,
-        current_name: String,
+        current_text: String,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
         let editor = cx.new(|cx| {
             let mut editor = Editor::single_line(window, cx);
-            editor.set_text(current_name, window, cx);
+            if matches!(purpose, WorkspaceTextPrompt::Label) {
+                editor.set_placeholder_text("Label, e.g. review or blocked", window, cx);
+            }
+            editor.set_text(current_text, window, cx);
             editor.select_all(&editor::actions::SelectAll, window, cx);
             editor
         });
         Self {
             editor,
             panel,
+            purpose,
             workspace_id,
         }
     }
@@ -3091,31 +3423,49 @@ impl RenameWorkspaceModal {
     }
 
     fn confirm(&mut self, _: &menu::Confirm, window: &mut Window, cx: &mut Context<Self>) {
-        let name = self.editor.read(cx).text(cx);
-        if !name.trim().is_empty() {
-            let workspace_id = self.workspace_id.clone();
-            self.panel
-                .update(cx, |panel, cx| {
-                    panel.rename_workspace(workspace_id, name, window, cx);
-                })
-                .log_err();
+        let text = self.editor.read(cx).text(cx);
+        let workspace_id = self.workspace_id.clone();
+        match self.purpose {
+            WorkspaceTextPrompt::Rename => {
+                if !text.trim().is_empty() {
+                    self.panel
+                        .update(cx, |panel, cx| {
+                            panel.rename_workspace(workspace_id, text, window, cx);
+                        })
+                        .log_err();
+                }
+            }
+            WorkspaceTextPrompt::Label => {
+                self.panel
+                    .update(cx, |panel, cx| {
+                        panel.set_workspace_label(&workspace_id, &text, cx);
+                    })
+                    .log_err();
+            }
         }
         cx.emit(DismissEvent);
     }
 }
 
-impl EventEmitter<DismissEvent> for RenameWorkspaceModal {}
+impl EventEmitter<DismissEvent> for WorkspaceTextModal {}
 
-impl ModalView for RenameWorkspaceModal {}
+impl ModalView for WorkspaceTextModal {}
 
-impl Focusable for RenameWorkspaceModal {
+impl Focusable for WorkspaceTextModal {
     fn focus_handle(&self, cx: &App) -> FocusHandle {
         self.editor.focus_handle(cx)
     }
 }
 
-impl Render for RenameWorkspaceModal {
+impl Render for WorkspaceTextModal {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let hint = match self.purpose {
+            WorkspaceTextPrompt::Rename => {
+                "Rename the workspace. Its branch is renamed too, until it has \
+                 been pushed or has a PR."
+            }
+            WorkspaceTextPrompt::Label => "Label the workspace. Leave empty to remove the label.",
+        };
         v_flex()
             .key_context("RenameWorkspaceModal")
             .on_action(cx.listener(Self::cancel))
@@ -3136,14 +3486,7 @@ impl Render for RenameWorkspaceModal {
                     .rounded_b_sm()
                     .w_full()
                     .p_2()
-                    .child(
-                        Label::new(
-                            "Rename the workspace. Its branch is renamed too, until it has \
-                             been pushed or has a PR.",
-                        )
-                        .size(LabelSize::Small)
-                        .color(Color::Muted),
-                    ),
+                    .child(Label::new(hint).size(LabelSize::Small).color(Color::Muted)),
             )
     }
 }
@@ -3231,10 +3574,14 @@ impl Render for WorkspacePanel {
         content = content.child(self.render_header(cx));
 
         let groups = self.grouped_workspaces();
-        let has_workspaces = !groups.is_empty();
+        let pinned = self.pinned_workspace_summaries();
+        let has_workspaces = !groups.is_empty() || !pinned.is_empty();
 
         if has_workspaces {
             let mut list = v_flex().py_0p5().overflow_y_hidden().flex_grow(1.0);
+            if !pinned.is_empty() {
+                list = list.child(self.render_pinned_section(&pinned, cx));
+            }
             let mut hidden = Vec::new();
             for (project, workspaces) in &groups {
                 if self.is_project_hidden(project) {
@@ -3453,6 +3800,14 @@ mod tests {
             unique_workspace_name("42-login", &["42-login".to_string()]),
             "42-login-2"
         );
+    }
+
+    #[test]
+    fn new_workspaces_list_above_a_saved_order() {
+        let saved = vec!["old-a".to_string(), "old-b".to_string()];
+        let mut listed = vec!["old-b", "newest", "old-a", "newer"];
+        listed.sort_by_key(|id| saved_order_rank(&saved, id));
+        assert_eq!(listed, vec!["newest", "newer", "old-a", "old-b"]);
     }
 
     #[test]
