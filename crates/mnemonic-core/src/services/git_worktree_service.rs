@@ -54,20 +54,20 @@ pub fn create_mnemonic_worktree(
             ],
         )?;
     } else {
-        let base = if base_branch.trim().is_empty() {
-            "HEAD"
-        } else {
-            base_branch.trim()
-        };
+        let base = resolve_base_ref(repo_path, base_branch);
+        // Without --no-track a branch started from origin/main would track
+        // origin/main, so a plain `git push` could target main and the branch
+        // would look published before it ever was.
         git(
             repo_path,
             &[
                 "worktree",
                 "add",
+                "--no-track",
                 "-b",
                 &branch,
                 path_arg(&worktree_path).as_str(),
-                base,
+                &base,
             ],
         )?;
     }
@@ -78,6 +78,54 @@ pub fn create_mnemonic_worktree(
         path: worktree_path.to_string_lossy().to_string(),
         branch,
     })
+}
+
+/// New branches start from the freshly fetched `origin/<base>`, because a
+/// local base branch is usually behind and branching from it builds on stale
+/// code. The local ref is used only when the repository has no such remote
+/// branch, and anything that is not a branch name (a commit) is used as given.
+fn resolve_base_ref(repo_path: &Path, base_branch: &str) -> String {
+    let base_branch = base_branch.trim();
+    let base_branch = if base_branch.is_empty() {
+        "main"
+    } else {
+        base_branch
+    };
+    let name = base_branch.strip_prefix("origin/").unwrap_or(base_branch);
+    let remote_ref = format!("refs/remotes/origin/{name}");
+    let is_branch = base_branch.starts_with("origin/")
+        || ref_exists(repo_path, &remote_ref)
+        || ref_exists(repo_path, &format!("refs/heads/{name}"));
+    if !is_branch {
+        return base_branch.to_string();
+    }
+
+    if let Err(err) = git(
+        repo_path,
+        &[
+            "fetch",
+            "origin",
+            &format!("+refs/heads/{name}:{remote_ref}"),
+        ],
+    ) {
+        log::warn!(
+            "Couldn't fetch origin/{name} in {}, branching from the last fetched copy: {err}",
+            repo_path.display()
+        );
+    }
+    if ref_exists(repo_path, &remote_ref) {
+        format!("origin/{name}")
+    } else {
+        log::warn!(
+            "No origin/{name} in {}, branching from local {name}",
+            repo_path.display()
+        );
+        name.to_string()
+    }
+}
+
+fn ref_exists(repo_path: &Path, reference: &str) -> bool {
+    git(repo_path, &["show-ref", "--verify", "--quiet", reference]).is_ok()
 }
 
 /// Public entry point for callers outside this module (e.g. external worktree workspaces).
@@ -519,4 +567,72 @@ fn git(repo_path: &Path, args: &[&str]) -> Result<String, String> {
     }
 
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn new_branch_starts_from_latest_remote_main_without_tracking_it() -> Result<(), String> {
+        let root = tempfile::tempdir().map_err(|err| err.to_string())?;
+        let remote = root.path().join("remote.git");
+        let upstream = root.path().join("upstream");
+        let local = root.path().join("local");
+        let commit = |directory: &Path, message: &str| -> Result<String, String> {
+            git(
+                directory,
+                &[
+                    "-c",
+                    "user.name=test",
+                    "-c",
+                    "user.email=test@example.com",
+                    "commit",
+                    "--allow-empty",
+                    "-m",
+                    message,
+                ],
+            )?;
+            git(directory, &["rev-parse", "HEAD"])
+        };
+
+        git(
+            root.path(),
+            &["init", "--bare", "-b", "main", path_arg(&remote).as_str()],
+        )?;
+        git(
+            root.path(),
+            &[
+                "clone",
+                path_arg(&remote).as_str(),
+                path_arg(&upstream).as_str(),
+            ],
+        )?;
+        git(&upstream, &["checkout", "-b", "main"])?;
+        commit(&upstream, "first")?;
+        git(&upstream, &["push", "origin", "main"])?;
+        git(
+            root.path(),
+            &[
+                "clone",
+                path_arg(&remote).as_str(),
+                path_arg(&local).as_str(),
+            ],
+        )?;
+        let latest = commit(&upstream, "second")?;
+        git(&upstream, &["push", "origin", "main"])?;
+
+        let created = create_mnemonic_worktree(
+            &local.to_string_lossy(),
+            &root.path().join("workspaces").to_string_lossy(),
+            "ws-1",
+            "jay/feature",
+            "main",
+        )?;
+
+        let head = git(Path::new(&created.path), &["rev-parse", "HEAD"])?;
+        assert_eq!(head, latest);
+        assert!(!branch_is_published(&local, "jay/feature")?);
+        Ok(())
+    }
 }
