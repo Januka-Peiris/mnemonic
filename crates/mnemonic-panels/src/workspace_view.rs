@@ -89,6 +89,9 @@ const ENTER_DELAY_MILLIS: u64 = 250;
 /// running. Claude Code redraws its spinner continuously while working, so
 /// output going quiet for this long means it's waiting for input.
 const AGENT_IDLE_AFTER: Duration = Duration::from_secs(4);
+/// How long a "Finished" pop-up stays up. The sidebar dot stays until the
+/// workspace is opened, so nothing is lost when it goes.
+const FINISHED_NOTIFICATION_DURATION: Duration = Duration::from_secs(5);
 
 /// Archive waits at most this long for the workspace's teardown commands.
 const TEARDOWN_TIMEOUT: Duration = Duration::from_secs(120);
@@ -1008,6 +1011,7 @@ pub struct WorkspaceView {
     cli_quiet_reported: bool,
     notification_windows: Vec<WindowHandle<AgentNotification>>,
     notification_subscriptions: Vec<Subscription>,
+    notification_auto_dismiss: Option<Task<()>>,
     /// Errors and warnings in this workspace's files, from the project's
     /// language servers.
     diagnostic_summary: DiagnosticSummary,
@@ -4058,7 +4062,17 @@ impl WorkspaceView {
             .and_then(|index| self.sessions.get(index))
             .map(|session| session.title.clone())
             .unwrap_or_default();
+        let finished = matches!(event, acp_thread::AcpThreadEvent::Stopped(_));
         self.show_attention_notification(source, SharedString::from(caption), icon, cx);
+        if finished {
+            self.notification_auto_dismiss = Some(cx.spawn(async move |this, cx| {
+                cx.background_executor()
+                    .timer(FINISHED_NOTIFICATION_DURATION)
+                    .await;
+                this.update(cx, |this, cx| this.dismiss_notifications(cx))
+                    .log_err();
+            }));
+        }
     }
 
     /// An agent CLI that has gone quiet is waiting at its prompt. Only the
@@ -4152,6 +4166,7 @@ impl WorkspaceView {
     }
 
     fn dismiss_notifications(&mut self, cx: &mut Context<Self>) {
+        self.notification_auto_dismiss = None;
         self.notification_subscriptions.clear();
         for window in self.notification_windows.drain(..) {
             window
@@ -5986,6 +6001,7 @@ impl WorkspaceHost {
                     cli_quiet_reported: false,
                     notification_windows: Vec::new(),
                     notification_subscriptions: Vec::new(),
+                    notification_auto_dismiss: None,
                     workspace_id: summary.id.clone(),
                     workspace_name: SharedString::from(summary.name.clone()),
                     worktree_path,

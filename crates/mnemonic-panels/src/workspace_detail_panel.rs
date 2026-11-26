@@ -855,7 +855,7 @@ impl WorkspaceDetailPanel {
         if let Some(workspace) = self.workspace.upgrade() {
             workspace.update(cx, |workspace, cx| {
                 workspace.show_toast(
-                    Toast::new(NotificationId::unique::<MnemonicPrToast>(), message),
+                    Toast::new(NotificationId::unique::<MnemonicPrToast>(), message).autohide(),
                     cx,
                 );
             });
