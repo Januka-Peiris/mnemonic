@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use editor::Editor;
 use gpui::{
-    Action, AnyElement, AnyWindowHandle, App, AppContext as _, AsyncApp, ClipboardItem, Context,
+    Action, AnyWindowHandle, App, AppContext as _, AsyncApp, ClipboardItem, Context,
     DismissEvent, Entity, EventEmitter, FocusHandle, Focusable, IntoElement, PathPromptOptions,
     Pixels, PromptLevel, Render, SharedString, Subscription, Task, WeakEntity, Window, actions, px,
 };
@@ -2009,6 +2009,18 @@ impl WorkspacePanel {
             (!linked_names.is_empty()).then(|| format!("Linked to {}", linked_names.join(", ")));
 
         let row_group = SharedString::from(format!("workspace-row-{}", ws.id));
+        let agent_running = self.workspace.upgrade().is_some_and(|workspace| {
+            WorkspaceHost::workspace_agent_busy(workspace.read(cx), &ws.id, cx)
+        });
+        // A finished turn, permission request or error stands out by its
+        // name alone; everything else is muted.
+        let attention = mnemonic_bridge::agent_attention(&ws.id);
+        let name_color = match attention {
+            Some(AgentAttention::Error) => Color::Error,
+            Some(AgentAttention::NeedsAttention) => Color::Default,
+            None if is_selected => Color::Default,
+            None => Color::Muted,
+        };
         let pr_state = mnemonic_bridge::pr_state(&ws.id);
         let pr_color = pr_state
             .as_deref()
@@ -2061,21 +2073,28 @@ impl WorkspacePanel {
             .on_click(cx.listener(move |this, _, window, cx| {
                 this.select_workspace(ws_id.clone(), window, cx);
             }))
-            .child(self.render_agent_indicator(&ws.id, cx))
             .child({
                 let icon_color = match pr_color {
                     Some(color) => Color::Custom(color),
                     None if is_selected => Color::Default,
                     None => Color::Muted,
                 };
+                // Not animated: an animation re-renders the whole panel on
+                // every frame for as long as any agent runs.
+                let icon_name = if agent_running {
+                    IconName::LoadCircle
+                } else {
+                    IconName::FileGit
+                };
                 let icon = div()
                     .id(SharedString::from(format!("pr-state-{}", ws.id)))
                     .child(
-                        Icon::new(IconName::FileGit)
+                        Icon::new(icon_name)
                             .size(IconSize::XSmall)
                             .color(icon_color),
                     );
                 match pr_state.as_deref() {
+                    _ if agent_running => icon.tooltip(Tooltip::text("Agent running")),
                     Some(state) => {
                         let label = mnemonic_bridge::pr_state_label(state);
                         let tooltip = match mnemonic_bridge::pr_number(&ws.id) {
@@ -2096,7 +2115,10 @@ impl WorkspacePanel {
                     .child(
                         Label::new(ws.name.clone())
                             .size(LabelSize::Default)
-                            .color(Color::Default)
+                            .color(name_color)
+                            .when(attention.is_some(), |label| {
+                                label.weight(gpui::FontWeight::BOLD)
+                            })
                             .single_line(),
                     )
                     .when(in_pinned_section, |el| {
@@ -2365,60 +2387,6 @@ impl WorkspacePanel {
                     })
                 })
             })
-    }
-
-    /// Error (red) and needs-attention (accent) alerts stay until the
-    /// workspace is opened and win over the running spinner; otherwise a
-    /// muted dot.
-    fn render_agent_indicator(&self, workspace_id: &str, cx: &App) -> AnyElement {
-        let running = self.workspace.upgrade().is_some_and(|workspace| {
-            WorkspaceHost::workspace_agent_busy(workspace.read(cx), workspace_id, cx)
-        });
-        let (indicator, tooltip) = match mnemonic_bridge::agent_attention(workspace_id) {
-            Some(AgentAttention::Error) => (
-                div()
-                    .size(px(7.))
-                    .rounded_full()
-                    .bg(cx.theme().status().error)
-                    .into_any_element(),
-                "Agent stopped with an error",
-            ),
-            Some(AgentAttention::NeedsAttention) => (
-                div()
-                    .size(px(7.))
-                    .rounded_full()
-                    .bg(cx.theme().colors().text_accent)
-                    .into_any_element(),
-                "Agent finished or needs your input",
-            ),
-            None if running => (
-                // Not animated: an animation re-renders the whole panel on
-                // every frame for as long as any agent runs.
-                Icon::new(IconName::ArrowCircle)
-                    .size(IconSize::XSmall)
-                    .color(Color::Muted)
-                    .into_any_element(),
-                "Agent running",
-            ),
-            None => (
-                div()
-                    .size(px(7.))
-                    .rounded_full()
-                    .bg(cx.theme().colors().text_muted)
-                    .into_any_element(),
-                "Agent idle",
-            ),
-        };
-        h_flex()
-            .id(SharedString::from(format!(
-                "agent-indicator-{workspace_id}"
-            )))
-            .size(px(12.))
-            .flex_none()
-            .justify_center()
-            .tooltip(Tooltip::text(tooltip))
-            .child(indicator)
-            .into_any_element()
     }
 
     fn render_empty(&self) -> impl IntoElement {
