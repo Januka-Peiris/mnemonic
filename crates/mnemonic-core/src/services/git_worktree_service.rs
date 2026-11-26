@@ -223,7 +223,49 @@ pub fn archive_mnemonic_worktree(repo_path: &str, worktree_path: &str) -> Result
             path_arg(&destination).as_str(),
         ],
     )?;
+    discard_cargo_target(&archive_parent, &destination);
     Ok(destination)
+}
+
+/// A Rust worktree's `target/` folder often holds tens of gigabytes, and an
+/// archived worktree is rarely built again, so archiving drops it. A restored
+/// worktree simply rebuilds.
+fn discard_cargo_target(archive_parent: &Path, worktree: &Path) {
+    let target = worktree.join("target");
+    let target_is_directory =
+        fs::symlink_metadata(&target).is_ok_and(|metadata| metadata.is_dir());
+    if !worktree.join("Cargo.toml").is_file() || !target_is_directory {
+        return;
+    }
+    let worktree_name = worktree
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let mut trash = archive_parent.join(format!(".target-trash-{worktree_name}"));
+    let mut suffix = 1;
+    while trash.exists() {
+        trash = archive_parent.join(format!(".target-trash-{worktree_name}-{suffix}"));
+        suffix += 1;
+    }
+    // Renaming is instant, so the archived checkout never holds a half-deleted
+    // target if it is restored while the slow delete is still running.
+    if let Err(err) = fs::rename(&target, &trash) {
+        log::warn!(
+            target: "mnemonic_lib",
+            "could not move {} out of the archived worktree: {err}",
+            target.display()
+        );
+        return;
+    }
+    std::thread::spawn(move || {
+        if let Err(err) = fs::remove_dir_all(&trash) {
+            log::warn!(
+                target: "mnemonic_lib",
+                "could not delete archived build output {}: {err}",
+                trash.display()
+            );
+        }
+    });
 }
 
 /// Moves an archived worktree back to where it was before it was archived.
@@ -633,6 +675,48 @@ mod tests {
         let head = git(Path::new(&created.path), &["rev-parse", "HEAD"])?;
         assert_eq!(head, latest);
         assert!(!branch_is_published(&local, "jay/feature")?);
+        Ok(())
+    }
+
+    #[test]
+    fn archiving_a_rust_worktree_drops_its_target_folder() -> Result<(), String> {
+        let root = tempfile::tempdir().map_err(|err| err.to_string())?;
+        let repo = root.path().join("repo");
+        fs::create_dir_all(&repo).map_err(|err| err.to_string())?;
+        git(&repo, &["init", "-b", "main"])?;
+        fs::write(repo.join("Cargo.toml"), "[workspace]\n").map_err(|err| err.to_string())?;
+        git(&repo, &["add", "Cargo.toml"])?;
+        git(
+            &repo,
+            &[
+                "-c",
+                "user.name=test",
+                "-c",
+                "user.email=test@example.com",
+                "commit",
+                "-m",
+                "first",
+            ],
+        )?;
+        let worktree = root.path().join("workspaces").join("repo").join("ws-1");
+        git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "jay/feature",
+                path_arg(&worktree).as_str(),
+            ],
+        )?;
+        fs::create_dir_all(worktree.join("target").join("debug"))
+            .map_err(|err| err.to_string())?;
+
+        let archived =
+            archive_mnemonic_worktree(&repo.to_string_lossy(), &worktree.to_string_lossy())?;
+
+        assert!(archived.join("Cargo.toml").is_file());
+        assert!(!archived.join("target").exists());
         Ok(())
     }
 }
